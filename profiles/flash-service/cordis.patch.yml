@@ -144,6 +144,13 @@
         # `.env.example` are not, so a worker can still document configuration.
         protectEnvFiles: true
         blockDestructiveGit: true
+        # A mutation may not leave the workspace. The sandbox is supposed to enforce
+        # this, but its writable set is wider than the root — a live verification run
+        # deleted a file in the caller's tree through an absolute path because both
+        # the disposable copy and the root happened to sit under TMPDIR, which the
+        # sandbox allows. With isolation on, the workspace is a disposable copy, so
+        # "outside the workspace" means "not mine to touch".
+        fenceMutations: true
         # Credential locations, resolved against the worker's home directory.
         # The sandbox denies writes outside the workspace but permits reads, so
         # without these a worker could read a private key and report it back.

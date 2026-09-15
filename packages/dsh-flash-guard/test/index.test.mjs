@@ -33,7 +33,7 @@ const ROOT = '/Users/tester/code/project'
 // whether a target is *outside* the fence need to know where the fence is.
 const settings = resolveSettings({ root: ROOT })
 /** One context for the pure decisions: a workspace below a home directory. */
-const context = { cwd: ROOT, home: HOME, settings }
+const context = { cwd: ROOT, home: HOME, settings, fence: ROOT }
 
 /** Ask the guard about one call. */
 function decide(name, args, overrides = {}) {
@@ -226,8 +226,8 @@ test('shell access to a secret is refused however it is spelled', () => {
 test('a redirect into repository state is refused, an ordinary redirect is not', () => {
   assert.equal(classifyShell('echo x > .git/config', context)?.reason, REASON.STATE)
   assert.equal(classifyShell('echo x >>.git/config', context)?.reason, REASON.STATE)
-  assert.equal(classifyShell('node script.js 2> /tmp/err.log', context), undefined)
   assert.equal(classifyShell('printf x > src/out.txt', context), undefined)
+  assert.equal(classifyShell('node script.js 2> err.log', context), undefined)
   assert.equal(classifyShell('echo done 2>&1', context), undefined)
 })
 
@@ -353,9 +353,18 @@ test('a child that reports no cwd is still fenced by the configured root', async
   assert.equal(ran, 0)
   assert.equal(beside.error.info.reason, REASON.CRITICAL_RM)
 
-  // Something unrelated to the fence is still ordinary: scratch space is deletable.
+  // The fence is not the neighbourhood rule: *anything* a mutation names outside the
+  // configured root is refused, however unrelated it looks. The sandbox's writable set
+  // is wider than the root (its temp area, for one), so this rule is what makes the
+  // root the whole truth about what a worker may change.
   const unrelated = await handler({ name: 'bash', arguments: { command: 'rm -rf /tmp/flash-guard-unrelated-scratch' } }, next)
-  assert.equal(unrelated.error, undefined)
+  assert.equal(ran, 0)
+  assert.equal(unrelated.error.info.reason, REASON.CRITICAL_RM)
+  assert.match(unrelated.error.message, /outside/)
+
+  // Inside the root it is still ordinary work.
+  const inside = await handler({ name: 'bash', arguments: { command: 'rm -rf scratch' } }, next)
+  assert.equal(inside.error, undefined)
   assert.equal(ran, 1)
 
   // An agent that does report a cwd keeps using it instead of the fallback.
@@ -448,6 +457,23 @@ test('the review bypass corpus is refused', () => {
   // Tool calls whose path is not in a `file_path` argument.
   const callCases = [
     ['bash', { command: 'rm -rf project', workdir: '/Users/tester/code' }, REASON.CRITICAL_RM],
+    // The fence, from the outside: the sandbox's writable set is wider than the root
+    // (its temp area, for one), so naming an absolute path outside the workspace used
+    // to reach the caller's tree. A live run deleted a file in the caller's tree
+    // exactly this way, and these are the shapes that closed it.
+    ['bash', { command: `rm -f ${HOME}/code/other/README.md`, workdir: ROOT }, REASON.CRITICAL_RM],
+    ['bash', { command: 'rm -rf /tmp/flash-guard-unrelated-scratch', workdir: ROOT }, REASON.CRITICAL_RM],
+    ['bash', { command: 'rm -f /tmp/outside.txt', workdir: ROOT }, REASON.CRITICAL_RM],
+    ['bash', { command: 'cp secrets.txt /tmp/leak.txt', workdir: ROOT }, REASON.CRITICAL_RM],
+    ['bash', { command: 'printf x > /tmp/outside.txt', workdir: ROOT }, REASON.CRITICAL_RM],
+    ['bash', { command: 'mv build /tmp/build-old', workdir: ROOT }, REASON.CRITICAL_RM],
+    ['bash', { command: 'cd /tmp && rm -rf outside.txt', workdir: ROOT }, REASON.CRITICAL_RM],
+    ['bash', { command: 'mv /tmp/download.tar.gz .', workdir: ROOT }, REASON.CRITICAL_RM],
+    ['bash', { command: 'rsync -a build/ /tmp/build-copy/', workdir: ROOT }, REASON.CRITICAL_RM],
+    ['write', { file_path: '/tmp/outside.txt', content: 'x' }, REASON.CRITICAL_RM],
+    // The fence is the last rule, so a target that is *also* repository state or a secret
+    // keeps its more specific reason even when it lies outside the workspace.
+    ['write', { file_path: '/tmp/x/.npmrc', content: 'x' }, REASON.SECRET],
     ['bash', { command: 'rm -rf .git', workdir: ROOT }, REASON.STATE],
     ['apply_patch', { patch: '*** Begin Patch\n*** Update File: .git/config\n@@\n-x\n+y\n*** End Patch' }, REASON.STATE],
     ['apply_patch', { input: '--- a/.npmrc\n+++ b/.npmrc\n' }, REASON.SECRET],
@@ -469,8 +495,6 @@ test('the bypass corpus still allows the work these shapes also spell', () => {
     'bash -c "npm test"',
     'node -e "console.log(1)"',
     'node --test packages/flash-mcp/test/',
-    'mv build /tmp/build-old',
-    'rsync -a build/ /tmp/build-copy/',
     'git -C . status --short',
     'git push origin main',
     'git branch -a',
@@ -485,7 +509,16 @@ test('the bypass corpus still allows the work these shapes also spell', () => {
     'ls | xargs wc -l',
     'cat .env.example',
     'test -f .env.example && cat .env.example',
-    'rm -rf /tmp/flash-scratch-1234',
+    // The fence confines mutations, not reads: a worker may still read the toolchain,
+    // the system documentation, or a shared cache. And a redirect to a device is not a
+    // write at all, so the most common redirect in existence stays legal.
+    'cat /etc/hosts',
+    'grep -rn "flash_task" /usr/share/doc',
+    'echo x > /dev/null',
+    'node script.js 2>/dev/null',
+    'printf x > src/out.txt',
+    'mkdir -p src/generated',
+    'cp src/a.js src/b.js',
   ]
   for (const command of allowed) {
     assert.equal(classifyShell(command, context), undefined, command)

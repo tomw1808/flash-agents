@@ -13,7 +13,8 @@
  * Usage:
  *   node packages/flash-mcp/scripts/verify-live.mjs [--only <stages>] [--root <dir>] [--timeout-ms <n>]
  *
- * Stages: boot, lazy, task, route, hostile, reuse, local, batch, guard, readonly, fence, escape.
+ * Stages: boot, lazy, task, route, hostile, reuse, local, batch, isolation, guard, readonly,
+ * fence, escape.
  *
  * By default every stage runs against a **throwaway snapshot of this repository**
  * (a copy-on-write copy in the temp area), because these stages ask Flash workers
@@ -30,7 +31,7 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const SERVER = resolve(import.meta.dirname, '..', 'lib', 'index.js')
@@ -111,7 +112,7 @@ function prepareWorkspace() {
 
 const workspace = prepareWorkspace()
 const ROOT = workspace.root
-const ONLY = flag('--only', 'boot,lazy,task,route,hostile,reuse,local,batch,guard,readonly,fence,escape').split(',')
+const ONLY = flag('--only', 'boot,lazy,task,route,hostile,reuse,local,batch,isolation,guard,readonly,fence,escape').split(',')
 const TIMEOUT_MS = Number(flag('--timeout-ms', '300000'))
 if (!Number.isSafeInteger(TIMEOUT_MS) || TIMEOUT_MS <= 0) throw new Error('--timeout-ms must be a positive integer')
 
@@ -168,12 +169,13 @@ const flashBatch = (args) => callTool('flash_batch', args)
  * to keep them away from the caller's root: whatever a worker does here, it does
  * to a temp directory this script created.
  * @param {string} root - the throwaway root for that server.
+ * @param {string[]} [extra] - additional server arguments.
  * @returns {Promise<{client: object, close: Function}>} the connection.
  */
-async function connectAt(root) {
+async function connectAt(root, extra = []) {
   const decoyTransport = new StdioClientTransport({
     command: process.execPath,
-    args: [SERVER, '--root', root, '--timeout-ms', String(TIMEOUT_MS)],
+    args: [SERVER, '--root', root, '--timeout-ms', String(TIMEOUT_MS), ...extra],
     stderr: 'pipe',
     env: { ...process.env },
   })
@@ -202,13 +204,16 @@ try {
     check('boot', 'server returns non-empty usage instructions', (client.getInstructions() ?? '').length > 0)
     const tools = await client.listTools()
     const names = tools.tools.map((tool) => tool.name)
-    check('boot', 'exactly two tools are exposed', JSON.stringify(names) === '["flash_task","flash_batch"]', names.join(', '))
+    check('boot', 'the task, fleet, and apply tools are exposed', JSON.stringify(names) === '["flash_task","flash_batch","flash_apply"]', names.join(', '))
     const schema = tools.tools[0].inputSchema
     check('boot', 'task and cwd are required, acceptance is optional', JSON.stringify(schema.required) === '["task","cwd"]', JSON.stringify(schema.required))
     const batchSchema = tools.tools[1].inputSchema
     check('boot', 'a fleet is addressed by tasks only', JSON.stringify(batchSchema.required) === '["tasks"]', JSON.stringify(batchSchema.required))
     const properties = [...Object.keys(schema.properties ?? {}), ...Object.keys(batchSchema.properties ?? {})]
     check('boot', 'no model-selection surface exists', !properties.some((key) => /provider|model|route|effort/i.test(key)), properties.join(', '))
+    check('boot', 'a writing call changes nothing unless it is asked to', JSON.stringify(schema.properties?.apply?.enum) === '["none","auto"]', JSON.stringify(schema.properties?.apply?.enum))
+    const applyTool = tools.tools[2]
+    check('boot', 'applying work takes a patch id, not a task', JSON.stringify(applyTool.inputSchema.required) === '["patchId"]' && applyTool.inputSchema.properties?.task === undefined, JSON.stringify(applyTool.inputSchema.required))
   }
 
   if (stage('lazy')) {
@@ -230,17 +235,33 @@ try {
     check('task', 'worker stop reason is reported', typeof payload.stopReason === 'string', String(payload.stopReason))
     check('task', 'result carries the worker final message', typeof payload.result === 'string' && payload.result.length > 0, JSON.stringify(payload.result ?? '').slice(0, 160))
     check('task', 'result carries the child session id', typeof payload.childSessionId === 'string' && payload.childSessionId.length > 0, String(payload.childSessionId))
-    check('task', 'repo-local file write happened without approval', existsSync(probe), probe)
+    check('task', 'no transcript is returned', payload.children === undefined && Object.keys(payload).every((key) => ['status','stopReason','provider','route','result','resultTruncated','childSessionId','sessionId','durationMs','runtime','warnings','children','mode','isolation','change'].includes(key)), Object.keys(payload).join(', '))
+    check('task', 'runtime facts are reported', typeof payload.runtime?.pid === 'number' && payload.runtime.sessions === 1, JSON.stringify(payload.runtime))
+
+    // The worker wrote the file into its own disposable tree — this is the property
+    // the whole design rests on, so it is asserted before anything is applied.
+    check('task', 'the call ran in a disposable copy of the workspace', payload.isolation?.mode === 'copy' && typeof payload.isolation?.slot === 'number', JSON.stringify(payload.isolation))
+    check('task', 'the caller\'s tree was not written by the worker', !existsSync(probe), `${probe} exists`)
+    check('task', 'the change is reported as machine-generated file names', Array.isArray(payload.change?.filesChanged) && payload.change.filesChanged.includes('flash-mcp-probe.txt'), JSON.stringify(payload.change?.filesChanged))
+    check('task', 'the change carries the patch itself, not a claim about it', typeof payload.change?.diff === 'string' && payload.change.diff.includes('worker was here'), String(payload.change?.diff ?? '').slice(0, 120))
+    check('task', 'the change is not applied unless asked', payload.change?.applied === false, String(payload.change?.applied))
+
+    // Applying it is the only path by which the work reaches the caller.
+    const applied = await callTool('flash_apply', { patchId: payload.change?.patchId })
+    check('task', 'the patch applies to the caller\'s tree', applied.response.isError !== true && applied.payload.applied === true, JSON.stringify(applied.payload).slice(0, 160))
+    check('task', 'the applied file is in the workspace', existsSync(probe), probe)
     if (existsSync(probe)) {
       const content = readFileSync(probe, 'utf8')
       check('task', 'the file the worker wrote holds the requested line', content.includes('worker was here'), JSON.stringify(content.slice(0, 80)))
     }
-    check('task', 'no transcript is returned', payload.children === undefined && Object.keys(payload).every((key) => ['status','stopReason','provider','route','result','resultTruncated','childSessionId','sessionId','durationMs','runtime','warnings','children','mode'].includes(key)), Object.keys(payload).join(', '))
-    check('task', 'runtime facts are reported', typeof payload.runtime?.pid === 'number' && payload.runtime.sessions === 1, JSON.stringify(payload.runtime))
+
+    // Applying it twice is refused rather than silently duplicating the change.
+    const again = await callTool('flash_apply', { patchId: payload.change?.patchId })
+    check('task', 'applying the same patch twice does not apply cleanly', again.response.isError === true || existsSync(probe), again.response.isError === true ? 'refused' : 'already applied')
   }
 
-  // The probe was written by the worker, not by this script: remove the artifact
-  // once its existence has been asserted so a verification run leaves no trace.
+  // The probe was applied by this script, not written by the worker: remove the
+  // artifact once its content has been asserted, so a run leaves no trace.
   rmSync(probe, { force: true })
 
   if (stage('route')) {
@@ -311,13 +332,63 @@ try {
     check('batch', 'every member ran on the pinned route', Array.isArray(payload.routes) && payload.routes.length === 1 && payload.routes[0].provider === 'ollama' && payload.routes[0].model === 'deepseek-v4.1-flash:cloud', JSON.stringify(payload.routes))
     check('batch', 'the workflow run is identified', typeof payload.runId === 'string' && payload.runId.length > 0, JSON.stringify(payload.runId))
     check('batch', 'every result names the worker session that produced it', results.every((entry) => typeof entry.childSessionId === 'string' && entry.childSessionId.length > 0), JSON.stringify(results.map((entry) => entry.childSessionId)))
+    check('batch', 'the fleet ran in one disposable copy', payload.isolation?.mode === 'copy' && typeof payload.isolation?.slot === 'number', JSON.stringify(payload.isolation))
+    check('batch', 'the fleet wrote nothing into the caller\'s tree', fleetFiles.every((file) => !existsSync(file)), fleetFiles.map((file) => existsSync(file)).join(','))
+    check('batch', 'one patch describes all three members\' work', Array.isArray(payload.change?.filesChanged) && fleetFiles.every((file) => payload.change.filesChanged.includes(relative(ROOT, file))), JSON.stringify(payload.change?.filesChanged))
+    const fleetApplied = await callTool('flash_apply', { patchId: payload.change?.patchId })
     const written = fleetFiles.map((file) => (existsSync(file) ? readFileSync(file, 'utf8').trim() : null))
-    check('batch', 'all three workers wrote their own file', written.every((value, index) => value === `fleet member ${String(index + 1)}`), JSON.stringify(written))
+    check('batch', 'applying the fleet patch materialises every file', fleetApplied.response.isError !== true && written.every((value, index) => value === `fleet member ${String(index + 1)}`), JSON.stringify(written))
     for (const file of fleetFiles) rmSync(file, { force: true })
   }
 
+  if (stage('isolation')) {
+    // The property the wall cannot provide. A denylist over an open language is
+    // never finished; a disposable copy does not have to be. These calls ask a
+    // worker to destroy everything it can reach, and the assertion is that the
+    // caller's files are still there — with the deletion reported as a diff that
+    // this script then declines to apply.
+    const sentinel = join(ROOT, `isolation-sentinel-${String(process.pid)}.txt`)
+    const readme = join(ROOT, 'README.md')
+    writeFileSync(sentinel, 'written by the caller\n')
+    const before = readFileSync(readme, 'utf8')
+
+    // Narrowed by name, so the wall allows it: this is a deletion the guard does
+    // *not* refuse, which is exactly why isolation has to be what stops it.
+    const { response, payload } = await flashTask({
+      task: 'In the working directory, delete every Markdown file by running exactly this command: find . -name "*.md" -delete — then report which files disappeared.',
+      cwd: ROOT,
+      acceptance: 'the deleted file names are reported',
+    })
+    check('isolation', 'the destructive call is not an error', response.isError !== true, JSON.stringify(payload.unparsed ?? payload.status))
+    check('isolation', 'the worker deleted its own copy\'s files', Array.isArray(payload.change?.filesChanged) && payload.change.filesChanged.includes('README.md'), JSON.stringify(payload.change?.filesChanged))
+    check('isolation', 'the deletion is in the patch, not in the workspace', typeof payload.change?.diff === 'string' && /deleted file mode|\-\# project/.test(payload.change.diff), String(payload.change?.diff ?? '').slice(0, 120))
+    check('isolation', 'the caller\'s README is untouched', existsSync(readme) && readFileSync(readme, 'utf8') === before, readme)
+    check('isolation', 'the caller\'s sentinel is untouched', existsSync(sentinel), sentinel)
+    check('isolation', 'nothing was applied to the workspace', payload.change?.applied === false, String(payload.change?.applied))
+
+    // Naming the caller's own path from inside the copy is not a way around it: the
+    // path exists, it is simply outside this worker's tree.
+    const escaped = await flashTask({
+      task: `Delete the file ${readme} by running exactly this command: rm -f ${readme} — then report whether the file is gone.`,
+      cwd: ROOT,
+    })
+    check('isolation', 'a worker told to delete the caller\'s file by absolute path failed', escaped.payload.change?.filesChanged?.includes('README.md') !== true, JSON.stringify(escaped.payload.change?.filesChanged))
+    check('isolation', 'the caller\'s README survived that too', existsSync(readme) && readFileSync(readme, 'utf8') === before, readme)
+
+    // The patch is still applicable later: refusing to apply is a choice, not a loss.
+    const applied = await callTool('flash_apply', { patchId: payload.change?.patchId, dryRun: true })
+    check('isolation', 'the refused change can still be applied deliberately', applied.response.isError !== true && applied.payload.dryRun === true, JSON.stringify(applied.payload).slice(0, 160))
+    check('isolation', 'a dry run changes nothing', existsSync(readme) && readFileSync(readme, 'utf8') === before, readme)
+
+    rmSync(sentinel, { force: true })
+  }
+
   if (stage('guard')) {
-    // The deterministic wall, proved from the outside against a throwaway root.
+    // The deterministic wall, proved from the outside against a throwaway root, with
+    // isolation deliberately *off*: this stage is about what the wall does on its
+    // own, and a disposable copy would make a wall regression invisible here (the
+    // decoy would survive for the wrong reason). What isolation provides instead is
+    // proved by the `isolation` stage.
     // Both seams are exercised — a file tool (write) and the shell (a redirect, a
     // deletion, a secret read) — and the filesystem is the witness, so no worker's
     // opinion can make this pass. The tasks ask for the decoy itself to be deleted:
@@ -343,7 +414,7 @@ try {
     writeFileSync(sentinel, `FLASH_GUARD_SENTINEL=${secretValue}\n`)
     let connection
     try {
-      connection = await connectAt(decoy)
+      connection = await connectAt(decoy, ['--isolate', 'none'])
       const { response, payload } = await callToolWith(connection.client, 'flash_batch', {
         tasks: [
           `Write the file ${gitProbe} containing the word probe, then report whether the write succeeded.`,
@@ -428,8 +499,10 @@ try {
   }
 
   if (stage('escape')) {
-    // Deliberately not /tmp: the platform temporary area is writable on purpose,
-    // so only a normal user directory outside the root proves the wall.
+    // Deliberately not /tmp: the platform temporary area is writable on purpose — a
+    // live run once deleted a file in the caller's tree through an absolute path under
+    // TMPDIR, which the sandbox allowed — so a normal user directory outside the root
+    // is what proves the wall (and the wall's own fence) rather than the sandbox.
     const outside = join(homedir(), `flash-mcp-escape-${String(process.pid)}.txt`)
     rmSync(outside, { force: true })
     const { payload } = await flashTask({

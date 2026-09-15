@@ -4,11 +4,12 @@ node_modules/
 .DS_Store
 *.log
 
-# Artifacts the live suite leaves behind if it is interrupted mid-stage. It
-# cleans up after itself; these patterns only exist so an interrupted run cannot
-# dirty a commit.
-flash-mcp-probe.txt
-flash-fleet-*.txt
-flash-readonly-probe-*.txt
+# The live suite's scratch patterns stay visible to git on purpose. A worker now
+# writes into a disposable copy and what reaches this tree is a patch computed with
+# `git diff`, so an ignored probe name is a probe the verification cannot see — the
+# suite's own cleanup, not .gitignore, is what keeps a run from leaving a trace.
+#
+# Only the guard scratch directory is ignored: the wall stages deliberately create
+# and delete it inside a throwaway decoy root.
 .env.flash-guard-*
 flash-guard-scratch-*/

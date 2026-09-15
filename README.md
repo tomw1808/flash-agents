@@ -43,9 +43,11 @@ packages/flash-mcp/                 MCP stdio server + SDK JSON-RPC client half
   lib/mcp.js                        minimal MCP stdio server: framing, initialize, tools, cancel
   lib/sdk.js                        client for one persistent `dsh` child over the shipped SDK protocol
   lib/service.js                    flash_task: fresh session per call, compact result, cwd fence
+  lib/isolation.js                  disposable copies, the patch a call produces, and apply
   lib/index.js                      CLI entry, tool contract, lifecycle
   test/mcp.test.mjs                 protocol-level server tests
   test/service.test.mjs             service tests against a fake runtime
+  test/isolation.test.mjs            isolation against real git, real copies, real patches
   test/integration.test.mjs         MCP → SDK → stand-in Harness, whole pipeline, no LLM
   test-support/fake-dsh.mjs         the stand-in Harness process (outside `test/`, so it is never collected)
   scripts/verify-live.mjs           live end-to-end verification through the official MCP client
@@ -143,19 +145,24 @@ Claude Code ──MCP stdio──► flash-mcp ──SDK stdio JSON-RPC──►
 
 ### The tools
 
-Two doors, and nothing else:
+Three doors, and nothing else:
 
 | Tool | Required | Purpose |
 |---|---|---|
 | `flash_task` | `task`, `cwd` | one self-contained task on one worker |
 | `flash_batch` | `tasks` | a fleet the caller has already split, one worker per task |
+| `flash_apply` | `patchId` | put the change an earlier call produced into the workspace |
 
-Optional on both: `acceptance` (one string, or per task in `flash_batch`), `cwd`, and `mode`
-(`workspace-write` — the default — or `read-only`). There is no model, provider, effort, or
-permission parameter: the route is not a caller capability, and neither is the sandbox. Unknown
-arguments are ignored rather than forwarded.
+Optional on `flash_task` / `flash_batch`: `acceptance` (one string, or per task in `flash_batch`),
+`cwd`, `mode` (`workspace-write` — the default — or `read-only`), and `apply` (`none` — the default —
+or `auto`). There is no model, provider, effort, or permission parameter: the route is not a caller
+capability, and neither is the sandbox. Unknown arguments are ignored rather than forwarded.
 
-`flash_task { task, cwd, acceptance?, mode? }` returns one worker's outcome:
+A writing call does not run in your repository. It runs in a **disposable copy** of it and returns the
+change it made; `apply: "auto"` applies that change before returning, and `flash_apply { patchId }`
+applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck).
+
+`flash_task { task, cwd, acceptance?, mode?, apply? }` returns one worker's outcome:
 
 ```json
 {
@@ -169,9 +176,28 @@ arguments are ignored rather than forwarded.
   "sessionId": "flash-task-564be63a-b6f7-45f1-aa9c-d74f61265991",
   "durationMs": 8123,
   "mode": "workspace-write",
-  "runtime": { "pid": 98476, "booted": true, "uptimeMs": 13323, "sessions": 1, "profile": "flash-service" }
+  "runtime": { "pid": 98476, "booted": true, "uptimeMs": 13323, "sessions": 1, "profile": "flash-service" },
+  "isolation": { "mode": "copy", "slot": 0 },
+  "change": {
+    "available": true,
+    "filesChanged": ["flash-mcp-probe.txt"],
+    "diffstat": " flash-mcp-probe.txt | 1 +\n 1 file changed, 1 insertion(+)",
+    "diff": "diff --git a/flash-mcp-probe.txt …",
+    "diffTruncated": false,
+    "applied": false,
+    "patchId": "flash-9d1c…"
+  }
 }
 ```
+
+- `change` is computed by the service from the copy, not reported by the worker: `filesChanged` comes
+  from `git diff --name-status`, `diffstat` from `--stat`, and `diff` is the patch itself (clipped to
+  `--diff-chars`, with `diffTruncated` saying whether it was). A worker's own account of what it did
+  is in `result` and is **not** evidence that it did it.
+- Without git in the root the copy still isolates, but there is no diff to compute: `change.available`
+  is `false` and `change.reason` says why.
+- `isolation.mode` is `copy` for a writing call and `none` for a `read-only` call (which cannot write,
+  and therefore reads your real tree instead of a copy of it).
 
 `flash_batch { tasks, cwd?, acceptance?, mode? }` returns one entry per task, **in task order**, so
 `results[i]` always answers `tasks[i]`:
@@ -243,6 +269,14 @@ report it back. It refuses, deterministically and without consulting any model:
 | secrets | the `.env` family (minus `.env.example`/`.sample`/`.template`/`.dist`), `.netrc`, `.pgpass`, `.git-credentials`, and `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.dsh`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker/config.json` | denied | denied |
 | state | any `.git` segment; `.npmrc`, `.mcp.json`, `.gitconfig`, shell rc files | allowed | denied |
 | catastrophic | `rm`/`rmdir` of `/`, a top-level directory, a home, the service root or an ancestor, a bare glob at the root; an unbounded `find … -delete` or `find … -exec rm`; anything piped into `xargs rm`; redirects into a protected target; `git reset --hard`, `git clean -fdx`, `git push --force`, `git checkout -- .` | — | denied |
+| the fence | **any** mutation naming a path outside the workspace: a deletion, a command-line write destination (`cp`, `mv`, `install`, `ln`, `rsync`, `tee`, `sed -i`, `dd of=`), or a redirect — device targets such as `/dev/null` excepted | allowed | denied |
+
+The fence is the newest rule and the one a live run earned. The sandbox confines writes to the
+workspace *plus* the platform's temporary areas, so with the workspace itself under `TMPDIR` a worker
+deleted a file in the caller's tree by naming its absolute path — the sandbox allowed it, and the
+path was neither a secret, nor repository state, nor adjacent to the root, so nothing refused it. Now
+a mutation outside the workspace is refused however it is spelled, and reads stay open: a worker may
+still read `/etc/hosts`, `/usr/share/doc`, or a shared cache.
 
 A denied call never runs: the wrapper returns an `isError` result instead of calling `next()`, and
 carries `error.info.code = "FLASH_GUARD_DENIED"` with a reason (`PROTECTED_SECRET`,
@@ -255,7 +289,9 @@ task that caused them in `results[i].denials`:
 ```
 
 It is a **circuit breaker, not a sandbox**: the file and shell sandboxes remain the enforcement
-boundary, and it makes no claim about the rest of the shell language. It refuses in the safe
+boundary, and it makes no claim about the rest of the shell language. `fenceMutations: false` in a
+profile's `flash-guard.config` turns the fence off where an agent works in more than one tree and the
+sandbox is trusted to be the whole story; the service profile leaves it on. It refuses in the safe
 direction — a command that merely *mentions* a secret path is denied too — so treat a denial as
 "ask the caller", not "the command was necessarily malicious". Protected lists are composed in the
 profile (`flash-guard.config`), so a deployment can widen or narrow them there.
@@ -273,12 +309,50 @@ whose profile (`flash-service-readonly`, generated by `install.mjs` as this repo
 composition with exactly one change: `sandbox-policy.mode: read-only`) denies every mutation at the
 sandbox. Nothing can widen the standing profile: unknown modes are refused with `MODE_UNAVAILABLE`.
 
-### Worktree guidance
+### Isolation: the worker gets a tree it may wreck
 
-The sandbox root is the whole workspace, and a worker may write anywhere inside it. Point `--root`
-at something you are willing to lose: a **git worktree or a scratch clone**, not a checkout holding
-uncommitted work you care about. The wall protects `.git` and secrets, but it does not protect your
-uncommitted source.
+The wall is a denylist over an open language, and a denylist over an open language is never finished —
+`rm -rf "$(pwd)"`, `bash -c "…"`, inline interpreter code, `mv . /tmp` and a dozen other spellings all
+had to be added after the fact. Isolation removes the premise instead:
+
+1. a writing call leases a **disposable copy** of the root (a copy-on-write clone where the
+   filesystem supports one, so an ordinary repository costs milliseconds and no space);
+2. the runtime that serves the call is rooted *there*, so the sandbox confines the worker to a tree
+   nobody needs;
+3. afterwards the service computes what changed in the copy — `filesChanged`, `diffstat`, and the
+   patch itself — and returns that instead of the worker's account of itself;
+4. nothing reaches your repository until a patch is **applied**, by `apply: "auto"` on the call or by
+   `flash_apply { patchId }` afterwards.
+
+The copy includes `.git` and your uncommitted work, because a worker that sees the last commit
+instead of your working tree is useless while you are mid-edit. `rm -rf` of everything the worker can
+reach destroys a throwaway copy and shows up as a patch that deletes files — which you then decline
+to apply.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--isolate copy` | ✓ | writing calls run in a disposable copy |
+| `--isolate none` | | workers write to the root directly; the wall is the only defence |
+| `--slots <n>` | 2 | how many copies may be in flight; each one is a runtime process |
+| `--state-dir <path>` | `TMPDIR/flash-mcp` | where copies and returned patches live |
+| `--diff-chars <n>` | 20000 | how much of a patch a result carries |
+
+Honest limits of this design:
+
+- A **fleet is one call, so it is one copy**: its members share a working directory and therefore see
+  each other's edits. Per-member trees would need a runtime per member, which the engine's design
+  (one session per run) does not allow.
+- A `read-only` call is deliberately **not** isolated: it cannot write anything, and running it in
+  your real tree means it reads your current state rather than a copy's.
+- A **non-git root** is still isolated, but there is no diff to compute, so there is no verdict — only
+  the worker's report.
+- Without copy-on-write (Linux, non-APFS) the copy is a real copy and costs real time and space per
+  call. `--slots 1` bounds it.
+- `apply` writes the patch with `git apply` (or `patch -p1` when the root is not a repository) into
+  the working tree, leaving your index alone. A patch that no longer applies is reported as an error
+  naming the kept patch file, so a conflict is never lost work.
+- `--isolate none` exists for debugging the wall. With it, point `--root` at something you are willing
+  to lose: the wall protects `.git` and secrets, but it does not protect your uncommitted source.
 
 ### Environment
 
@@ -298,8 +372,8 @@ uncommitted source.
 ## Verify
 
 ```sh
-npm test                                        # all three suites: 85 tests, no LLM
-node --test packages/flash-mcp/test/            # 44 protocol, service, pipeline, and fleet tests
+npm test                                        # all three suites: 102 tests, no LLM
+node --test packages/flash-mcp/test/            # 61 protocol, service, isolation, pipeline, fleet tests
 node --test packages/dsh-flash-guard/test/      # 19 wall tests
 node --test packages/dsh-subagent-flash/test/   # 22 provider contract tests
 npm run verify                                  # live end-to-end, needs Ollama and a profile boot
@@ -322,36 +396,40 @@ implementation of the protocol the target agent speaks — and prints one line p
 
 ### What was verified live
 
-`npm run verify` → **69/69 checks**, from a real MCP client over real stdio, against real
+`npm run verify` → **91/91 checks**, from a real MCP client over real stdio, against real
 `dsh --profile flash-service` and `flash-service-readonly` runtimes:
 
 | Stage | Checks | What it establishes |
 |---|---|---|
-| `boot` | 6 | the server identifies itself, exposes exactly two tools, and offers **no model-selection property** |
+| `boot` | 8 | the server identifies itself, exposes the task/fleet/apply doors, offers **no model-selection property**, and defaults to applying nothing |
 | `lazy` | 1 | no runtime process exists before the first call |
-| `task` | 10 | a real worker writes and reads a repo-local file **without interactive approval**, and the result carries its status, stop reason, observed route, session, and no transcript |
+| `task` | 17 | a real worker writes and reads a repo-local file **without interactive approval**, the file is **not** in the caller's tree, the change comes back as a patch holding the worker's own line, `flash_apply` puts it there, and a second apply is refused |
 | `route` | 2 | the worker ran `ollama/deepseek-v4.1-flash:cloud` under `provider: flash` |
 | `hostile` | 2 | caller-supplied `provider`/`model`/`agentOptions` cannot change the child route and are not echoed |
 | `reuse` | 6 | one process, one handshake, same pid across calls, a fresh orchestration **and** worker session per call |
 | `local` | 2 | a repo-local command runs unattended, and the worker's reported output is real |
-| `batch` | 11 | a pre-split fleet runs one worker per task, in parallel (peak concurrency 3), on the pinned route, paired back in task order with each member's session and a `runId` |
-| `guard` | 18 | the wall refuses `.git` writes, a redirect into `.git`, and a secret read; **`rm -rf <service root>` and `rm -rf *` are stopped with `CRITICAL_PATH`**; an ordinary `rm -rf <scratch>` still runs; every denial comes back structured (`code`, `reason`) and attributed per task |
-| `readonly` | 6 | `mode: "read-only"` runs the call in its own process on the generated profile, the write is denied by the sandbox, reads still work, and an unknown mode is refused |
+| `batch` | 13 | a pre-split fleet runs one worker per task, in parallel, on the pinned route, paired back in task order with each member's session and a `runId`; the fleet writes nothing into the caller's tree, and one applied patch materialises all three files |
+| `isolation` | 10 | a worker told to delete its workspace's Markdown files really does delete them — **in the copy** — and the deletions arrive as a patch while the caller's README and sentinel survive; a worker told to delete the caller's file *by absolute path* fails; a dry run still changes nothing |
+| `guard` | 18 | the wall refuses `.git` writes, a redirect into `.git`, and a secret read; **`rm -rf <service root>` and `rm -rf *` are stopped with `CRITICAL_PATH`**; an ordinary `rm -rf <scratch>` inside the root still runs; every denial comes back structured (`code`, `reason`) and attributed per task |
+| `readonly` | 7 | `mode: "read-only"` runs the call in its own process on the generated profile, the write is denied by the sandbox, reads still work, the call is **not** isolated, and an unknown mode is refused |
 | `fence` | 2 | a `cwd` outside the root fails closed with the confinement named |
 | `escape` | 3 | a write outside the workspace is denied and the file never appears |
 
-The `guard` stage is the one worth reading twice: it asks workers to delete their workspace on
-purpose, so it runs against a **throwaway decoy root** served by its own `flash-mcp` instance, and
-asserts the decoy's marker and contents survived. A wall regression costs a temp directory and fails
-a check; the repository this script was pointed at is outside the blast radius by construction. The
-stage also confirms the caller's tree is untouched, and it reports *how* each critical command was
-stopped — by the wall (a `CRITICAL_PATH` denial) or by the worker declining — rather than assuming
-either, because a model cannot be relied on to attempt a deletion on cue.
+Two stages are worth reading twice. The `isolation` stage runs with isolation **on** and asks a worker
+to destroy everything it can reach; the assertion is that the caller's files are still there and that
+the destruction is merely a patch the script declines to apply. The `guard` stage runs with isolation
+deliberately **off**, against a **throwaway decoy root**: it is about what the wall does on its own,
+and a disposable copy would make a wall regression invisible there — the decoy would survive for the
+wrong reason. A wall regression costs a temp directory and fails a check; the repository this script
+was pointed at is outside the blast radius by construction. That stage also reports *how* each
+critical command was stopped — by the wall (a `CRITICAL_PATH` denial) or by the worker declining —
+rather than assuming either, because a model cannot be relied upon to attempt a deletion on cue.
 
-Earlier, for the interactive preset: the host row mounts through live patch reload with the pinned
-`agentRouteDefaults`; a hostile-override child was forwarded `ollama/deepseek-v4.1-flash:cloud` and
-answered `flash ok`; the leaf guard rejected a depth-1 parent; and the `flash-orchestrator` subtree
-composes against the live provider.
+The `escape` stage's target is deliberately *not* under `/tmp`, and that is not a style choice: the
+sandbox permits writes to the platform's temporary area, and an earlier run of the `isolation` stage
+deleted a file in the caller's tree through an absolute path under `TMPDIR` — allowed by the sandbox,
+because the copy and the root both happened to live there. The wall's fence rule is what closed that
+hole, and this stage is where it stays closed.
 
 ## Hard limits
 
@@ -493,7 +571,21 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
   MCP request or a timed-out task stops being *waited on* while the session keeps running inside
   Harness, and its later notifications are ignored.
 - **The platform temporary area is writable by design.** `/tmp` and friends are not denied by
-  `workspace-write`; the wall is around the workspace root, not around every path outside it.
+  `workspace-write`, and that is not theoretical: a live run deleted a file in the caller's tree
+  through an absolute path under `TMPDIR` while the sandbox allowed it. The wall's fence rule
+  (`fenceMutations`, on in the service profile) is what refuses a mutation outside the workspace now;
+  the sandbox alone is not that boundary.
+- **The fence is on by default and cannot be narrowed per call.** It is a standing profile rule, like
+  every other one, so a worker cannot talk its way out of it — and a deployment that genuinely needs
+  an agent writing across several trees has to turn it off in `flash-guard.config`
+  (`fenceMutations: false`) rather than per call.
+- **Work that git ignores is reported, not carried.** The patch is computed with `git diff`, so a file
+  your `.gitignore` excludes never reaches `apply`: the result names it under `change.ignored` and
+  warns, which turns a misleading "no change" into an explicit one, but the patch is still not a
+  filesystem diff.
+- **A patch applies to the working tree, not to your index.** `git apply` without `--index` leaves
+  staging alone, so a partially-staged file can make an otherwise clean patch conflict; the patch file
+  is kept and named in the error when that happens.
 - **The service needs a local Ollama serving the pinned model.** The route is registered by the
   profile, so a missing daemon or model surfaces as a worker-turn error rather than a startup error.
   To serve a different model, edit `profiles/flash-service/cordis.patch.yml` and reinstall.

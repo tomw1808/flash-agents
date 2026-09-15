@@ -5,7 +5,8 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -40,6 +41,9 @@ class FakeSdkClient {
     this.running = false
     this.starts = 0
     this.initializes = []
+    /** When set, the "worker" writes this file into whatever tree it was given. */
+    this.writes = undefined
+    this.cwd = undefined
     this.prompts = []
     this.notificationHandlers = new Set()
     this.exitHandlers = new Set()
@@ -54,6 +58,7 @@ class FakeSdkClient {
 
   async initialize(params) {
     this.initializes.push(params)
+    this.cwd = params.cwd
     return { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' }
   }
 
@@ -84,6 +89,9 @@ class FakeSdkClient {
   #replay(sessionId, text) {
     const script = this.script
     const childSessionId = `child-${sessionId}`
+    if (this.writes !== undefined && this.cwd !== undefined) {
+      writeFileSync(join(this.cwd, this.writes), 'written by the worker\n')
+    }
     if (script === 'no-delegation') {
       this.emit('session.status', { sessionId, status: 'running' })
       this.emit('session.event', {
@@ -269,9 +277,32 @@ function makeService({ script, ...overrides } = {}) {
     root,
     clientFactory: () => client,
     log: () => {},
+    // These tests pin the contract of a call that runs in the root itself. What a
+    // call does when it is isolated is exercised in its own block below.
+    isolate: { mode: 'none' },
     ...overrides,
   })
   return { root, client, service }
+}
+
+/** A git-backed root, and a worker that writes one file into whatever tree it gets. */
+function makeIsolatedService({ slots = 2, file = 'worker-output.txt', ...overrides } = {}) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-iso-')))
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root })
+  writeFileSync(join(root, 'README.md'), '# project\n')
+  execFileSync('git', ['add', '-A'], { cwd: root })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: root })
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-iso-state-')))
+  const client = new FakeSdkClient({})
+  client.writes = file
+  const service = new FlashTaskService({
+    root,
+    clientFactory: () => client,
+    log: () => {},
+    isolate: { slots, stateDir },
+    ...overrides,
+  })
+  return { root, client, service, stateDir }
 }
 
 test('runs one task through one child and returns a compact result', async () => {
@@ -302,6 +333,7 @@ test('runs one task through one child and returns a compact result', async () =>
   assert.deepEqual(Object.keys(result).sort(), [
     'childSessionId',
     'durationMs',
+    'isolation',
     'mode',
     'provider',
     'result',
@@ -649,4 +681,100 @@ test('the fleet prompt pins identity and asks for exactly one workflow call', ()
   assert.match(prompt, /reply with exactly: DELEGATED/)
   assert.ok(prompt.includes('<script>\nreturn 1\n</script>'))
   assert.ok(prompt.includes('<args>\n{"items":[]}\n</args>'))
+})
+
+// ── isolation: the worker gets a tree it is allowed to wreck ────────────────
+
+test('a writing call runs in a disposable copy, not in the caller’s tree', async () => {
+  const { root, client, service } = makeIsolatedService({ file: 'worker-output.txt' })
+  const result = await service.flashTask({ task: 'write one file', cwd: root })
+
+  assert.equal(result.isolation.mode, 'copy')
+  assert.equal(result.isolation.slot, 0)
+  assert.equal(result.change.available, true)
+  assert.deepEqual(result.change.filesChanged, ['worker-output.txt'])
+  assert.match(result.change.diff, /written by the worker/)
+  assert.equal(result.change.applied, false)
+  assert.equal(result.change.diffTruncated, false)
+  assert.equal(typeof result.change.patchId, 'string')
+
+  // The worker was told it is in a copy, and its runtime is rooted there.
+  assert.match(client.prompts[0].text, /disposable copy of/)
+  assert.match(client.prompts[0].text, /Use relative paths/)
+  assert.notEqual(client.initializes[0].cwd, root)
+  assert.match(client.initializes[0].cwd, /slots\/slot-0$/)
+
+  // Nothing reached the caller's tree: the diff is the only way back.
+  assert.equal(existsSync(join(root, 'worker-output.txt')), false)
+  await service.close()
+})
+
+test('apply "auto" is the one path by which work reaches the caller', async () => {
+  const { root, service } = makeIsolatedService({ file: 'auto.txt' })
+  const result = await service.flashTask({ task: 'write one file', cwd: root, apply: 'auto' })
+  assert.equal(result.change.applied, true)
+  assert.equal(readFileSync(join(root, 'auto.txt'), 'utf8'), 'written by the worker\n')
+  await service.close()
+})
+
+test('flash_apply applies a patch later, and a dry run only checks it', async () => {
+  const { root, service } = makeIsolatedService({ file: 'later.txt' })
+  const result = await service.flashTask({ task: 'write one file', cwd: root })
+  assert.equal(existsSync(join(root, 'later.txt')), false)
+
+  const checked = service.flashApply({ patchId: result.change.patchId, dryRun: true })
+  assert.equal(checked.applied, false)
+  assert.equal(existsSync(join(root, 'later.txt')), false)
+
+  const applied = service.flashApply({ patchId: result.change.patchId })
+  assert.equal(applied.applied, true)
+  assert.equal(readFileSync(join(root, 'later.txt'), 'utf8'), 'written by the worker\n')
+  await service.close()
+})
+
+test('a read-only call is not isolated: it cannot write, and it reads the caller’s tree', async () => {
+  const { root, client, service } = makeIsolatedService({ file: 'never.txt' })
+  const result = await service.flashTask({ task: 'read the README', cwd: root, mode: 'read-only' })
+  assert.equal(result.mode, 'read-only')
+  assert.equal(result.isolation.mode, 'none')
+  assert.equal(result.isolation.slot, null)
+  assert.equal(result.change, undefined)
+  assert.equal(client.initializes[0].cwd, root)
+  await service.close()
+})
+
+test('a patch is refused when the patch id is unknown, and apply needs isolation', async () => {
+  const { root, service } = makeIsolatedService()
+  assert.throws(() => service.flashApply({ patchId: 'flash-missing' }), (error) => error.code === 'APPLY_FAILED')
+  await service.close()
+
+  const plain = makeService()
+  await assert.rejects(
+    () => plain.service.flashTask({ task: 'x', cwd: plain.root, apply: 'auto' }),
+    (error) => error.code === 'ISOLATION_DISABLED',
+  )
+  assert.throws(() => plain.service.flashApply({ patchId: 'flash-any' }), (error) => error.code === 'ISOLATION_DISABLED')
+  await plain.service.close()
+})
+
+test('two concurrent calls get two different trees', async () => {
+  const { root, client, service } = makeIsolatedService({ slots: 2 })
+  const [first, second] = await Promise.all([
+    service.flashTask({ task: 'first', cwd: root }),
+    service.flashTask({ task: 'second', cwd: root }),
+  ])
+  assert.deepEqual([first.isolation.slot, second.isolation.slot].sort(), [0, 1])
+  assert.equal(new Set(client.initializes.map((params) => params.cwd)).size, 2)
+  assert.equal(existsSync(join(root, 'worker-output.txt')), false)
+  await service.close()
+})
+
+test('a fleet is one call and therefore one tree', async () => {
+  const { root, client, service } = makeIsolatedService({ slots: 2 })
+  const result = await service.flashBatch({ tasks: ['one', 'two'], cwd: root, script: 'batch' })
+  assert.equal(result.isolation.mode, 'copy')
+  assert.equal(result.isolation.slot, 0)
+  assert.equal(result.change.available, true)
+  assert.equal(new Set(client.initializes.map((params) => params.cwd)).size, 1)
+  await service.close()
 })

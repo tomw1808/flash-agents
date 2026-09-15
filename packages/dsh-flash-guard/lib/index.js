@@ -131,6 +131,10 @@ const DEFAULT_SETTINGS = Object.freeze({
   ],
   /** Whether destructive git worktree/history commands are refused. */
   blockDestructiveGit: true,
+  // A mutation may not leave the workspace. This is the rule the live run needed: the
+  // sandbox's writable set is wider than the root, so a worker could delete a file in
+  // the caller's tree by naming its absolute path.
+  fenceMutations: true,
 })
 
 /**
@@ -172,6 +176,7 @@ function resolveSettings(config = {}) {
     envFileExceptions: stringArrayOr(source.envFileExceptions, DEFAULT_SETTINGS.envFileExceptions),
     homeProtectedPaths: stringArrayOr(source.homeProtectedPaths, DEFAULT_SETTINGS.homeProtectedPaths),
     blockDestructiveGit: booleanOr(source.blockDestructiveGit, DEFAULT_SETTINGS.blockDestructiveGit),
+    fenceMutations: booleanOr(source.fenceMutations, DEFAULT_SETTINGS.fenceMutations),
   }
 }
 
@@ -251,7 +256,7 @@ function isHomeProtected(resolved, home, settings) {
  * @returns {{reason: string, detail: string} | undefined} the verdict, or undefined to allow.
  */
 function classifyPathAccess(input) {
-  const { path: candidate, cwd = '', home = '', settings, mutate } = input
+  const { path: candidate, cwd = '', home = '', settings, mutate, fence = '' } = input
   if (typeof candidate !== 'string' || candidate.length === 0) return undefined
   const resolved = resolveTarget(candidate, cwd, home)
   const base = basenameOf(resolved)
@@ -278,6 +283,17 @@ function classifyPathAccess(input) {
   }
   if (settings.protectedFileNames.includes(base)) {
     return { reason: REASON.STATE, detail: `${base} configures the tooling` }
+  }
+  // The fence, kept last so the more specific diagnosis wins: a secret, a state file,
+  // or a config name is reported as itself even when it also lies outside the fence.
+  // Enforced for mutations, it says a worker may change its own workspace and nothing
+  // else. The sandbox is supposed to do this, but its writable temp area is
+  // wider than the workspace — a live run deleted a file in the caller's tree through
+  // an absolute path, because both the disposable copy and the root happened to live
+  // under TMPDIR, which the sandbox allows. Reads are not fenced (toolchains, `/usr`,
+  // shared caches), and device paths are not writes at all.
+  if (settings.fenceMutations !== false && fence !== '' && fence !== resolved && !isAtOrUnder(resolved, fence) && !DEVICE_PATH.test(resolved)) {
+    return { reason: REASON.CRITICAL_RM, detail: `mutates ${resolved}, which is outside ${fence}` }
   }
   return undefined
 }
@@ -434,6 +450,12 @@ const DESTRUCTIVE_GIT = [
   /^gc$/,
 ]
 
+/**
+ * Device and descriptor paths that a redirect may legitimately name. `> /dev/null`
+ * is not a write outside the workspace, it is a write nowhere.
+ */
+const DEVICE_PATH = /^\/(?:dev\/(?:null|stdout|stderr|stdin|tty|zero|fd\/\d+)|proc\/self\/fd\/\d+)$/
+
 /** A search pattern that reads as credential hunting, not as ordinary reading. */
 const SECRET_HUNT = /(?:secret|token|password|passwd|api[_-]?key|private[_-]?key|credential|BEGIN [A-Z ]*PRIVATE KEY)/i
 
@@ -445,18 +467,13 @@ const SECRET_HUNT = /(?:secret|token|password|passwd|api[_-]?key|private[_-]?key
 const PATCH_BODY_ARGUMENT = /^(?:patch|input|diff|body)$/i
 
 /**
- * Whether a deletion is dangerous precisely because it leaves the service root.
- *
- * Inside the root the ordinary rules apply: a worktree is the worker's to change.
- * Outside it a worker has no business deleting anything, and the two shapes that
- * matter are the ones the incident class uses — the user's home (`rm -rf x` after a
- * bare `cd`), an ancestor of the root, and a *sibling* of the root, which is what
- * `cd .. && rm -rf <dirname>` reaches. Scratch space such as `/tmp` is neither, and
- * stays deletable.
- *
- * @param {string} resolved - the resolved deletion target.
+ * Whether a target is dangerous precisely because it is adjacent to the workspace:
+ * inside the home directory, an ancestor of the root, or a sibling of it. This is
+ * the rule that stops `rm -rf ~/Projects/thing` and `rm -rf <root>/..` without
+ * making every path outside the root fatal.
+ * @param {string} resolved - the canonical target.
  * @param {{root: string, home: string}} context - the fence and the home directory.
- * @returns {boolean} true when the target must be refused for being outside.
+ * @returns {boolean} whether the target is adjacent to the workspace.
  */
 function isOutsideRootCritical(resolved, context) {
   const { root, home } = context
@@ -561,7 +578,7 @@ function isSecretHunt(program, argv) {
  * @returns {{reason: string, detail: string} | undefined} the verdict, or undefined.
  */
 function classifyRmTarget(raw, resolved, context) {
-  const { cwd, home, settings } = context
+  const { cwd, home, settings, fence = '' } = context
   // A bare glob removes the directory's whole contents.
   if (/^(?:\.\/)?(?:\*|\.\*|\{\*,\.\*\}|\*\.[A-Za-z0-9]+)$/.test(raw)) {
     return { reason: REASON.CRITICAL_RM, detail: 'removes every entry of a directory' }
@@ -570,7 +587,7 @@ function classifyRmTarget(raw, resolved, context) {
     return { reason: REASON.CRITICAL_RM, detail: 'removes the home directory' }
   }
   if (!isAbsolute(resolved)) {
-    const pathVerdict = classifyPathAccess({ path: resolved, cwd, home, settings, mutate: true })
+    const pathVerdict = classifyPathAccess({ fence, path: resolved, cwd, home, settings, mutate: true })
     return pathVerdict
   }
   if (resolved === sep || /^[/\\][^/\\]+[/\\]?$/.test(resolved)) {
@@ -582,7 +599,7 @@ function classifyRmTarget(raw, resolved, context) {
   if (cwd.length > 0 && (resolved === cwd || isAtOrUnder(cwd, resolved))) {
     return { reason: REASON.CRITICAL_RM, detail: 'removes the service root or an ancestor of it' }
   }
-  return classifyPathAccess({ path: resolved, cwd, home, settings, mutate: true })
+  return classifyPathAccess({ fence, path: resolved, cwd, home, settings, mutate: true })
 }
 
 /**
@@ -592,7 +609,7 @@ function classifyRmTarget(raw, resolved, context) {
  * @returns {{reason: string, detail: string} | undefined} the verdict, or undefined to allow.
  */
 function classifyShell(command, context) {
-  const { cwd, home, settings } = context
+  const { cwd, home, settings, fence = '' } = context
   if (typeof command !== 'string' || command.trim().length === 0) return undefined
   // A `cd` earlier in the same command line moves everything after it, so the
   // commands that follow are classified against the directory it moved to. When the
@@ -706,12 +723,6 @@ function classifyShell(command, context) {
     if (isSecretHunt(program, argv)) {
       return { reason: REASON.SECRET, detail: `recursively searches for credentials (${argv.slice(1).find((token) => !token.startsWith('-'))})` }
     }
-    // A write destination is mutated even though it is only an argument.
-    for (const destination of writeDestinations(program, argv)) {
-      if (SHELL_SUBSTITUTION.test(destination)) continue
-      const verdict = classifyPathAccess({ path: destination, cwd, home, settings, mutate: true })
-      if (verdict !== undefined) return verdict
-    }
     if (INTERPRETER_PROGRAMS.has(program)) {
       // Inline code can name a secret inside a quoted string, where tokenization
       // cannot see it as a path.
@@ -737,7 +748,7 @@ function classifyShell(command, context) {
       if (input !== null) {
         const target = input[1].length > 0 ? input[1] : argv[position + 1]
         if (typeof target === 'string' && target.length > 0) {
-          const verdict = classifyPathAccess({ path: target, cwd, home, settings, mutate: false })
+          const verdict = classifyPathAccess({ fence, path: target, cwd, home, settings, mutate: false })
           if (verdict !== undefined) return verdict
         }
         continue
@@ -747,7 +758,7 @@ function classifyShell(command, context) {
         const attached = redirect[1]
         const target = attached.length > 0 ? attached : argv[position + 1]
         if (typeof target === 'string' && target.length > 0) {
-          const verdict = classifyPathAccess({ path: target, cwd, home, settings, mutate: true })
+          const verdict = classifyPathAccess({ fence, path: target, cwd, home, settings, mutate: true })
           if (verdict !== undefined) return verdict
         }
         continue
@@ -763,8 +774,17 @@ function classifyShell(command, context) {
           ? basenameOf(expandHome(fileToken, home))
           : undefined
       if (mentionsSecret === undefined) continue
-      const verdict = classifyPathAccess({ path: fileToken, cwd, home, settings, mutate: false })
+      const verdict = classifyPathAccess({ fence, path: fileToken, cwd, home, settings, mutate: false })
       if (verdict !== undefined && verdict.reason === REASON.SECRET) return verdict
+    }
+    // A write destination is mutated even though it is only an argument. This runs
+    // after the per-token pass so that a command which both reads a secret and writes
+    // outside the workspace is reported as the secret read: the more alarming fact,
+    // and the one a caller can act on.
+    for (const destination of writeDestinations(program, argv)) {
+      if (SHELL_SUBSTITUTION.test(destination)) continue
+      const verdict = classifyPathAccess({ fence, path: destination, cwd, home, settings, mutate: true })
+      if (verdict !== undefined) return verdict
     }
   }
   return undefined
@@ -788,6 +808,12 @@ function decideToolCall(input) {
   let verdict
   let subject = ''
 
+  // The fence a mutation may not leave: the configured root when there is one, else
+  // the directory the agent itself was started in. It is deliberately the *origin*
+  // cwd rather than one reached by `cd` — a command that walks out of the workspace
+  // and then deletes something there is exactly what this rule is for.
+  const fence = settings.fenceMutations === false ? '' : settings.rootExplicit === true ? settings.root : cwd
+
   if (SHELL_TOOL.test(toolName)) {
     const command = args === null || typeof args !== 'object' ? undefined : args.command ?? args.cmd ?? args.script
     if (typeof command !== 'string') return undefined
@@ -801,7 +827,7 @@ function decideToolCall(input) {
           ? declared
           : resolveTarget(declared, cwd, home)
         : cwd
-    verdict = classifyShell(command, { cwd: shellCwd, home, settings })
+    verdict = classifyShell(command, { cwd: shellCwd, fence, home, settings })
     subject = command
   } else {
     const mutate = MUTATING_TOOL.test(toolName)
@@ -809,7 +835,7 @@ function decideToolCall(input) {
     if (!mutate && !readable) return undefined
     const paths = [...pathArguments(args), ...patchTargets(args)]
     for (const candidate of paths) {
-      verdict = classifyPathAccess({ path: candidate, cwd, home, settings, mutate })
+      verdict = classifyPathAccess({ fence, path: candidate, cwd, home, settings, mutate })
       if (verdict !== undefined) {
         subject = candidate
         break
@@ -935,7 +961,8 @@ function apply(ctx, config = {}) {
   const home = typeof process.env.HOME === 'string' ? process.env.HOME : ''
   // The root this wall falls back to when an agent reports no cwd: the configured
   // one, else the process cwd, which the SDK has already set to the service root.
-  const root = typeof settings.root === 'string' && settings.root !== '' ? settings.root : process.cwd()
+  settings.rootExplicit = typeof settings.root === 'string' && settings.root !== ''
+  const root = settings.rootExplicit ? settings.root : process.cwd()
   // Write the effective fence back into the settings the classifier sees. Without
   // this the rules that ask "is this target *outside* the root?" were keyed on an
   // empty string in the default configuration — that is, they were inert in exactly

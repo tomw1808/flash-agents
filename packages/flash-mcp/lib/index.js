@@ -41,6 +41,12 @@ const INSTRUCTIONS = [
   '',
   'The service is confined to its configured root. A `cwd` outside that root is rejected,',
   'and worker operations outside it are denied by the Harness sandbox rather than executed.',
+  '',
+  'A writing call does not run in your repository: it runs in a disposable copy of it, and its',
+  'result carries the change it made (`change.filesChanged`, `change.diffstat`, `change.diff`).',
+  'Nothing reaches your tree until you apply it — pass `apply: "auto"` to apply a call\'s change',
+  'immediately, or call `flash_apply` with the `change.patchId` afterwards. Review the diff; the',
+  'worker\'s own account of what it did is not evidence that it did it.',
 ].join('\n')
 
 /**
@@ -85,6 +91,11 @@ export function listTools() {
             type: 'string',
             enum: ['workspace-write', 'read-only'],
             description: 'Optional narrowing of what this call may change. "workspace-write" (the default) confines writes to the service root; "read-only" runs the call in a process whose file sandbox denies every mutation, so it cannot change anything. No mode can widen the standing confinement.',
+          },
+          apply: {
+            type: 'string',
+            enum: ['none', 'auto'],
+            description: 'What to do with the change the worker made in its disposable copy. "none" (the default) returns the diff and leaves your tree untouched; "auto" applies it to the service root before returning. Read change.diff before trusting either.',
           },
         },
         required: ['task', 'cwd'],
@@ -144,8 +155,41 @@ export function listTools() {
             enum: ['workspace-write', 'read-only'],
             description: 'Optional narrowing of what this call may change. "workspace-write" (the default) confines writes to the service root; "read-only" runs the call in a process whose file sandbox denies every mutation, so it cannot change anything. No mode can widen the standing confinement.',
           },
+          apply: {
+            type: 'string',
+            enum: ['none', 'auto'],
+            description: 'What to do with the change the fleet made in its disposable copy. "none" (the default) returns the diff and leaves your tree untouched; "auto" applies it to the service root before returning. Every member shares one copy, so the fleet produces one patch.',
+          },
         },
         required: ['tasks'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'flash_apply',
+      description: [
+        'Apply the change a previous flash_task or flash_batch call left in its disposable copy.',
+        '',
+        'Workers never write to your repository: each writing call runs in a copy of it and returns',
+        'a patch. This applies that patch to the service root. The patch is computed by the service',
+        'from the copy, so it contains exactly what the worker changed — including deletions and new',
+        'files — and nothing else.',
+        '',
+        'Pass `dryRun: true` to check that it still applies without changing anything.',
+      ].join('\n'),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          patchId: {
+            type: 'string',
+            description: 'The change.patchId from the result of the call whose work should be applied.',
+          },
+          dryRun: {
+            type: 'boolean',
+            description: 'Check that the patch applies without writing anything.',
+          },
+        },
+        required: ['patchId'],
         additionalProperties: false,
       },
     },
@@ -165,6 +209,10 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env) {
     perItemChars: numberFrom(env.FLASH_PER_ITEM_CHARS, undefined),
     maxResultChars: numberFrom(env.FLASH_RESULT_MAX_CHARS, undefined),
     maxTokens: numberFrom(env.FLASH_MAX_TOKENS, undefined),
+    isolate: env.FLASH_ISOLATE ?? 'copy',
+    slots: numberFrom(env.FLASH_SLOTS, undefined),
+    stateDir: env.FLASH_STATE_DIR ?? undefined,
+    diffChars: numberFrom(env.FLASH_DIFF_CHARS, undefined),
     help: false,
   }
   for (let index = 0; index < argv.length; index += 1) {
@@ -193,6 +241,18 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env) {
       case '--max-result-chars':
         options.maxResultChars = numberFrom(next(), undefined)
         break
+      case '--isolate':
+        options.isolate = next()
+        break
+      case '--slots':
+        options.slots = numberFrom(next(), undefined)
+        break
+      case '--state-dir':
+        options.stateDir = next()
+        break
+      case '--diff-chars':
+        options.diffChars = numberFrom(next(), undefined)
+        break
       case '--batch-timeout-ms':
         options.batchTimeoutMs = numberFrom(next(), undefined)
         break
@@ -209,6 +269,9 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env) {
       default:
         throw new Error(`unknown argument "${flag}"`)
     }
+  }
+  if (options.isolate !== 'copy' && options.isolate !== 'none') {
+    throw new Error(`--isolate ${JSON.stringify(options.isolate)} is not available; use "copy" (default) or "none"`)
   }
   return options
 }
@@ -227,11 +290,17 @@ Options:
   --max-tasks <n>           tasks accepted in one flash_batch call (default: 16)
   --per-item-chars <n>      returned budget for one worker inside a fleet (default: 4000)
   --max-result-chars <n>    returned child-message budget (default: 8000)
+  --isolate <mode>          "copy" (default) runs writing calls in a disposable copy of the
+                            root; "none" lets workers write to the root directly
+  --slots <n>               disposable trees kept in flight, one runtime each (default: 2)
+  --state-dir <path>        where slot trees and returned patches live (default: TMPDIR/flash-mcp)
+  --diff-chars <n>          how much of a patch a result carries (default: 20000)
   -h, --help                show this help
 
 Environment: FLASH_SERVICE_ROOT, FLASH_SERVICE_PROFILE, FLASH_SERVICE_PROVIDER,
 FLASH_SERVICE_MODEL, FLASH_TASK_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS, FLASH_MAX_TASKS,
-FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_DSH_BIN.
+FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
+FLASH_STATE_DIR, FLASH_DIFF_CHARS, FLASH_DSH_BIN.
 `
 
 /**
@@ -243,8 +312,25 @@ FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_DSH_BIN.
  */
 export function startServer(options, input = process.stdin, output = process.stdout) {
   const log = (message) => process.stderr.write(`[flash-mcp] ${message}\n`)
-  const service = new FlashTaskService({ ...options, log })
+  const service = new FlashTaskService({
+    ...options,
+    isolate: {
+      mode: options.isolate,
+      ...(options.slots === undefined ? {} : { slots: options.slots }),
+      ...(options.stateDir === undefined ? {} : { stateDir: options.stateDir }),
+      ...(options.diffChars === undefined ? {} : { diffChars: options.diffChars }),
+    },
+    log,
+  })
   log(`root ${service.root}; profile ${service.profile}; route ${service.provider}/${service.model}`)
+  if (service.isolation === undefined) {
+    log(
+      'WARNING: isolation is off (--isolate none). Workers will write to the root directly; ' +
+        'a destructive command can only be caught by the flash-guard wall, which is a denylist.',
+    )
+  } else {
+    log(`isolation: ${String(service.isolation.size)} disposable tree(s) under ${service.stateDir}`)
+  }
 
   const connection = serveStdio({
     serverInfo: SERVER_INFO,
@@ -259,7 +345,9 @@ export function startServer(options, input = process.stdin, output = process.std
           ? () => service.flashTask(args, { signal })
           : name === 'flash_batch'
             ? () => service.flashBatch(args, { signal })
-            : undefined
+            : name === 'flash_apply'
+              ? () => service.flashApply(args)
+              : undefined
       if (run === undefined) {
         return { content: [{ type: 'text', text: `unknown tool "${name}"` }], isError: true }
       }

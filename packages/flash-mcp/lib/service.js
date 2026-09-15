@@ -16,9 +16,11 @@
  */
 
 import { existsSync, realpathSync } from 'node:fs'
-import { isAbsolute, relative, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
+import { WorkspaceIsolation } from './isolation.js'
 import { HarnessSdkClient } from './sdk.js'
 
 /** Route the service pins; callers can never change it. */
@@ -39,6 +41,17 @@ const DEFAULT_MAX_TASKS = 16
 
 /** Default size of one worker's returned message inside a fleet result. */
 const DEFAULT_PER_ITEM_CHARS = 4_000
+/**
+ * How much of a patch a tool result carries. Large enough to review a normal
+ * change without re-reading the files, small enough that a runaway diff cannot
+ * eat the caller's context: the whole patch stays on disk either way.
+ */
+const DEFAULT_DIFF_CHARS = 20_000
+/**
+ * How many disposable trees may be in flight at once. Each one costs a runtime
+ * process, so this is a memory budget as much as a concurrency limit.
+ */
+const DEFAULT_SLOTS = 2
 
 /** Marker the workflow tool renders immediately before the script's JSON value. */
 const WORKFLOW_VALUE_MARKER = 'Return value:'
@@ -135,6 +148,7 @@ export class FlashTaskService {
     env = process.env,
     log = () => {},
     clientFactory,
+    isolate = {},
   }) {
     this.root = realpathSync(resolve(root))
     this.profile = profile
@@ -149,13 +163,34 @@ export class FlashTaskService {
     this.env = env
     this.log = log
     this.clientFactory =
-      clientFactory ?? ((profileName) => new HarnessSdkClient({ profile: profileName, cwd: this.root, env, log }))
+      clientFactory ?? ((profileName, cwd) => new HarnessSdkClient({ profile: profileName, cwd, env, log }))
+    this.stateDir = resolve(isolate.stateDir ?? join(tmpdir(), 'flash-mcp'))
+    this.diffChars = isolate.diffChars ?? DEFAULT_DIFF_CHARS
+    /**
+     * Disposable trees for writing calls. `mode: "none"` is the opt-out, and it is
+     * the only configuration in which a worker touches the caller's repository
+     * directly — which is why the CLI says so out loud when it is used.
+     *
+     * @type {WorkspaceIsolation | undefined}
+     */
+    this.isolation =
+      isolate.mode === 'none'
+        ? undefined
+        : new WorkspaceIsolation({
+            root: this.root,
+            slots: isolate.slots ?? DEFAULT_SLOTS,
+            stateDir: this.stateDir,
+            log,
+          })
 
     /**
-     * One persistent runtime per profile, keyed by name. A call that asks for
-     * `read-only` boots the read-only profile instead of reusing the writing one,
-     * because the sandbox mode is fixed for the life of a process and is the only
-     * airtight way to make "this call cannot modify anything" true.
+     * One persistent runtime per profile *and working directory*, keyed by both. A
+     * call that asks for `read-only` boots the read-only profile instead of reusing
+     * the writing one, because the sandbox mode is fixed for the life of a process
+     * and is the only airtight way to make "this call cannot modify anything" true.
+     * The directory is part of the key because the sandbox root is fixed when a
+     * process starts: isolation is therefore one runtime per disposable tree, and
+     * the pool keeps them alive rather than booting one per call.
      *
      * @type {Map<string, object>}
      */
@@ -163,9 +198,14 @@ export class FlashTaskService {
     this.sessions = 0
   }
 
-  /** Runtime facts for the returned payload, for the profile that served the call. */
-  #runtimeInfo(profileName) {
-    const run = this.runtimes.get(profileName)
+  /** The map key for one runtime: a profile is only meaningful together with a cwd. */
+  #runtimeKey(profileName, cwd) {
+    return `${profileName}@${cwd}`
+  }
+
+  /** Runtime facts for the returned payload, for the runtime that served the call. */
+  #runtimeInfo(profileName, cwd) {
+    const run = this.runtimes.get(this.#runtimeKey(profileName, cwd))
     return {
       pid: run?.client?.pid ?? null,
       booted: run?.initialized === true,
@@ -173,6 +213,21 @@ export class FlashTaskService {
       sessions: this.sessions,
       profile: profileName,
     }
+  }
+
+  /**
+   * The isolation pool a call should use, or undefined when it must run in place.
+   *
+   * A read-only call is deliberately *not* isolated: it cannot change anything, and
+   * running it in the caller's own tree means it reads the caller's current state
+   * rather than a copy's.
+   *
+   * @param {string} profileName - the profile that will serve the call.
+   * @returns {WorkspaceIsolation | undefined} the pool, when the call may write.
+   */
+  #isolationFor(profileName) {
+    if (this.isolation === undefined) return undefined
+    return profileName === this.profile ? this.isolation : undefined
   }
 
   /**
@@ -204,31 +259,57 @@ export class FlashTaskService {
    */
   async flashTask(args, { signal } = {}) {
     const task = requireText(args?.task, 'task')
-    const cwd = this.#resolveCwd(args?.cwd)
+    const rootCwd = this.#resolveCwd(args?.cwd)
     const acceptance = optionalText(args?.acceptance)
+    const apply = this.#resolveApply(args?.apply)
     warnAboutIgnoredArguments(args, 'flash_task', this.log)
 
     const sessionId = `flash-task-${randomUUID()}`
     const profileName = this.#profileForMode(args?.mode)
-    const childPrompt = buildChildPrompt({ cwd, task, acceptance })
-    const { state, started } = await this.#runSession({
-      sessionId,
-      prompt: buildOrchestrationPrompt(childPrompt),
-      timeoutMs: this.taskTimeoutMs,
-      label: 'flash_task',
-      note: `${String(childPrompt.length)} chars of task text`,
-      signal,
-      profile: profileName,
-    })
+    const pool = this.#isolationFor(profileName)
+    const slot = pool === undefined ? undefined : await pool.lease()
+    try {
+      const cwd = slot === undefined ? rootCwd : pool.slotCwd(slot, rootCwd)
+      if (slot !== undefined) pool.prepare(slot)
+      const childPrompt = buildChildPrompt({
+        cwd,
+        task,
+        acceptance,
+        ...(slot === undefined ? {} : { copyOf: this.root }),
+      })
+      const { state, started } = await this.#runSession({
+        sessionId,
+        prompt: buildOrchestrationPrompt(childPrompt),
+        timeoutMs: this.taskTimeoutMs,
+        label: 'flash_task',
+        note: `${String(childPrompt.length)} chars of task text`,
+        signal,
+        profile: profileName,
+        cwd,
+      })
 
-    if (state.children.length === 0) {
-      throw new FlashTaskError(
-        `the orchestrator finished without delegating${describeParent(state)}`,
-        'NOT_DELEGATED',
-      )
+      if (state.children.length === 0) {
+        throw new FlashTaskError(
+          `the orchestrator finished without delegating${describeParent(state)}`,
+          'NOT_DELEGATED',
+        )
+      }
+      this.#logToolTrace(state)
+      const change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars })
+      const applied = change?.available === true && apply === 'auto' ? this.#applyChange(change) : undefined
+      return this.#buildResult({
+        state,
+        sessionId,
+        started,
+        profile: profileName,
+        cwd,
+        slot,
+        change,
+        applied,
+      })
+    } finally {
+      if (slot !== undefined) pool.release(slot)
     }
-    this.#logToolTrace(state)
-    return this.#buildResult({ state, sessionId, started, profile: profileName })
   }
 
   /**
@@ -249,47 +330,134 @@ export class FlashTaskService {
    */
   async flashBatch(args, { signal } = {}) {
     const tasks = normalizeTasks(args?.tasks, this.maxTasks)
-    const cwd = this.#resolveCwd(args?.cwd)
+    const rootCwd = this.#resolveCwd(args?.cwd)
     const acceptance = optionalText(args?.acceptance)
+    const apply = this.#resolveApply(args?.apply)
     warnAboutIgnoredArguments(args, 'flash_batch', this.log)
 
     const sessionId = `flash-batch-${randomUUID()}`
     const profileName = this.#profileForMode(args?.mode)
-    const items = tasks.map((entry, index) => ({
-      label: `task-${String(index + 1)}`,
-      prompt: [
-        buildChildPrompt({ cwd, task: entry.task, acceptance: entry.acceptance ?? acceptance }),
-        '',
-        WORKER_RULES,
-      ].join('\n'),
-    }))
-    const { state, started } = await this.#runSession({
-      sessionId,
-      prompt: buildBatchPrompt({
-        count: items.length,
-        script: BATCH_SCRIPT,
-        args: { items, perItemChars: this.perItemChars },
-      }),
-      timeoutMs: this.batchTimeoutMs,
-      label: 'flash_batch',
-      note: `${String(items.length)} delegated tasks`,
-      signal,
-      profile: profileName,
-    })
+    // A fleet is one call and therefore one tree: its members share a working
+    // directory exactly as they share a runtime, so they see each other's edits.
+    const pool = this.#isolationFor(profileName)
+    const slot = pool === undefined ? undefined : await pool.lease()
+    try {
+      const cwd = slot === undefined ? rootCwd : pool.slotCwd(slot, rootCwd)
+      if (slot !== undefined) pool.prepare(slot)
+      const copyOf = slot === undefined ? {} : { copyOf: this.root }
+      const items = tasks.map((entry, index) => ({
+        label: `task-${String(index + 1)}`,
+        prompt: [
+          buildChildPrompt({ cwd, task: entry.task, acceptance: entry.acceptance ?? acceptance, ...copyOf }),
+          '',
+          WORKER_RULES,
+        ].join('\n'),
+      }))
+      const { state, started } = await this.#runSession({
+        sessionId,
+        prompt: buildBatchPrompt({
+          count: items.length,
+          script: BATCH_SCRIPT,
+          args: { items, perItemChars: this.perItemChars },
+        }),
+        timeoutMs: this.batchTimeoutMs,
+        label: 'flash_batch',
+        note: `${String(items.length)} delegated tasks`,
+        signal,
+        profile: profileName,
+        cwd,
+      })
 
-    if (state.subagentStarts === 0) {
+      if (state.subagentStarts === 0) {
+        throw new FlashTaskError(
+          `the orchestrator finished without starting the fleet${describeParent(state)}`,
+          'NOT_DELEGATED',
+        )
+      }
+      this.#logToolTrace(state)
+      const change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars })
+      const applied = change?.available === true && apply === 'auto' ? this.#applyChange(change) : undefined
+      return this.#buildBatchResult({
+        state,
+        tasks,
+        sessionId,
+        started,
+        profile: profileName,
+        cwd,
+        slot,
+        change,
+        applied,
+      })
+    } finally {
+      if (slot !== undefined) pool.release(slot)
+    }
+  }
+
+  /**
+   * Apply a stored patch to the caller's repository, and report it as a tool error
+   * if it will not apply — the patch stays on disk either way, so a conflict is a
+   * message with a path in it rather than lost work.
+   *
+   * @param {object} change - the change a finished call produced.
+   * @returns {object} the apply outcome.
+   */
+  #applyChange(change) {
+    try {
+      return this.isolation.apply({ patchId: change.patchId })
+    } catch (error) {
       throw new FlashTaskError(
-        `the orchestrator finished without starting the fleet${describeParent(state)}`,
-        'NOT_DELEGATED',
+        `the worker changed files, but the patch did not apply to ${this.root}: ${messageOf(error)}. ` +
+          `The patch is kept at ${String(change.patchPath)}.`,
+        'APPLY_FAILED',
       )
     }
-    this.#logToolTrace(state)
-    return this.#buildBatchResult({ state, tasks, sessionId, started, profile: profileName })
+  }
+
+  /**
+   * Apply a patch a previous call left behind.
+   *
+   * @param {object} args - the MCP tool arguments.
+   * @param {string} args.patchId - the id from an earlier result.
+   * @param {boolean} [args.dryRun] - check that it applies without changing anything.
+   * @returns {object} the apply outcome.
+   */
+  flashApply(args) {
+    const patchId = requireText(args?.patchId, 'patchId')
+    if (this.isolation === undefined) {
+      throw new FlashTaskError(
+        'this service runs without isolation (--isolate none), so its calls have no patch to apply',
+        'ISOLATION_DISABLED',
+      )
+    }
+    try {
+      return this.isolation.apply({ patchId, dryRun: args?.dryRun === true })
+    } catch (error) {
+      throw new FlashTaskError(messageOf(error), 'APPLY_FAILED')
+    }
+  }
+
+  /**
+   * Read the `apply` argument. Only an explicit `auto` applies anything: the
+   * default leaves the caller's tree alone until it asks.
+   *
+   * @param {unknown} value - the requested mode.
+   * @returns {'none' | 'auto'} what to do with the patch.
+   */
+  #resolveApply(value) {
+    if (value === undefined || value === null || value === 'none') return 'none'
+    if (value === 'auto') {
+      if (this.isolation === undefined) {
+        throw new FlashTaskError('apply "auto" needs isolation, but this service runs with --isolate none', 'ISOLATION_DISABLED')
+      }
+      return 'auto'
+    }
+    throw new FlashTaskError(`apply ${JSON.stringify(value)} is not available; use "none" (default) or "auto"`, 'APPLY_UNAVAILABLE')
   }
 
   /** Start one session on the persistent runtime and wait for it to go idle. */
-  async #runSession({ sessionId, prompt, timeoutMs, label, note, signal, profile }) {
-    const client = await this.#ensureRuntime(profile)
+  async #runSession({ sessionId, prompt, timeoutMs, label, note, signal, profile, cwd = this.root }) {
+    const client = await this.#ensureRuntime(profile, cwd)
+    const key = this.#runtimeKey(profile, cwd)
     const state = createObserveState()
     const started = Date.now()
     const completion = createDeferred()
@@ -308,7 +476,7 @@ export class FlashTaskService {
         label,
         signal,
         sessionId,
-        diagnostics: () => this.runtimes.get(profile)?.client?.diagnostics ?? '',
+        diagnostics: () => this.runtimes.get(key)?.client?.diagnostics ?? '',
       })
       return { state, started }
     } finally {
@@ -326,11 +494,12 @@ export class FlashTaskService {
     }
   }
 
-  /** Dispose every runtime this service started. */
+  /** Dispose every runtime this service started, and the disposable trees. */
   async close() {
     const runs = [...this.runtimes.values()]
     this.runtimes.clear()
     for (const run of runs) await run.client?.shutdown().catch(() => {})
+    this.isolation?.close()
   }
 
   /**
@@ -340,19 +509,20 @@ export class FlashTaskService {
    * @param {string} profileName - the profile to run on.
    * @returns {Promise<object>} the live client.
    */
-  async #ensureRuntime(profileName) {
-    const existing = this.runtimes.get(profileName)
+  async #ensureRuntime(profileName, cwd) {
+    const key = this.#runtimeKey(profileName, cwd)
+    const existing = this.runtimes.get(key)
     if (existing?.client?.running && existing.initialized) return existing.client
     if (existing?.starting !== undefined) return await existing.starting
     const run = existing ?? { client: undefined, initialized: false, starting: undefined, startedAt: undefined }
-    this.runtimes.set(profileName, run)
+    this.runtimes.set(key, run)
     run.starting = (async () => {
       let client
       try {
-        client = this.clientFactory(profileName)
+        client = this.clientFactory(profileName, cwd)
         client.start()
         const info = await client.initialize({
-          cwd: this.root,
+          cwd,
           provider: this.provider,
           model: this.model,
           ...(this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens }),
@@ -364,7 +534,7 @@ export class FlashTaskService {
         return client
       } catch (error) {
         await client?.shutdown().catch(() => {})
-        this.runtimes.delete(profileName)
+        this.runtimes.delete(key)
         throw new FlashTaskError(
           `could not initialize the ${profileName} runtime: ${messageOf(error)}`,
           'RUNTIME_INIT_FAILED',
@@ -383,9 +553,11 @@ export class FlashTaskService {
     if (requested === undefined || requested === null || requested === '') return this.root
     const text = requireText(requested, 'cwd')
     const absolute = isAbsolute(text) ? resolve(text) : resolve(this.root, text)
-    const real = existsSync(absolute) ? realpathSync(absolute) : absolute
+    const real = this.#realPath(absolute)
     const relation = relative(this.root, real)
-    if (relation.startsWith('..') || isAbsolute(relation)) {
+    // Segment-aware: `relative` yields `..foo` for a *sibling* named `..foo`, and a
+    // plain `startsWith('..')` refused that honest directory as if it were outside.
+    if (relation === '..' || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
       throw new FlashTaskError(
         `cwd "${text}" is outside the service root ${this.root}; this service is confined to that root`,
         'CWD_OUTSIDE_ROOT',
@@ -394,8 +566,64 @@ export class FlashTaskService {
     return real
   }
 
+  /**
+   * The real path of a directory, resolved through its nearest existing ancestor.
+   *
+   * A cwd the caller is about to create does not exist yet, and realpath'ing only
+   * the paths that exist made a `/tmp` → `/private/tmp` root compare as if the same
+   * directory were outside itself. Resolving the ancestor that does exist and
+   * re-appending the rest gives one canonical form for both cases.
+   *
+   * @param {string} candidate - an absolute path.
+   * @returns {string} its canonical form.
+   */
+  #realPath(candidate) {
+    let current = candidate
+    const tail = []
+    while (!existsSync(current)) {
+      const parent = resolve(current, '..')
+      if (parent === current) return candidate
+      tail.unshift(current.slice(parent.length).replace(/^[/\\]/, ''))
+      current = parent
+    }
+    return join(realpathSync(current), ...tail)
+  }
+
+  /**
+   * The isolation facts a result carries: which tree served the call, and what the
+   * worker changed in it.
+   *
+   * @param {object} input - the call's isolation state.
+   * @param {string} input.profileName - the profile that served the call.
+   * @param {object} [input.slot] - the disposable tree, when the call had one.
+   * @param {object} [input.change] - the change the call produced.
+   * @param {boolean} [input.applied] - whether the change was applied to the root.
+   * @returns {object} fields to spread into the result.
+   */
+  #changeFields({ profileName, slot, change, applied }) {
+    const isolated = this.isolation !== undefined && profileName === this.profile
+    const fields = { isolation: { mode: isolated ? 'copy' : 'none', slot: slot?.id ?? null } }
+    if (change === undefined) return fields
+    return {
+      ...fields,
+      change: {
+        available: change.available,
+        ...(change.available ? {} : { reason: change.reason }),
+        filesChanged: change.filesChanged.map((line) => line.split('\t').at(-1)),
+        // Files the worker created that git ignores, so the patch cannot carry them.
+        // Named so that "no change" is never the whole answer when there was work.
+        ...((change.ignored ?? []).length === 0 ? {} : { ignored: change.ignored }),
+        diffstat: change.diffstat,
+        diff: change.diff,
+        diffTruncated: change.diff.length < change.diffChars,
+        applied: applied !== undefined,
+        ...(change.patchId === undefined ? {} : { patchId: change.patchId }),
+      },
+    }
+  }
+
   /** Assemble the compact per-task fleet result. */
-  #buildBatchResult({ state, tasks, sessionId, started, profile }) {
+  #buildBatchResult({ state, tasks, sessionId, started, profile, cwd, slot, change, applied }) {
     const envelope = extractWorkflowValue(state.workflowText)
     const payload = envelope.value
     const warnings = []
@@ -515,13 +743,14 @@ export class FlashTaskService {
       sessionId,
       mode: profile.endsWith('-readonly') ? 'read-only' : 'workspace-write',
       durationMs: Date.now() - started,
-      runtime: this.#runtimeInfo(profile),
+      runtime: this.#runtimeInfo(profile, cwd),
+      ...this.#changeFields({ profileName: profile, slot, change, applied }),
       ...(warnings.length === 0 ? {} : { warnings }),
     }
   }
 
   /** Assemble the compact result the MCP client receives. */
-  #buildResult({ state, sessionId, started, profile }) {
+  #buildResult({ state, sessionId, started, profile, cwd, slot, change, applied }) {
     const children = state.children.map((child) => {
       const clipped = truncate(child.result, this.maxResultChars)
       return {
@@ -538,6 +767,11 @@ export class FlashTaskService {
     const warnings = []
     if (children.length > 1) warnings.push(`the orchestrator delegated ${String(children.length)} times; the last child is reported as the result`)
     if (primary.status !== 'ok') warnings.push(`the worker ended with status "${String(primary.status)}"`)
+    if ((change?.ignored ?? []).length > 0) {
+      warnings.push(
+        `the worker created ${String(change.ignored.length)} path(s) that git ignores, so the patch cannot carry them: ${change.ignored.slice(0, 5).join(', ')}`,
+      )
+    }
 
     return {
       status: primary.status,
@@ -550,7 +784,8 @@ export class FlashTaskService {
       sessionId,
       mode: profile.endsWith('-readonly') ? 'read-only' : 'workspace-write',
       durationMs: Date.now() - started,
-      runtime: this.#runtimeInfo(profile),
+      runtime: this.#runtimeInfo(profile, cwd),
+      ...this.#changeFields({ profileName: profile, slot, change, applied }),
       ...(warnings.length === 0 ? {} : { warnings }),
       ...(children.length === 1 ? {} : { children }),
     }
@@ -911,9 +1146,17 @@ function warnAboutIgnoredArguments(args, toolName, log) {
 }
 
 /** The worker-facing task text. */
-export function buildChildPrompt({ cwd, task, acceptance }) {
+export function buildChildPrompt({ cwd, task, acceptance, copyOf }) {
   return [
     `Working directory: ${cwd}`,
+    ...(copyOf === undefined
+      ? []
+      : [
+          '',
+          `This working directory is a disposable copy of ${copyOf}, so the caller's files are here at the same relative paths.`,
+          'Use relative paths. A path naming the original tree refers to a different directory that you cannot write, and',
+          'anything outside this copy is discarded — only the change you leave here is reported back.',
+        ]),
     'Task:',
     task,
     ...(acceptance === undefined ? [] : ['', 'Acceptance criteria:', acceptance]),
