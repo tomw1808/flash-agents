@@ -138,6 +138,29 @@ test('rm against a root, a home, or the workspace is a critical path', () => {
   }
 })
 
+test('an unbounded deletion is critical however it is spelled', () => {
+  // These shapes reach a whole tree without naming one. A deletion narrowed by a
+  // name or path pattern is ordinary cleanup and stays allowed (see the test
+  // below), so the line is drawn at what the command can actually reach.
+  for (const command of [
+    'find . -delete',
+    'find /tmp/project -delete',
+    'find . -type f -delete',
+    'find . -maxdepth 1 -exec rm -rf {} +',
+    'find . -type f | xargs rm -f',
+    'xargs rm -rf',
+    'ls | xargs rm -rf',
+  ]) {
+    const verdict = decide('bash', { command })
+    assert.equal(verdict?.reason, REASON.CRITICAL_RM, command)
+  }
+  // Reading through find, a pattern-narrowed deletion, and ordinary piping stay open.
+  assert.equal(decide('bash', { command: "find . -name '*.tmp' -print" }), undefined)
+  assert.equal(decide('bash', { command: "find . -name '*.log' -delete" }), undefined)
+  assert.equal(decide('bash', { command: 'ls | xargs wc -l' }), undefined)
+  assert.equal(decide('bash', { command: 'find . -type f -newer package.json' }), undefined)
+})
+
 test('ordinary deletion still works', () => {
   for (const command of [
     'rm -rf node_modules',

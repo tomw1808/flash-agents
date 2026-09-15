@@ -1,0 +1,13 @@
+{
+  "name": "flash-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cheap DeepSeek Harness Flash workers for an external coding agent",
+  "type": "module",
+  "scripts": {
+    "test": "node --test packages/flash-mcp/test/ packages/dsh-flash-guard/test/ packages/dsh-subagent-flash/test/",
+    "verify": "node packages/flash-mcp/test/verify-live.mjs",
+    "install-profile": "node install.mjs",
+    "uninstall-profile": "node install.mjs --uninstall"
+  }
+}

@@ -295,6 +295,9 @@ function tokenize(simple) {
   return tokens
 }
 
+/** `find` flags that bound a deletion to a name or path pattern. */
+const FIND_NARROWING = ['-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex']
+
 /** Program prefixes that merely wrap the real program. */
 const PREFIX_PROGRAMS = new Set(['sudo', 'command', 'env', 'time', 'nohup', 'xargs'])
 /** Programs that read a file named as an argument. */
@@ -391,6 +394,21 @@ function classifyShell(command, context) {
     const program = basenameOf(tokens[index] ?? '')
     const argv = tokens.slice(index)
 
+    // Deletion does not always say `rm` with a path, so these two shapes are read
+    // for what they can actually reach. A whole-tree deletion is a critical path
+    // whichever program spells it; a deletion narrowed by a name or path pattern
+    // is ordinary cleanup and stays allowed.
+    if (tokens.some((token, at) => basenameOf(token) === 'xargs' && basenameOf(tokens[at + 1] ?? '') === 'rm')) {
+      return { reason: REASON.CRITICAL_RM, detail: 'deletes whatever is piped into xargs' }
+    }
+    if (program === 'find') {
+      const execAt = argv.findIndex((token) => token === '-exec' || token === '-execdir')
+      const pipedToRm = execAt >= 0 && basenameOf(argv[execAt + 1] ?? '') === 'rm'
+      const narrowed = FIND_NARROWING.some((flag) => argv.includes(flag))
+      if ((argv.includes('-delete') || pipedToRm) && !narrowed) {
+        return { reason: REASON.CRITICAL_RM, detail: 'deletes everything find matches' }
+      }
+    }
     if (program === 'rm' || program === 'rmdir' || program === 'shred') {
       const targets = argv.slice(1).filter((token) => !token.startsWith('-'))
       for (const raw of targets) {
