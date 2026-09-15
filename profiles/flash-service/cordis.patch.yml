@@ -1,0 +1,192 @@
+# flash-service — the headless DeepSeek Harness worker profile behind `flash-mcp`.
+#
+# Bundles (see package.json): @deepseek-ai/dsh-base + @deepseek-ai/dsh-sdk-app.
+# That gives this profile the SDK stdio JSON-RPC app over the full base tree:
+# the subagent registry and its in-process backends, the file and shell sandboxes,
+# the approval seam, sessions, and the LLM adapters.
+#
+# SDK-created agents join no preset — the SDK server calls `agents.create` without
+# one — so every row an agent needs is composed HERE, directly into the profile.
+# There is no preset selection to get wrong and no external preset to load.
+#
+# The block between the markers is managed by install.mjs and replaced on every run.
+
+# >>> flash-service (managed by install.mjs — do not edit between the markers)
+
+# ── permissions: explicit headless policy ───────────────────────────────────
+#
+# This process has no interactive answerer: nobody can approve anything. Instead
+# of relying on that absence, the policy is deterministic.
+#
+#   sandbox-policy mode workspace-write → mutations under the session workspace
+#     (the SDK `initialize.cwd`, which is the service root) need no approval at
+#     all, so ordinary repository-local edits and commands run unattended.
+#   approval policy never → anything that would need approval is denied outright,
+#     so a sandbox denial is final and no escape can be granted.
+#
+# The result is a one-way wall: inside the workspace works, outside fails closed.
+# This is deliberately NOT danger-full-access.
+- id: sandbox-policy
+  config:
+    mode: workspace-write
+
+- id: approval
+  config:
+    policy: never
+
+# The user-facing preset switcher is a browser affordance. Without it no runtime
+# switch can widen the mode above to danger-full-access.
+- id: permission
+  disabled: true
+
+# ── model routes ───────────────────────────────────────────────────────────
+#
+# This profile declares its own route instead of reading a settings document.
+# Two reasons, both deliberate:
+#
+#   * independence — a service must not break because a user-facing settings
+#     file moved, emptied, or started naming a credential that a headless
+#     process cannot supply. Nothing outside this file can change the route.
+#   * least privilege in the model dimension — exactly one model is registered,
+#     so no caller and no agent can select a larger, slower, or costlier one.
+#
+# No `apiKeyEnv`: this route needs no credential. The Ollama daemon serves
+# these models — cloud models included — from its own sign-in, and pi-ai's
+# openai-completions transport only requires that a route carry either an apiKey
+# or an authorization header. Declaring the header keeps this service free of
+# secrets and independent of whatever environment launched it.
+- id: llm-pi-ai
+  config:
+    providers:
+      ollama:
+        displayName: Ollama
+        api: openai-completions
+        baseURL: http://127.0.0.1:11434/v1
+        headers:
+          authorization: Bearer ollama
+        models:
+          - id: deepseek-v4.1-flash:cloud
+            name: deepseek-v4.1-flash:cloud
+            input:
+              - text
+
+# Keep the composition's own default consistent with the single registered
+# route, so an agent created without an explicit route cannot fall back to a
+# provider this profile does not serve.
+- id: agent-default-model
+  config:
+    provider: ollama
+    model: deepseek-v4.1-flash:cloud
+
+# ── delegation surface: exactly one door per call ───────────────────────────
+#
+# The base tree ships several ways to start work. This service exposes one door
+# for a single task (`flash`) and one for a fleet (`workflow`), so a dispatcher
+# cannot wander into unrouted or long-running delegation. `flash_gauntlet` is
+# intentionally absent at this stage.
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-ralph
+  disabled: true
+
+# The fleet engine. Fan-out, concurrency, the total-child ceiling, and per-item
+# isolation are shipped behaviour; this profile sets their values and pins where
+# the members run.
+- id: workflow-worker-thread
+  config:
+    # Every fleet member starts through the strict routing-contract provider, so
+    # the route is pinned by construction and a script gains no provider selector.
+    provider: flash
+    # A fleet is a batch of cheap workers, not a stampede: four at a time, and a
+    # hard ceiling well below the engine default of 1000.
+    maxConcurrentAgents: 4
+    maxTotalAgents: 32
+    maxItemsPerCall: 64
+
+# The dispatcher's fleet tool. Its result is rendered as text into the tool
+# result, and the service reads the per-task return value out of that text, so
+# this ceiling must stay well above the largest fleet's rendered payload.
+- id: tool-workflow
+  config:
+    maxResultChars: 250000
+# Goal loops are an autonomy surface no dispatcher needs.
+- id: tool-goal
+  disabled: true
+
+- insert:
+    # The deterministic wall, wrapping tool dispatch in this process. It is a
+    # circuit breaker, not a sandbox: the file and shell sandboxes remain the
+    # enforcement boundary, and this row closes the handful of holes a cheap
+    # worker must never be able to reach — credential reads (the sandbox confines
+    # writes, not reads), repository state, and unbounded deletion.
+    #
+    # It wraps `tools/execute` rather than the `fs/*-intent` waterfall because the
+    # shipped observation policy registers on that waterfall and returns without
+    # calling `next()`, so a peer listener there can be skipped. A dispatch
+    # wrapper either calls `next()` or runs no tool body at all.
+    - id: flash-guard
+      name: ./plugins/dsh-flash-guard.js
+      config:
+        # `root` is deliberately unset: the wall falls back to the process cwd,
+        # which the SDK has already set to this service root, so agents created by
+        # the workflow engine (which carry no cwd of their own) are still fenced.
+        # Segments no tool may mutate anywhere. Reads stay open: `git status`
+        # reads `.git`, and a worker that cannot run git is not a worker.
+        protectedSegments:
+          - .git
+        # The `.env` family is secret for reading and writing; templates such as
+        # `.env.example` are not, so a worker can still document configuration.
+        protectEnvFiles: true
+        blockDestructiveGit: true
+        # Credential locations, resolved against the worker's home directory.
+        # The sandbox denies writes outside the workspace but permits reads, so
+        # without these a worker could read a private key and report it back.
+        homeProtectedPaths:
+          - .ssh
+          - .aws
+          - .gnupg
+          - .dsh
+          - .config/gh
+          - .config/gcloud
+          - .docker/config.json
+
+    # The strict routing-contract provider: every child runs on
+    # ollama/deepseek-v4.1-flash:cloud whatever a caller asks for, and no child
+    # may start a child of its own (maxChildDepth 0).
+    - id: subagent-flash-in-process
+      name: ./plugins/dsh-subagent-flash.js
+      config:
+        providerName: flash
+        baseProvider: spawn
+        provider: ollama
+        model: deepseek-v4.1-flash:cloud
+        maxChildDepth: 0
+
+    # The only model-visible delegation tool. It waits for the child, so one
+    # dispatch prompt produces exactly one finished child to report.
+    - id: tool-flash
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: flash
+        toolName: flash
+        backgroundMode: one-shot
+        enableRunInBackground: false
+        maxDepth: 1
+        persona: >-
+          You are one cheap, sandboxed worker. Do exactly the single task you were given and
+          report what you found or changed. Work only under the working directory in your task:
+          the sandbox denies effects outside it, that denial is final, and approval prompts are
+          disabled in this service — never retry with sandbox_permissions. Keep your final answer
+          short and concrete, and name every file you changed.
+        # Every name here must exist in THIS composition: tools.restrict() throws
+        # on an unknown name and that failure would abort the whole child start.
+        toolFilter:
+          deny:
+            - flash
+# <<< flash-service

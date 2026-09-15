@@ -1,0 +1,5 @@
+name: Flash Orchestrator
+description: >-
+  Orchestrates cheap DeepSeek V4.1 Flash workers. One narrow delegation tool, a bounded
+  parallel workflow engine, and a bounded fresh-agent gauntlet — every child pinned to
+  the `ollama` / `deepseek-v4.1-flash:cloud` route through the `flash` backend.

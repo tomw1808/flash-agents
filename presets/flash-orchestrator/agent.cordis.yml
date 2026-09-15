@@ -1,0 +1,231 @@
+# The `flash-orchestrator` agent preset: a coding orchestrator whose delegated work
+# always runs on the cheap, deployment-pinned `flash` backend.
+#
+# This file is an AGENT-PLANE composition, mounted once under a standing scope; every
+# session naming it joins by scope parentage. The host composition keeps the registries
+# (`tools`, `systemPrompt`, `sessions`), the sandbox and approval stack, and the
+# `subagents` registry with its providers. This preset contributes the delegation TOOLS
+# and the workflow engine it owns.
+#
+# Required host rows (installed by `install.mjs`, not by this file):
+#   - `subagent-flash-in-process` — the strict `flash` provider, pinned to
+#     ollama/deepseek-v4.1-flash:cloud. Without it the `tool-flash` row below waits
+#     forever for its provider and contributes no tool.
+#
+# A service row here MUST sit inside a group carrying an `isolate` realm. `workflows`
+# is the only service this preset owns; `subagents` is a host singleton and is consumed,
+# never published, from inside that realm.
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+# `{{model}}` and `{{cwd}}` resolve from the agent's own route and workspace.
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    prefix: >-
+      You are a coding orchestrator powered by the {{model}} model.
+    suffix: |
+      You direct cheap delegated work. Three tools reach the flash backend, and every
+      child they start runs on ollama/deepseek-v4.1-flash:cloud regardless of your own
+      model:
+
+      - `flash` — one narrow, read-only task per call. Children cannot edit files, run
+        shell commands, ask the user, or delegate further. Use it for lookups, reading,
+        searching, and summarizing, one focused question per call.
+      - `workflow` — bounded parallel fan-out over independent pieces. Deployment caps:
+        4 concurrent children and 32 total children per run. Children run on flash and
+        cannot orchestrate; each starts with an empty conversation, so make every prompt
+        self-contained.
+      - `ralph` — a fresh-agent gauntlet toward one immutable objective. Each round opens
+        a brand-new child, the shared workspace is the long-term memory, and only a
+        bounded structured report crosses rounds. At most 12 rounds. Use it only when the
+        user explicitly asks for fresh-agent iteration.
+
+      Prefer `flash` for one or two lookups. Prefer `workflow` when work decomposes into
+      many independent pieces. Children never see this conversation.
+
+      Your working directory is {{cwd}}.
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# ── shell ───────────────────────────────────────────────────────────────────
+
+# `shell-env` and the sandbox executors stay host-plane. These rows only register into
+# the host tool registry, so they need no realm.
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+# ── filesystem ──────────────────────────────────────────────────────────────
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── background jobs ─────────────────────────────────────────────────────────
+
+# Only the model-facing controls; the task registry stays host-plane and is keyed by
+# owning agent, so one host instance serves every session.
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+# ── skills ──────────────────────────────────────────────────────────────────
+
+# The skill registry is host+per-scope layered: these rows register into THIS preset's
+# layer, so they need no realm.
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+# ── goals ───────────────────────────────────────────────────────────────────
+
+# The goal service and session driver stay host-plane. The human command and the
+# model-facing tool register into this preset's scoped layers.
+- id: command-goal
+  name: '@deepseek-ai/dsh-command-goal'
+
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+
+# ── compaction ──────────────────────────────────────────────────────────────
+
+# `compaction-basic` reads `toolResultPrune` through `ctx.get`, so both rows share one
+# realm. `tokenMeter` stays host-plane and is resolved from here.
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
+
+# ── delegation: the flash routing contract and its two bounded loops ────────
+
+# `subagents` (and therefore the `flash` provider) is a HOST singleton whose
+# cross-session queries the api-proxy serves, and a provider name registers once —
+# so the registry and its backends never live here. This group owns only the
+# `workflowEngine`, which nothing outside an agent reads; every row that reaches it
+# shares this entry-local realm, and a consumer left outside would resolve a host
+# engine this preset does not populate.
+- id: delegation
+  name: cordis:group
+  group: true
+  isolate:
+    workflowEngine: true
+  config:
+    # Goal 3 — one model-facing delegation tool for one narrow task.
+    # `provider: flash` pins the child route; `agentOptions` repeats the same route as
+    # the tool's own default so route preflight resolves it; `maxDepth: 1` lets this
+    # agent delegate one level and forbids the child from delegating further; the
+    # `toolFilter` deny list keeps the child cheap and read-only.
+    - id: tool-flash
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: flash
+        toolName: flash
+        backgroundMode: one-shot
+        maxDepth: 1
+        agentOptions:
+          provider: ollama
+          model: deepseek-v4.1-flash:cloud
+        persona: >-
+          You are one narrow flash worker. Do exactly the single task you were given and
+          report what you found. You cannot edit files, run shell commands, ask the user,
+          or delegate. Use read, glob, grep, and the web tools. Keep your answer short and
+          concrete: state findings and cite the files or URLs they came from.
+        # `tools.restrict()` THROWS on any name this composition does not define,
+        # and that failure aborts the whole child start, so every name below is a
+        # tool this preset actually registers. Recursion is additionally cut
+        # structurally by the provider's own depth guard, which does not depend on
+        # these names.
+        toolFilter:
+          deny:
+            - bash
+            - write
+            - edit
+            - present
+            - ask_user_question
+            - get_goal
+            - create_goal
+            - update_goal
+            - todo_write
+            - flash
+            - workflow
+            - ralph
+
+    # Goal 5 — bounded parallel fan-out. The engine caps are the hard limits:
+    # 4 concurrent `agent()` calls, 32 total children per run, 32 items per call.
+    # Goal 2 — every `agent()` child is started through the strict `flash` provider.
+    - id: workflow-worker-thread
+      name: '@deepseek-ai/dsh-workflow-worker-thread'
+      config:
+        provider: flash
+        maxConcurrentAgents: 4
+        maxTotalAgents: 32
+        maxItemsPerCall: 32
+        syncTimeoutMs: 5000
+        disposeGraceMs: 5000
+
+    - id: tool-workflow
+      name: '@deepseek-ai/dsh-tool-workflow'
+      config:
+        maxResultChars: 16384
+
+    # Goals 6 and 7 — the shipped fresh-agent gauntlet. Its fixed script owns the loop:
+    # one fresh structured-output child per round, the immutable objective, the shared
+    # workspace as durable memory, and one bounded structured handoff between rounds.
+    # Hard ceilings: 12 rounds (the engine's per-run total-child cap is set from this
+    # same number), and a failed round ends the run. `subagentProvider: flash` pins
+    # every round to the contract route. No custom failure/no-progress logic in v1.
+    - id: tool-ralph
+      name: '@deepseek-ai/dsh-tool-ralph'
+      config:
+        subagentProvider: flash
+        maxRounds: 12
+        maxHandoffChars: 8192
+        maxResultChars: 8192
+
+# ── remaining model-facing rows ─────────────────────────────────────────────
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+# The `web` service and its search provider stay host-plane; only the tool is per-session.
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    fetch: true
+    searchTimeoutMs: 60000
+
+- id: present
+  name: '@deepseek-ai/dsh-tool-present'

@@ -1,0 +1,23 @@
+{
+  "name": "flash-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local stdio MCP server exposing DeepSeek Harness Flash delegation to coding agents",
+  "main": "lib/index.js",
+  "bin": {
+    "flash-mcp": "lib/index.js"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./mcp": "./lib/mcp.js",
+    "./sdk": "./lib/sdk.js",
+    "./service": "./lib/service.js"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

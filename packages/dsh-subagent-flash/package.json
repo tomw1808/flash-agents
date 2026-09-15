@@ -1,0 +1,22 @@
+{
+  "name": "dsh-subagent-flash",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Strict routing contract subagent backend for DeepSeek Harness: every child runs on Ollama / deepseek-v4.1-flash:cloud.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "row": {
+      "id": "subagent-flash-in-process",
+      "name": "./plugins/dsh-subagent-flash.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "license": "MIT"
+}

@@ -1,0 +1,22 @@
+{
+  "name": "dsh-flash-guard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deterministic outer wall for DeepSeek Harness flash-service workers: protected paths, credential reads, and critical command shapes.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "row": {
+      "id": "flash-guard",
+      "name": "./plugins/dsh-flash-guard.js"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "license": "MIT"
+}
