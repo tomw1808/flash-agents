@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test packages/flash-mcp/test/ packages/dsh-flash-guard/test/ packages/dsh-subagent-flash/test/",
-    "verify": "node packages/flash-mcp/test/verify-live.mjs",
+    "verify": "node packages/flash-mcp/scripts/verify-live.mjs",
     "install-profile": "node install.mjs",
     "uninstall-profile": "node install.mjs --uninstall"
   }

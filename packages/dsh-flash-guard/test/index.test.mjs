@@ -29,7 +29,9 @@ import {
 
 const HOME = '/Users/tester'
 const ROOT = '/Users/tester/code/project'
-const settings = resolveSettings({})
+// The root is configured explicitly, as the service profile does: rules that ask
+// whether a target is *outside* the fence need to know where the fence is.
+const settings = resolveSettings({ root: ROOT })
 /** One context for the pure decisions: a workspace below a home directory. */
 const context = { cwd: ROOT, home: HOME, settings }
 
@@ -99,8 +101,14 @@ test('repository state is protected against writes but stays readable', () => {
     assert.equal(path(candidate, true)?.reason, REASON.STATE, candidate)
     assert.equal(path(candidate, false), undefined, candidate)
   }
-  for (const candidate of ['.npmrc', '.mcp.json', '.gitconfig', '.bashrc', '.zshrc']) {
+  for (const candidate of ['.gitconfig', '.bashrc', '.zshrc']) {
     assert.equal(path(candidate, true)?.reason, REASON.STATE, candidate)
+  }
+  // `.npmrc` and `.mcp.json` hold registry tokens and server credentials, so they
+  // are secrets rather than state: reading them is refused as well as writing.
+  for (const candidate of ['.npmrc', '.mcp.json', '.pypirc']) {
+    assert.equal(path(candidate, true)?.reason, REASON.SECRET, candidate)
+    assert.equal(path(candidate, false)?.reason, REASON.SECRET, candidate)
   }
   assert.equal(decide('write', { file_path: '.git/hooks/pre-commit', content: 'x' })?.reason, REASON.STATE)
   assert.equal(decide('edit', { file_path: `${ROOT}/.git/config`, old_string: 'a', new_string: 'b' })?.reason, REASON.STATE)
@@ -177,7 +185,7 @@ test('ordinary deletion still works', () => {
 test('rm of repository state or a secret is refused, whatever the depth', () => {
   assert.equal(classifyShell('rm -rf .git', context)?.reason, REASON.STATE)
   assert.equal(classifyShell('rm -rf ./sub/.git', context)?.reason, REASON.STATE)
-  assert.equal(classifyShell('rm -rf .npmrc', context)?.reason, REASON.STATE)
+  assert.equal(classifyShell('rm -rf .npmrc', context)?.reason, REASON.SECRET)
   assert.equal(classifyShell('rm -f .env', context)?.reason, REASON.SECRET)
 })
 
@@ -228,6 +236,9 @@ test('chained commands are examined one by one', () => {
   assert.equal(classifyShell('ls | head -5', context), undefined)
   assert.equal(classifyShell('cd src && rm -f old.js', context), undefined)
   assert.equal(splitSimpleCommands('a && b || c; d | e').length, 5)
+  // A separator inside quotes belongs to its command, not to the command line: the
+  // raw split used to cut this in half and mis-resolve what followed.
+  assert.deepEqual(splitSimpleCommands('bash -c "cd .. && rm -rf x"'), [['bash', '-c', 'cd .. && rm -rf x']])
   assert.deepEqual(tokenize('rm -rf "my dir"'), ['rm', '-rf', 'my dir'])
 })
 
@@ -335,9 +346,16 @@ test('a child that reports no cwd is still fenced by the configured root', async
   assert.equal(ran, 0)
   assert.equal(ancestor.error.info.reason, REASON.CRITICAL_RM)
 
-  // A neighbour of the fence is an ordinary command and still runs.
+  // A deletion outside the fence is refused as well. The neighbour of the fence is
+  // the `cd .. && rm -rf <dirname>` shape — how a workspace *beside* the root gets
+  // removed — so the rule covers the fence's neighbourhood, not every path.
   const beside = await handler({ name: 'bash', arguments: { command: `rm -rf ${fence}-other` } }, next)
-  assert.equal(beside.error, undefined)
+  assert.equal(ran, 0)
+  assert.equal(beside.error.info.reason, REASON.CRITICAL_RM)
+
+  // Something unrelated to the fence is still ordinary: scratch space is deletable.
+  const unrelated = await handler({ name: 'bash', arguments: { command: 'rm -rf /tmp/flash-guard-unrelated-scratch' } }, next)
+  assert.equal(unrelated.error, undefined)
   assert.equal(ran, 1)
 
   // An agent that does report a cwd keeps using it instead of the fallback.
@@ -355,4 +373,124 @@ test('a child that reports no cwd is still fenced by the configured root', async
   const fromProcess = await ownHandlers.get('tools/execute')({ name: 'bash', arguments: { command: `rm -rf ${process.cwd()}` } }, next)
   assert.equal(ran, 2)
   assert.equal(fromProcess.error.info.reason, REASON.CRITICAL_RM)
+})
+
+// ── the bypass corpus ───────────────────────────────────────────────────────
+
+/**
+ * Every shape from the 2026-09-15 review §1.1, which listed them as *passing*.
+ *
+ * These are the same classes that produced the incident: a shell spelling the
+ * target in a way the classifier did not expect. Each row is refused for a named
+ * reason, so a future change that reopens one is a failing test rather than a
+ * deleted repository.
+ */
+test('the review bypass corpus is refused', () => {
+  const shellCases = [
+    // A target only the shell can resolve.
+    ['rm -rf "$(pwd)"', REASON.CRITICAL_RM],
+    ['rm -rf $PWD', REASON.CRITICAL_RM],
+    ['rm -rf "${ROOT}"', REASON.CRITICAL_RM],
+    ['rm -rf `pwd`', REASON.CRITICAL_RM],
+    // A `cd` before the deletion.
+    ['cd .. && rm -rf project', REASON.CRITICAL_RM],
+    ['cd / && rm -rf Users', REASON.CRITICAL_RM],
+    ['cd "$UNKNOWN" && rm -rf everything', REASON.CRITICAL_RM],
+    // The deletion hidden inside another program.
+    ['bash -c "rm -rf ."', REASON.CRITICAL_RM],
+    ["sh -c 'rm -rf ..'", REASON.CRITICAL_RM],
+    ['bash -c "cd .. && rm -rf project"', REASON.CRITICAL_RM],
+    ['node -e "fs.rmSync(\'.\',{recursive:true})"', REASON.CRITICAL_RM],
+    ['python3 -c "import shutil; shutil.rmtree(\'.\')"', REASON.CRITICAL_RM],
+    ["perl -e 'rmtree(\".\")'", REASON.CRITICAL_RM],
+    ['ruby -e "FileUtils.rm_rf(\'.\')"', REASON.CRITICAL_RM],
+    // Removal spelled as a move or a synchronisation.
+    ['mv . /tmp/gone', REASON.CRITICAL_RM],
+    ['mv /Users/tester/code/project /tmp/gone', REASON.CRITICAL_RM],
+    ['rsync -a --delete empty/ ./', REASON.CRITICAL_RM],
+    // Git state, with global options in front of the subcommand.
+    ['git -C . clean -fdx', REASON.DESTRUCTIVE_GIT],
+    ['git -C /Users/tester/code/project reset --hard', REASON.DESTRUCTIVE_GIT],
+    ['git push --force-with-lease origin main', REASON.DESTRUCTIVE_GIT],
+    ['git push origin +main', REASON.DESTRUCTIVE_GIT],
+    ['git branch -D main', REASON.DESTRUCTIVE_GIT],
+    ['git stash clear', REASON.DESTRUCTIVE_GIT],
+    ['git update-ref -d refs/heads/main', REASON.DESTRUCTIVE_GIT],
+    ['git reflog expire --expire=now --all', REASON.DESTRUCTIVE_GIT],
+    // Secrets named through another program or spelling.
+    ['source .env', REASON.SECRET],
+    ['. .env', REASON.SECRET],
+    ['read ~/.npmrc', REASON.SECRET],
+    ['cat ~/.npmrc', REASON.SECRET],
+    ['cat .en""v', REASON.SECRET],
+    ['cat .env*', REASON.SECRET],
+    ['< .env', REASON.SECRET],
+    ['cat ~/.codex/auth.json', REASON.SECRET],
+    ['cat ~/.claude.json', REASON.SECRET],
+    ['grep -rn API_KEY .', REASON.SECRET],
+    ['rg --recursive "BEGIN RSA PRIVATE KEY" /Users/tester', REASON.SECRET],
+    // A protected path reached as a write destination.
+    ['cp good.txt .git/config', REASON.STATE],
+    ['sed -i s/a/b/ .npmrc', REASON.SECRET],
+    ['sed -i s/a/b/ .git/config', REASON.STATE],
+    ['tee /Users/tester/.ssh/authorized_keys', REASON.SECRET],
+    ['dd of=.git/config if=/dev/zero', REASON.STATE],
+    ['install -m 600 payload .git/hooks/pre-commit', REASON.STATE],
+    // Still unbounded, still refused.
+    ['find . -delete', REASON.CRITICAL_RM],
+    ['find . -name "*" -delete', REASON.CRITICAL_RM],
+    ['ls | xargs rm -rf', REASON.CRITICAL_RM],
+  ]
+  for (const [command, reason] of shellCases) {
+    assert.equal(classifyShell(command, context)?.reason, reason, command)
+  }
+
+  // Tool calls whose path is not in a `file_path` argument.
+  const callCases = [
+    ['bash', { command: 'rm -rf project', workdir: '/Users/tester/code' }, REASON.CRITICAL_RM],
+    ['bash', { command: 'rm -rf .git', workdir: ROOT }, REASON.STATE],
+    ['apply_patch', { patch: '*** Begin Patch\n*** Update File: .git/config\n@@\n-x\n+y\n*** End Patch' }, REASON.STATE],
+    ['apply_patch', { input: '--- a/.npmrc\n+++ b/.npmrc\n' }, REASON.SECRET],
+    ['apply_patch', { patch: '*** Delete File: .env\n' }, REASON.SECRET],
+  ]
+  for (const [name, args, reason] of callCases) {
+    assert.equal(decide(name, args)?.reason, reason, `${name} ${JSON.stringify(args)}`)
+  }
+})
+
+test('the bypass corpus still allows the work these shapes also spell', () => {
+  // A wall that refuses everything is not a wall, it is an outage: each rule above
+  // is paired with the ordinary command that shares its syntax.
+  const allowed = [
+    'rm -rf build',
+    'rm -rf ./node_modules',
+    'cd packages/flash-mcp && rm -f probe.txt',
+    'cd sub && rm -rf build',
+    'bash -c "npm test"',
+    'node -e "console.log(1)"',
+    'node --test packages/flash-mcp/test/',
+    'mv build /tmp/build-old',
+    'rsync -a build/ /tmp/build-copy/',
+    'git -C . status --short',
+    'git push origin main',
+    'git branch -a',
+    'git stash list',
+    'cat package.json',
+    'grep -rn "flash_task" src/',
+    'rg --recursive "workflow engine" packages/',
+    'cp src/a.js src/b.js',
+    'sed -i s/old/new/ src/index.js',
+    'find . -name "*.log" -delete',
+    'find . -type f -delete -name "*.tmp"',
+    'ls | xargs wc -l',
+    'cat .env.example',
+    'test -f .env.example && cat .env.example',
+    'rm -rf /tmp/flash-scratch-1234',
+  ]
+  for (const command of allowed) {
+    assert.equal(classifyShell(command, context), undefined, command)
+  }
+  assert.equal(decide('bash', { command: 'rm -rf build', workdir: ROOT }), undefined)
+  assert.equal(decide('bash', { command: 'npm test', workdir: '/Users/tester/code/project/packages' }), undefined)
+  assert.equal(decide('apply_patch', { patch: '*** Update File: src/index.js\n' }), undefined)
 })

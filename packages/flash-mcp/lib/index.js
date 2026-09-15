@@ -16,7 +16,9 @@
  * @module flash-mcp
  */
 
+import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { serveStdio, describeError } from './mcp.js'
 import { FlashTaskService } from './service.js'
@@ -319,8 +321,29 @@ async function main() {
   await done
 }
 
-const isEntryPoint = process.argv[1] !== undefined && import.meta.url === `file://${resolve(process.argv[1])}`
-if (isEntryPoint) {
+/**
+ * Whether this module is the program the user actually ran.
+ *
+ * `import.meta.url` is a percent-encoded real path, while `process.argv[1]` is
+ * whatever the shell was given: a symlink (`node_modules/.bin/flash-mcp`, `npm
+ * link`, `npx`) and a path with spaces or non-ASCII characters all differ from it.
+ * Comparing the two literally made the server exit silently in those cases — the
+ * client only saw the connection close. Resolve both sides to a canonical file URL.
+ *
+ * @returns {boolean} true when this file is the entry point.
+ */
+function isEntryPoint() {
+  const invoked = process.argv[1]
+  if (invoked === undefined || invoked === '') return false
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(invoked)).href
+  } catch {
+    // A path that cannot be resolved is not this module.
+    return false
+  }
+}
+
+if (isEntryPoint()) {
   main().catch((error) => {
     process.stderr.write(`flash-mcp: ${describeError(error)}\n`)
     process.exit(1)

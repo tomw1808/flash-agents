@@ -15,7 +15,7 @@ import { PassThrough } from 'node:stream'
 import { startServer } from '../lib/index.js'
 import { HarnessSdkClient, resolveDshCommand } from '../lib/sdk.js'
 
-const FAKE_DSH = resolve(import.meta.dirname, 'fake-dsh.mjs')
+const FAKE_DSH = resolve(import.meta.dirname, '..', 'test-support', 'fake-dsh.mjs')
 
 /** A running server plus a frame-level MCP client over it. */
 async function connect({ env = {}, root } = {}) {

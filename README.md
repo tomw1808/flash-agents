@@ -38,7 +38,7 @@ packages/dsh-subagent-flash/        host-plane provider row (the only custom Har
   test/contract.test.mjs            22 contract tests, run with `node --test`
 packages/dsh-flash-guard/           the deterministic wall (`tools/execute` wrapper)
   lib/index.js                      pure classifiers + one wrapper, zero imports
-  test/index.test.mjs               16 tests, run with `node --test`
+  test/index.test.mjs               19 tests, run with `node --test` (includes the bypass corpus)
 packages/flash-mcp/                 MCP stdio server + SDK JSON-RPC client half
   lib/mcp.js                        minimal MCP stdio server: framing, initialize, tools, cancel
   lib/sdk.js                        client for one persistent `dsh` child over the shipped SDK protocol
@@ -47,8 +47,8 @@ packages/flash-mcp/                 MCP stdio server + SDK JSON-RPC client half
   test/mcp.test.mjs                 protocol-level server tests
   test/service.test.mjs             service tests against a fake runtime
   test/integration.test.mjs         MCP → SDK → stand-in Harness, whole pipeline, no LLM
-  test/fake-dsh.mjs                 the stand-in Harness process
-  test/verify-live.mjs              live end-to-end verification through the official MCP client
+  test-support/fake-dsh.mjs         the stand-in Harness process (outside `test/`, so it is never collected)
+  scripts/verify-live.mjs           live end-to-end verification through the official MCP client
 presets/flash-orchestrator/         interactive agent preset (repo is the source of truth)
   agent.cordis.yml                  17 rows: identity, shell, fs, jobs, skills, goals,
                                     compaction, delegation, remaining tools
@@ -298,16 +298,22 @@ uncommitted source.
 ## Verify
 
 ```sh
-npm test                                        # all three suites: 83 tests, no LLM
+npm test                                        # all three suites: 85 tests, no LLM
 node --test packages/flash-mcp/test/            # 44 protocol, service, pipeline, and fleet tests
-node --test packages/dsh-flash-guard/test/      # 17 wall tests
+node --test packages/dsh-flash-guard/test/      # 19 wall tests
 node --test packages/dsh-subagent-flash/test/   # 22 provider contract tests
 npm run verify                                  # live end-to-end, needs Ollama and a profile boot
 ```
 
-Do **not** run a bare `node --test`: Node treats every file under a `test/` directory as a test file, so
-it would also execute `fake-dsh.mjs` (the stand-in Harness, which waits on stdin) and
-`verify-live.mjs` (the whole live suite). Name the directories, or use `npm test`.
+`npm test` names the three `test/` directories on purpose. The stand-in Harness lives in
+`test-support/` and the live suite in `scripts/` so that neither is ever collected as a test file —
+it used to be possible to hang the suite for five minutes by running `node --test` bare.
+
+`npm run verify` runs every stage against a **throwaway copy-on-write snapshot of this repository**
+(including `.git`, and including uncommitted edits), because these stages ask workers with bash to
+write files and one of them asks a worker to delete its workspace on purpose. `--root <dir>` overrides
+that and warns loudly first. The workspace snapshot is removed afterwards; the `guard` stage keeps its
+own separate decoy root on top of that.
 
 The pipeline tests run a stand-in Harness process, so MCP framing, lazy boot, process reuse,
 session-per-call, route observation, and result projection are covered without an LLM. `verify-live`

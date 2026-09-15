@@ -50,7 +50,7 @@
  * @module dsh-flash-guard
  */
 
-import { isAbsolute, join, normalize, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
 
 /** Cordis plugin name. */
 const name = 'flash-guard'
@@ -86,9 +86,6 @@ const ENV_FILE = /^\.env(\..+)?$/
 /** A `~`, `$HOME`, or `${HOME}` prefix. */
 const HOME_PREFIX = /^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/
 /** Shell control operators that end one simple command. */
-const COMMAND_SEPARATOR = /\s*(?:&&|\|\||;|\||\n)\s*/
-/** A single-quoted or double-quoted or bare shell token. */
-const SHELL_TOKEN = /"([^"]*)"|'([^']*)'|(\S+)/g
 
 const DEFAULT_SETTINGS = Object.freeze({
   /**
@@ -111,14 +108,27 @@ const DEFAULT_SETTINGS = Object.freeze({
     '.zshrc',
     '.zprofile',
   ],
-  /** File names no tool may read or mutate, anywhere. */
-  secretFileNames: ['.netrc', '.pgpass', '.git-credentials'],
+  /**
+   * File names no tool may read or mutate, anywhere. `.npmrc` and `.mcp.json` are
+   * here rather than in the state list because they hold registry tokens and
+   * server credentials: the file is a secret, not merely repository state.
+   */
+  secretFileNames: ['.netrc', '.pgpass', '.git-credentials', '.npmrc', '.mcp.json', '.pypirc', '.htpasswd', '.dockercfg'],
   /** Whether the `.env` family counts as secret. */
   protectEnvFiles: true,
   /** `.env` names that are templates rather than secrets. */
   envFileExceptions: ['.env.example', '.env.sample', '.env.template', '.env.dist'],
-  /** Home-relative credential paths no tool may read or mutate. */
-  homeProtectedPaths: ['.ssh', '.aws', '.gnupg', '.dsh', '.config/gh', '.config/gcloud', '.docker/config.json'],
+  /**
+   * Home-relative credential paths no tool may read or mutate. The agent-tool
+   * directories belong here as much as the cloud ones: they hold OAuth tokens for
+   * the very coding agents this service is driven by.
+   */
+  homeProtectedPaths: [
+    '.ssh', '.aws', '.gnupg', '.dsh', '.config/gh', '.config/gcloud', '.docker/config.json',
+    '.codex', '.claude', '.claude.json', '.config/claude', '.kube', '.azure', '.terraform.d',
+    '.config/op', '.cargo/credentials', '.cargo/credentials.toml', 'Library/Keychains',
+    '.bash_history', '.zsh_history', '.python_history', '.node_repl_history',
+  ],
   /** Whether destructive git worktree/history commands are refused. */
   blockDestructiveGit: true,
 })
@@ -245,11 +255,15 @@ function classifyPathAccess(input) {
   if (typeof candidate !== 'string' || candidate.length === 0) return undefined
   const resolved = resolveTarget(candidate, cwd, home)
   const base = basenameOf(resolved)
+  // The shell expands a glob before the program ever sees it, so `.env*` and `.en?`
+  // reach the same file as `.env` while reading as an ordinary pattern to a name
+  // check.
+  const unglobbed = base.replace(/[*?[\]]/g, '')
 
-  if (settings.protectEnvFiles && ENV_FILE.test(base) && !settings.envFileExceptions.includes(base)) {
+  if (settings.protectEnvFiles && ENV_FILE.test(unglobbed) && !settings.envFileExceptions.includes(unglobbed)) {
     return { reason: REASON.SECRET, detail: `the .env family is secret (${base})` }
   }
-  if (settings.secretFileNames.includes(base)) {
+  if (settings.secretFileNames.includes(base) || settings.secretFileNames.includes(unglobbed)) {
     return { reason: REASON.SECRET, detail: `credential file (${base})` }
   }
   if (isHomeProtected(resolved, home, settings)) {
@@ -269,14 +283,77 @@ function classifyPathAccess(input) {
 }
 
 /**
+ * Lex a command line the way a shell does, and split it at its control operators.
+ *
+ * Both jobs belong to one pass. Quotes decide what is a token, what is a separator,
+ * and what is *inside* a token: `cat .en""v` is one token spelling `.env`, and a
+ * separator inside quotes — `bash -c "cd .. && rm -rf x"` — is not a separator at
+ * all. The previous regex tokenizer did neither, so both spellings walked through
+ * as ordinary text, and splitting the raw string first cut quoted deletions in half
+ * and then classified the second half against the wrong directory.
+ *
+ * @param {string} command - the command line.
+ * @returns {string[][]} one token array per simple command.
+ */
+function lexShell(command) {
+  const commands = []
+  let tokens = []
+  let current = ''
+  let started = false
+  let quote = ''
+  const endToken = () => {
+    if (!started) return
+    tokens.push(current)
+    current = ''
+    started = false
+  }
+  const endCommand = () => {
+    endToken()
+    if (tokens.length > 0) commands.push(tokens)
+    tokens = []
+  }
+  for (let at = 0; at < command.length; at += 1) {
+    const char = command[at]
+    if (quote !== '') {
+      if (char === quote) quote = ''
+      else current += char
+      started = true
+      continue
+    }
+    if (char === '"' || char === "'") {
+      // An empty quoted argument is still an argument, so the token starts here.
+      quote = char
+      started = true
+      continue
+    }
+    if (/\s/.test(char)) {
+      endToken()
+      continue
+    }
+    const pair = command.slice(at, at + 2)
+    if (pair === '&&' || pair === '||') {
+      endCommand()
+      at += 1
+      continue
+    }
+    if (char === ';' || char === '|' || char === '&' || char === '\n') {
+      endCommand()
+      continue
+    }
+    current += char
+    started = true
+  }
+  endCommand()
+  return commands
+}
+
+/**
  * Split a shell command line into simple commands at its control operators.
- * Quoted separators are not honoured; over-splitting only ever yields *more*
- * scrutiny, which is the safe direction for a wall.
  * @param {string} command - the command string.
- * @returns {string[]} the simple commands.
+ * @returns {string[][]} one token array per simple command.
  */
 function splitSimpleCommands(command) {
-  return command.split(COMMAND_SEPARATOR).filter((part) => part.trim().length > 0)
+  return lexShell(command)
 }
 
 /**
@@ -285,17 +362,41 @@ function splitSimpleCommands(command) {
  * @returns {string[]} its tokens.
  */
 function tokenize(simple) {
-  const tokens = []
-  SHELL_TOKEN.lastIndex = 0
-  let match = SHELL_TOKEN.exec(simple)
-  while (match !== null) {
-    tokens.push(match[1] ?? match[2] ?? match[3] ?? '')
-    match = SHELL_TOKEN.exec(simple)
-  }
-  return tokens
+  return lexShell(simple).flat()
 }
 
-/** `find` flags that bound a deletion to a name or path pattern. */
+/**
+ * A target the shell expands before the program ever sees it. This wall reads the
+ * command line, so `$(pwd)`, `` `pwd` `` and `$VAR` are exactly what it cannot see;
+ * deletion of an unknowable target is refused rather than guessed at.
+ */
+const SHELL_SUBSTITUTION = /\$\(|`|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/
+
+/** Shells whose `-c` payload is another command line, so it is parsed as one. */
+const SHELL_PROGRAMS = new Set(['sh', 'bash', 'zsh', 'ksh', 'dash', 'ash', 'pwsh', 'powershell'])
+
+/** Inline-code flags per interpreter, whose payload is scanned for deletion calls. */
+const INLINE_CODE_FLAGS = {
+  node: ['-e', '--eval', '-p', '--print'],
+  python: ['-c'],
+  python3: ['-c'],
+  perl: ['-e'],
+  ruby: ['-e'],
+  php: ['-r'],
+  bun: ['-e'],
+  deno: ['eval'],
+}
+
+/**
+ * Deletion reachable from inline code. A worker can delete a tree without ever
+ * running `rm`, and a wall that only reads argv misses it entirely.
+ */
+const INLINE_DELETE = /\b(?:rmSync|rmdirSync|unlinkSync|unlink|rmdir|rm|removeSync|rmtree|remove|rm_rf)\s*\(|shutil\.rmtree|FileUtils\.rm_rf/
+
+/** Programs whose path argument is a destination (a write), not a source. */
+const WRITE_DESTINATION_PROGRAMS = new Set(['cp', 'mv', 'install', 'ln', 'rsync', 'tee', 'sed', 'dd'])
+
+/** Programs that read a file named as an argument. */
 const FIND_NARROWING = ['-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex']
 
 /** Program prefixes that merely wrap the real program. */
@@ -305,6 +406,9 @@ const FILE_READING_PROGRAMS = new Set([
   'cat', 'bat', 'head', 'tail', 'less', 'more', 'grep', 'rg', 'sed', 'awk', 'cut', 'sort', 'uniq',
   'strings', 'xxd', 'od', 'base64', 'gzip', 'tar', 'zip', 'cp', 'mv', 'rm', 'install', 'scp',
   'rsync', 'curl', 'wget', 'python', 'python3', 'node', 'perl', 'ruby', 'openssl', 'git', 'docker',
+  // `source`/`.` read a file by name; `read` reads it into a variable. All three
+  // make `. .env` an access, which the previous list missed.
+  'source', '.', 'read',
 ])
 /** Programs that run inline code, where a path can hide inside a string. */
 const INTERPRETER_PROGRAMS = new Set(['python', 'python3', 'node', 'deno', 'bun', 'perl', 'ruby', 'php', 'sh', 'bash', 'zsh', 'pwsh'])
@@ -323,7 +427,45 @@ const DESTRUCTIVE_GIT = [
   /^restore$/,
   /^push$/,
   /^filter-branch$/,
+  /^branch$/,
+  /^stash$/,
+  /^reflog$/,
+  /^update-ref$/,
+  /^gc$/,
 ]
+
+/** A search pattern that reads as credential hunting, not as ordinary reading. */
+const SECRET_HUNT = /(?:secret|token|password|passwd|api[_-]?key|private[_-]?key|credential|BEGIN [A-Z ]*PRIVATE KEY)/i
+
+/**
+ * Tools whose argument is a patch body rather than a path. Deliberately not
+ * `content`: a file *written* through a write tool may itself be a patch fixture,
+ * and paths inside that text are data, not accesses.
+ */
+const PATCH_BODY_ARGUMENT = /^(?:patch|input|diff|body)$/i
+
+/**
+ * Whether a deletion is dangerous precisely because it leaves the service root.
+ *
+ * Inside the root the ordinary rules apply: a worktree is the worker's to change.
+ * Outside it a worker has no business deleting anything, and the two shapes that
+ * matter are the ones the incident class uses — the user's home (`rm -rf x` after a
+ * bare `cd`), an ancestor of the root, and a *sibling* of the root, which is what
+ * `cd .. && rm -rf <dirname>` reaches. Scratch space such as `/tmp` is neither, and
+ * stays deletable.
+ *
+ * @param {string} resolved - the resolved deletion target.
+ * @param {{root: string, home: string}} context - the fence and the home directory.
+ * @returns {boolean} true when the target must be refused for being outside.
+ */
+function isOutsideRootCritical(resolved, context) {
+  const { root, home } = context
+  if (resolved === '' || root === undefined || root === '') return false
+  if (resolved === root || isAtOrUnder(resolved, root)) return false
+  if (home !== '' && isAtOrUnder(resolved, home)) return true
+  if (isAtOrUnder(root, resolved)) return true
+  return dirname(resolved) === dirname(root)
+}
 
 /**
  * Whether a `git` invocation is one of the destructive shapes this row refuses.
@@ -333,16 +475,82 @@ const DESTRUCTIVE_GIT = [
 function destructiveGitReason(argv) {
   const start = argv.findIndex((token) => basenameOf(token) === 'git')
   if (start < 0) return undefined
-  const rest = argv.slice(start + 1).filter((token) => !token.startsWith('-'))
+  // Global options come before the subcommand and some of them take a value, so
+  // `git -C . clean -fdx` has to be read as `clean`, not as `-C`.
+  const rest = []
+  for (let at = start + 1; at < argv.length; at += 1) {
+    const token = argv[at]
+    if (token === '-C' || token === '-c' || token === '--git-dir' || token === '--work-tree' || token === '--namespace') {
+      at += 1
+      continue
+    }
+    if (token.startsWith('-')) continue
+    rest.push(token)
+  }
   const subcommand = rest[0]
   if (subcommand === undefined || !DESTRUCTIVE_GIT.some((pattern) => pattern.test(subcommand))) return undefined
   const joined = argv.slice(start).join(' ')
   if (subcommand === 'reset' && !/--hard|--merge|--keep/.test(joined)) return undefined
   if (subcommand === 'clean' && !/-[a-z]*[fdx]/.test(joined)) return undefined
-  if (subcommand === 'push' && !/--force|-f\b/.test(joined)) return undefined
+  if (subcommand === 'push' && !/(?:--force(?:-with-lease)?|-f\b|\s\+\S)/.test(joined)) return undefined
   if (subcommand === 'checkout' && !/\s(?:\.|--\s+\.|\*)/.test(`${joined} `)) return undefined
   if (subcommand === 'restore' && !/\s(?:\.|--\s+\.)/.test(`${joined} `)) return undefined
+  if (subcommand === 'branch' && !/(?:-D\b|--delete\s+--force|-d\s+-f)/.test(joined)) return undefined
+  if (subcommand === 'stash' && !/^(?:drop|clear)$/.test(rest[1] ?? '')) return undefined
+  if (subcommand === 'reflog' && !/^expire$/.test(rest[1] ?? '')) return undefined
+  if (subcommand === 'update-ref' && !/(?:-d\b|--delete)/.test(joined)) return undefined
+  if (subcommand === 'gc' && !/--prune=(?:now|all)/.test(joined)) return undefined
   return subcommand
+}
+
+/**
+ * The path arguments that a write-shaped program creates or overwrites.
+ *
+ * `cp x .git/config`, `sed -i s/a/b/ .npmrc` and `tee ~/.ssh/authorized_keys` all
+ * mutate a protected path while naming it as an argument, which a read-only
+ * classification lets through.
+ *
+ * @param {string} program - the invoked program.
+ * @param {string[]} argv - its tokens.
+ * @returns {string[]} candidate destination paths.
+ */
+function writeDestinations(program, argv) {
+  if (!WRITE_DESTINATION_PROGRAMS.has(program)) return []
+  const values = argv.slice(1).filter((token) => !token.startsWith('-'))
+  if (program === 'dd') return argv.filter((token) => token.startsWith('of=')).map((token) => token.slice(3))
+  if (program === 'tee') return values
+  if (program === 'sed') {
+    const inPlace = argv.some((token) => token === '-i' || /^-i./.test(token))
+    return inPlace ? values : []
+  }
+  const targetAt = argv.findIndex((token) => token === '-t' || token === '--target-directory')
+  if (targetAt >= 0 && typeof argv[targetAt + 1] === 'string') return [argv[targetAt + 1]]
+  return values.length === 0 ? [] : [values[values.length - 1]]
+}
+
+/**
+ * Whether one simple command deletes something.
+ * @param {string} program - the invoked program.
+ * @param {string[]} argv - its tokens.
+ * @returns {boolean} true when the command is a deletion.
+ */
+function isDeletionProgram(program, argv) {
+  if (program === 'rm' || program === 'rmdir' || program === 'shred') return true
+  if (program === 'find') {
+    const execAt = argv.findIndex((token) => token === '-exec' || token === '-execdir')
+    return argv.includes('-delete') || (execAt >= 0 && basenameOf(argv[execAt + 1] ?? '') === 'rm')
+  }
+  return argv.some((token, at) => basenameOf(token) === 'xargs' && basenameOf(argv[at + 1] ?? '') === 'rm')
+}
+
+/** Whether a recursive search is hunting for credentials rather than reading code. */
+function isSecretHunt(program, argv) {
+  if (program !== 'grep' && program !== 'rg' && program !== 'ag') return false
+  // Short flags cluster: `-rn` is recursive and numbered, so it is not `-r`.
+  const recursive = argv.some((token) => /^-[a-zA-Z]*[rR][a-zA-Z]*$/.test(token) || token === '--recursive')
+  if (!recursive) return false
+  const pattern = argv.slice(1).find((token) => !token.startsWith('-'))
+  return pattern !== undefined && SECRET_HUNT.test(pattern)
 }
 
 /**
@@ -386,16 +594,54 @@ function classifyRmTarget(raw, resolved, context) {
 function classifyShell(command, context) {
   const { cwd, home, settings } = context
   if (typeof command !== 'string' || command.trim().length === 0) return undefined
-  for (const simple of splitSimpleCommands(command)) {
-    const tokens = tokenize(simple)
+  // A `cd` earlier in the same command line moves everything after it, so the
+  // commands that follow are classified against the directory it moved to. When the
+  // destination is a shell expansion the move cannot be followed at all, and a
+  // deletion after it is refused rather than resolved against the wrong directory.
+  let effectiveCwd = cwd
+  let cwdUnknown = false
+  for (const tokens of splitSimpleCommands(command)) {
     if (tokens.length === 0) continue
+    const simple = tokens.join(' ')
     let index = 0
     while (index < tokens.length && PREFIX_PROGRAMS.has(basenameOf(tokens[index]))) index += 1
     const program = basenameOf(tokens[index] ?? '')
     const argv = tokens.slice(index)
 
-    // Deletion does not always say `rm` with a path, so these two shapes are read
-    // for what they can actually reach. A whole-tree deletion is a critical path
+    if (program === 'cd' || program === 'pushd' || program === 'popd' || program === 'chdir') {
+      const destination = argv.slice(1).find((token) => !token.startsWith('-'))
+      if (destination === undefined) {
+        effectiveCwd = home
+        cwdUnknown = home === ''
+      } else if (SHELL_SUBSTITUTION.test(destination)) {
+        cwdUnknown = true
+      } else {
+        effectiveCwd = resolveTarget(destination, effectiveCwd, home)
+        cwdUnknown = false
+      }
+      continue
+    }
+    // A shell running `-c '<command line>'` is another command line. Parsing it is
+    // the only way `bash -c "rm -rf ."` is a deletion at all: tokenization sees
+    // one quoted argument and nothing else.
+    if (SHELL_PROGRAMS.has(program)) {
+      const at = argv.findIndex((token) => token === '-c' || token === '-Command' || token === '/c')
+      const payload = at >= 0 ? argv[at + 1] : undefined
+      if (typeof payload === 'string' && payload.trim().length > 0) {
+        const nested = classifyShell(payload, context)
+        if (nested !== undefined) return nested
+      }
+    }
+    // Inline code can delete without ever invoking a delete program.
+    const inlineFlags = INLINE_CODE_FLAGS[program]
+    if (inlineFlags !== undefined) {
+      const at = argv.findIndex((token) => inlineFlags.includes(token))
+      if (at >= 0 && INLINE_DELETE.test(argv.slice(at + 1).join(' '))) {
+        return { reason: REASON.CRITICAL_RM, detail: `${program} inline code deletes files` }
+      }
+    }
+    // Deletion does not always say `rm` with a path, so these shapes are read for
+    // what they can actually reach. A whole-tree deletion is a critical path
     // whichever program spells it; a deletion narrowed by a name or path pattern
     // is ordinary cleanup and stays allowed.
     if (tokens.some((token, at) => basenameOf(token) === 'xargs' && basenameOf(tokens[at + 1] ?? '') === 'rm')) {
@@ -404,18 +650,67 @@ function classifyShell(command, context) {
     if (program === 'find') {
       const execAt = argv.findIndex((token) => token === '-exec' || token === '-execdir')
       const pipedToRm = execAt >= 0 && basenameOf(argv[execAt + 1] ?? '') === 'rm'
-      const narrowed = FIND_NARROWING.some((flag) => argv.includes(flag))
+      // `-name '*'` bounds nothing, so a narrowing flag only counts when the value
+      // in front of it is something more specific than every name.
+      const narrowed = FIND_NARROWING.some((flag, at) => {
+        const flagAt = argv.indexOf(flag)
+        if (flagAt < 0) return false
+        const value = argv[flagAt + 1] ?? ''
+        return !/^['"]?\*['"]?$/.test(value) && value.length > 0
+      })
       if ((argv.includes('-delete') || pipedToRm) && !narrowed) {
         return { reason: REASON.CRITICAL_RM, detail: 'deletes everything find matches' }
       }
     }
+    if ((program === 'rm' || program === 'rmdir' || program === 'shred') && cwdUnknown) {
+      return { reason: REASON.CRITICAL_RM, detail: `deletes after an unresolvable cd (${simple.trim().slice(0, 80)})` }
+    }
     if (program === 'rm' || program === 'rmdir' || program === 'shred') {
       const targets = argv.slice(1).filter((token) => !token.startsWith('-'))
       for (const raw of targets) {
-        const resolved = resolveTarget(raw, cwd, home)
+        if (SHELL_SUBSTITUTION.test(raw)) {
+          return { reason: REASON.CRITICAL_RM, detail: `deletes ${raw}, which only the shell can resolve` }
+        }
+        const resolved = resolveTarget(raw, effectiveCwd, home)
+        if (
+          isOutsideRootCritical(resolved, { root: settings.root, home }) ||
+          isOutsideRootCritical(effectiveCwd, { root: settings.root, home })
+        ) {
+          return { reason: REASON.CRITICAL_RM, detail: `deletes ${raw} outside the service root` }
+        }
         const verdict = classifyRmTarget(raw, resolved, context)
         if (verdict !== undefined) return verdict
       }
+    }
+    // `mv` and `rsync --delete` remove things without naming a delete program:
+    // `mv . /tmp/gone` empties the directory it moves, and `rsync -a --delete` makes
+    // the destination match an empty source.
+    if (program === 'mv' && !cwdUnknown) {
+      for (const raw of argv.slice(1).filter((token) => !token.startsWith('-'))) {
+        if (SHELL_SUBSTITUTION.test(raw)) {
+          return { reason: REASON.CRITICAL_RM, detail: `moves ${raw}, which only the shell can resolve` }
+        }
+        const verdict = classifyRmTarget(raw, resolveTarget(raw, effectiveCwd, home), context)
+        if (verdict !== undefined) return verdict
+      }
+    }
+    if (program === 'rsync' && argv.includes('--delete')) {
+      const destination = argv.slice(1).filter((token) => !token.startsWith('-')).pop()
+      const resolved = destination === undefined ? '' : resolveTarget(destination, cwd, home)
+      if (resolved.length > 0 && cwd.length > 0 && (resolved === cwd || isAtOrUnder(cwd, resolved))) {
+        return { reason: REASON.CRITICAL_RM, detail: 'rsync --delete empties the service root' }
+      }
+    }
+    // A recursive search for credentials reads secrets that are never named as a
+    // path, which no per-token rule can see.
+    if (isSecretHunt(program, argv)) {
+      return { reason: REASON.SECRET, detail: `recursively searches for credentials (${argv.slice(1).find((token) => !token.startsWith('-'))})` }
+    }
+    // A write destination is mutated even though it is only an argument.
+    for (const destination of writeDestinations(program, argv)) {
+      if (SHELL_SUBSTITUTION.test(destination)) continue
+      const verdict = classifyPathAccess({ path: destination, cwd, home, settings, mutate: true })
+      if (verdict !== undefined) return verdict
     }
     if (INTERPRETER_PROGRAMS.has(program)) {
       // Inline code can name a secret inside a quoted string, where tokenization
@@ -436,6 +731,17 @@ function classifyShell(command, context) {
       const token = argv[position]
       // A redirect target is a write, whatever program produced it. The target
       // may be attached (`>.env`) or a separate token (`> .env`).
+      // `< .env` reads a file just as much as `cat .env` does, and the input
+      // redirect is the one shape that names a read without a program.
+      const input = /^(?:\d*)<(?!<)(.*)$/.exec(token)
+      if (input !== null) {
+        const target = input[1].length > 0 ? input[1] : argv[position + 1]
+        if (typeof target === 'string' && target.length > 0) {
+          const verdict = classifyPathAccess({ path: target, cwd, home, settings, mutate: false })
+          if (verdict !== undefined) return verdict
+        }
+        continue
+      }
       const redirect = /^(?:\d*|&)>>?(.*)$/.exec(token)
       if (redirect !== null) {
         const attached = redirect[1]
@@ -478,7 +784,6 @@ function classifyShell(command, context) {
 function decideToolCall(input) {
   const { name: toolName, args, cwd = '', home = '', settings } = input
   if (typeof toolName !== 'string' || settings === undefined) return undefined
-  const context = { cwd, home, settings }
   /** @type {{reason: string, detail: string} | undefined} */
   let verdict
   let subject = ''
@@ -486,13 +791,23 @@ function decideToolCall(input) {
   if (SHELL_TOOL.test(toolName)) {
     const command = args === null || typeof args !== 'object' ? undefined : args.command ?? args.cmd ?? args.script
     if (typeof command !== 'string') return undefined
-    verdict = classifyShell(command, context)
+    // A shell tool can be told which directory to run in, and a relative path means
+    // something different there. Ignoring `workdir` classified the command against
+    // the wrong directory — the same mistake as ignoring `cd`.
+    const declared = args === null || typeof args !== 'object' ? undefined : args.workdir ?? args.cwd
+    const shellCwd =
+      typeof declared === 'string' && declared.length > 0
+        ? isAbsolute(declared)
+          ? declared
+          : resolveTarget(declared, cwd, home)
+        : cwd
+    verdict = classifyShell(command, { cwd: shellCwd, home, settings })
     subject = command
   } else {
     const mutate = MUTATING_TOOL.test(toolName)
     const readable = READ_ONLY_TOOL.test(toolName)
     if (!mutate && !readable) return undefined
-    const paths = pathArguments(args)
+    const paths = [...pathArguments(args), ...patchTargets(args)]
     for (const candidate of paths) {
       verdict = classifyPathAccess({ path: candidate, cwd, home, settings, mutate })
       if (verdict !== undefined) {
@@ -528,6 +843,31 @@ function pathArguments(args) {
       for (const entry of value) {
         if (typeof entry === 'string' && entry.length > 0) found.push(entry)
       }
+    }
+  }
+  return found
+}
+
+/**
+ * Collect the file paths named inside a patch body.
+ *
+ * `apply_patch` names its targets in the body rather than in a `file_path`
+ * argument, so a patch that rewrites `.git/config` or `~/.ssh/authorized_keys`
+ * carried no path this wall could see.
+ *
+ * @param {unknown} args - parsed tool arguments.
+ * @returns {string[]} candidate paths.
+ */
+function patchTargets(args) {
+  if (args === null || typeof args !== 'object') return []
+  const found = []
+  for (const [key, value] of Object.entries(args)) {
+    if (!PATCH_BODY_ARGUMENT.test(key) || typeof value !== 'string') continue
+    for (const line of value.split('\n')) {
+      const match = /^(?:\*\*\* (?:Update|Add|Delete) File: |\+\+\+ b\/|--- a\/)(.+)$/.exec(line.trim())
+      if (match === null) continue
+      const named = match[1].trim()
+      if (named.length > 0 && named !== '/dev/null') found.push(named)
     }
   }
   return found
@@ -596,6 +936,11 @@ function apply(ctx, config = {}) {
   // The root this wall falls back to when an agent reports no cwd: the configured
   // one, else the process cwd, which the SDK has already set to the service root.
   const root = typeof settings.root === 'string' && settings.root !== '' ? settings.root : process.cwd()
+  // Write the effective fence back into the settings the classifier sees. Without
+  // this the rules that ask "is this target *outside* the root?" were keyed on an
+  // empty string in the default configuration — that is, they were inert in exactly
+  // the deployment they exist for.
+  settings.root = root
   ctx.on('tools/execute', async (exec, next) => {
     const verdict = decideToolCall({
       name: exec?.name,

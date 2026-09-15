@@ -11,31 +11,106 @@
  * MCP_SDK_DIR) only so this script needs no dependency of its own.
  *
  * Usage:
- *   node packages/flash-mcp/test/verify-live.mjs [--root <dir>] [--only <stages>]
+ *   node packages/flash-mcp/scripts/verify-live.mjs [--only <stages>] [--root <dir>] [--timeout-ms <n>]
  *
  * Stages: boot, lazy, task, route, hostile, reuse, local, batch, guard, readonly, fence, escape.
  *
- * The `guard` stage asks a worker to delete its own workspace on purpose, so it
- * runs against a throwaway root of its own — never the repository the caller
- * passed in. A wall regression destroys that decoy and fails a check.
+ * By default every stage runs against a **throwaway snapshot of this repository**
+ * (a copy-on-write copy in the temp area), because these stages ask Flash workers
+ * with bash to write files — and one of them asks a worker to delete its own
+ * workspace on purpose. Point `--root` at a directory explicitly only when you are
+ * willing to lose what is in it; the script says so loudly when you do.
+ *
+ * The `guard` stage additionally uses its own decoy root, so that the destructive
+ * part of the suite is one step further from anything real.
  * Booting the service profile writes under $DSH_HOME, so run it with whatever
  * access your environment needs for that.
  */
 
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const SERVER = resolve(import.meta.dirname, '..', 'lib', 'index.js')
-const SDK_DIR = process.env.MCP_SDK_DIR ?? '/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@modelcontextprotocol/sdk'
+const REPO = resolve(import.meta.dirname, '..', '..', '..')
 
+/**
+ * Locate the MCP SDK that ships with the installed Harness.
+ *
+ * The client half has to be a *different* implementation of the protocol than the
+ * server under test, and the harness install is the one this project already
+ * depends on — so resolve it from the `dsh` on PATH rather than hardcoding a prefix
+ * (Homebrew, npm, pnpm, and a source checkout all disagree). `MCP_SDK_DIR` overrides.
+ *
+ * @returns {string} the directory holding `@modelcontextprotocol/sdk`.
+ */
+async function resolveSdkDir() {
+  const override = process.env.MCP_SDK_DIR
+  if (override !== undefined && override !== '') return override
+  const tried = []
+  const { resolveDshCommand } = await import(pathToFileURL(resolve(import.meta.dirname, '..', 'lib', 'sdk.js')).href)
+  let entry
+  try {
+    // `resolveDshCommand` returns a spawn command: either an executable on PATH or
+    // the current Node plus a JavaScript entry, so the install is found from either.
+    const launcher = resolveDshCommand({ FLASH_DSH_BIN: process.env.FLASH_DSH_BIN, PATH: process.env.PATH })
+    entry = realpathSync(launcher.prefix.length > 0 ? launcher.prefix[0] : launcher.command)
+  } catch (error) {
+    throw new Error(`could not find the dsh install to resolve the MCP SDK from (${describe(error)}); set MCP_SDK_DIR`)
+  }
+  let dir = entry
+  for (;;) {
+    const candidate = join(dir, 'node_modules', '@modelcontextprotocol', 'sdk')
+    if (existsSync(join(candidate, 'package.json'))) return candidate
+    tried.push(candidate)
+    const parent = resolve(dir, '..')
+    if (parent === dir) break
+    dir = parent
+  }
+  throw new Error(`no @modelcontextprotocol/sdk beside ${entry}; tried:\n  ${tried.join('\n  ')}\nset MCP_SDK_DIR to its directory`)
+}
+
+const describe = (error) => (error instanceof Error ? error.message : String(error))
 const argv = process.argv.slice(2)
 const flag = (name, fallback) => {
   const index = argv.indexOf(name)
   return index < 0 ? fallback : argv[index + 1]
 }
-const ROOT = resolve(flag('--root', '/Users/thomas/Projects/flash-agent'))
+const SDK_DIR = await resolveSdkDir()
+
+/**
+ * The workspace the stages run against: a throwaway snapshot unless one was named.
+ *
+ * A copy-on-write copy (APFS `cp -c`) of the whole repository — including `.git`,
+ * so git-dependent behaviour and the guard's state rules are exercised, and
+ * including uncommitted edits, so the suite verifies what is on disk right now
+ * rather than what was last committed.
+ *
+ * @returns {{root: string, cleanup: Function}} the workspace and its removal.
+ */
+function prepareWorkspace() {
+  const explicit = flag('--root', undefined)
+  if (explicit !== undefined) {
+    process.stderr.write(
+      `[verify] WARNING: running writing workers, and a deliberate self-deletion test, against ${explicit}.\n` +
+      '[verify] Only do this with a directory you are willing to lose.\n',
+    )
+    return { root: realpathSync(resolve(explicit)), cleanup: () => {} }
+  }
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'flash-verify-')))
+  const dest = join(parent, 'repo')
+  try {
+    execFileSync('cp', ['-cR', REPO, dest])
+  } catch {
+    execFileSync('cp', ['-R', REPO, dest])
+  }
+  return { root: realpathSync(dest), cleanup: () => rmSync(parent, { recursive: true, force: true }) }
+}
+
+const workspace = prepareWorkspace()
+const ROOT = workspace.root
 const ONLY = flag('--only', 'boot,lazy,task,route,hostile,reuse,local,batch,guard,readonly,fence,escape').split(',')
 const TIMEOUT_MS = Number(flag('--timeout-ms', '300000'))
 if (!Number.isSafeInteger(TIMEOUT_MS) || TIMEOUT_MS <= 0) throw new Error('--timeout-ms must be a positive integer')
@@ -370,6 +445,7 @@ try {
 } catch (error) {
   check('harness', 'verification ran to completion', false, error instanceof Error ? error.message : String(error))
 } finally {
+  workspace.cleanup()
   await client.close().catch(() => {})
 }
 
