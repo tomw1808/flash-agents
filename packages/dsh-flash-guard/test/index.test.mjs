@@ -359,8 +359,10 @@ test('a child that reports no cwd is still fenced by the configured root', async
   // root the whole truth about what a worker may change.
   const unrelated = await handler({ name: 'bash', arguments: { command: 'rm -rf /tmp/flash-guard-unrelated-scratch' } }, next)
   assert.equal(ran, 0)
-  assert.equal(unrelated.error.info.reason, REASON.CRITICAL_RM)
+  assert.equal(unrelated.error.info.reason, REASON.OUTSIDE_WORKSPACE)
   assert.match(unrelated.error.message, /outside/)
+  // A caller branching on the code can tell this from `rm -rf /`.
+  assert.match(unrelated.content[0].text, /OUTSIDE_WORKSPACE/)
 
   // Inside the root it is still ordinary work.
   const inside = await handler({ name: 'bash', arguments: { command: 'rm -rf scratch' } }, next)
@@ -462,15 +464,15 @@ test('the review bypass corpus is refused', () => {
     // to reach the caller's tree. A live run deleted a file in the caller's tree
     // exactly this way, and these are the shapes that closed it.
     ['bash', { command: `rm -f ${HOME}/code/other/README.md`, workdir: ROOT }, REASON.CRITICAL_RM],
-    ['bash', { command: 'rm -rf /tmp/flash-guard-unrelated-scratch', workdir: ROOT }, REASON.CRITICAL_RM],
-    ['bash', { command: 'rm -f /tmp/outside.txt', workdir: ROOT }, REASON.CRITICAL_RM],
-    ['bash', { command: 'cp secrets.txt /tmp/leak.txt', workdir: ROOT }, REASON.CRITICAL_RM],
-    ['bash', { command: 'printf x > /tmp/outside.txt', workdir: ROOT }, REASON.CRITICAL_RM],
-    ['bash', { command: 'mv build /tmp/build-old', workdir: ROOT }, REASON.CRITICAL_RM],
-    ['bash', { command: 'cd /tmp && rm -rf outside.txt', workdir: ROOT }, REASON.CRITICAL_RM],
-    ['bash', { command: 'mv /tmp/download.tar.gz .', workdir: ROOT }, REASON.CRITICAL_RM],
-    ['bash', { command: 'rsync -a build/ /tmp/build-copy/', workdir: ROOT }, REASON.CRITICAL_RM],
-    ['write', { file_path: '/tmp/outside.txt', content: 'x' }, REASON.CRITICAL_RM],
+    ['bash', { command: 'rm -rf /tmp/flash-guard-unrelated-scratch', workdir: ROOT }, REASON.OUTSIDE_WORKSPACE],
+    ['bash', { command: 'rm -f /tmp/outside.txt', workdir: ROOT }, REASON.OUTSIDE_WORKSPACE],
+    ['bash', { command: 'cp secrets.txt /tmp/leak.txt', workdir: ROOT }, REASON.OUTSIDE_WORKSPACE],
+    ['bash', { command: 'printf x > /tmp/outside.txt', workdir: ROOT }, REASON.OUTSIDE_WORKSPACE],
+    ['bash', { command: 'mv build /tmp/build-old', workdir: ROOT }, REASON.OUTSIDE_WORKSPACE],
+    ['bash', { command: 'cd /tmp && rm -rf outside.txt', workdir: ROOT }, REASON.OUTSIDE_WORKSPACE],
+    ['bash', { command: 'mv /tmp/download.tar.gz .', workdir: ROOT }, REASON.OUTSIDE_WORKSPACE],
+    ['bash', { command: 'rsync -a build/ /tmp/build-copy/', workdir: ROOT }, REASON.OUTSIDE_WORKSPACE],
+    ['write', { file_path: '/tmp/outside.txt', content: 'x' }, REASON.OUTSIDE_WORKSPACE],
     // The fence is the last rule, so a target that is *also* repository state or a secret
     // keeps its more specific reason even when it lies outside the workspace.
     ['write', { file_path: '/tmp/x/.npmrc', content: 'x' }, REASON.SECRET],

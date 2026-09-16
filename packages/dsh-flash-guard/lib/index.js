@@ -70,6 +70,10 @@ const REASON = Object.freeze({
   STATE: 'PROTECTED_STATE',
   CRITICAL_RM: 'CRITICAL_PATH',
   DESTRUCTIVE_GIT: 'DESTRUCTIVE_GIT',
+  // Its own reason, not CRITICAL_PATH: `> /tmp/out.log` and `rm -rf /` are both
+  // refused, but a caller branching on the code has to be able to tell "you may not
+  // leave the workspace" from "you are about to delete everything".
+  OUTSIDE_WORKSPACE: 'OUTSIDE_WORKSPACE',
 })
 
 /** Tools whose command string carries a shell program. */
@@ -293,7 +297,7 @@ function classifyPathAccess(input) {
   // under TMPDIR, which the sandbox allows. Reads are not fenced (toolchains, `/usr`,
   // shared caches), and device paths are not writes at all.
   if (settings.fenceMutations !== false && fence !== '' && fence !== resolved && !isAtOrUnder(resolved, fence) && !DEVICE_PATH.test(resolved)) {
-    return { reason: REASON.CRITICAL_RM, detail: `mutates ${resolved}, which is outside ${fence}` }
+    return { reason: REASON.OUTSIDE_WORKSPACE, detail: `mutates ${resolved}, which is outside ${fence}` }
   }
   return undefined
 }

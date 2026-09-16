@@ -23,6 +23,7 @@
  * @typedef {object} Slot
  * @property {number} id - slot number, stable for the life of the pool.
  * @property {string} dir - the disposable tree the worker runs in.
+ * @property {string} tmpDir - a temp directory inside `dir`, for the worker's TMPDIR.
  * @property {string | null} base - commit this call started from, or null without git.
  * @property {boolean} busy - whether a call currently holds the slot.
  *
@@ -30,6 +31,8 @@
  * @property {boolean} available - whether a diff could be computed at all.
  * @property {string} [reason] - why not, when it could not.
  * @property {string[]} filesChanged - `STATUS<TAB>path` entries, in git's order.
+ * @property {string[]} ignored - paths the worker created that git ignores, so the patch
+ *   cannot carry them; reported rather than silently dropped.
  * @property {string} diffstat - `git diff --stat` output.
  * @property {string} diff - the patch itself, possibly truncated by the service.
  * @property {number} diffChars - the patch length before truncation.
@@ -38,9 +41,90 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { tmpdir } from 'node:os'
+
+/**
+ * The only shape a patch id may have. It is checked before the id is used to build a
+ * path, so an id cannot name a different file: `../` in a patch id used to be a way to
+ * read any `.patch` on disk.
+ */
+const PATCH_ID = /^flash-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+/** The temp directory a worker is pointed at, relative to its disposable tree. */
+const SLOT_TMP = '.flash-tmp'
+
+/** An error a caller can branch on, carrying the same `code` shape the service uses. */
+export class IsolationError extends Error {
+  /**
+   * @param {string} message - what went wrong.
+   * @param {string} code - a stable code, e.g. `CANCELLED`, `TIMEOUT`.
+   */
+  constructor(message, code) {
+    super(message)
+    this.name = 'IsolationError'
+    this.code = code
+  }
+}
+
+/**
+ * Where one process's disposable trees live when no state directory is configured.
+ *
+ * Keyed by root so two services over different repositories cannot collide, by pid so
+ * two services over the *same* repository cannot either, and by a per-instance nonce so
+ * two pools inside one process cannot. The previous shared default was a data-loss bug:
+ * a second instance deleted the first instance's in-flight tree and then handed the same
+ * path to a different worker, whose patch could carry their work.
+ *
+ * The pid level is kept as its own directory so a dead process's copies can be swept as
+ * a unit, and the nonce lives below it.
+ *
+ * @param {string} root - the canonical service root.
+ * @returns {string} the state directory for this process, root, and pool.
+ */
+function defaultStateDir(root) {
+  const digest = createHash('sha256').update(root).digest('hex').slice(0, 12)
+  const instance = randomUUID().slice(0, 8)
+  return join(tmpdir(), 'flash-mcp', digest, String(process.pid), instance)
+}
+
+/**
+ * Whether a process is still running. Used to decide whose old trees are safe to remove.
+ * @param {number} pid - the process id to ask about.
+ * @returns {boolean} true when the process exists.
+ */
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // EPERM means it exists and belongs to someone else; ESRCH means it is gone.
+    return error?.code === 'EPERM'
+  }
+}
+
+/**
+ * Remove the state directories of processes that no longer exist.
+ *
+ * Only siblings for *this root* are considered, and only directories named after a
+ * numeric pid: a live service's trees are never touched, which is the property the
+ * constructor's blanket `rm -rf slots` did not have.
+ *
+ * @param {string} root - the canonical service root.
+ * @returns {void}
+ */
+function sweepDeadOwners(root) {
+  const digest = createHash('sha256').update(root).digest('hex').slice(0, 12)
+  const parent = join(tmpdir(), 'flash-mcp', digest)
+  if (!existsSync(parent)) return
+  for (const entry of readdirSync(parent)) {
+    if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue
+    if (processAlive(Number(entry))) continue
+    rmSync(join(parent, entry), { recursive: true, force: true })
+  }
+}
 
 /** Arguments that keep a commit in a throwaway copy from running the caller's hooks. */
 const COMMIT_CONFIG = [
@@ -58,6 +142,11 @@ const COMMIT_CONFIG = [
  * @returns {string} standard output.
  * @throws {Error} with git's own message when the command fails.
  */
+/** One error message from an unknown throwable. */
+function messageOf(error) {
+  return error instanceof Error ? error.message : String(error)
+}
+
 function git(args, cwd) {
   try {
     return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
@@ -113,12 +202,48 @@ function copyTree(from, to) {
   // and `cp -R <dir> <dest>` then copies the directory *into* the destination
   // instead of copying its contents.
   const source = from.endsWith(sep) ? `${from}.` : `${from}${sep}.`
+  const copy = (args) => execFileSync('cp', [...args, source, to], { stdio: ['ignore', 'ignore', 'pipe'] })
+  // `-c` is macOS's "clone the blocks" flag; on GNU coreutils it means nothing and
+  // would either error or take a different meaning, while `--reflink=always` is the
+  // Linux spelling and refuses rather than silently copying when unsupported. The
+  // `always` form is what makes the returned mechanism honest: a silent fallback
+  // inside `cp --reflink=auto` would be reported as a clone that never happened.
   try {
-    execFileSync('cp', ['-cR', source, to], { stdio: ['ignore', 'ignore', 'pipe'] })
+    if (process.platform === 'darwin') {
+      copy(['-cR'])
+    } else {
+      copy(['--reflink=always', '-R'])
+    }
     return 'clone'
   } catch {
-    execFileSync('cp', ['-R', source, to], { stdio: ['ignore', 'ignore', 'pipe'] })
+    copy(['-R'])
     return 'copy'
+  }
+}
+
+/**
+ * Make one name inside a copied tree invisible to git, so the worker's temp files are
+ * not part of the change it reports.
+ *
+ * The copy's own `.git/info/exclude` is used rather than the caller's `.gitignore`: the
+ * exclusion belongs to this disposable tree, not to the repository it was copied from.
+ *
+ * @param {string} dir - a copied tree.
+ * @param {string} name - the entry to exclude, relative to the tree.
+ * @returns {void}
+ */
+function excludeFromDiff(dir, name) {
+  const infoDir = join(dir, '.git', 'info')
+  if (!existsSync(infoDir)) return
+  const excludePath = join(infoDir, 'exclude')
+  try {
+    const current = existsSync(excludePath) ? readFileSync(excludePath, 'utf8') : ''
+    if (current.split('\n').includes(`${name}/`)) return
+    const separator = current.length === 0 || current.endsWith('\n') ? '' : '\n'
+    writeFileSync(excludePath, `${current}${separator}# flash-mcp: the worker's temp directory, inside the disposable copy\n${name}/\n`)
+  } catch {
+    // A tree whose .git cannot be written is still usable; the diff will simply name
+    // the temp directory as ignored work.
   }
 }
 
@@ -142,12 +267,17 @@ export class WorkspaceIsolation {
    * @param {object} options - isolation settings.
    * @param {string} options.root - the caller's repository, which is never written.
    * @param {number} [options.slots] - how many trees may be in flight at once.
-   * @param {string} options.stateDir - where slot trees and stored patches live.
+   * @param {string} [options.stateDir] - where slot trees and stored patches live. When
+   *   it is omitted the layout is per root *and* per process, so two services cannot
+   *   share a tree or a patch directory by accident. A configured directory is used as
+   *   given: one service per directory is then the deployment's responsibility.
    * @param {(message: string) => void} [options.log] - progress log.
    */
   constructor({ root, slots = 2, stateDir, log = () => {} }) {
     this.root = resolve(root)
-    this.stateDir = resolve(stateDir)
+    /** Whether this instance owns a private state directory it may clear. */
+    this.ownsStateDir = stateDir === undefined || stateDir === null || stateDir === ''
+    this.stateDir = this.ownsStateDir ? defaultStateDir(this.root) : resolve(stateDir)
     this.log = log
     this.clones = 0
     /** Patches kept for a later `flash_apply`. @type {Map<string, object>} */
@@ -160,11 +290,17 @@ export class WorkspaceIsolation {
       base: null,
       busy: false,
     }))
-    // Slot trees belong to this process: a previous process's copies are dead
-    // weight, and reusing one would hand a worker another call's leftovers.
+    // Only trees this process owns are cleared. A default state directory is private
+    // by construction, so clearing it cannot touch a live service; the dead owners of
+    // previous runs are removed too, since their copies are dead weight whose reuse
+    // would hand a worker another call's leftovers.
+    if (this.ownsStateDir) sweepDeadOwners(this.root)
     rmSync(join(this.stateDir, 'slots'), { recursive: true, force: true })
     mkdirSync(join(this.stateDir, 'calls'), { recursive: true })
-    for (const slot of this.slots) mkdirSync(slot.dir, { recursive: true })
+    for (const slot of this.slots) {
+      mkdirSync(slot.dir, { recursive: true })
+      slot.tmpDir = join(slot.dir, SLOT_TMP)
+    }
   }
 
   /** How many trees may be in flight at once. */
@@ -174,17 +310,57 @@ export class WorkspaceIsolation {
 
   /**
    * Take a slot, waiting for one when every tree is in use.
+   *
+   * Waiting is bounded by the caller's own budget and cancellable: a call that is
+   * cancelled or out of time must not go on to lease a tree, copy a repository, and
+   * only then discover that nobody is waiting for the answer.
+   *
+   * @param {object} [options] - how long the caller may wait.
+   * @param {AbortSignal} [options.signal] - client cancellation.
+   * @param {number} [options.deadline] - epoch milliseconds this call must be done by.
    * @returns {Promise<Slot>} the slot this call owns until it is released.
+   * @throws {IsolationError} with code `CANCELLED` or `TIMEOUT`.
    */
-  async lease() {
+  async lease({ signal, deadline } = {}) {
+    const budget = deadline === undefined ? undefined : Math.max(0, deadline - Date.now())
+    if (signal?.aborted === true) throw new IsolationError('the call was cancelled before a tree could be leased', 'CANCELLED')
+    if (budget === 0) throw new IsolationError('the call had no time left before a tree could be leased', 'TIMEOUT')
     const free = this.slots.find((slot) => !slot.busy)
     if (free !== undefined) {
       free.busy = true
       return free
     }
-    return await new Promise((resolveLease) => {
-      this.waiting.push(resolveLease)
+    return await new Promise((resolveLease, rejectLease) => {
+      const waiter = { resolveLease, rejectLease, signal, timer: undefined, onAbort: undefined }
+      waiter.settle = (settle, value) => {
+        this.#dropWaiter(waiter)
+        settle(value)
+      }
+      if (budget !== undefined) {
+        waiter.timer = setTimeout(() => {
+          waiter.settle(rejectLease, new IsolationError(`no tree was free within the call's ${String(budget)}ms budget`, 'TIMEOUT'))
+        }, budget)
+      }
+      if (signal !== undefined) {
+        waiter.onAbort = () => {
+          waiter.settle(rejectLease, new IsolationError('the call was cancelled while waiting for a tree', 'CANCELLED'))
+        }
+        signal.addEventListener('abort', waiter.onAbort, { once: true })
+      }
+      this.waiting.push(waiter)
     })
+  }
+
+  /**
+   * Take a waiter out of the queue and off its timers.
+   * @param {object} waiter - the waiter to forget.
+   * @returns {void}
+   */
+  #dropWaiter(waiter) {
+    const at = this.waiting.indexOf(waiter)
+    if (at >= 0) this.waiting.splice(at, 1)
+    if (waiter.timer !== undefined) clearTimeout(waiter.timer)
+    if (waiter.onAbort !== undefined) waiter.signal?.removeEventListener?.('abort', waiter.onAbort)
   }
 
   /**
@@ -197,7 +373,7 @@ export class WorkspaceIsolation {
     if (next !== undefined) {
       // Hand the slot straight to the waiter: it stays busy, so two calls can never
       // be handed the same tree.
-      next(slot)
+      next.settle(next.resolveLease, slot)
       return
     }
     slot.busy = false
@@ -220,6 +396,13 @@ export class WorkspaceIsolation {
     this.clones += 1
     slot.base = null
     slot.baseReason = undefined
+    // The worker has nowhere legitimate to write outside its copy — the wall refuses
+    // it, and the sandbox is wider than the workspace — so it is given a temp
+    // directory *inside* the copy and pointed at it through TMPDIR. Excluded before
+    // the base commit, so tools that write there produce no diff and no surprise.
+    slot.tmpDir = join(slot.dir, SLOT_TMP)
+    mkdirSync(slot.tmpDir, { recursive: true })
+    excludeFromDiff(slot.dir, SLOT_TMP)
     if (!isGitWorkTree(slot.dir)) {
       slot.baseReason = 'the service root is not a git repository, so no diff could be computed'
       return { base: null, mechanism, reason: slot.baseReason }
@@ -263,6 +446,7 @@ export class WorkspaceIsolation {
       git(['add', '-A'], slot.dir)
       const patchId = `flash-${randomUUID()}`
       const patchPath = join(this.stateDir, 'calls', `${patchId}.patch`)
+      const metaPath = join(this.stateDir, 'calls', `${patchId}.json`)
       const diff = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', slot.base], slot.dir)
       const diffstat = git(['diff', '--cached', '--stat', '--no-color', slot.base], slot.dir)
       const names = git(['diff', '--cached', '--name-status', slot.base], slot.dir)
@@ -271,8 +455,22 @@ export class WorkspaceIsolation {
       // than silently dropped: a caller told "no change" while the worker wrote a
       // whole build directory has been misled, not informed.
       const ignored = ignoredPaths(slot.dir).filter((entry) => !(slot.ignoredBase ?? []).includes(entry))
+      // The record travels with the patch, so a restarted service can still tell which
+      // repository the patch was computed for and whether it has already been applied.
+      const record = {
+        patchId,
+        patchPath,
+        metaPath,
+        root: this.root,
+        base: slot.base,
+        filesChanged,
+        diffstat: diffstat.trim(),
+        createdAt: Date.now(),
+        appliedAt: null,
+      }
       writeFileSync(patchPath, diff)
-      this.patches.set(patchId, { patchId, patchPath, filesChanged, diffstat, createdAt: Date.now() })
+      this.#writeMeta(record)
+      this.patches.set(patchId, record)
       return {
         available: true,
         filesChanged,
@@ -306,17 +504,22 @@ export class WorkspaceIsolation {
    * @param {object} options - the patch to apply.
    * @param {string} options.patchId - a patch id from an earlier call.
    * @param {boolean} [options.dryRun] - check that it applies without changing anything.
+   * @param {boolean} [options.force] - apply again even though the record says it was applied.
    * @returns {{patchId: string, applied: boolean, dryRun: boolean, root: string, filesChanged: string[], diffstat: string}} the outcome.
-   * @throws {Error} when the patch is unknown or does not apply.
+   * @throws {Error} when the patch is unknown, belongs to another repository, was already
+   *   applied, or does not apply.
    */
-  apply({ patchId, dryRun = false }) {
-    const record = this.patches.get(patchId) ?? this.#readStoredPatch(patchId)
-    if (record === undefined) {
+  apply({ patchId, dryRun = false, force = false }) {
+    const record = this.#lookupPatch(patchId)
+    if (!existsSync(record.patchPath)) throw new Error(`the patch file for ${patchId} is gone (${record.patchPath})`)
+    // A patch that was applied once is not idempotent: `git apply` may well find a
+    // second place to put the change when the surrounding lines repeat. Recording the
+    // apply is what makes "already applied" a rule instead of a coincidence.
+    if (!dryRun && !force && record.appliedAt !== null && record.appliedAt !== undefined) {
       throw new Error(
-        `no patch ${JSON.stringify(patchId)} is held by this service; patches are kept in ${join(this.stateDir, 'calls')}`,
+        `patch ${patchId} was already applied to ${this.root} at ${new Date(record.appliedAt).toISOString()}; pass force: true to apply it again`,
       )
     }
-    if (!existsSync(record.patchPath)) throw new Error(`the patch file for ${patchId} is gone (${record.patchPath})`)
     const check = dryRun ? ['--check'] : []
     if (isGitWorkTree(this.root)) {
       // Without `--index` the caller's index is left alone; only the working tree moves.
@@ -326,6 +529,11 @@ export class WorkspaceIsolation {
         cwd: this.root,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
+    }
+    if (!dryRun) {
+      record.appliedAt = Date.now()
+      this.#writeMeta(record)
+      this.patches.set(patchId, record)
     }
     return {
       patchId,
@@ -338,14 +546,60 @@ export class WorkspaceIsolation {
   }
 
   /**
-   * Re-read a patch this process wrote earlier, so an id survives a service restart.
+   * Find one patch, and refuse to hand back one this service may not apply.
+   *
+   * Two refusals matter here. The id must have the shape this service issues, because
+   * the id is used to build a path — `../` used to reach any `.patch` on disk. And the
+   * record must name *this* repository: a patch computed for another root is not a
+   * merge, it is a different edit to different files, and applying it produced a tree
+   * holding another caller's work under this caller's name.
+   *
    * @param {string} patchId - the id to look for.
-   * @returns {object | undefined} the stored record, or undefined.
+   * @returns {object} the held or re-read record.
+   * @throws {Error} when the id is malformed, unknown, or belongs to another root.
    */
-  #readStoredPatch(patchId) {
-    const patchPath = join(this.stateDir, 'calls', `${patchId}.patch`)
-    if (!existsSync(patchPath)) return undefined
-    return { patchId, patchPath, filesChanged: [], diffstat: '' }
+  #lookupPatch(patchId) {
+    if (typeof patchId !== 'string' || !PATCH_ID.test(patchId)) {
+      throw new Error(
+        `patchId ${JSON.stringify(patchId)} is not an id this service issues; ids look like "flash-<uuid>"`,
+      )
+    }
+    const held = this.patches.get(patchId)
+    if (held !== undefined) return held
+    const metaPath = join(this.stateDir, 'calls', `${patchId}.json`)
+    if (!existsSync(metaPath)) {
+      throw new Error(
+        `no patch ${patchId} is held by this service; patches are kept in ${join(this.stateDir, 'calls')}`,
+      )
+    }
+    let record
+    try {
+      record = JSON.parse(readFileSync(metaPath, 'utf8'))
+    } catch (error) {
+      throw new Error(`the record for patch ${patchId} is unreadable: ${messageOf(error)}`)
+    }
+    record.metaPath = metaPath
+    record.patchPath = join(this.stateDir, 'calls', `${patchId}.patch`)
+    if (record.root !== this.root) {
+      throw new Error(
+        `patch ${patchId} was computed for ${String(record.root)}, not for ${this.root}; patches do not cross repositories`,
+      )
+    }
+    this.patches.set(patchId, record)
+    return record
+  }
+
+  /**
+   * Write a patch's record next to it.
+   * @param {object} record - the record to store.
+   * @returns {void}
+   */
+  #writeMeta(record) {
+    const { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt } = record
+    writeFileSync(
+      record.metaPath,
+      `${JSON.stringify({ patchId, root, base, filesChanged, diffstat, createdAt, appliedAt }, null, 2)}\n`,
+    )
   }
 
   /**

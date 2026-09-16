@@ -15,6 +15,7 @@
 
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -185,8 +186,166 @@ test('a dry run checks a patch without changing anything', async () => {
 test('an unknown patch id is refused with a usable message', async () => {
   const repo = makeRepo()
   const { isolation, stateDir } = makePool(repo)
-  assert.throws(() => isolation.apply({ patchId: 'flash-nope' }), /no patch "flash-nope" is held/)
-  assert.throws(() => isolation.apply({ patchId: 'flash-nope' }), new RegExp(stateDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  const missing = `flash-${randomUUID()}`
+  assert.throws(() => isolation.apply({ patchId: missing }), new RegExp(`no patch ${missing} is held`))
+  assert.throws(
+    () => isolation.apply({ patchId: missing }),
+    new RegExp(stateDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+  )
+  isolation.close()
+})
+
+test('a patch id cannot name a file of its own choosing', async () => {
+  const repo = makeRepo()
+  const { isolation } = makePool(repo)
+  // Ids are used to build paths, so anything that is not the issued shape is refused
+  // before the path exists — `../` used to walk out of the calls directory.
+  for (const bad of ['flash-nope', '../secrets', `flash-${randomUUID()}.patch`, '', 'flash-../../../../etc/passwd']) {
+    assert.throws(() => isolation.apply({ patchId: bad }), /is not an id this service issues/, String(bad))
+  }
+  assert.throws(() => isolation.apply({ patchId: undefined }), /is not an id this service issues/)
+  isolation.close()
+})
+
+test('a patch computed for another repository is refused', async () => {
+  const first = makeRepo()
+  const second = makeRepo()
+  const a = makePool(first)
+  const slot = await a.isolation.lease()
+  a.isolation.prepare(slot)
+  const change = (writeFileSync(join(slot.dir, 'made-by-a.txt'), 'from A\n'), a.isolation.collect(slot))
+  assert.equal(change.available, true)
+
+  // The same patch, with the same state directory, looked up through a service over a
+  // different root. It used to be accepted, putting one caller's work into another
+  // caller's tree under their name.
+  const b = { isolation: new WorkspaceIsolation({ root: second, slots: 1, stateDir: a.stateDir }) }
+  assert.throws(
+    () => b.isolation.apply({ patchId: change.patchId }),
+    /was computed for .*not for .*patches do not cross repositories/,
+  )
+  assert.equal(existsSync(join(second, 'made-by-a.txt')), false)
+  a.isolation.close()
+  b.isolation.close()
+})
+
+test('applying the same patch twice is refused by the record, not by luck', async () => {
+  const repo = makeRepo()
+  // A block that repeats, and a change inside it: the shape where `git apply` can find
+  // a second place to put the same change instead of failing. Whether git would is not
+  // the question here — the service must not ask it twice at all.
+  const file = join(repo, 'repeat.txt')
+  writeFileSync(file, 'alpha\nbeta\ngamma\nalpha\nbeta\ngamma\nalpha\nbeta\ngamma\n')
+  execFileSync('git', ['add', '-A'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'repeat'], { cwd: repo })
+
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  writeFileSync(join(slot.dir, 'repeat.txt'), 'alpha\nbeta\ngamma\nADDED\nalpha\nbeta\ngamma\nalpha\nbeta\ngamma\n')
+  const change = isolation.collect(slot)
+
+  assert.equal(isolation.apply({ patchId: change.patchId }).applied, true)
+  // The refusal comes from the recorded apply, before git is consulted at all.
+  assert.throws(() => isolation.apply({ patchId: change.patchId }), /was already applied/)
+  assert.equal(readFileSync(file, 'utf8').split('ADDED').length - 1, 1)
+
+  // `force` is the explicit way past the bookkeeping. What git then decides is git's
+  // business; what matters is that the refusal above did not come from git.
+  let forced
+  try {
+    forced = isolation.apply({ patchId: change.patchId, force: true })
+  } catch (error) {
+    forced = error
+  }
+  assert.equal(forced instanceof Error ? /already applied/.test(forced.message) : false, false)
+  isolation.close()
+})
+
+test('a stored patch remembers that it was applied, across a restart', async () => {
+  const repo = makeRepo()
+  const first = makePool(repo)
+  const slot = await first.isolation.lease()
+  first.isolation.prepare(slot)
+  writeFileSync(join(slot.dir, 'survivor.txt'), 'kept\n')
+  const change = first.isolation.collect(slot)
+  // A dry run checks without marking anything.
+  assert.equal(first.isolation.apply({ patchId: change.patchId, dryRun: true }).dryRun, true)
+  first.isolation.apply({ patchId: change.patchId })
+  first.isolation.close()
+
+  // The record travelled on disk, so a fresh service over the same root still refuses.
+  const second = new WorkspaceIsolation({ root: repo, slots: 1, stateDir: first.stateDir })
+  assert.throws(() => second.apply({ patchId: change.patchId }), /was already applied/)
+  assert.equal(existsSync(join(repo, 'survivor.txt')), true)
+  second.close()
+})
+
+test('two services over one repository do not share a state directory', async () => {
+  const repo = makeRepo()
+  // No state directory configured: this is the default layout, which used to be
+  // $TMPDIR/flash-mcp for every instance of every root.
+  const first = new WorkspaceIsolation({ root: repo, slots: 1 })
+  const second = new WorkspaceIsolation({ root: repo, slots: 1 })
+  try {
+    assert.notEqual(first.stateDir, second.stateDir)
+    const slot = await first.lease()
+    first.prepare(slot)
+    writeFileSync(join(slot.dir, 'in-flight.txt'), 'a worker is writing here\n')
+    assert.equal(existsSync(join(slot.dir, 'in-flight.txt')), true)
+
+    // Starting the second service must not clear the first one's in-flight tree.
+    const other = new WorkspaceIsolation({ root: repo, slots: 1 })
+    try {
+      assert.equal(existsSync(join(slot.dir, 'in-flight.txt')), true)
+      assert.notEqual(other.stateDir, first.stateDir)
+    } finally {
+      other.close()
+    }
+  } finally {
+    first.close()
+    second.close()
+  }
+})
+
+test('waiting for a tree is bounded by the call, not by the pool', async () => {
+  const repo = makeRepo()
+  const { isolation } = makePool(repo, 1)
+  const held = await isolation.lease()
+
+  // A queued call with a deadline is refused rather than served late.
+  await assert.rejects(
+    () => isolation.lease({ deadline: Date.now() + 30 }),
+    (error) => error.code === 'TIMEOUT' && /no tree was free/.test(error.message),
+  )
+  // A cancelled call stops waiting immediately, and never copies a repository.
+  const controller = new AbortController()
+  const waiting = isolation.lease({ signal: controller.signal })
+  controller.abort()
+  await assert.rejects(() => waiting, (error) => error.code === 'CANCELLED')
+
+  // The queue is genuinely empty afterwards: releasing hands the tree to nobody.
+  isolation.release(held)
+  assert.equal(isolation.waiting.length, 0)
+  assert.equal(isolation.slots[0].busy, false)
+  isolation.close()
+})
+
+test('a worker is pointed at a temp directory inside its own copy', async () => {
+  const repo = makeRepo()
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+
+  assert.equal(slot.tmpDir, join(slot.dir, '.flash-tmp'))
+  assert.equal(existsSync(slot.tmpDir), true)
+  // What a tool that honours TMPDIR writes there is not part of the reported change.
+  writeFileSync(join(slot.tmpDir, 'scratch.bin'), 'temp\n')
+  writeFileSync(join(slot.dir, 'real.txt'), 'work\n')
+  const change = isolation.collect(slot)
+  assert.deepEqual(change.filesChanged.map((line) => line.split('\t').at(-1)), ['real.txt'])
+  assert.deepEqual(change.ignored, [])
+  assert.doesNotMatch(change.diff, /scratch\.bin/)
   isolation.close()
 })
 

@@ -95,7 +95,7 @@ export function listTools() {
           apply: {
             type: 'string',
             enum: ['none', 'auto'],
-            description: 'What to do with the change the worker made in its disposable copy. "none" (the default) returns the diff and leaves your tree untouched; "auto" applies it to the service root before returning. Read change.diff before trusting either.',
+            description: 'What to do with the change the worker made in its disposable copy. "none" (the default) returns the diff and leaves your tree untouched; "auto" applies it to the service root before returning. Read change.diff before trusting either — and note that a diff is clipped when change.diffTruncated is true, while flash_apply always uses the stored full patch.',
           },
         },
         required: ['task', 'cwd'],
@@ -175,7 +175,12 @@ export function listTools() {
         'from the copy, so it contains exactly what the worker changed — including deletions and new',
         'files — and nothing else.',
         '',
-        'Pass `dryRun: true` to check that it still applies without changing anything.',
+        'The patch applied here is the *stored* one, not the possibly-truncated `change.diff`',
+        'in the result, so a long change still applies whole.',
+        '',
+        'Pass `dryRun: true` to check that it still applies without changing anything. A patch that',
+        'was already applied is refused; pass `force: true` to apply it again anyway. Patches do not',
+        'cross repositories: one computed for another root is refused.',
       ].join('\n'),
       inputSchema: {
         type: 'object',
@@ -187,6 +192,10 @@ export function listTools() {
           dryRun: {
             type: 'boolean',
             description: 'Check that the patch applies without writing anything.',
+          },
+          force: {
+            type: 'boolean',
+            description: 'Apply the patch even though the record says it was already applied to this root.',
           },
         },
         required: ['patchId'],
@@ -293,7 +302,9 @@ Options:
   --isolate <mode>          "copy" (default) runs writing calls in a disposable copy of the
                             root; "none" lets workers write to the root directly
   --slots <n>               disposable trees kept in flight, one runtime each (default: 2)
-  --state-dir <path>        where slot trees and returned patches live (default: TMPDIR/flash-mcp)
+  --state-dir <path>        where slot trees and returned patches live (default: a directory
+                            private to this root and this process under TMPDIR); a
+                            configured directory is shared, so one service per directory
   --diff-chars <n>          how much of a patch a result carries (default: 20000)
   -h, --help                show this help
 

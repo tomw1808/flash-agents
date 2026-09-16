@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
-import { WorkspaceIsolation } from './isolation.js'
+import { IsolationError, WorkspaceIsolation } from './isolation.js'
 import { HarnessSdkClient } from './sdk.js'
 
 /** Route the service pins; callers can never change it. */
@@ -111,6 +111,9 @@ export class FlashTaskCancelled extends Error {
   constructor(message = 'flash_task was cancelled by the client') {
     super(message)
     this.name = 'FlashTaskCancelled'
+    // The same `code` shape the other failures carry, so a caller (and the MCP layer)
+    // can tell a cancellation from a failure without reading the message.
+    this.code = 'CANCELLED'
   }
 }
 
@@ -132,7 +135,8 @@ export class FlashTaskService {
    * @param {number} [options.perItemChars] - returned per-worker budget inside a fleet.
    * @param {Record<string, string | undefined>} [options.env] - runtime environment.
    * @param {(message: string) => void} [options.log] - diagnostic sink (stderr).
-   * @param {() => HarnessSdkClient} [options.clientFactory] - runtime factory (tests).
+   * @param {(profile: string, cwd: string, extraEnv?: object) => HarnessSdkClient} [options.clientFactory]
+   *   runtime factory (tests).
    */
   constructor({
     root,
@@ -162,9 +166,18 @@ export class FlashTaskService {
     this.perItemChars = perItemChars
     this.env = env
     this.log = log
+    // The environment a runtime boots with may be narrowed per call — the disposable
+    // tree's own temp directory is handed to the worker through TMPDIR, so a tool that
+    // writes temp files has somewhere legitimate to put them.
     this.clientFactory =
-      clientFactory ?? ((profileName, cwd) => new HarnessSdkClient({ profile: profileName, cwd, env, log }))
-    this.stateDir = resolve(isolate.stateDir ?? join(tmpdir(), 'flash-mcp'))
+      clientFactory ??
+      ((profileName, cwd, extraEnv) =>
+        new HarnessSdkClient({
+          profile: profileName,
+          cwd,
+          env: extraEnv === undefined ? env : { ...env, ...extraEnv },
+          log,
+        }))
     this.diffChars = isolate.diffChars ?? DEFAULT_DIFF_CHARS
     /**
      * Disposable trees for writing calls. `mode: "none"` is the opt-out, and it is
@@ -179,9 +192,13 @@ export class FlashTaskService {
         : new WorkspaceIsolation({
             root: this.root,
             slots: isolate.slots ?? DEFAULT_SLOTS,
-            stateDir: this.stateDir,
+            // Left undefined, the pool picks a directory that is private to this root
+            // and this process. A shared default was a data-loss bug: one instance
+            // cleared another's in-flight tree and reused its path.
+            ...(isolate.stateDir === undefined ? {} : { stateDir: isolate.stateDir }),
             log,
           })
+    this.stateDir = this.isolation?.stateDir ?? resolve(isolate.stateDir ?? join(tmpdir(), 'flash-mcp'))
 
     /**
      * One persistent runtime per profile *and working directory*, keyed by both. A
@@ -231,6 +248,54 @@ export class FlashTaskService {
   }
 
   /**
+   * Lease a tree for one call, bounded by that call's budget and cancellable.
+   *
+   * The wait is where a queued call used to outlive its own deadline: it queued, took a
+   * tree, copied a repository, and only then noticed nobody was waiting. The signal and
+   * the deadline are passed in so the queue can refuse instead.
+   *
+   * @param {WorkspaceIsolation} pool - the pool to lease from.
+   * @param {string} label - the tool name, for the error message.
+   * @param {number} budgetMs - the wall-clock budget of the call being served.
+   * @param {AbortSignal} [signal] - client cancellation.
+   * @returns {Promise<object>} the leased slot.
+   * @throws {FlashTaskCancelled | FlashTaskError} when the call is cancelled or out of time.
+   */
+  async #lease(pool, label, budgetMs, signal) {
+    try {
+      return await pool.lease({ signal, deadline: Date.now() + budgetMs })
+    } catch (error) {
+      if (error instanceof IsolationError && error.code === 'CANCELLED') {
+        throw new FlashTaskCancelled(`${label} was cancelled while waiting for a free tree`, error.code)
+      }
+      throw new FlashTaskError(messageOf(error), error?.code ?? 'ISOLATION_FAILED')
+    }
+  }
+
+  /**
+   * The runtime a call runs on, and the environment it needs.
+   *
+   * The runtime is rooted at the *tree*, never at a subdirectory of it: the sandbox root
+   * is fixed when a process starts, so a runtime per requested subdirectory meant one
+   * process per distinct `cwd`, none of which ever exits. The subdirectory still reaches
+   * the worker, in the prompt, where it belongs.
+   *
+   * @param {object | undefined} slot - the leased tree, when the call is isolated.
+   * @param {string} rootCwd - the resolved directory inside the caller's root.
+   * @returns {{promptCwd: string, runtimeCwd: string, extraEnv: object | undefined}} where to run.
+   */
+  #runLocation(slot, rootCwd, pool) {
+    if (slot === undefined || pool === undefined) {
+      return { promptCwd: rootCwd, runtimeCwd: rootCwd, extraEnv: undefined }
+    }
+    return {
+      promptCwd: pool.slotCwd(slot, rootCwd),
+      runtimeCwd: slot.dir,
+      extraEnv: slot.tmpDir === undefined ? undefined : { TMPDIR: slot.tmpDir },
+    }
+  }
+
+  /**
    * The profile that enforces one requested mode. Only narrowing is selectable:
    * `read-only` boots a profile whose sandbox denies every write, while the
    * default `workspace-write` is the service's own standing mode. No caller can
@@ -267,15 +332,15 @@ export class FlashTaskService {
     const sessionId = `flash-task-${randomUUID()}`
     const profileName = this.#profileForMode(args?.mode)
     const pool = this.#isolationFor(profileName)
-    const slot = pool === undefined ? undefined : await pool.lease()
+    const slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal)
     try {
-      const cwd = slot === undefined ? rootCwd : pool.slotCwd(slot, rootCwd)
+      const { promptCwd, runtimeCwd, extraEnv } = this.#runLocation(slot, rootCwd, pool)
       if (slot !== undefined) pool.prepare(slot)
       const childPrompt = buildChildPrompt({
-        cwd,
+        cwd: promptCwd,
         task,
         acceptance,
-        ...(slot === undefined ? {} : { copyOf: this.root }),
+        ...(slot === undefined ? {} : { copy: true }),
       })
       const { state, started } = await this.#runSession({
         sessionId,
@@ -285,7 +350,8 @@ export class FlashTaskService {
         note: `${String(childPrompt.length)} chars of task text`,
         signal,
         profile: profileName,
-        cwd,
+        cwd: runtimeCwd,
+        extraEnv,
       })
 
       if (state.children.length === 0) {
@@ -302,7 +368,7 @@ export class FlashTaskService {
         sessionId,
         started,
         profile: profileName,
-        cwd,
+        cwd: runtimeCwd,
         slot,
         change,
         applied,
@@ -340,15 +406,15 @@ export class FlashTaskService {
     // A fleet is one call and therefore one tree: its members share a working
     // directory exactly as they share a runtime, so they see each other's edits.
     const pool = this.#isolationFor(profileName)
-    const slot = pool === undefined ? undefined : await pool.lease()
+    const slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal)
     try {
-      const cwd = slot === undefined ? rootCwd : pool.slotCwd(slot, rootCwd)
+      const { promptCwd, runtimeCwd, extraEnv } = this.#runLocation(slot, rootCwd, pool)
       if (slot !== undefined) pool.prepare(slot)
-      const copyOf = slot === undefined ? {} : { copyOf: this.root }
+      const copy = slot === undefined ? {} : { copy: true }
       const items = tasks.map((entry, index) => ({
         label: `task-${String(index + 1)}`,
         prompt: [
-          buildChildPrompt({ cwd, task: entry.task, acceptance: entry.acceptance ?? acceptance, ...copyOf }),
+          buildChildPrompt({ cwd: promptCwd, task: entry.task, acceptance: entry.acceptance ?? acceptance, ...copy }),
           '',
           WORKER_RULES,
         ].join('\n'),
@@ -365,7 +431,8 @@ export class FlashTaskService {
         note: `${String(items.length)} delegated tasks`,
         signal,
         profile: profileName,
-        cwd,
+        cwd: runtimeCwd,
+        extraEnv,
       })
 
       if (state.subagentStarts === 0) {
@@ -383,7 +450,7 @@ export class FlashTaskService {
         sessionId,
         started,
         profile: profileName,
-        cwd,
+        cwd: runtimeCwd,
         slot,
         change,
         applied,
@@ -419,6 +486,7 @@ export class FlashTaskService {
    * @param {object} args - the MCP tool arguments.
    * @param {string} args.patchId - the id from an earlier result.
    * @param {boolean} [args.dryRun] - check that it applies without changing anything.
+   * @param {boolean} [args.force] - apply again even though the record says it was applied.
    * @returns {object} the apply outcome.
    */
   flashApply(args) {
@@ -430,7 +498,7 @@ export class FlashTaskService {
       )
     }
     try {
-      return this.isolation.apply({ patchId, dryRun: args?.dryRun === true })
+      return this.isolation.apply({ patchId, dryRun: args?.dryRun === true, force: args?.force === true })
     } catch (error) {
       throw new FlashTaskError(messageOf(error), 'APPLY_FAILED')
     }
@@ -455,8 +523,8 @@ export class FlashTaskService {
   }
 
   /** Start one session on the persistent runtime and wait for it to go idle. */
-  async #runSession({ sessionId, prompt, timeoutMs, label, note, signal, profile, cwd = this.root }) {
-    const client = await this.#ensureRuntime(profile, cwd)
+  async #runSession({ sessionId, prompt, timeoutMs, label, note, signal, profile, cwd = this.root, extraEnv }) {
+    const client = await this.#ensureRuntime(profile, cwd, extraEnv)
     const key = this.#runtimeKey(profile, cwd)
     const state = createObserveState()
     const started = Date.now()
@@ -509,7 +577,7 @@ export class FlashTaskService {
    * @param {string} profileName - the profile to run on.
    * @returns {Promise<object>} the live client.
    */
-  async #ensureRuntime(profileName, cwd) {
+  async #ensureRuntime(profileName, cwd, extraEnv) {
     const key = this.#runtimeKey(profileName, cwd)
     const existing = this.runtimes.get(key)
     if (existing?.client?.running && existing.initialized) return existing.client
@@ -519,7 +587,7 @@ export class FlashTaskService {
     run.starting = (async () => {
       let client
       try {
-        client = this.clientFactory(profileName, cwd)
+        client = this.clientFactory(profileName, cwd, extraEnv)
         client.start()
         const info = await client.initialize({
           cwd,
@@ -1146,17 +1214,17 @@ function warnAboutIgnoredArguments(args, toolName, log) {
 }
 
 /** The worker-facing task text. */
-export function buildChildPrompt({ cwd, task, acceptance, copyOf }) {
+export function buildChildPrompt({ cwd, task, acceptance, copy }) {
   return [
     `Working directory: ${cwd}`,
-    ...(copyOf === undefined
-      ? []
-      : [
+    ...(copy === true
+      ? [
           '',
-          `This working directory is a disposable copy of ${copyOf}, so the caller's files are here at the same relative paths.`,
-          'Use relative paths. A path naming the original tree refers to a different directory that you cannot write, and',
+          "This working directory is a disposable copy of the caller's repository, so its files are here at the same relative paths.",
+          'Use relative paths: a path naming the original repository refers to a different directory that you cannot write, and',
           'anything outside this copy is discarded — only the change you leave here is reported back.',
-        ]),
+        ]
+      : []),
     'Task:',
     task,
     ...(acceptance === undefined ? [] : ['', 'Acceptance criteria:', acceptance]),

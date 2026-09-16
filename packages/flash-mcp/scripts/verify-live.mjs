@@ -31,7 +31,7 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join, relative, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const SERVER = resolve(import.meta.dirname, '..', 'lib', 'index.js')
@@ -313,11 +313,15 @@ try {
   }
 
   if (stage('batch')) {
-    const fleetFiles = [1, 2, 3].map((index) => join(ROOT, `flash-fleet-${String(process.pid)}-${String(index)}.txt`))
+    // Named relative to the working directory, not by absolute path: the fleet runs in a
+    // disposable copy, and a task naming the caller's own tree is a task the wall now
+    // refuses — correctly, since a worker has no business writing there.
+    const fleetNames = [1, 2, 3].map((index) => `flash-fleet-${String(process.pid)}-${String(index)}.txt`)
+    const fleetFiles = fleetNames.map((name) => join(ROOT, name))
     for (const file of fleetFiles) rmSync(file, { force: true })
     const { response, payload } = await flashBatch({
-      tasks: fleetFiles.map((file, index) => ({
-        task: `Create the file ${file} containing exactly the single line "fleet member ${String(index + 1)}" (no trailing punctuation), then read it back and confirm its contents.`,
+      tasks: fleetNames.map((name, index) => ({
+        task: `Create the file ${name} in the working directory containing exactly the single line "fleet member ${String(index + 1)}" (no trailing punctuation), then read it back and confirm its contents.`,
         acceptance: `the file exists and holds exactly "fleet member ${String(index + 1)}"`,
       })),
       cwd: ROOT,
@@ -334,7 +338,7 @@ try {
     check('batch', 'every result names the worker session that produced it', results.every((entry) => typeof entry.childSessionId === 'string' && entry.childSessionId.length > 0), JSON.stringify(results.map((entry) => entry.childSessionId)))
     check('batch', 'the fleet ran in one disposable copy', payload.isolation?.mode === 'copy' && typeof payload.isolation?.slot === 'number', JSON.stringify(payload.isolation))
     check('batch', 'the fleet wrote nothing into the caller\'s tree', fleetFiles.every((file) => !existsSync(file)), fleetFiles.map((file) => existsSync(file)).join(','))
-    check('batch', 'one patch describes all three members\' work', Array.isArray(payload.change?.filesChanged) && fleetFiles.every((file) => payload.change.filesChanged.includes(relative(ROOT, file))), JSON.stringify(payload.change?.filesChanged))
+    check('batch', 'one patch describes all three members\' work', Array.isArray(payload.change?.filesChanged) && fleetNames.every((name) => payload.change.filesChanged.includes(name)), JSON.stringify(payload.change?.filesChanged))
     const fleetApplied = await callTool('flash_apply', { patchId: payload.change?.patchId })
     const written = fleetFiles.map((file) => (existsSync(file) ? readFileSync(file, 'utf8').trim() : null))
     check('batch', 'applying the fleet patch materialises every file', fleetApplied.response.isError !== true && written.every((value, index) => value === `fleet member ${String(index + 1)}`), JSON.stringify(written))
@@ -513,6 +517,9 @@ try {
     check('escape', 'an out-of-workspace write did not happen', !existsSync(outside), outside)
     const text = `${payload.result ?? ''} ${JSON.stringify(payload.warnings ?? [])}`
     check('escape', 'the worker reported the denial instead of claiming success', /denied|not permitted|permission|sandbox|EPERM|outside/i.test(text) || payload.status !== 'ok', JSON.stringify(payload.result ?? '').slice(0, 240))
+    // The fence has its own code, so a caller can tell "you may not leave the workspace"
+    // from "you are about to delete everything" without reading the message.
+    check('escape', 'the refusal carries the fence code, not a generic one', /OUTSIDE_WORKSPACE/.test(text) || payload.status !== 'ok', JSON.stringify(payload.result ?? '').slice(0, 240))
     check('escape', 'the service root itself is not writable for that path', !existsSync(join(homedir(), '.flash-mcp-escape-probe')), outside)
   }
 } catch (error) {

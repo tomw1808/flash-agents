@@ -62,6 +62,11 @@ class FakeSdkClient {
     return { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' }
   }
 
+  /** The environment a runtime was booted with, when the factory passed one on. */
+  recordEnv(extraEnv) {
+    this.extraEnv = extraEnv
+  }
+
   async prompt({ sessionId, text }) {
     this.prompts.push({ sessionId, text })
     queueMicrotask(() => this.#replay(sessionId, text))
@@ -286,18 +291,21 @@ function makeService({ script, ...overrides } = {}) {
 }
 
 /** A git-backed root, and a worker that writes one file into whatever tree it gets. */
-function makeIsolatedService({ slots = 2, file = 'worker-output.txt', ...overrides } = {}) {
+function makeIsolatedService({ slots = 2, file = 'worker-output.txt', script, ...overrides } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-iso-')))
   execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root })
   writeFileSync(join(root, 'README.md'), '# project\n')
   execFileSync('git', ['add', '-A'], { cwd: root })
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: root })
   const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-iso-state-')))
-  const client = new FakeSdkClient({})
+  const client = new FakeSdkClient({ script })
   client.writes = file
   const service = new FlashTaskService({
     root,
-    clientFactory: () => client,
+    clientFactory: (profileName, cwd, extraEnv) => {
+      client.recordEnv(extraEnv)
+      return client
+    },
     log: () => {},
     isolate: { slots, stateDir },
     ...overrides,
@@ -776,5 +784,75 @@ test('a fleet is one call and therefore one tree', async () => {
   assert.equal(result.isolation.slot, 0)
   assert.equal(result.change.available, true)
   assert.equal(new Set(client.initializes.map((params) => params.cwd)).size, 1)
+  await service.close()
+})
+
+test('one tree is one runtime, however many cwds a call names inside it', async () => {
+  const { root, client, service } = makeIsolatedService({ slots: 2 })
+  mkdirSync(join(root, 'packages', 'inner'), { recursive: true })
+  writeFileSync(join(root, 'packages', 'inner', 'inner.txt'), 'inner\n')
+  execFileSync('git', ['add', '-A'], { cwd: root })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'sub'], { cwd: root })
+
+  const first = await service.flashTask({ task: 'one', cwd: root })
+  const second = await service.flashTask({ task: 'two', cwd: join(root, 'packages', 'inner') })
+
+  // The sandbox root is fixed when a process starts, so keying a runtime on the
+  // requested subdirectory started a process per directory that never exited. The
+  // runtime is the tree; the subdirectory reaches the worker in the prompt instead.
+  assert.equal(client.initializes.length, 1)
+  assert.equal(first.runtime.pid, second.runtime.pid)
+  assert.match(client.initializes[0].cwd, /slots\/slot-0$/)
+  // Both prompts name the directory the caller asked for, inside the tree the worker got.
+  assert.match(client.prompts[0].text, /Working directory: [^\n]*slots\/slot-0/)
+  assert.match(client.prompts[1].text, /Working directory: [^\n]*packages\/inner/)
+  await service.close()
+})
+
+test('the worker is given a TMPDIR inside its own tree', async () => {
+  const { root, client, service } = makeIsolatedService()
+  await service.flashTask({ task: 'write one file', cwd: root })
+  assert.match(client.extraEnv.TMPDIR, /slots\/slot-0\/\.flash-tmp$/)
+  assert.equal(existsSync(client.extraEnv.TMPDIR), true)
+  // Outside the copy is refused by the wall, so the temp directory has to be inside it.
+  assert.equal(client.extraEnv.TMPDIR.startsWith(root), false)
+  await service.close()
+})
+
+test('a call cancelled while it waits for a tree never copies the repository', async () => {
+  const { root, client, service } = makeIsolatedService({ slots: 1, script: 'silent', taskTimeoutMs: 400 })
+  const holding = service.flashTask({ task: 'hold the only tree', cwd: root }).catch((error) => error)
+  await new Promise((resolve) => setTimeout(resolve, 50))
+
+  const controller = new AbortController()
+  const queued = service.flashTask({ task: 'queued', cwd: root }, { signal: controller.signal })
+  controller.abort()
+  const cancelled = await queued.catch((error) => error)
+  assert.equal(cancelled.code, 'CANCELLED')
+  assert.match(cancelled.message, /cancelled while waiting/)
+
+  // Nothing was prepared for the cancelled call: it never reached the copy.
+  assert.equal(client.initializes.length, 1)
+  await holding
+  await service.close()
+})
+
+test('a patch that was applied is refused as already applied', async () => {
+  const { root, service } = makeIsolatedService()
+  const result = await service.flashTask({ task: 'write one file', cwd: root, apply: 'auto' })
+  assert.equal(result.change.applied, true)
+  assert.throws(
+    () => service.flashApply({ patchId: result.change.patchId }),
+    (error) => error.code === 'APPLY_FAILED' && /already applied/.test(error.message),
+  )
+  // `force` bypasses the bookkeeping, not git: what git then decides is git's business,
+  // but it is no longer the recorded-apply refusal.
+  let forced
+  try {
+    forced = service.flashApply({ patchId: result.change.patchId, force: true })
+  } catch (error) {
+    forced = error
+  }
+  assert.equal(forced instanceof Error ? /already applied/.test(forced.message) : false, false)
   await service.close()
 })
