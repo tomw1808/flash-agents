@@ -1,4 +1,12 @@
-# flash-service — the headless DeepSeek Harness worker profile behind `flash-mcp`.
+# flash-service — the headless DeepSeek Harness worker profile behind `flash-agents`.
+#
+# THIS FILE IS A TEMPLATE. `install.mjs` renders it and writes the result into
+# $DSH_HOME/profiles/<name>/cordis.patch.yml. Placeholders name settings in
+# flash.config.json by dotted path: a dollar-sign placeholder becomes a JSON value, so a
+# colon inside a model id cannot be misread, while an at-sign placeholder becomes plain
+# text for comments and the marker lines below. An unknown or unrendered placeholder
+# fails the install rather than generating a composition with a hole in it — which is
+# also why this comment describes the two sigils instead of spelling them.
 #
 # Bundles (see package.json): @deepseek-ai/dsh-base + @deepseek-ai/dsh-sdk-app.
 # That gives this profile the SDK stdio JSON-RPC app over the full base tree:
@@ -11,7 +19,7 @@
 #
 # The block between the markers is managed by install.mjs and replaced on every run.
 
-# >>> flash-service (managed by install.mjs — do not edit between the markers)
+# >>> @{profile.name} (managed by install.mjs — do not edit between the markers)
 
 # ── permissions: explicit headless policy ───────────────────────────────────
 #
@@ -25,10 +33,13 @@
 #     so a sandbox denial is final and no escape can be granted.
 #
 # The result is a one-way wall: inside the workspace works, outside fails closed.
-# This is deliberately NOT danger-full-access.
+# This is deliberately NOT danger-full-access. The mode is a rendered value because
+# the read-only profile is this same template with exactly that one value changed —
+# it used to be produced by replacing the words in the generated text, which would
+# have picked the wrong line the day a comment mentioned them.
 - id: sandbox-policy
   config:
-    mode: workspace-write
+    mode: ${sandbox.mode}
 
 - id: approval
   config:
@@ -55,18 +66,21 @@
 # openai-completions transport only requires that a route carry either an apiKey
 # or an authorization header. Declaring the header keeps this service free of
 # secrets and independent of whatever environment launched it.
+#
+# `baseURL` and the transport are Ollama's: pointing this at another provider means
+# editing these three lines as well as `route` in flash.config.json.
 - id: llm-pi-ai
   config:
     providers:
-      ollama:
+      @{route.provider}:
         displayName: Ollama
         api: openai-completions
         baseURL: http://127.0.0.1:11434/v1
         headers:
           authorization: Bearer ollama
         models:
-          - id: deepseek-v4.1-flash:cloud
-            name: deepseek-v4.1-flash:cloud
+          - id: ${route.model}
+            name: ${route.model}
             input:
               - text
 
@@ -75,8 +89,8 @@
 # provider this profile does not serve.
 - id: agent-default-model
   config:
-    provider: ollama
-    model: deepseek-v4.1-flash:cloud
+    provider: ${route.provider}
+    model: ${route.model}
 
 # ── delegation surface: exactly one door per call ───────────────────────────
 #
@@ -103,18 +117,18 @@
     # Every fleet member starts through the strict routing-contract provider, so
     # the route is pinned by construction and a script gains no provider selector.
     provider: flash
-    # A fleet is a batch of cheap workers, not a stampede: four at a time, and a
-    # hard ceiling well below the engine default of 1000.
-    maxConcurrentAgents: 4
-    maxTotalAgents: 32
-    maxItemsPerCall: 64
+    # A fleet is a batch of cheap workers, not a stampede: the caps come from
+    # flash.config.json, and they sit far below the engine default of 1000.
+    maxConcurrentAgents: ${limits.maxConcurrentAgents}
+    maxTotalAgents: ${limits.maxTotalAgents}
+    maxItemsPerCall: ${limits.maxItemsPerCall}
 
 # The dispatcher's fleet tool. Its result is rendered as text into the tool
 # result, and the service reads the per-task return value out of that text, so
 # this ceiling must stay well above the largest fleet's rendered payload.
 - id: tool-workflow
   config:
-    maxResultChars: 250000
+    maxResultChars: ${limits.workflowMaxResultChars}
 # Goal loops are an autonomy surface no dispatcher needs.
 - id: tool-goal
   disabled: true
@@ -130,6 +144,8 @@
     # shipped observation policy registers on that waterfall and returns without
     # calling `next()`, so a peer listener there can be skipped. A dispatch
     # wrapper either calls `next()` or runs no tool body at all.
+    #
+    # Every list here is rendered from flash.config.json's `guard` section.
     - id: flash-guard
       name: ./plugins/dsh-flash-guard.js
       config:
@@ -138,41 +154,33 @@
         # the workflow engine (which carry no cwd of their own) are still fenced.
         # Segments no tool may mutate anywhere. Reads stay open: `git status`
         # reads `.git`, and a worker that cannot run git is not a worker.
-        protectedSegments:
-          - .git
+        protectedSegments: ${guard.protectedSegments}
         # The `.env` family is secret for reading and writing; templates such as
         # `.env.example` are not, so a worker can still document configuration.
-        protectEnvFiles: true
-        blockDestructiveGit: true
+        protectEnvFiles: ${guard.protectEnvFiles}
+        blockDestructiveGit: ${guard.blockDestructiveGit}
         # A mutation may not leave the workspace. The sandbox is supposed to enforce
         # this, but its writable set is wider than the root — a live verification run
         # deleted a file in the caller's tree through an absolute path because both
         # the disposable copy and the root happened to sit under TMPDIR, which the
         # sandbox allows. With isolation on, the workspace is a disposable copy, so
         # "outside the workspace" means "not mine to touch".
-        fenceMutations: true
+        fenceMutations: ${guard.fenceMutations}
         # Credential locations, resolved against the worker's home directory.
         # The sandbox denies writes outside the workspace but permits reads, so
         # without these a worker could read a private key and report it back.
-        homeProtectedPaths:
-          - .ssh
-          - .aws
-          - .gnupg
-          - .dsh
-          - .config/gh
-          - .config/gcloud
-          - .docker/config.json
+        homeProtectedPaths: ${guard.homeProtectedPaths}
 
-    # The strict routing-contract provider: every child runs on
-    # ollama/deepseek-v4.1-flash:cloud whatever a caller asks for, and no child
-    # may start a child of its own (maxChildDepth 0).
+    # The strict routing-contract provider: every child runs on the configured
+    # route whatever a caller asks for, and no child may start a child of its own
+    # (maxChildDepth 0).
     - id: subagent-flash-in-process
       name: ./plugins/dsh-subagent-flash.js
       config:
         providerName: flash
         baseProvider: spawn
-        provider: ollama
-        model: deepseek-v4.1-flash:cloud
+        provider: ${route.provider}
+        model: ${route.model}
         maxChildDepth: 0
 
     # The only model-visible delegation tool. It waits for the child, so one
@@ -196,4 +204,4 @@
         toolFilter:
           deny:
             - flash
-# <<< flash-service
+# <<< @{profile.name}

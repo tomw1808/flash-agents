@@ -1,0 +1,19 @@
+{
+  "name": "flash-agents",
+  "owner": {
+    "name": "Thomas Wiesner",
+    "url": "https://github.com/tomw1808"
+  },
+  "description": "Cheap, isolated DeepSeek Harness workers for your coding agent, plus a gauntlet skill for orchestrating them.",
+  "plugins": [
+    {
+      "name": "flash-agents",
+      "source": "./",
+      "description": "Hand narrow work to cheap Flash workers that run in a disposable copy of your repository and return a patch. Includes the gauntlet orchestration skill and a setup doctor.",
+      "category": "development",
+      "keywords": ["subagents", "delegation", "mcp", "ollama", "deepseek", "orchestration"],
+      "license": "MIT",
+      "homepage": "https://github.com/tomw1808/flash-agents"
+    }
+  ]
+}

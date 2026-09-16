@@ -1,0 +1,61 @@
+{
+  "name": "flash-agents",
+  "displayName": "Flash Agents",
+  "version": "0.1.0",
+  "author": {
+    "name": "Thomas Wiesner",
+    "url": "https://github.com/tomw1808"
+  },
+  "description": "Delegate narrow tasks to cheap DeepSeek Harness workers. Each writing call runs in a disposable copy of your repository and returns a patch, so nothing reaches your tree until you apply it.",
+  "license": "MIT",
+  "repository": "https://github.com/tomw1808/flash-agents",
+  "homepage": "https://github.com/tomw1808/flash-agents",
+  "keywords": ["subagents", "delegation", "mcp", "ollama", "orchestration"],
+  "mcpServers": {
+    "flash": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/packages/flash-mcp/lib/index.js",
+        "serve",
+        "--root",
+        "${CLAUDE_PROJECT_DIR}"
+      ],
+      "env": {
+        "FLASH_LOG_FILE": "${CLAUDE_PLUGIN_DATA}/flash.log",
+        "FLASH_SERVICE_MODEL": "${user_config.model}",
+        "FLASH_SLOTS": "${user_config.slots}",
+        "FLASH_ISOLATE": "${user_config.isolate}",
+        "FLASH_STATE_DIR": "${user_config.state_dir}"
+      }
+    }
+  },
+  "userConfig": {
+    "model": {
+      "type": "string",
+      "title": "Worker model",
+      "description": "Any model the local Ollama serves. The default is the one this project is tuned for; smaller local models are weaker at tool calling.",
+      "default": "deepseek-v4.1-flash:cloud"
+    },
+    "slots": {
+      "type": "number",
+      "title": "Disposable copies in flight",
+      "description": "How many worker copies of your repository may exist at once. Each one is a separate harness process, so this is a memory decision.",
+      "default": 2,
+      "min": 1,
+      "max": 8
+    },
+    "isolate": {
+      "type": "string",
+      "title": "Isolation",
+      "description": "\"copy\" runs every writing call in a disposable copy and returns a patch. \"none\" lets workers write to your repository directly, and leaves the deterministic wall as the only defence.",
+      "default": "copy",
+      "options": ["copy", "none"]
+    },
+    "state_dir": {
+      "type": "directory",
+      "title": "State directory",
+      "description": "Where worker copies and returned patches live. Leave empty for a private directory under the system temp area; set it to a fixed path to make worker session history browsable.",
+      "required": false
+    }
+  }
+}
