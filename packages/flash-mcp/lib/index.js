@@ -22,6 +22,8 @@ import { pathToFileURL } from 'node:url'
 
 import { serveStdio, describeError } from './mcp.js'
 import { FlashTaskService } from './service.js'
+import { loadConfig } from './config.js'
+import { formatChecks, runChecks } from './doctor.js'
 
 /** Server identity reported to the MCP client. */
 export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.0' })
@@ -205,24 +207,36 @@ export function listTools() {
   ]
 }
 
-/** Parse CLI arguments and environment into service options. */
-export function parseOptions(argv = process.argv.slice(2), env = process.env) {
+/**
+ * Parse CLI arguments and environment into service options.
+ *
+ * Defaults come from `flash.config.json` rather than from literals here, so the
+ * route and the numeric limits have one home. Environment values are read through
+ * `textFrom`, which treats an empty string as unset: a plugin manifest expands an
+ * unset setting to `""`, and `--isolate ""` would otherwise be a startup error.
+ *
+ * @param {string[]} [argv] - arguments after the command name.
+ * @param {Record<string, string | undefined>} [env] - environment to read.
+ * @param {object} [config] - resolved configuration; loaded from disk by default.
+ * @returns {object} the service options.
+ */
+export function parseOptions(argv = process.argv.slice(2), env = process.env, config = loadConfig({ env })) {
   const options = {
-    root: env.FLASH_SERVICE_ROOT ?? process.cwd(),
-    profile: env.FLASH_SERVICE_PROFILE ?? 'flash-service',
-    provider: env.FLASH_SERVICE_PROVIDER ?? 'ollama',
-    model: env.FLASH_SERVICE_MODEL ?? 'deepseek-v4.1-flash:cloud',
-    taskTimeoutMs: numberFrom(env.FLASH_TASK_TIMEOUT_MS, undefined),
-    batchTimeoutMs: numberFrom(env.FLASH_BATCH_TIMEOUT_MS, undefined),
-    maxTasks: numberFrom(env.FLASH_MAX_TASKS, undefined),
-    perItemChars: numberFrom(env.FLASH_PER_ITEM_CHARS, undefined),
-    maxResultChars: numberFrom(env.FLASH_RESULT_MAX_CHARS, undefined),
+    root: textFrom(env.FLASH_SERVICE_ROOT) ?? process.cwd(),
+    profile: textFrom(env.FLASH_SERVICE_PROFILE) ?? 'flash-service',
+    provider: config.route.provider,
+    model: config.route.model,
+    taskTimeoutMs: numberFrom(env.FLASH_TASK_TIMEOUT_MS, config.limits.taskTimeoutMs),
+    batchTimeoutMs: numberFrom(env.FLASH_BATCH_TIMEOUT_MS, config.limits.batchTimeoutMs),
+    maxTasks: numberFrom(env.FLASH_MAX_TASKS, config.limits.maxTasks),
+    perItemChars: numberFrom(env.FLASH_PER_ITEM_CHARS, config.limits.perItemChars),
+    maxResultChars: numberFrom(env.FLASH_RESULT_MAX_CHARS, config.limits.maxResultChars),
     maxTokens: numberFrom(env.FLASH_MAX_TOKENS, undefined),
-    isolate: env.FLASH_ISOLATE ?? 'copy',
-    slots: numberFrom(env.FLASH_SLOTS, undefined),
-    stateDir: env.FLASH_STATE_DIR ?? undefined,
-    diffChars: numberFrom(env.FLASH_DIFF_CHARS, undefined),
-    logFile: env.FLASH_LOG_FILE ?? undefined,
+    isolate: textFrom(env.FLASH_ISOLATE) ?? 'copy',
+    slots: numberFrom(env.FLASH_SLOTS, config.limits.slots),
+    stateDir: textFrom(env.FLASH_STATE_DIR),
+    diffChars: numberFrom(env.FLASH_DIFF_CHARS, config.limits.diffChars),
+    logFile: textFrom(env.FLASH_LOG_FILE),
     help: false,
   }
   for (let index = 0; index < argv.length; index += 1) {
@@ -289,9 +303,10 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env) {
   return options
 }
 
-const USAGE = `flash-mcp — DeepSeek Harness Flash delegation over MCP stdio
+const USAGE = `flash-agents — cheap DeepSeek Harness workers over MCP stdio
 
-Usage: flash-mcp [options]
+Usage: flash-agents [serve] [options]           serve the MCP stdio protocol (the default)
+       flash-agents doctor [--profile <id>]     check the prerequisites and print the fixes
 
 Options:
   --root <path>             sandbox root and runtime working directory (default: cwd)
@@ -318,6 +333,10 @@ Environment: FLASH_SERVICE_ROOT, FLASH_SERVICE_PROFILE, FLASH_SERVICE_PROVIDER,
 FLASH_SERVICE_MODEL, FLASH_TASK_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS, FLASH_MAX_TASKS,
 FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
 FLASH_STATE_DIR, FLASH_DIFF_CHARS, FLASH_LOG_FILE, FLASH_DSH_BIN.
+
+The route and the numeric limits default to flash.config.json, the one file that owns
+them. An empty environment value counts as unset, so a generated configuration may
+leave a setting blank rather than having to omit it.
 `
 
 /**
@@ -436,13 +455,70 @@ function numberFrom(value, fallback) {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback
 }
 
-/** Entry point. */
+/**
+ * Read a setting that must be a non-empty string, or nothing at all.
+ *
+ * An unset plugin setting expands to an empty string rather than disappearing, so
+ * `""` has to mean "unset" everywhere a value is optional.
+ *
+ * @param {unknown} value - the raw environment value.
+ * @returns {string | undefined} the value, or undefined when it is absent or empty.
+ */
+function textFrom(value) {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/**
+ * Run the prerequisite checks and print them, fixes included.
+ *
+ * The model and the minimum harness version come from the same configuration the
+ * server runs on, so the doctor cannot approve a setup the service would reject.
+ *
+ * @param {string[]} [argv] - arguments after the command name.
+ * @param {object} [options] - injected effects, for tests.
+ * @param {Record<string, string | undefined>} [options.env] - environment to read.
+ * @param {(text: string) => void} [options.write] - output sink.
+ * @param {Function} [options.run] - command runner handed to the checks.
+ * @param {Function} [options.probe] - HTTP probe handed to the checks.
+ * @returns {Promise<number>} the exit code: 0 when nothing failed.
+ */
+export async function runDoctor(argv = [], { env = process.env, write, run, probe } = {}) {
+  const emit = write ?? ((text) => process.stdout.write(text))
+  const config = loadConfig({ env })
+  const at = argv.indexOf('--profile')
+  const result = await runChecks({
+    env,
+    model: config.route.model,
+    minDshVersion: config.dsh.minVersion,
+    profile: at < 0 ? (textFrom(env.FLASH_SERVICE_PROFILE) ?? 'flash-service') : argv[at + 1],
+    ...(run === undefined ? {} : { run }),
+    ...(probe === undefined ? {} : { probe }),
+  })
+  emit(`${formatChecks(result)}\n`)
+  emit(
+    result.ok
+      ? `\nall required checks passed${result.warnings === 0 ? '' : ` (${String(result.warnings)} warning(s))`}\n`
+      : `\n${String(result.failures)} check(s) failed; run the fixes above and try again\n`,
+  )
+  return result.ok ? 0 : 1
+}
+
+/** Entry point: one subcommand, or the server when none is named. */
 async function main() {
+  const argv = process.argv.slice(2)
+  const command = argv[0] === undefined || argv[0].startsWith('-') ? 'serve' : argv.shift()
+  if (command === 'doctor') {
+    process.exit(await runDoctor(argv))
+  }
+  if (command !== 'serve') {
+    process.stderr.write(`flash-agents: unknown command "${command}"\n\n${USAGE}`)
+    process.exit(2)
+  }
   let options
   try {
-    options = parseOptions()
+    options = parseOptions(argv)
   } catch (error) {
-    process.stderr.write(`flash-mcp: ${describeError(error)}\n\n${USAGE}`)
+    process.stderr.write(`flash-agents: ${describeError(error)}\n\n${USAGE}`)
     process.exit(2)
   }
   if (options.help) {

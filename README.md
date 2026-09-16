@@ -44,14 +44,20 @@ packages/flash-mcp/                 MCP stdio server + SDK JSON-RPC client half
   lib/sdk.js                        client for one persistent `dsh` child over the shipped SDK protocol
   lib/service.js                    flash_task: fresh session per call, compact result, cwd fence
   lib/isolation.js                  disposable copies, patch provenance, and apply
+  lib/config.js                     the one source of truth: route, limits, guard lists
+  lib/doctor.js                     prerequisite checks, each with the command that fixes it
   lib/index.js                      CLI entry, tool contract, lifecycle
   test/mcp.test.mjs                 protocol-level server tests
   test/service.test.mjs             service tests against a fake runtime
   test/isolation.test.mjs            isolation against real git, real copies, real patches
+  test/config.test.mjs               the configuration contract: merge, validate, freeze
+  test/doctor.test.mjs               every prerequisite check, with injected effects
+  test/cli.test.mjs                  where defaults come from, and what `doctor` reports
   test/integration.test.mjs         MCP → SDK → stand-in Harness, whole pipeline, no LLM
   test-support/fake-dsh.mjs         the stand-in Harness process (outside `test/`, so it is never collected)
   scripts/verify-live.mjs           live end-to-end verification through the official MCP client
   scripts/flash-sessions.mjs        list the worker sessions Harness persisted, newest first
+  scripts/flash-drive.mjs           drive this server from a shell: the self-test loop
 presets/flash-orchestrator/         interactive agent preset (repo is the source of truth)
   agent.cordis.yml                  17 rows: identity, shell, fs, jobs, skills, goals,
                                     compaction, delegation, remaining tools
@@ -396,6 +402,40 @@ Honest limits of this design:
 - `--isolate none` exists for debugging the wall. With it, point `--root` at something you are willing
   to lose: the wall protects `.git` and secrets, but it does not protect your uncommitted source.
 
+### Configuration
+
+`flash.config.json` at the repository root owns the route, the numeric limits, and the
+guard's protected lists. It is the one file to edit: the CLI takes its defaults from there,
+and `lib/config.js` validates it, so an unknown key or a mistyped value fails at startup
+naming the path that is wrong instead of silently falling back to something else.
+
+```json
+{
+  "route": { "provider": "ollama", "model": "deepseek-v4.1-flash:cloud" },
+  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 300000, "diffChars": 20000 },
+  "guard": { "protectedSegments": [".git"], "fenceMutations": true },
+  "dsh": { "package": "@deepseek-ai/dsh", "minVersion": "0.1.5" }
+}
+```
+
+**Another model needs no code change.** Set `route.model` — or `FLASH_SERVICE_MODEL` — to
+anything the local Ollama serves; only Ollama itself is a hard prerequisite. Smaller local
+models are weaker at tool calling, so expect more variance and more `NOT_DELEGATED` calls
+than the pinned default. Support for other providers is a welcome pull request, not a
+shipped feature.
+
+### Prerequisites
+
+```sh
+node packages/flash-mcp/lib/index.js doctor
+```
+
+One line per check — Node, `dsh` and its version, the service profile composing, the Ollama
+daemon, the configured model, `git`, and `zstd` — followed by the exact command that repairs
+anything broken. A warning (an old `dsh`, a missing `zstd`, which only session reading needs)
+does not fail the run; a real failure exits non-zero, so `doctor` doubles as a setup gate in
+a script or in CI.
+
 ### Environment
 
 | Variable | Default | Meaning |
@@ -450,11 +490,12 @@ What neither surface offers is *intervention*: the SDK protocol has `initialize`
 ## Verify
 
 ```sh
-npm test                                        # all three suites: 116 tests, no LLM
-node --test packages/flash-mcp/test/            # 75 protocol, service, isolation, pipeline, fleet tests
+npm test                                        # all three suites: 146 tests, no LLM
+node --test packages/flash-mcp/test/            # 105 protocol, service, config, doctor, CLI, isolation, pipeline, fleet tests
 node --test packages/dsh-flash-guard/test/      # 19 wall tests
 node --test packages/dsh-subagent-flash/test/   # 22 provider contract tests
 npm run verify                                  # live end-to-end, needs Ollama and a profile boot
+npm run drive -- --root <dir> --task-file <f>   # hand one task to a real worker from a shell
 ```
 
 `npm test` names the three `test/` directories on purpose. The stand-in Harness lives in
