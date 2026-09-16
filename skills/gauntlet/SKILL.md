@@ -9,10 +9,12 @@ description: >-
 
 # Gauntlet: frontier-model orchestration, cheap-model execution
 
-> **Status: sample / draft for review.** This file is not installed anywhere. Read it, critique
-> it, and try it by hand on a few real tasks before copying it into `.claude/skills/` or an
-> equivalent. It assumes no helper script: every mechanical step is written as plain shell/git
-> so any agent harness can follow it.
+> **Status: shipped with the `flash-agents` plugin, and still young.** Installing the plugin
+> makes this available as `/flash-agents:gauntlet`. It assumes no helper script: every
+> mechanical step is written as plain shell/git, so any agent harness can follow it — and it has
+> been reasoned through more thoroughly than it has been run end to end. Read §10 (open
+> questions) before handing it a long or expensive job, and run it on a task whose bar you can
+> actually execute.
 
 ## The idea in one paragraph
 
