@@ -16,7 +16,7 @@
  * @module flash-mcp
  */
 
-import { realpathSync } from 'node:fs'
+import { appendFileSync, openSync, realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -222,6 +222,7 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env) {
     slots: numberFrom(env.FLASH_SLOTS, undefined),
     stateDir: env.FLASH_STATE_DIR ?? undefined,
     diffChars: numberFrom(env.FLASH_DIFF_CHARS, undefined),
+    logFile: env.FLASH_LOG_FILE ?? undefined,
     help: false,
   }
   for (let index = 0; index < argv.length; index += 1) {
@@ -261,6 +262,9 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env) {
         break
       case '--diff-chars':
         options.diffChars = numberFrom(next(), undefined)
+        break
+      case '--log-file':
+        options.logFile = next()
         break
       case '--batch-timeout-ms':
         options.batchTimeoutMs = numberFrom(next(), undefined)
@@ -306,12 +310,14 @@ Options:
                             private to this root and this process under TMPDIR); a
                             configured directory is shared, so one service per directory
   --diff-chars <n>          how much of a patch a result carries (default: 20000)
+  --log-file <path>         append every diagnostic line, timestamped, to this file as
+                            well as stderr
   -h, --help                show this help
 
 Environment: FLASH_SERVICE_ROOT, FLASH_SERVICE_PROFILE, FLASH_SERVICE_PROVIDER,
 FLASH_SERVICE_MODEL, FLASH_TASK_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS, FLASH_MAX_TASKS,
 FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
-FLASH_STATE_DIR, FLASH_DIFF_CHARS, FLASH_DSH_BIN.
+FLASH_STATE_DIR, FLASH_DIFF_CHARS, FLASH_LOG_FILE, FLASH_DSH_BIN.
 `
 
 /**
@@ -322,7 +328,35 @@ FLASH_STATE_DIR, FLASH_DIFF_CHARS, FLASH_DSH_BIN.
  * @returns {{service: FlashTaskService, connection: {close: () => void}, done: Promise<void>}}
  */
 export function startServer(options, input = process.stdin, output = process.stdout) {
-  const log = (message) => process.stderr.write(`[flash-mcp] ${message}\n`)
+  const logFile =
+    typeof options.logFile === 'string' && options.logFile.length > 0 ? options.logFile : undefined
+  /** Open the append target once; any failure degrades to stderr-only logging. */
+  let logFd
+  const reportLogFileFailure = (error) => {
+    process.stderr.write(
+      `[flash-mcp] log file ${JSON.stringify(logFile)} unavailable (${describeError(error)}); ` +
+        'continuing with stderr-only logging\n',
+    )
+  }
+  if (logFile !== undefined) {
+    try {
+      logFd = openSync(logFile, 'a')
+    } catch (error) {
+      reportLogFileFailure(error)
+      logFd = undefined
+    }
+  }
+  const log = (message) => {
+    const line = `[flash-mcp] ${message}`
+    process.stderr.write(`${line}\n`)
+    if (logFd === undefined) return
+    try {
+      appendFileSync(logFd, `${new Date().toISOString()} ${line}\n`)
+    } catch (error) {
+      logFd = undefined
+      reportLogFileFailure(error)
+    }
+  }
   const service = new FlashTaskService({
     ...options,
     isolate: {

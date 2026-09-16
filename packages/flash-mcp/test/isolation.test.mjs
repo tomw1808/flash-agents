@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, sep } from 'node:path'
 import { test } from 'node:test'
 
 import { WorkspaceIsolation } from '../lib/isolation.js'
@@ -414,4 +414,35 @@ test('a call whose patch is empty is not confused with a call that ignored its w
   assert.deepEqual(empty.filesChanged, [])
   assert.deepEqual(empty.ignored, [])
   await isolation.close()
+})
+
+test('a sweep reclaims a dead owner’s trees without taking its patches', async () => {
+  // Found by a self-test: two servers ran one task each, and the second one's startup
+  // sweep deleted the first one's whole per-process directory — including the patch the
+  // caller had just been told to apply. Patches therefore live beside those directories.
+  const repo = makeRepo()
+  const first = new WorkspaceIsolation({ root: repo })
+  const slot = await first.lease()
+  first.prepare(slot)
+  writeFileSync(join(slot.dir, 'from-worker.txt'), 'work worth keeping\n')
+  const change = first.collect(slot)
+  first.release(slot)
+  assert.equal(change.available, true)
+
+  const pidDir = dirname(first.stateDir)
+  assert.ok(!first.patchDir.startsWith(pidDir + sep), `${first.patchDir} must not sit under ${pidDir}`)
+
+  // A dead owner's leftovers, then the next service starting on the same root. The pid is
+  // above every platform maximum, so it can never name a live process.
+  const deadOwner = join(dirname(pidDir), '4194303')
+  mkdirSync(join(deadOwner, 'slots', 'slot-0'), { recursive: true })
+  const second = new WorkspaceIsolation({ root: repo })
+  assert.equal(existsSync(deadOwner), false, 'a dead owner’s trees are still reclaimed')
+
+  // The work survived the first service, and the second one can still apply it.
+  const applied = second.apply({ patchId: change.patchId })
+  assert.equal(applied.applied, true)
+  assert.equal(readFileSync(join(repo, 'from-worker.txt'), 'utf8'), 'work worth keeping\n')
+  await first.close()
+  await second.close()
 })

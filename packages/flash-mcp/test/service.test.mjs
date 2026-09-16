@@ -689,6 +689,11 @@ test('the fleet prompt pins identity and asks for exactly one workflow call', ()
   assert.match(prompt, /reply with exactly: DELEGATED/)
   assert.ok(prompt.includes('<script>\nreturn 1\n</script>'))
   assert.ok(prompt.includes('<args>\n{"items":[]}\n</args>'))
+  // Observed in a live run: the dispatcher relayed `args` as a *string*, the workflow
+  // tool answered `"args" must be an object`, and the fleet never started. The prompt
+  // therefore names the shape of each argument instead of only asking for a copy.
+  assert.match(prompt, /passed as a JSON OBJECT/)
+  assert.match(prompt, /objects, not text/)
 })
 
 // ── isolation: the worker gets a tree it is allowed to wreck ────────────────

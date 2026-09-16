@@ -85,9 +85,33 @@ export class IsolationError extends Error {
  * @returns {string} the state directory for this process, root, and pool.
  */
 function defaultStateDir(root) {
-  const digest = createHash('sha256').update(root).digest('hex').slice(0, 12)
   const instance = randomUUID().slice(0, 8)
-  return join(tmpdir(), 'flash-mcp', digest, String(process.pid), instance)
+  return join(tmpdir(), 'flash-mcp', rootDigest(root), String(process.pid), instance)
+}
+
+/**
+ * The per-root directory name every layout below is keyed by.
+ * @param {string} root - the canonical service root.
+ * @returns {string} a short stable digest of that path.
+ */
+function rootDigest(root) {
+  return createHash('sha256').update(root).digest('hex').slice(0, 12)
+}
+
+/**
+ * Where patches live for one root.
+ *
+ * Deliberately NOT under the pid level. `sweepDeadOwners` reclaims a dead owner's
+ * directory whole, and a patch is the one thing inside it the caller may still need:
+ * a self-test lost a finished worker's patch exactly this way when the next service
+ * started on the same root. Patches therefore sit beside the pid directories — which
+ * the sweep only visits for numeric names — and outlive the process that issued them.
+ *
+ * @param {string} root - the canonical service root.
+ * @returns {string} the patch directory for this root.
+ */
+function defaultPatchDir(root) {
+  return join(tmpdir(), 'flash-mcp', rootDigest(root), 'patches')
 }
 
 /**
@@ -116,8 +140,7 @@ function processAlive(pid) {
  * @returns {void}
  */
 function sweepDeadOwners(root) {
-  const digest = createHash('sha256').update(root).digest('hex').slice(0, 12)
-  const parent = join(tmpdir(), 'flash-mcp', digest)
+  const parent = join(tmpdir(), 'flash-mcp', rootDigest(root))
   if (!existsSync(parent)) return
   for (const entry of readdirSync(parent)) {
     if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue
@@ -278,6 +301,12 @@ export class WorkspaceIsolation {
     /** Whether this instance owns a private state directory it may clear. */
     this.ownsStateDir = stateDir === undefined || stateDir === null || stateDir === ''
     this.stateDir = this.ownsStateDir ? defaultStateDir(this.root) : resolve(stateDir)
+    /**
+     * Where patches are stored. With a private state directory they sit one level
+     * above this process's own, so the sweep that reclaims a dead service's copies
+     * cannot take a patch the caller was told it could still apply.
+     */
+    this.patchDir = this.ownsStateDir ? defaultPatchDir(this.root) : join(this.stateDir, 'calls')
     this.log = log
     this.clones = 0
     /** Patches kept for a later `flash_apply`. @type {Map<string, object>} */
@@ -296,7 +325,7 @@ export class WorkspaceIsolation {
     // would hand a worker another call's leftovers.
     if (this.ownsStateDir) sweepDeadOwners(this.root)
     rmSync(join(this.stateDir, 'slots'), { recursive: true, force: true })
-    mkdirSync(join(this.stateDir, 'calls'), { recursive: true })
+    mkdirSync(this.patchDir, { recursive: true })
     for (const slot of this.slots) {
       mkdirSync(slot.dir, { recursive: true })
       slot.tmpDir = join(slot.dir, SLOT_TMP)
@@ -445,8 +474,8 @@ export class WorkspaceIsolation {
     try {
       git(['add', '-A'], slot.dir)
       const patchId = `flash-${randomUUID()}`
-      const patchPath = join(this.stateDir, 'calls', `${patchId}.patch`)
-      const metaPath = join(this.stateDir, 'calls', `${patchId}.json`)
+      const patchPath = join(this.patchDir, `${patchId}.patch`)
+      const metaPath = join(this.patchDir, `${patchId}.json`)
       const diff = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', slot.base], slot.dir)
       const diffstat = git(['diff', '--cached', '--stat', '--no-color', slot.base], slot.dir)
       const names = git(['diff', '--cached', '--name-status', slot.base], slot.dir)
@@ -566,11 +595,9 @@ export class WorkspaceIsolation {
     }
     const held = this.patches.get(patchId)
     if (held !== undefined) return held
-    const metaPath = join(this.stateDir, 'calls', `${patchId}.json`)
+    const metaPath = join(this.patchDir, `${patchId}.json`)
     if (!existsSync(metaPath)) {
-      throw new Error(
-        `no patch ${patchId} is held by this service; patches are kept in ${join(this.stateDir, 'calls')}`,
-      )
+      throw new Error(`no patch ${patchId} is held by this service; patches are kept in ${this.patchDir}`)
     }
     let record
     try {
@@ -579,7 +606,7 @@ export class WorkspaceIsolation {
       throw new Error(`the record for patch ${patchId} is unreadable: ${messageOf(error)}`)
     }
     record.metaPath = metaPath
-    record.patchPath = join(this.stateDir, 'calls', `${patchId}.patch`)
+    record.patchPath = join(this.patchDir, `${patchId}.patch`)
     if (record.root !== this.root) {
       throw new Error(
         `patch ${patchId} was computed for ${String(record.root)}, not for ${this.root}; patches do not cross repositories`,

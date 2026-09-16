@@ -51,6 +51,7 @@ packages/flash-mcp/                 MCP stdio server + SDK JSON-RPC client half
   test/integration.test.mjs         MCP → SDK → stand-in Harness, whole pipeline, no LLM
   test-support/fake-dsh.mjs         the stand-in Harness process (outside `test/`, so it is never collected)
   scripts/verify-live.mjs           live end-to-end verification through the official MCP client
+  scripts/flash-sessions.mjs        list the worker sessions Harness persisted, newest first
 presets/flash-orchestrator/         interactive agent preset (repo is the source of truth)
   agent.cordis.yml                  17 rows: identity, shell, fs, jobs, skills, goals,
                                     compaction, delegation, remaining tools
@@ -337,6 +338,7 @@ to apply.
 | `--slots <n>` | 2 | how many copies may be in flight; each one is a runtime process |
 | `--state-dir <path>` | private to this root and process | where copies and returned patches live |
 | `--diff-chars <n>` | 20000 | how much of a patch a result carries |
+| `--log-file <path>` | unset | append every diagnostic line, timestamped, to a file as well as stderr |
 
 The state directory is keyed by root, by process, and by pool:
 
@@ -349,6 +351,12 @@ and then handed the same path to a different worker, so one call's patch could c
 call's work. A configured `--state-dir` is used as given — persistence across a restart, at the
 cost of the deployment owning that guarantee (one service per directory). Trees belonging to
 processes that no longer exist are swept at startup; a live service's trees never are.
+
+Patches sit one level above that, in `<sha256(root)[0:12]>/patches`, precisely because the sweep
+reclaims a dead owner's directory whole: a self-test lost a finished worker's patch that way when
+the next service started on the same root. A patch therefore outlives the process that issued it,
+and a later service on the same root can still apply it — at the cost of accumulating until you
+delete them.
 
 A patch is more than a file. Each one is stored with a record — the root it was computed for, the
 base commit, the files it touches, and whether it has been applied — and `flash_apply` refuses:
@@ -401,13 +409,49 @@ Honest limits of this design:
 | `FLASH_BATCH_TIMEOUT_MS` | `900000` | per-fleet wall-clock budget |
 | `FLASH_MAX_TASKS` | `16` | ceiling on tasks in one `flash_batch` call |
 | `FLASH_PER_ITEM_CHARS` | `4000` | returned per-worker budget inside a fleet |
+| `FLASH_LOG_FILE` | unset | file the diagnostics are appended to, timestamped, as well as stderr |
 | `FLASH_DSH_BIN` | `dsh` on `PATH` | the launcher to spawn (a `.js` path runs under the current Node) |
+
+### Observing a run
+
+The runtime is a separate, headless process, so nothing about a worker appears in your own session.
+Two surfaces make a run watchable.
+
+**While it runs** — `--log-file` (or `FLASH_LOG_FILE`) appends every diagnostic line to a file as well
+as stderr, so a run can be followed from another terminal:
+
+```sh
+claude mcp add flash -- node …/flash-mcp/lib/index.js --root <workspace> --log-file /tmp/flash.log
+tail -f /tmp/flash.log
+```
+
+Each line carries an ISO timestamp: runtime boot, session per call, child started, the observed route,
+each tool call and result, every guard denial, and the collected change.
+
+**Afterwards** — worker sessions are durable, in the same store the interactive surfaces use
+(`$DSH_HOME/sessions/<workspace-key>/<sessionId>/session.v3.jsonl.zstd`, one JSON event per line).
+`scripts/flash-sessions.mjs` lists them without guessing at the key:
+
+```sh
+node packages/flash-mcp/scripts/flash-sessions.mjs --limit 5          # newest first: time, id, cwd
+node packages/flash-mcp/scripts/flash-sessions.mjs --under "$TMPDIR/flash-mcp" --json
+zstd -dc <file> | jq -c '{type,seq}'                                  # the full event log
+```
+
+Note what the `cwd` column shows: with isolation on, a worker's workspace is a disposable copy, so its
+sessions are filed under that copy's path, which changes per service. A fixed `--state-dir` makes those
+keys stable and browsable, and `dsh --profile web` started in a slot directory will list them in the
+GUI's own session history.
+
+What neither surface offers is *intervention*: the SDK protocol has `initialize`, `session/prompt` and
+`shutdown` and no attach or cancel, so a worker can be watched but not steered. Driving the
+`flash-orchestrator` preset inside `dsh web` is the surface for that.
 
 ## Verify
 
 ```sh
-npm test                                        # all three suites: 102 tests, no LLM
-node --test packages/flash-mcp/test/            # 61 protocol, service, isolation, pipeline, fleet tests
+npm test                                        # all three suites: 116 tests, no LLM
+node --test packages/flash-mcp/test/            # 75 protocol, service, isolation, pipeline, fleet tests
 node --test packages/dsh-flash-guard/test/      # 19 wall tests
 node --test packages/dsh-subagent-flash/test/   # 22 provider contract tests
 npm run verify                                  # live end-to-end, needs Ollama and a profile boot
@@ -620,10 +664,11 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
 - **A patch applies to the working tree, not to your index.** `git apply` without `--index` leaves
   staging alone, so a partially-staged file can make an otherwise clean patch conflict; the patch file
   is kept and named in the error when that happens.
-- **In the default state layout, a patch does not outlive the service.** The directory is per process,
-  so a restarted server issues new ids and cannot read the old ones; pass `--state-dir` to make patches
-  survive a restart, and then keep one service per directory, because that is the guarantee the shared
-  default was wrongly assumed to provide.
+- **Patches outlive the service, and are never swept.** They live per root rather than per process, so
+  a restarted server — or the next one on the same root — can still apply an id it did not issue. The
+  copies are reclaimed, the patches are not: they accumulate under
+  `$TMPDIR/flash-mcp/<sha256(root)[0:12]>/patches` until you delete them. With a configured
+  `--state-dir` they stay in `<dir>/calls`, one service per directory.
 - **The service needs a local Ollama serving the pinned model.** The route is registered by the
   profile, so a missing daemon or model surfaces as a worker-turn error rather than a startup error.
 - **The dispatcher is a model, and it occasionally does the work itself.** A cheap model reads the

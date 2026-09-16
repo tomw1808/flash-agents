@@ -266,6 +266,22 @@ message". Map that to whatever is available:
 | flash-mcp (this repo) | a writing `flash_task` now runs in a **disposable copy of the server's `--root`**: the worker's sandbox root is that copy, the wall refuses any mutation outside it, and what comes back is a patch applied only by `flash_apply`. So `--root` is the repository you are willing to have copied, and `cwd` still selects the subdirectory inside it. One caveat for candidates: a `flash_batch` fleet is **one call and therefore one copy**, so one-copy-per-candidate means N *parallel* `flash_task` calls, bounded by `--slots` (each slot is a runtime process, so memory is the limit) | not a cheap-model job; use the host agent's own subagent |
 | No subagents available | don't use this skill | — |
 
+**Field notes from a real flash-mcp run** (two feature tasks, both landed as patches):
+
+- **One long-lived server per run, not one per call.** A patch is issued by a server and applied
+  through `flash_apply` on a server. Spawning a server per call works, but then you must locate the
+  patch file yourself; keep one process up for the whole gauntlet instead.
+- **Prefer N parallel `flash_task` over one `flash_batch`.** Beyond the one-copy-per-call point: a
+  fleet's payload has to survive being relayed *by a model*, and in a live run the dispatcher passed
+  `args` as a JSON string, so the workflow tool rejected it and no worker started. A single task
+  relays only its own text and is markedly more reliable.
+- **Two tasks, 120s and 137s**, each returning `filesChanged` plus a diff — good enough for the check
+  step (§5.2) to run on the applied patch.
+- **Watch a round with `--log-file`**, and read a worker's whole transcript afterwards with
+  `scripts/flash-sessions.mjs`. There is no way to intervene mid-task.
+- **The dispatcher occasionally does the work itself** instead of delegating; the call then fails with
+  `NOT_DELEGATED` and nothing is collected. Treat a failed candidate as variance and re-run it.
+
 Whatever the harness, containment is **best effort**. The original-checkout check is the guarantee. Never skip it,
 and never run a round with `D` inside the original repository.
 
