@@ -419,7 +419,7 @@ naming the path that is wrong instead of silently falling back to something else
 ```json
 {
   "route": { "provider": "ollama", "model": "deepseek-v4.1-flash:cloud" },
-  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 600000, "diffChars": 20000 },
+  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 3600000, "diffChars": 20000 },
   "guard": { "protectedSegments": [".git"], "fenceMutations": true },
   "dsh": { "package": "@deepseek-ai/dsh", "minVersion": "0.1.5" }
 }
@@ -450,10 +450,10 @@ a script or in CI.
 | `FLASH_SERVICE_ROOT` | cwd | sandbox root, runtime working directory, `cwd` fence |
 | `FLASH_SERVICE_PROFILE` | `flash-service` | profile the runtime boots |
 | `FLASH_SERVICE_PROVIDER` / `FLASH_SERVICE_MODEL` | `ollama` / `deepseek-v4.1-flash:cloud` | pinned orchestrator route (the worker route is pinned by the profile) |
-| `FLASH_TASK_TIMEOUT_MS` | `600000` | per-task wall-clock budget (a build-and-test task on a compiled project needs minutes) |
+| `FLASH_TASK_TIMEOUT_MS` | `3600000` | per-task wall-clock budget; a coherent feature slice that builds and tests between steps takes real minutes per cycle, and the call returns as soon as the worker finishes |
 | `FLASH_RESULT_MAX_CHARS` | `8000` | returned worker-message budget |
 | `FLASH_MAX_TOKENS` | unset | optional output cap for SDK agents |
-| `FLASH_BATCH_TIMEOUT_MS` | `1800000` | per-fleet wall-clock budget |
+| `FLASH_BATCH_TIMEOUT_MS` | `10800000` | per-fleet wall-clock budget |
 | `FLASH_MAX_TASKS` | `16` | ceiling on tasks in one `flash_batch` call |
 | `FLASH_PER_ITEM_CHARS` | `4000` | returned per-worker budget inside a fleet |
 | `FLASH_LOG_FILE` | unset | file the diagnostics are appended to, timestamped, as well as stderr |

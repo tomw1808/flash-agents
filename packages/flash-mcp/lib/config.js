@@ -39,12 +39,14 @@ export const DEFAULT_CONFIG = deepFreeze({
   limits: {
     slots: 2,
     maxTasks: 16,
-    // Ten minutes and thirty: a task that builds and tests a compiled project (a
-    // Swift package on a warm `.build` is the measured case) needs several minutes,
-    // and a fleet several tasks' worth. A budget that ends before the toolchain does
-    // reports "timeout" for work that was going fine.
-    taskTimeoutMs: 600_000,
-    batchTimeoutMs: 1_800_000,
+    // An hour and three: the worker is capable of a coherent feature slice, not
+    // only a five-minute edit, and a slice that builds and tests a compiled project
+    // between steps spends real minutes per cycle. A budget that ends before the
+    // work does reports "timeout" for work that was going fine and retires a tree
+    // the worker was still using; a generous budget costs nothing when the task is
+    // small, because the call returns when the worker finishes.
+    taskTimeoutMs: 3_600_000,
+    batchTimeoutMs: 10_800_000,
     perItemChars: 4_000,
     maxResultChars: 8_000,
     diffChars: 20_000,
