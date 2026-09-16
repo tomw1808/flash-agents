@@ -384,9 +384,16 @@ Honest limits of this design:
   the sandbox root is fixed when a process starts, so keying a runtime on the requested `cwd` started
   one process per distinct directory and none of them ever exited. The subdirectory reaches the worker
   in the prompt instead, and one tree is one process.
-- The worker's `TMPDIR` points at `.flash-tmp/` **inside** its copy, excluded from the diff through the
-  copy's own `.git/info/exclude`. A worker has nowhere legitimate to write outside its tree — the wall
-  refuses it — so tools that honour `TMPDIR` are given one they are allowed to use.
+- Each copy carries a scratch directory, `.flash-tmp/`, excluded from the diff through the copy's own
+  `.git/info/exclude`; the worker is told about it in its prompt. It is deliberately **not** handed
+  over through `TMPDIR`: the Harness derives the sandbox's writable roots from the runtime's own
+  `TMPDIR`, so pointing that into the tree withdrew the platform temp area from the grant, and every
+  toolchain that reaches it directly — `swift build` does, through `confstr` — failed with `EPERM`
+  inside its own scratch files while `touch` in the same directory succeeded.
+- A call that runs out of budget **still reports what its tree held**: the change so far is stored as
+  a patch, any tool refusals seen are named, and the tree is retired rather than recycled — the SDK
+  has no cancel, so the orphaned session may still be writing, and the next call must not inherit
+  that as its own work.
 - A call that is waiting for a tree is **bounded by its own budget and cancellable**: it used to queue,
   take a tree, copy the repository, and only then notice that nobody was waiting for the answer.
 - A `read-only` call is deliberately **not** isolated: it cannot write anything, and running it in
@@ -412,7 +419,7 @@ naming the path that is wrong instead of silently falling back to something else
 ```json
 {
   "route": { "provider": "ollama", "model": "deepseek-v4.1-flash:cloud" },
-  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 300000, "diffChars": 20000 },
+  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 600000, "diffChars": 20000 },
   "guard": { "protectedSegments": [".git"], "fenceMutations": true },
   "dsh": { "package": "@deepseek-ai/dsh", "minVersion": "0.1.5" }
 }
@@ -443,10 +450,10 @@ a script or in CI.
 | `FLASH_SERVICE_ROOT` | cwd | sandbox root, runtime working directory, `cwd` fence |
 | `FLASH_SERVICE_PROFILE` | `flash-service` | profile the runtime boots |
 | `FLASH_SERVICE_PROVIDER` / `FLASH_SERVICE_MODEL` | `ollama` / `deepseek-v4.1-flash:cloud` | pinned orchestrator route (the worker route is pinned by the profile) |
-| `FLASH_TASK_TIMEOUT_MS` | `300000` | per-task wall-clock budget |
+| `FLASH_TASK_TIMEOUT_MS` | `600000` | per-task wall-clock budget (a build-and-test task on a compiled project needs minutes) |
 | `FLASH_RESULT_MAX_CHARS` | `8000` | returned worker-message budget |
 | `FLASH_MAX_TOKENS` | unset | optional output cap for SDK agents |
-| `FLASH_BATCH_TIMEOUT_MS` | `900000` | per-fleet wall-clock budget |
+| `FLASH_BATCH_TIMEOUT_MS` | `1800000` | per-fleet wall-clock budget |
 | `FLASH_MAX_TASKS` | `16` | ceiling on tasks in one `flash_batch` call |
 | `FLASH_PER_ITEM_CHARS` | `4000` | returned per-worker budget inside a fleet |
 | `FLASH_LOG_FILE` | unset | file the diagnostics are appended to, timestamped, as well as stderr |

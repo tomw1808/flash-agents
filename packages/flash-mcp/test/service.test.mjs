@@ -6,9 +6,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import {
   BATCH_SCRIPT,
@@ -814,13 +814,42 @@ test('one tree is one runtime, however many cwds a call names inside it', async 
   await service.close()
 })
 
-test('the worker is given a TMPDIR inside its own tree', async () => {
+test('the runtime keeps the platform TMPDIR, and the worker is told about .flash-tmp', async () => {
   const { root, client, service } = makeIsolatedService()
   await service.flashTask({ task: 'write one file', cwd: root })
-  assert.match(client.extraEnv.TMPDIR, /slots\/slot-0\/\.flash-tmp$/)
-  assert.equal(existsSync(client.extraEnv.TMPDIR), true)
-  // Outside the copy is refused by the wall, so the temp directory has to be inside it.
-  assert.equal(client.extraEnv.TMPDIR.startsWith(root), false)
+  // The sandbox's writable roots are derived from the runtime's own TMPDIR. Narrowing it
+  // to the tree withdrew the platform temp area from that grant, and toolchains that
+  // reach it directly — the Swift toolchain does — failed with EPERM inside their own
+  // scratch files while `touch` in the same directory succeeded. So the environment
+  // the runtime boots with is left alone.
+  assert.equal(client.extraEnv, undefined)
+  // The tree still has a scratch directory of its own, and the worker learns of it in
+  // the prompt rather than through the environment.
+  assert.equal(existsSync(join(client.initializes[0].cwd, '.flash-tmp')), true)
+  assert.match(client.prompts[0].text, /\.flash-tmp/)
+  await service.close()
+})
+
+test('a timed-out isolated call reports what its tree held and retires the tree', async () => {
+  const { root, client, service } = makeIsolatedService({ slots: 1, script: 'silent', taskTimeoutMs: 100 })
+  const error = await service.flashTask({ task: 'never finishes', cwd: root }).catch((caught) => caught)
+  assert.equal(error.code, 'TIMEOUT')
+  // The session cannot be stopped, so the caller is told what the tree held when the
+  // budget ran out instead of just "timeout": the silent fake had written its one file
+  // before going quiet, and that file is stored as a patch the caller can still apply.
+  assert.match(error.message, /exceeded its 100ms budget/)
+  const stored = /stored as patch (flash-[0-9a-f-]+): 1 file changed, 1 insertion/.exec(error.message)
+  assert.ok(stored, `expected a stored patch in: ${error.message}`)
+  assert.ok(service.isolation.patches.has(stored[1]), 'the salvaged patch is kept for flash_apply')
+  // The tree the orphaned session may still write to was renamed beside the slot, and
+  // the slot's own directory is empty again, so the next call cannot inherit its edits.
+  const slot = service.isolation.slots[0]
+  assert.ok(readdirSync(dirname(slot.dir)).some((name) => name.startsWith('slot-0-orphan-')))
+  assert.deepEqual(readdirSync(slot.dir), [])
+  // The slot went back into the pool: the next call is served a fresh copy at the same path.
+  client.script = defaultScript
+  await service.flashTask({ task: 'write one file', cwd: root })
+  assert.equal(client.initializes.length, 1, 'the runtime is reused; only the tree is renewed')
   await service.close()
 })
 

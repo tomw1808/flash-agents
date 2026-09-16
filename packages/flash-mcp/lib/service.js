@@ -166,9 +166,12 @@ export class FlashTaskService {
     this.perItemChars = perItemChars
     this.env = env
     this.log = log
-    // The environment a runtime boots with may be narrowed per call — the disposable
-    // tree's own temp directory is handed to the worker through TMPDIR, so a tool that
-    // writes temp files has somewhere legitimate to put them.
+    // The environment a runtime boots with may be extended per call. It is no longer
+    // used to move TMPDIR into the disposable tree: the runtime's sandbox grants the
+    // platform temp area from its *own* TMPDIR, so narrowing it silently withdrew that
+    // grant, and every toolchain that reaches the platform temp area directly (the
+    // Swift toolchain does, through confstr) then failed with EPERM inside its own
+    // scratch files. See `#runLocation`.
     this.clientFactory =
       clientFactory ??
       ((profileName, cwd, extraEnv) =>
@@ -288,10 +291,16 @@ export class FlashTaskService {
     if (slot === undefined || pool === undefined) {
       return { promptCwd: rootCwd, runtimeCwd: rootCwd, extraEnv: undefined }
     }
+    // The runtime's environment is deliberately left alone. Pointing TMPDIR into the
+    // tree looked tidy, but the Harness derives the sandbox's writable roots from the
+    // runtime's `os.tmpdir()`, which reads that same variable: the per-user temp area
+    // (`/private/var/folders/…/T` on macOS) vanished from the grant, and `swift build`
+    // failed with EPERM while `touch` in the same directory succeeded. The tree's own
+    // scratch directory still exists and the worker is told about it in its prompt.
     return {
       promptCwd: pool.slotCwd(slot, rootCwd),
       runtimeCwd: slot.dir,
-      extraEnv: slot.tmpDir === undefined ? undefined : { TMPDIR: slot.tmpDir },
+      extraEnv: undefined,
     }
   }
 
@@ -373,9 +382,51 @@ export class FlashTaskService {
         change,
         applied,
       })
+    } catch (error) {
+      if (slot !== undefined && error?.code === 'TIMEOUT') this.#salvageTimedOut(pool, slot, error)
+      throw error
     } finally {
       if (slot !== undefined) pool.release(slot)
     }
+  }
+
+  /**
+   * What a timed-out isolated call leaves behind. The session cannot be stopped — the
+   * SDK has no cancel — so its worker may still be writing into the tree. Two things
+   * follow. The work so far is collected and stored as a patch, and the tree is retired
+   * instead of recycled, so a later call is never handed a copy another session is
+   * still editing. Both facts, and any tool refusals seen, go into the error the caller
+   * reads: a timeout that says only "timeout" is the one outcome that teaches nothing.
+   *
+   * @param {WorkspaceIsolation} pool - the pool the slot belongs to.
+   * @param {object} slot - the leased tree.
+   * @param {Error} error - the timeout error, whose message is extended in place.
+   */
+  #salvageTimedOut(pool, slot, error) {
+    let note
+    try {
+      const change = pool.collect(slot, { diffChars: this.diffChars })
+      if (!change.available) {
+        note = `no change could be collected from the tree (${change.reason})`
+      } else if (change.filesChanged.length === 0) {
+        note = 'the tree held no change when the budget ran out'
+      } else {
+        const summary = change.diffstat.split('\n').pop()?.trim() ?? ''
+        note = `the change so far (${String(change.filesChanged.length)} file(s)) is stored as patch ${change.patchId}: ${summary}`
+      }
+    } catch (collectError) {
+      note = `no change could be collected from the tree (${collectError instanceof Error ? collectError.message : String(collectError)})`
+    }
+    const denials = Array.isArray(error.denials) ? error.denials : []
+    let refusals = ''
+    if (denials.length > 0) {
+      const first = denials[0]
+      const reason = first.reason === undefined ? '' : ` (${first.reason})`
+      refusals = `; ${String(denials.length)} tool refusal(s), first: ${first.code}${reason} ${first.message.slice(0, 160).replace(/\s+/g, ' ')}`
+    }
+    pool.retire(slot)
+    this.log(`timeout: ${note}${refusals}`)
+    error.message = `${error.message}. ${note.charAt(0).toUpperCase()}${note.slice(1)}${refusals}`
   }
 
   /**
@@ -455,6 +506,9 @@ export class FlashTaskService {
         change,
         applied,
       })
+    } catch (error) {
+      if (slot !== undefined && error?.code === 'TIMEOUT') this.#salvageTimedOut(pool, slot, error)
+      throw error
     } finally {
       if (slot !== undefined) pool.release(slot)
     }
@@ -547,6 +601,11 @@ export class FlashTaskService {
         diagnostics: () => this.runtimes.get(key)?.client?.diagnostics ?? '',
       })
       return { state, started }
+    } catch (error) {
+      // A call that runs out of budget never builds a result, so the refusals seen so
+      // far travel on the error instead; the salvage step reports them from there.
+      if (error?.code === 'TIMEOUT') error.denials = state.denials
+      throw error
     } finally {
       unsubscribe()
       offExit()
@@ -965,7 +1024,11 @@ function observe(state, method, params, sessionId, completion, log) {
           ...(reason === undefined ? {} : { reason }),
           message: message.slice(0, 400),
         })
-        log(`worker refusal: ${code ?? 'tool error'}`)
+        // The reason and the start of the message go into the log as well: the result
+        // carries them too, but a call that times out never produces a result, and the
+        // log is then the only record of what the worker was refused.
+        const excerpt = message.slice(0, 200).replace(/\s+/g, ' ')
+        log(`worker refusal: ${code ?? 'tool error'}${reason === undefined ? '' : ` (${reason})`}${excerpt === '' ? '' : `: ${excerpt}`}`)
       }
     }
     return
@@ -1226,6 +1289,8 @@ export function buildChildPrompt({ cwd, task, acceptance, copy }) {
           "This working directory is a disposable copy of the caller's repository, so its files are here at the same relative paths.",
           'Use relative paths: a path naming the original repository refers to a different directory that you cannot write, and',
           'anything outside this copy is discarded — only the change you leave here is reported back.',
+          'Scratch files of your own (downloads, throwaway output, notes to yourself) go under ./.flash-tmp/ in this copy;',
+          'it already exists and is left out of the reported change.',
         ]
       : []),
     'Task:',

@@ -41,7 +41,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -425,10 +425,12 @@ export class WorkspaceIsolation {
     this.clones += 1
     slot.base = null
     slot.baseReason = undefined
-    // The worker has nowhere legitimate to write outside its copy — the wall refuses
-    // it, and the sandbox is wider than the workspace — so it is given a temp
-    // directory *inside* the copy and pointed at it through TMPDIR. Excluded before
-    // the base commit, so tools that write there produce no diff and no surprise.
+    // The worker has nowhere legitimate to name outside its copy — the wall refuses
+    // it — so it is given a scratch directory *inside* the copy and told about it in
+    // its prompt. It is not handed over through TMPDIR: the runtime's sandbox derives
+    // its writable roots from the runtime's own TMPDIR, and overriding that withdrew
+    // the platform temp area every toolchain assumes. Excluded before the base
+    // commit, so tools that write there produce no diff and no surprise.
     slot.tmpDir = join(slot.dir, SLOT_TMP)
     mkdirSync(slot.tmpDir, { recursive: true })
     excludeFromDiff(slot.dir, SLOT_TMP)
@@ -449,6 +451,31 @@ export class WorkspaceIsolation {
       slot.baseReason = `the base state could not be recorded: ${error.message}`
       return { base: null, mechanism, reason: slot.baseReason }
     }
+  }
+
+  /**
+   * Take a tree out of service after its call lost track of the worker. The session that
+   * ran there cannot be stopped, so it may still write; recycling the directory would
+   * hand its late edits to the next call as that call's own work. The slot keeps its
+   * number and gets an empty directory at the same path; the orphaned tree is renamed
+   * beside it and removed with the rest of this process's state.
+   *
+   * @param {Slot} slot - the slot whose call timed out.
+   */
+  retire(slot) {
+    const orphan = `${slot.dir}-orphan-${String(Date.now())}`
+    try {
+      renameSync(slot.dir, orphan)
+    } catch (error) {
+      this.log(`could not retire ${slot.dir}: ${messageOf(error)}`)
+      return
+    }
+    mkdirSync(slot.dir, { recursive: true })
+    slot.base = null
+    slot.baseReason = undefined
+    slot.tmpDir = undefined
+    slot.ignoredBase = undefined
+    this.log(`retired ${slot.dir} as ${orphan}: its session may still be writing there`)
   }
 
   /**

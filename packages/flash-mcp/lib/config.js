@@ -39,8 +39,12 @@ export const DEFAULT_CONFIG = deepFreeze({
   limits: {
     slots: 2,
     maxTasks: 16,
-    taskTimeoutMs: 300_000,
-    batchTimeoutMs: 900_000,
+    // Ten minutes and thirty: a task that builds and tests a compiled project (a
+    // Swift package on a warm `.build` is the measured case) needs several minutes,
+    // and a fleet several tasks' worth. A budget that ends before the toolchain does
+    // reports "timeout" for work that was going fine.
+    taskTimeoutMs: 600_000,
+    batchTimeoutMs: 1_800_000,
     perItemChars: 4_000,
     maxResultChars: 8_000,
     diffChars: 20_000,
