@@ -6,10 +6,10 @@
  *     (the MCP stdio transport: one JSON message per line, `\n`-terminated)
  *   - the `initialize` handshake and `notifications/initialized`
  *   - `tools/list` and `tools/call`
- *   - `ping` and request cancellation
+ *   - `ping`, request cancellation, and progress notifications
  *
  * Deliberately not implemented: prompts, resources, sampling, elicitation,
- * logging, progress, and completions. A Claude Code session only needs tools.
+ * logging, and completions. A Claude Code session only needs tools.
  *
  * @module flash-mcp/mcp
  */
@@ -40,8 +40,16 @@ const SERVER_NOT_INITIALIZED = -32002
  * @param {{name: string, version: string}} options.serverInfo - identity reported at handshake.
  * @param {string} [options.instructions] - optional usage guidance for the client model.
  * @param {() => Array<object>} options.listTools - MCP tool descriptors.
- * @param {(name: string, args: object, ctx: {signal: AbortSignal, log: (message: string) => void}) => Promise<object>} options.callTool
+ * @param {(name: string, args: object, ctx: {
+ *   signal: AbortSignal,
+ *   log: (message: string) => void,
+ *   progressToken: string | number | undefined,
+ *   sendProgress: (report: {progress: number, total?: number, message?: string}) => void,
+ * }) => Promise<object>} options.callTool
  *        Runs one tool; resolves to an MCP tool result (`{content, structuredContent?, isError?}`).
+ *        When the request carried `params._meta.progressToken`, the context exposes it and a
+ *        `sendProgress` sender that emits a valid `notifications/progress` for it; without a
+ *        token `sendProgress` sends nothing, because such a notification would be invalid.
  * @param {NodeJS.ReadableStream} [options.input] - protocol input (default stdin).
  * @param {NodeJS.WritableStream} [options.output] - protocol output (default stdout).
  * @param {(message: string) => void} [options.log] - diagnostic sink; MUST NOT be stdout.
@@ -118,8 +126,30 @@ export function serveStdio({
     }
     const controller = new AbortController()
     inFlight.set(id, controller)
+    // MCP: a progress notification is only valid for a request whose `params._meta`
+    // carried a `progressToken`. The second argument of the official SDK's request
+    // handler is exactly this meta (`_meta`) together with its `sendNotification`;
+    // this server is its own protocol layer, so it exposes the same two facts here.
+    const progressToken = params._meta?.progressToken
+    const sendProgress = (report) => {
+      // Never emit a notification the spec would reject: the token must be a string or
+      // number, and every progress notification needs a numeric `progress`.
+      if (typeof progressToken !== 'string' && typeof progressToken !== 'number') return
+      if (report === null || typeof report !== 'object') return
+      if (typeof report.progress !== 'number' || !Number.isFinite(report.progress)) return
+      send({
+        jsonrpc: JSONRPC_VERSION,
+        method: 'notifications/progress',
+        params: {
+          progressToken,
+          progress: report.progress,
+          ...(report.total === undefined ? {} : { total: report.total }),
+          ...(report.message === undefined ? {} : { message: report.message }),
+        },
+      })
+    }
     try {
-      const result = await callTool(params.name, args, { signal: controller.signal, log })
+      const result = await callTool(params.name, args, { signal: controller.signal, log, progressToken, sendProgress })
       sendResult(id, result)
     } catch (error) {
       if (controller.signal.aborted) sendError(id, REQUEST_CANCELLED, 'request cancelled')

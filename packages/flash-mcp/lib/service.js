@@ -53,6 +53,15 @@ const DEFAULT_DIFF_CHARS = 20_000
  */
 const DEFAULT_SLOTS = 2
 
+/**
+ * How often a running call tells the MCP client it is alive. The client aborts a
+ * tool call that shows no sign of life for its own idle timeout, and a worker can
+ * legitimately spend much longer than that; progress notifications are the only
+ * thing that resets that clock. A request without a `_meta.progressToken` gets no
+ * timer at all, because a progress notification would then be invalid.
+ */
+const DEFAULT_PROGRESS_INTERVAL_MS = 20_000
+
 /** Marker the workflow tool renders immediately before the script's JSON value. */
 const WORKFLOW_VALUE_MARKER = 'Return value:'
 
@@ -133,6 +142,7 @@ export class FlashTaskService {
    * @param {number} [options.batchTimeoutMs] - per-fleet wall-clock budget.
    * @param {number} [options.maxTasks] - ceiling on tasks in one fleet call.
    * @param {number} [options.perItemChars] - returned per-worker budget inside a fleet.
+   * @param {number} [options.progressIntervalMs] - how often a running call reports progress.
    * @param {Record<string, string | undefined>} [options.env] - runtime environment.
    * @param {(message: string) => void} [options.log] - diagnostic sink (stderr).
    * @param {(profile: string, cwd: string, extraEnv?: object) => HarnessSdkClient} [options.clientFactory]
@@ -149,6 +159,7 @@ export class FlashTaskService {
     batchTimeoutMs = DEFAULT_BATCH_TIMEOUT_MS,
     maxTasks = DEFAULT_MAX_TASKS,
     perItemChars = DEFAULT_PER_ITEM_CHARS,
+    progressIntervalMs = DEFAULT_PROGRESS_INTERVAL_MS,
     env = process.env,
     log = () => {},
     clientFactory,
@@ -164,6 +175,7 @@ export class FlashTaskService {
     this.batchTimeoutMs = batchTimeoutMs
     this.maxTasks = maxTasks
     this.perItemChars = perItemChars
+    this.progressIntervalMs = progressIntervalMs
     this.env = env
     this.log = log
     // The environment a runtime boots with may be extended per call. It is no longer
@@ -329,9 +341,11 @@ export class FlashTaskService {
    * @param {string} args.cwd - working directory for the worker; must be inside the root.
    * @param {string} [args.acceptance] - optional acceptance criteria for the worker.
    * @param {AbortSignal} [options.signal] - client cancellation.
+   * @param {(report: object) => void} [options.progress] - MCP progress sender.
+   * @param {unknown} [options.progressToken] - the request's progress token, when it had one.
    * @returns {Promise<object>} the compact structured result.
    */
-  async flashTask(args, { signal } = {}) {
+  async flashTask(args, { signal, progress, progressToken } = {}) {
     const task = requireText(args?.task, 'task')
     const rootCwd = this.#resolveCwd(args?.cwd)
     const acceptance = optionalText(args?.acceptance)
@@ -341,8 +355,21 @@ export class FlashTaskService {
     const sessionId = `flash-task-${randomUUID()}`
     const profileName = this.#profileForMode(args?.mode)
     const pool = this.#isolationFor(profileName)
-    const slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal)
+    // Progress spans the whole call, including a wait for a free tree: that wait is
+    // itself work the client must not mistake for a dead server. The interval is
+    // stopped on every path out of this method.
+    const stopProgress = startProgress({
+      progress,
+      token: progressToken,
+      label: 'flash_task',
+      sessionId,
+      budgetMs: this.taskTimeoutMs,
+      intervalMs: this.progressIntervalMs,
+      log: this.log,
+    })
+    let slot
     try {
+      slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal)
       const { promptCwd, runtimeCwd, extraEnv } = this.#runLocation(slot, rootCwd, pool)
       if (slot !== undefined) pool.prepare(slot)
       const childPrompt = buildChildPrompt({
@@ -383,20 +410,26 @@ export class FlashTaskService {
         applied,
       })
     } catch (error) {
-      if (slot !== undefined && error?.code === 'TIMEOUT') await this.#salvageTimedOut(pool, slot, error, profileName)
+      if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'CANCELLED')) {
+        await this.#salvageOrphaned(pool, slot, error, profileName)
+      }
       throw error
     } finally {
+      stopProgress()
       if (slot !== undefined) pool.release(slot)
     }
   }
 
   /**
-   * What a timed-out isolated call leaves behind. The session cannot be stopped — the
-   * SDK has no cancel — so its worker may still be writing into the tree. Two things
+   * What an isolated call that lost track of its worker leaves behind. The session
+   * cannot be stopped — the SDK has no cancel — so after either a timeout or a client
+   * cancellation its worker may still be writing into the tree; the session is
+   * orphaned identically in both cases, and the same salvage applies. Two things
    * follow. The work so far is collected and stored as a patch, and the tree is retired
    * instead of recycled, so a later call is never handed a copy another session is
    * still editing. Both facts, and any tool refusals seen, go into the error the caller
-   * reads: a timeout that says only "timeout" is the one outcome that teaches nothing.
+   * reads: a call that fails with only "timeout" or "cancelled" is the one outcome that
+   * teaches nothing.
    *
    * Shutting the runtime down is the only cancellation this service has: the SDK cannot
    * stop a session, but the service owns the process that runs it. The runtime that
@@ -406,17 +439,17 @@ export class FlashTaskService {
    *
    * @param {WorkspaceIsolation} pool - the pool the slot belongs to.
    * @param {object} slot - the leased tree.
-   * @param {Error} error - the timeout error, whose message is extended in place.
-   * @param {string} profileName - the profile the timed-out call ran on.
+   * @param {Error} error - the failure error, whose message is extended in place.
+   * @param {string} profileName - the profile the orphaned call ran on.
    */
-  async #salvageTimedOut(pool, slot, error, profileName) {
+  async #salvageOrphaned(pool, slot, error, profileName) {
     let note
     try {
       const change = pool.collect(slot, { diffChars: this.diffChars })
       if (!change.available) {
         note = `no change could be collected from the tree (${change.reason})`
       } else if (change.filesChanged.length === 0) {
-        note = 'the tree held no change when the budget ran out'
+        note = 'the tree held no change when the call ended early'
       } else {
         const summary = change.diffstat.split('\n').pop()?.trim() ?? ''
         note = `the change so far (${String(change.filesChanged.length)} file(s)) is stored as patch ${change.patchId}: ${summary}`
@@ -442,11 +475,11 @@ export class FlashTaskService {
       try {
         await run.client?.shutdown()
       } catch (shutdownError) {
-        this.log(`could not shut down the runtime of the timed-out session: ${messageOf(shutdownError)}`)
+        this.log(`could not shut down the runtime of the orphaned session: ${messageOf(shutdownError)}`)
       }
     }
     pool.retire(slot)
-    this.log(`timeout: ${note}${refusals}`)
+    this.log(`salvage: ${note}${refusals}`)
     error.message = `${error.message}. ${note.charAt(0).toUpperCase()}${note.slice(1)}${refusals}`
   }
 
@@ -464,9 +497,11 @@ export class FlashTaskService {
    * @param {string} [args.cwd] - working directory shared by every worker.
    * @param {string} [args.acceptance] - default acceptance criteria for every task.
    * @param {AbortSignal} [options.signal] - client cancellation.
+   * @param {(report: object) => void} [options.progress] - MCP progress sender.
+   * @param {unknown} [options.progressToken] - the request's progress token, when it had one.
    * @returns {Promise<object>} the compact per-task fleet result.
    */
-  async flashBatch(args, { signal } = {}) {
+  async flashBatch(args, { signal, progress, progressToken } = {}) {
     const tasks = normalizeTasks(args?.tasks, this.maxTasks)
     const rootCwd = this.#resolveCwd(args?.cwd)
     const acceptance = optionalText(args?.acceptance)
@@ -478,8 +513,19 @@ export class FlashTaskService {
     // A fleet is one call and therefore one tree: its members share a working
     // directory exactly as they share a runtime, so they see each other's edits.
     const pool = this.#isolationFor(profileName)
-    const slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal)
+    // As with flash_task, progress spans the whole call, a wait for a free tree included.
+    const stopProgress = startProgress({
+      progress,
+      token: progressToken,
+      label: 'flash_batch',
+      sessionId,
+      budgetMs: this.batchTimeoutMs,
+      intervalMs: this.progressIntervalMs,
+      log: this.log,
+    })
+    let slot
     try {
+      slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal)
       const { promptCwd, runtimeCwd, extraEnv } = this.#runLocation(slot, rootCwd, pool)
       if (slot !== undefined) pool.prepare(slot)
       const copy = slot === undefined ? {} : { copy: true }
@@ -528,9 +574,12 @@ export class FlashTaskService {
         applied,
       })
     } catch (error) {
-      if (slot !== undefined && error?.code === 'TIMEOUT') await this.#salvageTimedOut(pool, slot, error, profileName)
+      if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'CANCELLED')) {
+        await this.#salvageOrphaned(pool, slot, error, profileName)
+      }
       throw error
     } finally {
+      stopProgress()
       if (slot !== undefined) pool.release(slot)
     }
   }
@@ -623,9 +672,9 @@ export class FlashTaskService {
       })
       return { state, started }
     } catch (error) {
-      // A call that runs out of budget never builds a result, so the refusals seen so
-      // far travel on the error instead; the salvage step reports them from there.
-      if (error?.code === 'TIMEOUT') error.denials = state.denials
+      // A call that times out or is cancelled never builds a result, so the refusals
+      // seen so far travel on the error instead; the salvage step reports them from there.
+      if (error?.code === 'TIMEOUT' || error?.code === 'CANCELLED') error.denials = state.denials
       throw error
     } finally {
       unsubscribe()
@@ -1126,6 +1175,54 @@ function summarizeEvent(event) {
 
 function truncateText(text, maxChars) {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars)}…`
+}
+
+/**
+ * Report a running call to the MCP client until the returned stop function is called.
+ *
+ * MCP makes a progress notification valid only when the request carried a
+ * `_meta.progressToken`, so a call without one gets no timer and sends nothing;
+ * a notification without the token would be a protocol error, not a heartbeat.
+ * The token belongs to the client and is carried back by the MCP layer's sender
+ * (`sendProgress`); this helper only supplies the elapsed seconds, the budget in
+ * seconds when one is known, and a short human message.
+ *
+ * @param {object} options - progress wiring.
+ * @param {(report: object) => void} [options.progress] - MCP notification sender.
+ * @param {unknown} options.token - the request's progress token, when it had one.
+ * @param {string} options.label - the tool name, for the message.
+ * @param {string} options.sessionId - the worker session the call is waiting on.
+ * @param {number} [options.budgetMs] - the call's wall-clock budget, when known.
+ * @param {number} options.intervalMs - how often to report.
+ * @param {(message: string) => void} [options.log] - diagnostic sink.
+ * @returns {() => void} stops the reporting.
+ */
+function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs, log = () => {} }) {
+  if (token === undefined || token === null || typeof progress !== 'function') return () => {}
+  const startedAt = Date.now()
+  const timer = setInterval(() => {
+    try {
+      const elapsedMs = Date.now() - startedAt
+      progress({
+        progress: Math.round(elapsedMs) / 1000,
+        ...(budgetMs === undefined || budgetMs === null ? {} : { total: Math.round(budgetMs / 1000) }),
+        message: `${label} running ${formatElapsed(elapsedMs)}; worker session ${sessionId} active`,
+      })
+    } catch (error) {
+      // A client that has gone away must not turn a heartbeat into a task failure.
+      log(`could not send a progress notification: ${messageOf(error)}`)
+    }
+  }, intervalMs)
+  // The heartbeat must never be the only thing keeping the process alive.
+  timer.unref?.()
+  return () => clearInterval(timer)
+}
+
+/** Render elapsed milliseconds as a compact span, e.g. `4m20s`. */
+function formatElapsed(ms) {
+  const seconds = Math.max(0, Math.floor(ms / 1000))
+  const minutes = Math.floor(seconds / 60)
+  return minutes === 0 ? `${String(seconds)}s` : `${String(minutes)}m${String(seconds % 60)}s`
 }
 
 /** Wait for completion, bounded by the task budget and the client's signal. */

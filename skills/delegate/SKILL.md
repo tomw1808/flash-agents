@@ -80,10 +80,12 @@ Rules that held up:
 - **One goal per task.** Related fixes go in one task; unrelated goals do not.
 - **Name what it must not touch** — including files a sibling in the same batch owns.
 - **Give the verification recipe, not just "run the tests".** Compiled projects: cloned build
-  state carries absolute paths and is unusable in a copy, so the recipe uses a scratch build
-  directory inside the copy (`--scratch-path .flash-tmp/build-<slug>` for SwiftPM; the equivalent
-  for other toolchains). A cold build in the copy is usually seconds to a minute. Keep the recipe
-  in project memory so every task carries it.
+  state carries absolute paths and is unusable in a copy, so the recipe either removes it first
+  (`rm -rf .build` as the task's first step) or uses a scratch build directory inside the copy.
+  Toolchains with a sandbox of their own cannot start it inside the worker's sandbox: SwiftPM
+  needs `--disable-sandbox` on every `swift build`/`swift test`, or the worker reports
+  `Operation not permitted` and cannot verify anything. A cold build in the copy is usually
+  seconds to a minute. Keep the recipe in project memory so every task carries it verbatim.
 - **Ask for verbatim output** and for a "deviations" section. Workers use both honestly; that is
   where the real information is.
 - Use `acceptance` for the one-sentence definition of done; the body carries the how.

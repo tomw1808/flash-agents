@@ -46,6 +46,8 @@ class FakeSdkClient {
     this.shutdownCwds = []
     /** When set, the "worker" writes this file into whatever tree it was given. */
     this.writes = undefined
+    /** When set, the canned replay runs after this many milliseconds instead of a microtask. */
+    this.delayMs = 0
     this.cwd = undefined
     this.prompts = []
     this.notificationHandlers = new Set()
@@ -72,7 +74,9 @@ class FakeSdkClient {
 
   async prompt({ sessionId, text }) {
     this.prompts.push({ sessionId, text })
-    queueMicrotask(() => this.#replay(sessionId, text))
+    const replay = () => this.#replay(sessionId, text)
+    if (this.delayMs > 0) setTimeout(replay, this.delayMs)
+    else queueMicrotask(replay)
     return { messageId: `msg-${String(this.prompts.length)}` }
   }
 
@@ -438,6 +442,66 @@ test('honours client cancellation', async () => {
   const pending = service.flashTask({ task: 'x', cwd: root }, { signal: controller.signal })
   setTimeout(() => controller.abort(), 20)
   await assert.rejects(pending, (error) => error.name === 'FlashTaskCancelled')
+})
+
+test('reports progress to the client on an interval, and stops when the call settles', async () => {
+  const { root, client, service } = makeService({ progressIntervalMs: 10 })
+  client.delayMs = 80
+  const reports = []
+  const result = await service.flashTask(
+    { task: 'x', cwd: root },
+    { progress: (report) => reports.push(report), progressToken: 'tok-1' },
+  )
+
+  assert.equal(result.status, 'ok')
+  assert.ok(reports.length >= 2, `expected progress reports, saw ${String(reports.length)}`)
+  assert.equal(typeof reports[0].progress, 'number')
+  assert.equal(reports[0].total, Math.round(service.taskTimeoutMs / 1000))
+  assert.match(reports[0].message, /^flash_task running \d+m?\d*s; worker session flash-task-.* active$/)
+  for (let index = 1; index < reports.length; index += 1) {
+    assert.ok(reports[index].progress > reports[index - 1].progress, 'progress must move forward')
+  }
+  // The interval is cleared when the call settles, so no late heartbeat arrives.
+  const settled = reports.length
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  assert.equal(reports.length, settled, 'no progress after the call settled')
+})
+
+test('sends no progress when the request carried no progress token', async () => {
+  const { root, client, service } = makeService({ progressIntervalMs: 5 })
+  client.delayMs = 30
+  const reports = []
+  const result = await service.flashTask({ task: 'x', cwd: root }, { progress: (report) => reports.push(report) })
+  assert.equal(result.status, 'ok')
+  assert.deepEqual(reports, [], 'a request without a token must produce no notification')
+})
+
+test('reports progress while a queued call waits for a free tree', async () => {
+  const { root, service } = makeIsolatedService({ slots: 1, script: 'silent', taskTimeoutMs: 1_000, progressIntervalMs: 5 })
+  const holding = service.flashTask({ task: 'hold the only tree', cwd: root }).catch((error) => error)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+
+  const reports = []
+  const controller = new AbortController()
+  const queued = service.flashTask(
+    { task: 'queued', cwd: root },
+    { signal: controller.signal, progress: (report) => reports.push(report), progressToken: 'tok-queued' },
+  )
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  controller.abort()
+  const cancelled = await queued.catch((error) => error)
+
+  assert.equal(cancelled.code, 'CANCELLED')
+  assert.match(cancelled.message, /cancelled while waiting/)
+  assert.ok(reports.length >= 2, `expected progress while waiting, saw ${String(reports.length)}`)
+  assert.match(reports[0].message, /worker session flash-task-.* active/)
+  // A call that never got a tree is still a call the client must see living; but its
+  // interval stops when it is cancelled, and nothing is salvaged because nothing ran.
+  const settled = reports.length
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(reports.length, settled)
+  await holding
+  await service.close()
 })
 
 test('truncates an oversized child message and warns about a failed child', async () => {
@@ -869,6 +933,48 @@ test('a timed-out isolated call reports what its tree held, retires the tree, an
   await service.close()
 })
 
+test('a client-cancelled isolated call salvages its change and retires the tree like a timeout', async () => {
+  const { root, client, service } = makeIsolatedService({ slots: 1, script: 'silent', taskTimeoutMs: 10_000 })
+  const original = service.isolation.slots[0].dir
+  const controller = new AbortController()
+  const pending = service.flashTask({ task: 'never finishes', cwd: root }, { signal: controller.signal })
+  // Let the call lease, prepare the tree, and start its session; the silent fake has
+  // already written its one file before going quiet, so there is a change to salvage.
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  controller.abort()
+  const error = await pending.catch((caught) => caught)
+
+  // A cancellation orphans the session exactly as a timeout does: the SDK cannot stop
+  // it, so the work so far is stored and the tree is retired rather than recycled.
+  assert.equal(error.code, 'CANCELLED')
+  const stored = /stored as patch (flash-[0-9a-f-]+): 1 file changed, 1 insertion/.exec(error.message)
+  assert.ok(stored, `expected a stored patch in: ${error.message}`)
+  assert.ok(service.isolation.patches.has(stored[1]), 'the salvaged patch is kept for flash_apply')
+
+  const slot = service.isolation.slots[0]
+  assert.notEqual(slot.dir, original, 'the slot must move to a path it has never used')
+  assert.equal(existsSync(original), true, 'the orphaned tree must stay at its original path')
+  assert.equal(readFileSync(join(original, 'worker-output.txt'), 'utf8'), 'written by the worker\n')
+  assert.deepEqual(slot.orphans, [original], 'the orphan is remembered so close() can remove it')
+  assert.ok(client.shutdownCwds.includes(original), `expected a shutdown of ${original}, got ${JSON.stringify(client.shutdownCwds)}`)
+  await service.close()
+})
+
+test('a client-cancelled fleet salvages its one tree too', async () => {
+  const { root, service } = makeIsolatedService({ slots: 1, script: 'silent' })
+  const original = service.isolation.slots[0].dir
+  const controller = new AbortController()
+  const pending = service.flashBatch({ tasks: ['a'], cwd: root }, { signal: controller.signal })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  controller.abort()
+  const error = await pending.catch((caught) => caught)
+
+  assert.equal(error.code, 'CANCELLED')
+  assert.ok(service.isolation.patches.size > 0, 'the fleet change must be stored as a patch')
+  assert.deepEqual(service.isolation.slots[0].orphans, [original])
+  await service.close()
+})
+
 test('a call cancelled while it waits for a tree never copies the repository', async () => {
   const { root, client, service } = makeIsolatedService({ slots: 1, script: 'silent', taskTimeoutMs: 400 })
   const holding = service.flashTask({ task: 'hold the only tree', cwd: root }).catch((error) => error)
@@ -881,9 +987,14 @@ test('a call cancelled while it waits for a tree never copies the repository', a
   assert.equal(cancelled.code, 'CANCELLED')
   assert.match(cancelled.message, /cancelled while waiting/)
 
-  // Nothing was prepared for the cancelled call: it never reached the copy.
+  // Nothing was prepared for the cancelled call: it never reached the copy, so there
+  // is no change to salvage and no tree to retire.
   assert.equal(client.initializes.length, 1)
+  assert.equal(service.isolation.patches.size, 0)
+  const waitingSlot = service.isolation.slots[0].dir
   await holding
+  assert.equal(service.isolation.patches.size > 0, true, 'the holder still salvages its own timeout')
+  assert.notEqual(service.isolation.slots[0].dir, waitingSlot)
   await service.close()
 })
 

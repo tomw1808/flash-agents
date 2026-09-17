@@ -441,6 +441,13 @@ models are weaker at tool calling, so expect more variance and more `NOT_DELEGAT
 than the pinned default. Support for other providers is a welcome pull request, not a
 shipped feature.
 
+The client that launches this server owns its own timeout for a tool call, and that timeout
+must be **longer than the service's task budget** in `flash.config.json` — otherwise the
+client abandons a call the service is still working on. The plugin manifest sets the `flash`
+server's `timeout` to `3900000` ms, above the `3600000` ms budget. The server also sends MCP
+`notifications/progress` every 20 seconds for as long as a call runs, which keeps the client's
+idle clock alive when the worker produces no other output.
+
 ### Prerequisites
 
 ```sh

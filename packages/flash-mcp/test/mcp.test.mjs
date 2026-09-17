@@ -140,6 +140,56 @@ test('aborts an in-flight tool call when the client cancels it', async () => {
   connection.close()
 })
 
+test('sends progress notifications carrying the request token, and none without one', async () => {
+  const seenTokens = []
+  const withToken = connect({
+    async callTool(name, args, ctx) {
+      seenTokens.push(ctx.progressToken)
+      assert.equal(typeof ctx.sendProgress, 'function')
+      ctx.sendProgress({ progress: 1, total: 60, message: 'running' })
+      ctx.sendProgress({ progress: 2, total: 60, message: 'still running' })
+      return { content: [{ type: 'text', text: 'ok' }] }
+    },
+  })
+  withToken.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
+  withToken.send({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/call',
+    params: { name: 'flash_task', arguments: {}, _meta: { progressToken: 'tok-1' } },
+  })
+  // initialize result, two progress notifications, then the tool result.
+  await settle(withToken.frames, 4)
+  assert.deepEqual(seenTokens, ['tok-1'])
+  const progress = withToken.frames.filter((frame) => frame.method === 'notifications/progress')
+  assert.equal(progress.length, 2)
+  assert.deepEqual(progress[0].params, {
+    progressToken: 'tok-1',
+    progress: 1,
+    total: 60,
+    message: 'running',
+  })
+  // A progress notification carries no id and is never answered.
+  assert.equal(progress[0].id, undefined)
+  assert.equal(withToken.frames.at(-1).id, 2)
+  withToken.connection.close()
+
+  const withoutToken = connect({
+    async callTool(name, args, ctx) {
+      assert.equal(ctx.progressToken, undefined)
+      // A sender with no token must never emit an invalid notification.
+      ctx.sendProgress({ progress: 1 })
+      return { content: [{ type: 'text', text: 'ok' }] }
+    },
+  })
+  withoutToken.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
+  withoutToken.send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'flash_task', arguments: {} } })
+  await settle(withoutToken.frames, 2)
+  assert.equal(withoutToken.frames.length, 2)
+  assert.equal(withoutToken.frames.some((frame) => frame.method === 'notifications/progress'), false)
+  withoutToken.connection.close()
+})
+
 test('closes on input end without answering', async () => {
   const { input, frames, connection } = connect()
   input.end()

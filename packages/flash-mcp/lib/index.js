@@ -403,12 +403,12 @@ export function startServer(options, input = process.stdin, output = process.std
     log,
     input,
     output,
-    async callTool(name, args, { signal }) {
+    async callTool(name, args, { signal, progressToken, sendProgress }) {
       const run =
         name === 'flash_task'
-          ? () => service.flashTask(args, { signal })
+          ? () => service.flashTask(args, { signal, progress: sendProgress, progressToken })
           : name === 'flash_batch'
-            ? () => service.flashBatch(args, { signal })
+            ? () => service.flashBatch(args, { signal, progress: sendProgress, progressToken })
             : name === 'flash_apply'
               ? () => service.flashApply(args)
               : undefined
