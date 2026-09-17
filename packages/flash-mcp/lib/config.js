@@ -47,8 +47,8 @@ export const DEFAULT_CONFIG = deepFreeze({
     // small, because the call returns when the worker finishes.
     taskTimeoutMs: 3_600_000,
     batchTimeoutMs: 10_800_000,
-    perItemChars: 4_000,
-    maxResultChars: 8_000,
+    perItemChars: 12_000,
+    maxResultChars: 24_000,
     diffChars: 20_000,
     maxConcurrentAgents: 4,
     maxTotalAgents: 32,

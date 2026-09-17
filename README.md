@@ -468,11 +468,11 @@ a script or in CI.
 | `FLASH_SERVICE_PROFILE` | `flash-service` | profile the runtime boots |
 | `FLASH_SERVICE_PROVIDER` / `FLASH_SERVICE_MODEL` | `ollama` / `deepseek-v4.1-flash:cloud` | pinned orchestrator route (the worker route is pinned by the profile) |
 | `FLASH_TASK_TIMEOUT_MS` | `3600000` | per-task wall-clock budget; a coherent feature slice that builds and tests between steps takes real minutes per cycle, and the call returns as soon as the worker finishes |
-| `FLASH_RESULT_MAX_CHARS` | `8000` | returned worker-message budget |
+| `FLASH_RESULT_MAX_CHARS` | `24000` | returned worker-message budget |
 | `FLASH_MAX_TOKENS` | unset | optional output cap for SDK agents |
 | `FLASH_BATCH_TIMEOUT_MS` | `10800000` | per-fleet wall-clock budget |
 | `FLASH_MAX_TASKS` | `16` | ceiling on tasks in one `flash_batch` call |
-| `FLASH_PER_ITEM_CHARS` | `4000` | returned per-worker budget inside a fleet |
+| `FLASH_PER_ITEM_CHARS` | `12000` | returned per-worker budget inside a fleet |
 | `FLASH_LOG_FILE` | unset | file the diagnostics are appended to, timestamped, as well as stderr |
 | `FLASH_DSH_BIN` | `dsh` on `PATH` | the launcher to spawn (a `.js` path runs under the current Node) |
 
