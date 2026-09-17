@@ -34,9 +34,11 @@ const INSTRUCTIONS = [
   'Delegates one bounded task at a time to a cheap DeepSeek Harness worker that runs on',
   'ollama/deepseek-v4.1-flash:cloud inside a workspace-confined sandbox.',
   '',
-  'Use flash_task for narrow, self-contained work: reading, searching, summarizing, and',
-  'small repository-local edits. Every call is independent — the worker starts with an',
-  'empty conversation, so put everything it needs into `task`.',
+  'Use flash_task for one coherent, self-contained goal: a feature slice with its tests',
+  '(a thousand lines is fine), a fix round of confirmed findings, a read-only map or review,',
+  'or a mechanical refactor. Every call is independent — the worker starts with an empty',
+  'conversation, so put everything it needs into `task`: the decisions already taken, the',
+  'files it owns and must not touch, the tests to write, and the exact verification commands.',
   '',
   'Use flash_batch to hand off a fleet of independent tasks in one call: the Harness workflow',
   'engine fans them out under its own concurrency and total-agent caps, and each task returns',
@@ -65,7 +67,7 @@ export function listTools() {
     {
       name: 'flash_task',
       description: [
-        'Delegate one narrow task to a cheap DeepSeek Harness worker',
+        'Delegate one coherent task — a feature slice, a fix round, a review — to a cheap DeepSeek Harness worker',
         '(ollama/deepseek-v4.1-flash:cloud) and return its compact result.',
         '',
         'The worker runs in a fresh conversation inside a sandbox confined to the service',

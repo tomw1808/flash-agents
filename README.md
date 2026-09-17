@@ -136,6 +136,26 @@ The plugin ships three skills, each a way of working rather than a tool:
 | `/flash-agents:gauntlet` | Several genuinely different approaches are plausible and the result can be checked by running something: parallel builders, cheap critics, a blind duel. Costs the orchestrator more; the judge is a frontier-model step. |
 | `/flash-agents:setup` | Once, after installing: checks the harness, Ollama, the model and the profiles, and proves the pipeline with one real task. Manual-only. |
 
+### What to expect from a worker
+
+Calibration from a day on a 50k-line Swift app (2026-09-17), so a model steering this plugin
+knows how much to hand off:
+
+| Task shape | Size | Wall time | Outcome |
+|---|---|---|---|
+| Domain seam: protocol, adapter, injection into two coordinators, fake, tests | 1,250 lines, 15 tests, 3 scripts re-pointed | 30 min | landed after review; one macro warning fixed by hand |
+| Security fix round on an OAuth/MCP client, 11 findings, each with a fail-before/pass-after test | 1,400 lines | 40 min | landed; the reviewer still found one flow defect the round did not cover |
+| Harness rework: parsing, scope policy, schema table, probe chain, allow-list, 29 tests | 1,500 lines | 37 min | landed unchanged |
+| Read-only security review of the same client against the RFCs | — | 25 min | 11 confirmed findings |
+| Mechanical split of a 7,000-line file into 16, 41 scripts re-pointed | 7,900 lines moved | hit the 60 min budget | salvaged patch was complete |
+
+What it does not do well, and what the steering model must therefore read itself: flow semantics
+across a boundary, policy nuance, warnings outside the files it created, and grep-based checks
+that go stale when a second code path appears. Architecture stays with the steering model; the
+task text carries the decisions (signatures, contracts, mapping rules) and the worker implements
+them. One coherent goal with up to about six sub-goals per task; 800–1,500 words of task text.
+The `delegate` skill has the working loop and the task template.
+
 ### The pipeline
 
 ```
@@ -720,6 +740,11 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
 - **A running task cannot be interrupted.** The SDK protocol has no cancel method, so a cancelled
   MCP request or a timed-out task stops being *waited on* while the session keeps running inside
   Harness, and its later notifications are ignored.
+- **Worker trees live under the canonical temp path.** `os.tmpdir()` is a symlink on macOS
+  (`/var/folders` → `/private/var/folders`); the guard's fence compares canonical paths, and a
+  worker whose working directory was the symlinked spelling had its own `rm -rf .build` refused
+  once. The state directory is now derived from the resolved temp path, so every path a worker
+  sees is canonical.
 - **The platform temporary area is writable by design.** `/tmp` and friends are not denied by
   `workspace-write`, and that is not theoretical: a live run deleted a file in the caller's tree
   through an absolute path under `TMPDIR` while the sandbox allowed it. The wall's fence rule

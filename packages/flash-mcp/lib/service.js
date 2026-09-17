@@ -16,11 +16,10 @@
  */
 
 import { existsSync, realpathSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
-import { IsolationError, WorkspaceIsolation } from './isolation.js'
+import { IsolationError, WorkspaceIsolation, canonicalTmpdir } from './isolation.js'
 import { HarnessSdkClient } from './sdk.js'
 
 /** Route the service pins; callers can never change it. */
@@ -214,7 +213,7 @@ export class FlashTaskService {
             ...(isolate.patchRetentionDays === undefined ? {} : { patchRetentionDays: isolate.patchRetentionDays }),
             log,
           })
-    this.stateDir = this.isolation?.stateDir ?? resolve(isolate.stateDir ?? join(tmpdir(), 'flash-mcp'))
+    this.stateDir = this.isolation?.stateDir ?? resolve(isolate.stateDir ?? join(canonicalTmpdir(), 'flash-mcp'))
 
     /**
      * One persistent runtime per profile *and working directory*, keyed by both. A

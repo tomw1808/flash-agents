@@ -43,7 +43,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -99,7 +99,29 @@ export class IsolationError extends Error {
  * @returns {string} the base state directory.
  */
 function stateBaseDir() {
-  return join(tmpdir(), 'flash-mcp')
+  return join(canonicalTmpdir(), 'flash-mcp')
+}
+
+/**
+ * The platform temp directory with its symlinks resolved.
+ *
+ * On macOS `os.tmpdir()` is `/var/folders/...`, a symlink to `/private/var/...`. A slot
+ * tree created under the symlinked spelling becomes the worker's working directory in
+ * that spelling, while the guard's fence and the sandbox compare canonical paths — so a
+ * worker's `rm -rf .build` in its own tree was refused once as outside the fence, and
+ * only succeeded after it `cd`ed to the `/private/var` form of the same directory.
+ * Resolving once here means every path the worker ever sees is already canonical.
+ *
+ * @returns {string} the canonical temp directory, or the raw one when it cannot be
+ *   resolved.
+ */
+export function canonicalTmpdir() {
+  const raw = tmpdir()
+  try {
+    return realpathSync(raw)
+  } catch {
+    return raw
+  }
 }
 
 /**

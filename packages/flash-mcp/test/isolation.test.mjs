@@ -21,7 +21,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, sep } from 'node:path'
 import { test } from 'node:test'
 
-import { WorkspaceIsolation } from '../lib/isolation.js'
+import { WorkspaceIsolation, canonicalTmpdir } from '../lib/isolation.js'
 
 /** A throwaway repository, realpath'd so macOS `/var` vs `/private/var` cannot bite. */
 function makeRepo() {
@@ -688,3 +688,16 @@ test('startup drops other roots’ empty digest directories and keeps ones with 
   }
 })
 
+
+test('a pool with no configured state directory lives under the canonical temp directory', () => {
+  const repo = makeRepo()
+  try {
+    const pool = new WorkspaceIsolation({ root: repo })
+    const canonical = realpathSync(tmpdir())
+    assert.equal(canonicalTmpdir(), canonical)
+    assert.ok(pool.stateDir.startsWith(canonical + sep) || pool.stateDir === canonical,
+      `state dir ${pool.stateDir} is not under the canonical temp directory ${canonical}`)
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
