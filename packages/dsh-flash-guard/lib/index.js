@@ -50,6 +50,7 @@
  * @module dsh-flash-guard
  */
 
+import { existsSync, realpathSync } from 'node:fs'
 import { dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
 
 /** Cordis plugin name. */
@@ -231,6 +232,44 @@ function resolveTarget(value, cwd, home) {
 }
 
 /**
+ * Canonicalise an absolute path through its nearest existing ancestor.
+ *
+ * `path.normalize` collapses `.` and `..` but never resolves a symlink, so two
+ * spellings of one directory (`/var/...` and `/private/var/...` on macOS, or a
+ * disposable tree reached through a symlinked TMPDIR) compared as different paths.
+ * The fence therefore refused a worker its own workspace. `realpathSync` is applied
+ * to the longest existing prefix and the non-existent tail is re-appended, exactly
+ * as the service's `#realPath` does, because a candidate that does not exist yet
+ * must still be fenced by the ancestor it will be created under.
+ *
+ * A relative path is returned unchanged: it has no filesystem identity without the
+ * working directory it was resolved against, and every caller here has already
+ * resolved it against a known cwd when one existed.
+ *
+ * @param {string} value - an absolute path that may be spelled through symlinks.
+ * @returns {string} its canonical form, or the input when it could not be resolved.
+ */
+function canonicalPath(value) {
+  if (typeof value !== 'string' || value.length === 0 || !isAbsolute(value)) return value
+  let current = value
+  const tail = []
+  while (!existsSync(current)) {
+    const parent = dirname(current)
+    if (parent === current) return value
+    tail.unshift(current.slice(parent.length).replace(/^[/\\]/, ''))
+    current = parent
+  }
+  try {
+    const real = realpathSync.native(current)
+    return tail.length === 0 ? real : join(real, ...tail)
+  } catch {
+    // A path that exists but cannot be realpath'd is compared as spelled; the wall
+    // must not turn a permission error into a silent allowance.
+    return value
+  }
+}
+
+/**
  * Whether `child` is `parent` itself or below it.
  * @param {string} child - candidate descendant.
  * @param {string} parent - candidate ancestor.
@@ -296,8 +335,17 @@ function classifyPathAccess(input) {
   // an absolute path, because both the disposable copy and the root happened to live
   // under TMPDIR, which the sandbox allows. Reads are not fenced (toolchains, `/usr`,
   // shared caches), and device paths are not writes at all.
-  if (settings.fenceMutations !== false && fence !== '' && fence !== resolved && !isAtOrUnder(resolved, fence) && !DEVICE_PATH.test(resolved)) {
-    return { reason: REASON.OUTSIDE_WORKSPACE, detail: `mutates ${resolved}, which is outside ${fence}` }
+  //
+  // Both sides are canonicalised first: the secret/state rules above read the spelled
+  // path, but the fence compares filesystem identity. A shell whose cwd is reported
+  // through a symlink (`/var/folders/...`) was refused its own tree because the fence
+  // held the canonical spelling (`/private/var/folders/...`), or the reverse.
+  if (settings.fenceMutations !== false && fence !== '' && !DEVICE_PATH.test(resolved)) {
+    const fenceCanonical = canonicalPath(fence)
+    const resolvedCanonical = canonicalPath(resolved)
+    if (!isAtOrUnder(resolvedCanonical, fenceCanonical)) {
+      return { reason: REASON.OUTSIDE_WORKSPACE, detail: `mutates ${resolved}, which is outside ${fence}` }
+    }
   }
   return undefined
 }

@@ -211,6 +211,7 @@ export class FlashTaskService {
             // and this process. A shared default was a data-loss bug: one instance
             // cleared another's in-flight tree and reused its path.
             ...(isolate.stateDir === undefined ? {} : { stateDir: isolate.stateDir }),
+            ...(isolate.patchRetentionDays === undefined ? {} : { patchRetentionDays: isolate.patchRetentionDays }),
             log,
           })
     this.stateDir = this.isolation?.stateDir ?? resolve(isolate.stateDir ?? join(tmpdir(), 'flash-mcp'))

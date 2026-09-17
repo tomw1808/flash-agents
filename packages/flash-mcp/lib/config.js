@@ -54,6 +54,11 @@ export const DEFAULT_CONFIG = deepFreeze({
     maxTotalAgents: 32,
     maxItemsPerCall: 64,
     workflowMaxResultChars: 250_000,
+    // How long a stored patch is kept before the next startup prunes it. Patches
+    // accumulate in `$TMPDIR/flash-mcp/<digest>/patches` and most are never applied;
+    // a two-week window is long enough to come back to a finished call, and short
+    // enough that an unused machine does not grow without bound.
+    patchRetentionDays: 14,
   },
   guard: {
     protectedSegments: ['.git'],

@@ -99,6 +99,14 @@ test('a zero, negative or fractional limit is rejected', () => {
   assert.equal(positive.ok, true)
 })
 
+test('the patch retention window is a positive integer limit, defaulting to 14', () => {
+  assert.equal(DEFAULT_CONFIG.limits.patchRetentionDays, 14)
+  assert.equal(validateConfig({ limits: { patchRetentionDays: 30 } }).ok, true)
+  const bad = validateConfig({ limits: { patchRetentionDays: 0 } })
+  assert.equal(bad.ok, false)
+  assert.match(bad.errors.join('\n'), /limits\.patchRetentionDays must be a positive safe integer/)
+})
+
 test('a guard list must be an array of non-empty strings', () => {
   const notAnArray = validateConfig({ guard: { protectedSegments: '.git' } })
   assert.equal(notAnArray.ok, false)

@@ -9,6 +9,9 @@
  */
 
 import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
 
 import {
@@ -240,6 +243,46 @@ test('chained commands are examined one by one', () => {
   // raw split used to cut this in half and mis-resolve what followed.
   assert.deepEqual(splitSimpleCommands('bash -c "cd .. && rm -rf x"'), [['bash', '-c', 'cd .. && rm -rf x']])
   assert.deepEqual(tokenize('rm -rf "my dir"'), ['rm', '-rf', 'my dir'])
+})
+
+test('the fence compares canonical paths, not spellings', () => {
+  // The macOS temp symlink, simulated in a temp dir so the test does not depend on
+  // the host: `real` is the workspace, `link` names the same directory through a
+  // symlink — the `/var` vs `/private/var` shape. The fence used `path.normalize`,
+  // which never resolves a symlink, so a worker whose cwd was spelled one way and
+  // whose fence was spelled the other was refused its own tree with
+  // `OUTSIDE_WORKSPACE`.
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-fence-')))
+  const real = join(base, 'real')
+  mkdirSync(join(real, 'sub'), { recursive: true })
+  writeFileSync(join(real, 'sub', 'inside.txt'), 'x\n')
+  const link = join(base, 'link')
+  symlinkSync(real, link, 'dir')
+
+  const settings = resolveSettings({ root: link })
+  const ask = (candidate, cwd, fence) =>
+    classifyPathAccess({ path: candidate, cwd, home: HOME, settings, mutate: true, fence })
+
+  // A relative path under the fence, spelled through the symlink, is inside.
+  assert.equal(ask('.build', link, link), undefined)
+  // An absolute path spelled through the symlink is inside...
+  assert.equal(ask(join(link, 'sub', 'inside.txt'), link, link), undefined)
+  // ...and the same file spelled through the real directory is inside too.
+  assert.equal(ask(join(real, 'sub', 'inside.txt'), link, link), undefined)
+  // A candidate that does not exist yet is fenced by its nearest existing ancestor.
+  assert.equal(ask(join(link, 'deep', 'new.txt'), link, link), undefined)
+  // The reverse spelling: canonical fence, candidate named through the symlink.
+  assert.equal(ask(join(link, 'sub', 'inside.txt'), real, real), undefined)
+
+  // A sibling or the parent of the workspace is still outside, however it is spelled.
+  assert.equal(ask(join(base, 'outside.txt'), link, link)?.reason, REASON.OUTSIDE_WORKSPACE)
+  assert.equal(ask(base, link, link)?.reason, REASON.OUTSIDE_WORKSPACE)
+  assert.equal(ask(join(base, 'outside.txt'), real, real)?.reason, REASON.OUTSIDE_WORKSPACE)
+
+  // The secret and state rules still read the spelled path, not the canonical one:
+  // reaching a secret through the symlink is refused as a secret, not as a fence.
+  assert.equal(ask(join(link, '.env'), link, link)?.reason, REASON.SECRET)
+  assert.equal(ask(join(link, '.git', 'config'), link, link)?.reason, REASON.STATE)
 })
 
 // ── helpers ─────────────────────────────────────────────────────────────────

@@ -24,6 +24,7 @@ import { serveStdio, describeError } from './mcp.js'
 import { FlashTaskService } from './service.js'
 import { loadConfig } from './config.js'
 import { formatChecks, runChecks } from './doctor.js'
+import { cleanLayout } from './isolation.js'
 
 /** Server identity reported to the MCP client. */
 export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.0' })
@@ -241,6 +242,7 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
     slots: numberFrom(env.FLASH_SLOTS, config.limits.slots),
     stateDir: textFrom(env.FLASH_STATE_DIR),
     diffChars: numberFrom(env.FLASH_DIFF_CHARS, config.limits.diffChars),
+    patchRetentionDays: numberFrom(env.FLASH_PATCH_RETENTION_DAYS, config.limits.patchRetentionDays),
     logFile: textFrom(env.FLASH_LOG_FILE),
     help: false,
   }
@@ -282,6 +284,9 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
       case '--diff-chars':
         options.diffChars = numberFrom(next(), undefined)
         break
+      case '--patch-retention-days':
+        options.patchRetentionDays = numberFrom(next(), undefined)
+        break
       case '--log-file':
         options.logFile = next()
         break
@@ -312,6 +317,9 @@ const USAGE = `flash-agents — cheap DeepSeek Harness workers over MCP stdio
 
 Usage: flash-agents [serve] [options]           serve the MCP stdio protocol (the default)
        flash-agents doctor [--profile <id>]     check the prerequisites and print the fixes
+       flash-agents clean [--all] [--root <path>]
+                                                report the state directory per root and
+                                                remove dead trees and expired patches
 
 Options:
   --root <path>             sandbox root and runtime working directory (default: cwd)
@@ -330,6 +338,9 @@ Options:
                             private to this root and this process under TMPDIR); a
                             configured directory is shared, so one service per directory
   --diff-chars <n>          how much of a patch a result carries (default: 20000)
+  --patch-retention-days <n>
+                            days an unapplied patch is kept before the startup prune
+                            removes it (default: 14)
   --log-file <path>         append every diagnostic line, timestamped, to this file as
                             well as stderr
   -h, --help                show this help
@@ -337,7 +348,7 @@ Options:
 Environment: FLASH_SERVICE_ROOT, FLASH_SERVICE_PROFILE, FLASH_SERVICE_PROVIDER,
 FLASH_SERVICE_MODEL, FLASH_TASK_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS, FLASH_MAX_TASKS,
 FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
-FLASH_STATE_DIR, FLASH_DIFF_CHARS, FLASH_LOG_FILE, FLASH_DSH_BIN.
+FLASH_STATE_DIR, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_LOG_FILE, FLASH_DSH_BIN.
 
 The route and the numeric limits default to flash.config.json, the one file that owns
 them. An empty environment value counts as unset, so a generated configuration may
@@ -388,6 +399,7 @@ export function startServer(options, input = process.stdin, output = process.std
       ...(options.slots === undefined ? {} : { slots: options.slots }),
       ...(options.stateDir === undefined ? {} : { stateDir: options.stateDir }),
       ...(options.diffChars === undefined ? {} : { diffChars: options.diffChars }),
+      ...(options.patchRetentionDays === undefined ? {} : { patchRetentionDays: options.patchRetentionDays }),
     },
     log,
   })
@@ -508,12 +520,120 @@ export async function runDoctor(argv = [], { env = process.env, write, run, prob
   return result.ok ? 0 : 1
 }
 
+/** Format a byte count as megabytes, the unit the state report is read in. */
+function formatMb(bytes) {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/**
+ * The canonical spelling of a service root, so it matches its digest directory.
+ * The service builds its own root with `realpathSync(resolve(root))`, so the same
+ * resolver is used here; otherwise `clean` could name the wrong digest for a root
+ * reached through a symlink.
+ * @param {string} root - the configured or current root.
+ * @returns {string} its real path when it exists, else the resolved path.
+ */
+function canonicalRoot(root) {
+  const absolute = resolve(root)
+  try {
+    return realpathSync(absolute)
+  } catch {
+    return absolute
+  }
+}
+
+const CLEAN_USAGE = `flash-agents clean — report and reclaim the flash-mcp state directory
+
+Usage: flash-agents clean [--all] [--root <path>] [--patch-retention-days <n>]
+
+  --all                      also remove the slot trees of roots with no live server
+  --root <path>              service root whose digest is swept (default: cwd)
+  --patch-retention-days <n> days an unapplied patch is kept (default: flash.config.json)
+
+The default removes what a server startup removes for --root: dead owners (salvaging
+their unfinished trees as patches), expired patches, and other roots' empty digest
+directories. Patches are never removed by --all.
+`
+
+/**
+ * Report and reclaim the state directory, one line per root digest.
+ *
+ * The layout it reads is the default one the service writes: `$TMPDIR/flash-mcp` with
+ * one digest directory per root, one directory per server pid under it, and a
+ * `patches/` directory that outlives the process that issued the patches. Sizes are
+ * printed in MB because the report answers a disk question, not a file-count one.
+ *
+ * @param {string[]} [argv] - arguments after `clean`.
+ * @param {object} [options] - injected effects, for tests.
+ * @param {Record<string, string | undefined>} [options.env] - environment to read.
+ * @param {(text: string) => void} [options.write] - output sink.
+ * @param {string} [options.baseDir] - the state base directory, for tests.
+ * @param {number} [options.now] - the current time, for tests.
+ * @returns {Promise<number>} the exit code: 0 unless an argument is unknown.
+ */
+export async function runClean(argv = [], { env = process.env, write, baseDir, now } = {}) {
+  const emit = write ?? ((text) => process.stdout.write(text))
+  let all = false
+  let root = textFrom(env.FLASH_SERVICE_ROOT) ?? process.cwd()
+  /** @type {number | undefined} */
+  let retentionDays
+  for (let index = 0; index < argv.length; index += 1) {
+    const flag = argv[index]
+    const next = () => {
+      index += 1
+      if (index >= argv.length) throw new Error(`${flag} needs a value`)
+      return argv[index]
+    }
+    if (flag === '--all') all = true
+    else if (flag === '--root') root = next()
+    else if (flag === '--patch-retention-days') retentionDays = numberFrom(next(), undefined)
+    else if (flag === '--help' || flag === '-h') {
+      emit(CLEAN_USAGE)
+      return 0
+    } else throw new Error(`unknown argument "${flag}"`)
+  }
+  const config = loadConfig({ env })
+  const report = cleanLayout({
+    ...(baseDir === undefined ? {} : { baseDir }),
+    root: canonicalRoot(root),
+    all,
+    retentionDays: retentionDays ?? config.limits.patchRetentionDays,
+    ...(now === undefined ? {} : { now }),
+    log: (message) => emit(`[flash-mcp clean] ${message}\n`),
+  })
+  emit(`flash-mcp state: ${report.baseDir}\n`)
+  for (const entry of report.stats) {
+    const pids = entry.livePids.length === 0 ? 'none' : entry.livePids.join(', ')
+    emit(
+      `${entry.digest}${entry.own ? ' (this root)' : ''}  live pids: ${pids} | ` +
+        `slot trees: ${String(entry.slotTrees)} (${formatMb(entry.slotBytes)}) | ` +
+        `patches: ${String(entry.patches)} (${formatMb(entry.patchBytes)})\n`,
+    )
+  }
+  const { actions } = report
+  emit(
+    `removed: ${String(actions.deadOwnersRemoved)} dead owner(s), ${String(actions.patchesPruned)} expired patch(es), ` +
+      `${String(actions.emptyDigestsRemoved)} empty digest(s)` +
+      (all ? `, ${String(actions.foreignTreesRemoved)} foreign tree(s)` : '') +
+      '\n',
+  )
+  return 0
+}
+
 /** Entry point: one subcommand, or the server when none is named. */
 async function main() {
   const argv = process.argv.slice(2)
   const command = argv[0] === undefined || argv[0].startsWith('-') ? 'serve' : argv.shift()
   if (command === 'doctor') {
     process.exit(await runDoctor(argv))
+  }
+  if (command === 'clean') {
+    try {
+      process.exit(await runClean(argv))
+    } catch (error) {
+      process.stderr.write(`flash-agents: ${describeError(error)}\n\n${CLEAN_USAGE}`)
+      process.exit(2)
+    }
   }
   if (command !== 'serve') {
     process.stderr.write(`flash-agents: unknown command "${command}"\n\n${USAGE}`)

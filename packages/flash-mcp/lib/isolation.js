@@ -43,7 +43,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -65,6 +65,18 @@ const SLOT_TMP = '.flash-tmp'
 const EMPTY_RETRIES = 3
 const EMPTY_RETRY_DELAY_MS = 50
 
+/**
+ * How long a stored patch survives without being applied. The window is a startup
+ * default; a service overrides it from `limits.patchRetentionDays`.
+ */
+export const PATCH_RETENTION_DAYS = 14
+
+/** One day in milliseconds, the unit of the retention window. */
+const DAY_MS = 24 * 60 * 60 * 1000
+
+/** The shape of a per-root directory name: a truncated sha256 digest. */
+const DIGEST_NAME = /^[0-9a-f]{12}$/
+
 /** An error a caller can branch on, carrying the same `code` shape the service uses. */
 export class IsolationError extends Error {
   /**
@@ -76,6 +88,18 @@ export class IsolationError extends Error {
     this.name = 'IsolationError'
     this.code = code
   }
+}
+
+/**
+ * The one directory every default layout sits under: `$TMPDIR/flash-mcp`.
+ *
+ * It is the unit disk hygiene works on: per-root digests below it, each holding one
+ * directory per server pid and a `patches/` directory that outlives the process.
+ *
+ * @returns {string} the base state directory.
+ */
+function stateBaseDir() {
+  return join(tmpdir(), 'flash-mcp')
 }
 
 /**
@@ -95,7 +119,7 @@ export class IsolationError extends Error {
  */
 function defaultStateDir(root) {
   const instance = randomUUID().slice(0, 8)
-  return join(tmpdir(), 'flash-mcp', rootDigest(root), String(process.pid), instance)
+  return join(stateBaseDir(), rootDigest(root), String(process.pid), instance)
 }
 
 /**
@@ -103,7 +127,7 @@ function defaultStateDir(root) {
  * @param {string} root - the canonical service root.
  * @returns {string} a short stable digest of that path.
  */
-function rootDigest(root) {
+export function rootDigest(root) {
   return createHash('sha256').update(root).digest('hex').slice(0, 12)
 }
 
@@ -120,7 +144,7 @@ function rootDigest(root) {
  * @returns {string} the patch directory for this root.
  */
 function defaultPatchDir(root) {
-  return join(tmpdir(), 'flash-mcp', rootDigest(root), 'patches')
+  return join(stateBaseDir(), rootDigest(root), 'patches')
 }
 
 /**
@@ -136,6 +160,253 @@ function processAlive(pid) {
     // EPERM means it exists and belongs to someone else; ESRCH means it is gone.
     return error?.code === 'EPERM'
   }
+}
+
+/**
+ * The numeric per-pid owner directories of one root digest.
+ * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
+ * @returns {string[]} the owner directory names, in readdir order.
+ */
+function ownerDirs(digestDir) {
+  try {
+    return readdirSync(digestDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name))
+      .map((entry) => entry.name)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * The owners of one digest that are still running.
+ * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
+ * @returns {number[]} the live pids.
+ */
+function livePidsIn(digestDir) {
+  return ownerDirs(digestDir).map(Number).filter(processAlive)
+}
+
+/**
+ * Whether a directory tree holds any file at all.
+ *
+ * A digest left behind by a finished test run contains only empty directories —
+ * the pid shell and an empty `patches/` — so "holds no file" is what makes it
+ * removable without guessing at names.
+ *
+ * @param {string} dir - the directory to walk.
+ * @returns {boolean} true when at least one file exists below it.
+ */
+function treeHasFiles(dir) {
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return false
+  }
+  for (const entry of entries) {
+    if (entry.isFile()) return true
+    if (entry.isDirectory() && treeHasFiles(join(dir, entry.name))) return true
+  }
+  return false
+}
+
+/**
+ * The total size in bytes of the files below a directory.
+ * @param {string} dir - the directory to size.
+ * @returns {number} the sum of the file sizes, unreadable entries counted as zero.
+ */
+function directorySize(dir) {
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  let total = 0
+  for (const entry of entries) {
+    const child = join(dir, entry.name)
+    try {
+      if (entry.isDirectory()) total += directorySize(child)
+      else if (entry.isFile()) total += statSync(child).size
+    } catch {
+      // A file that vanished mid-walk contributes nothing.
+    }
+  }
+  return total
+}
+
+/**
+ * The per-root digest directories under a state base directory.
+ * @param {string} baseDir - usually `$TMPDIR/flash-mcp`.
+ * @returns {string[]} the digest names, sorted.
+ */
+function digestDirs(baseDir) {
+  try {
+    return readdirSync(baseDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && DIGEST_NAME.test(entry.name))
+      .map((entry) => entry.name)
+      .sort()
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Count and size the slot trees and patches of one root digest.
+ * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
+ * @returns {{slotTrees: number, slotBytes: number, patches: number, patchBytes: number}} the facts.
+ */
+function digestStats(digestDir) {
+  let slotTrees = 0
+  let slotBytes = 0
+  for (const pid of ownerDirs(digestDir)) {
+    const slotsDir = join(digestDir, pid, 'slots')
+    let slots
+    try {
+      slots = readdirSync(slotsDir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const slot of slots) {
+      if (!slot.isDirectory()) continue
+      slotTrees += 1
+      slotBytes += directorySize(join(slotsDir, slot.name))
+    }
+  }
+  let patches = 0
+  let patchBytes = 0
+  const patchesDir = join(digestDir, 'patches')
+  try {
+    for (const entry of readdirSync(patchesDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.patch')) continue
+      patches += 1
+      try {
+        patchBytes += statSync(join(patchesDir, entry.name)).size
+      } catch {
+        // A patch that vanished mid-walk contributes nothing.
+      }
+    }
+  } catch {
+    // No `patches/` directory: nothing stored for this root.
+  }
+  return { slotTrees, slotBytes, patches, patchBytes }
+}
+
+/**
+ * Whether a patch record is past the retention window.
+ *
+ * Age is measured from `createdAt`, but a patch salvaged recently is kept even when
+ * its own timestamp is old: the salvage is the only copy of a dead worker's work,
+ * and the sweep just recovered it. A record without a usable `createdAt` is never
+ * pruned — deleting work on a parse failure is worse than keeping a stale file.
+ *
+ * @param {object} record - a parsed patch record.
+ * @param {number} cutoff - epoch milliseconds before which a patch is old.
+ * @returns {boolean} true when the patch and its files may be removed.
+ */
+function patchExpired(record, cutoff) {
+  const createdAt = Number(record?.createdAt)
+  if (!Number.isFinite(createdAt) || createdAt >= cutoff) return false
+  const salvagedAt = Number(record?.salvagedFrom?.sweptAt)
+  if (Number.isFinite(salvagedAt) && salvagedAt >= cutoff) return false
+  return true
+}
+
+/**
+ * Remove this root's patches that are older than the retention window.
+ * @param {string} patchDir - the root's patch directory.
+ * @param {object} [options] - the window and the clock.
+ * @param {number} [options.retentionDays] - how long an unapplied patch survives.
+ * @param {number} [options.now] - the current time, for tests.
+ * @returns {number} how many patches were removed.
+ */
+export function prunePatches(patchDir, { retentionDays = PATCH_RETENTION_DAYS, now = Date.now() } = {}) {
+  const cutoff = now - retentionDays * DAY_MS
+  let names
+  try {
+    names = readdirSync(patchDir)
+  } catch {
+    return 0
+  }
+  let removed = 0
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const patchId = name.slice(0, -'.json'.length)
+    if (!PATCH_ID.test(patchId)) continue
+    const metaPath = join(patchDir, name)
+    let record
+    try {
+      record = JSON.parse(readFileSync(metaPath, 'utf8'))
+    } catch {
+      // A record that cannot be parsed cannot be aged; leave it for a human.
+      continue
+    }
+    if (record?.patchId !== patchId || !patchExpired(record, cutoff)) continue
+    try {
+      rmSync(metaPath, { force: true })
+      rmSync(join(patchDir, `${patchId}.patch`), { force: true })
+      removed += 1
+    } catch {
+      // A patch that will not go away is retried by the next startup.
+    }
+  }
+  return removed
+}
+
+/**
+ * Remove the dead owners' directories of one digest, without salvage.
+ *
+ * Used by `clean --all` for a foreign root: salvage needs the root string, which the
+ * digest does not carry, so the trees go and the patches beside them stay.
+ *
+ * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
+ * @param {(message: string) => void} [log] - progress log.
+ * @returns {number} how many owners were removed.
+ */
+function removeDeadOwnerDirs(digestDir, log = () => {}) {
+  let removed = 0
+  for (const pid of ownerDirs(digestDir)) {
+    if (processAlive(Number(pid))) continue
+    try {
+      rmSync(join(digestDir, pid), { recursive: true, force: true })
+      removed += 1
+    } catch (error) {
+      log(`could not remove dead owner ${pid} in ${digestDir}: ${messageOf(error)}`)
+    }
+  }
+  return removed
+}
+
+/**
+ * Remove digest directories of *other* roots that hold no files and no live owner.
+ *
+ * This is where the test suite's empty leftovers go: every throwaway root used to
+ * leave its own digest behind, so `$TMPDIR/flash-mcp` filled with directories that
+ * held nothing at all. A digest with any file, or with a live owner, is left alone —
+ * this root's digest is never a candidate.
+ *
+ * @param {string} root - the canonical service root.
+ * @param {object} [options] - where the layout lives and how to report.
+ * @param {string} [options.baseDir] - the state base directory.
+ * @param {(message: string) => void} [options.log] - progress log.
+ * @returns {number} how many digest directories were removed.
+ */
+function removeEmptyForeignDigests(root, { baseDir = stateBaseDir(), log = () => {} } = {}) {
+  const own = rootDigest(root)
+  let removed = 0
+  for (const digest of digestDirs(baseDir)) {
+    if (digest === own) continue
+    const dir = join(baseDir, digest)
+    if (livePidsIn(dir).length > 0) continue
+    if (treeHasFiles(dir)) continue
+    try {
+      rmSync(dir, { recursive: true, force: true })
+      removed += 1
+    } catch (error) {
+      log(`could not remove empty state directory ${dir}: ${messageOf(error)}`)
+    }
+  }
+  return removed
 }
 
 /**
@@ -156,14 +427,16 @@ function processAlive(pid) {
  * @param {string} root - the canonical service root.
  * @param {object} options - where to put salvaged patches and how to report.
  * @param {string} options.patchDir - the root's patch directory.
+ * @param {string} [options.baseDir] - the state base directory.
  * @param {(message: string) => void} [options.log] - progress log.
- * @returns {void}
+ * @returns {number} how many dead owners were removed.
  */
-function sweepDeadOwners(root, { patchDir, log = () => {} } = {}) {
-  const parent = join(tmpdir(), 'flash-mcp', rootDigest(root))
-  if (!existsSync(parent)) return
-  for (const entry of readdirSync(parent)) {
-    if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue
+function sweepDeadOwners(root, { patchDir, baseDir = stateBaseDir(), log = () => {} } = {}) {
+  const parent = join(baseDir, rootDigest(root))
+  if (!existsSync(parent)) return 0
+  let removed = 0
+  for (const entry of ownerDirs(parent)) {
+    if (Number(entry) === process.pid) continue
     if (processAlive(Number(entry))) continue
     const ownerDir = join(parent, entry)
     try {
@@ -175,12 +448,14 @@ function sweepDeadOwners(root, { patchDir, log = () => {} } = {}) {
     }
     try {
       rmSync(ownerDir, { recursive: true, force: true })
+      removed += 1
     } catch (error) {
       // A directory that will not go away is retried by the next sweep; refusing to start
       // over it would be the wedge this function exists to prevent.
       log(`could not remove dead owner ${entry}: ${messageOf(error)}`)
     }
   }
+  return removed
 }
 
 /**
@@ -468,6 +743,54 @@ function slotDirectory(stateDir, id, index) {
   return join(stateDir, 'slots', name)
 }
 
+/**
+ * Report and reclaim the default state base: one line of facts per root digest.
+ *
+ * This is what the `clean` CLI command runs. The default reclaims exactly what a
+ * startup does for this root — salvage and remove its dead owners, prune its expired
+ * patches, and drop other roots' empty digest leftovers — while `--all` goes
+ * further and removes the trees of every root that has no live server, because an
+ * operator asking for `--all` has decided nobody is coming back for them. Patches are
+ * never removed by `--all`: they are the only copy of a finished worker's work, and a
+ * root without a live server is precisely where a caller might still want one.
+ *
+ * @param {object} options - what to report and reclaim.
+ * @param {string} [options.baseDir] - the state base directory, usually `$TMPDIR/flash-mcp`.
+ * @param {string} options.root - the canonical service root of this invocation.
+ * @param {boolean} [options.all] - also remove the trees of roots with no live server.
+ * @param {number} [options.retentionDays] - the patch retention window.
+ * @param {number} [options.now] - the current time, for tests.
+ * @param {(message: string) => void} [options.log] - progress log.
+ * @returns {{baseDir: string, own: string, stats: object[], actions: object}} the report.
+ */
+export function cleanLayout({ baseDir = stateBaseDir(), root, all = false, retentionDays = PATCH_RETENTION_DAYS, now = Date.now(), log = () => {} } = {}) {
+  const own = rootDigest(root)
+  // Facts are read before anything is removed, so the report describes what was found.
+  const stats = digestDirs(baseDir).map((digest) => ({
+    digest,
+    own: digest === own,
+    livePids: livePidsIn(join(baseDir, digest)),
+    ...digestStats(join(baseDir, digest)),
+  }))
+  const actions = { deadOwnersRemoved: 0, patchesPruned: 0, emptyDigestsRemoved: 0, foreignTreesRemoved: 0 }
+  const ownDir = join(baseDir, own)
+  if (existsSync(ownDir)) {
+    actions.deadOwnersRemoved = sweepDeadOwners(root, { patchDir: join(ownDir, 'patches'), baseDir, log })
+    actions.patchesPruned = prunePatches(join(ownDir, 'patches'), { retentionDays, now })
+  }
+  actions.emptyDigestsRemoved = removeEmptyForeignDigests(root, { baseDir, log })
+  if (all) {
+    for (const digest of digestDirs(baseDir)) {
+      if (digest === own) continue
+      const dir = join(baseDir, digest)
+      if (livePidsIn(dir).length > 0) continue
+      actions.foreignTreesRemoved += removeDeadOwnerDirs(dir, log)
+    }
+    actions.emptyDigestsRemoved += removeEmptyForeignDigests(root, { baseDir, log })
+  }
+  return { baseDir, own, stats, actions }
+}
+
 export class WorkspaceIsolation {
   /**
    * @param {object} options - isolation settings.
@@ -477,9 +800,11 @@ export class WorkspaceIsolation {
    *   it is omitted the layout is per root *and* per process, so two services cannot
    *   share a tree or a patch directory by accident. A configured directory is used as
    *   given: one service per directory is then the deployment's responsibility.
+   * @param {number} [options.patchRetentionDays] - how many days an unapplied patch is
+   *   kept before the startup prune removes it.
    * @param {(message: string) => void} [options.log] - progress log.
    */
-  constructor({ root, slots = 2, stateDir, log = () => {} }) {
+  constructor({ root, slots = 2, stateDir, patchRetentionDays = PATCH_RETENTION_DAYS, log = () => {} }) {
     this.root = resolve(root)
     /** Whether this instance owns a private state directory it may clear. */
     this.ownsStateDir = stateDir === undefined || stateDir === null || stateDir === ''
@@ -490,6 +815,7 @@ export class WorkspaceIsolation {
      * cannot take a patch the caller was told it could still apply.
      */
     this.patchDir = this.ownsStateDir ? defaultPatchDir(this.root) : join(this.stateDir, 'calls')
+    this.patchRetentionDays = patchRetentionDays
     this.log = log
     this.clones = 0
     /** Patches kept for a later `flash_apply`. @type {Map<string, object>} */
@@ -510,8 +836,19 @@ export class WorkspaceIsolation {
     // would hand a worker another call's leftovers. Their unfinished work is stored as a
     // patch on the way out (see `sweepDeadOwners`), because a restart must not be the end
     // of a round that was minutes from finishing.
+    //
+    // After the sweep, disk hygiene runs in the same pass: other roots' empty digest
+    // directories are dropped, and this root's patches past the retention window are
+    // pruned. Both happen before `#loadPatches`, so the in-memory view only ever holds
+    // patches that still exist on disk. The prune runs for a configured state directory
+    // too, because an unapplied patch ages out wherever it is stored.
+    mkdirSync(this.stateDir, { recursive: true })
     mkdirSync(this.patchDir, { recursive: true })
-    if (this.ownsStateDir) sweepDeadOwners(this.root, { patchDir: this.patchDir, log: this.log })
+    if (this.ownsStateDir) {
+      sweepDeadOwners(this.root, { patchDir: this.patchDir, log: this.log })
+      removeEmptyForeignDigests(this.root, { log: this.log })
+    }
+    prunePatches(this.patchDir, { retentionDays: this.patchRetentionDays })
     rmSync(join(this.stateDir, 'slots'), { recursive: true, force: true })
     // Patches already on disk are made available to `apply` and `listPatches` up front,
     // so one this sweep just salvaged behaves exactly like one this process collected.
@@ -777,6 +1114,10 @@ export class WorkspaceIsolation {
         createdAt: Date.now(),
         appliedAt: null,
       }
+      // The patch directory is shared with sibling services and the startup prune, so
+      // it is recreated defensively: writing a finished call's patch must not fail
+      // because a concurrent sweep decided this digest looked empty.
+      mkdirSync(this.patchDir, { recursive: true })
       writeFileSync(patchPath, diff)
       this.#writeMeta(record)
       this.patches.set(patchId, record)
@@ -927,6 +1268,7 @@ export class WorkspaceIsolation {
    * @returns {void}
    */
   #writeMeta(record) {
+    mkdirSync(this.patchDir, { recursive: true })
     writePatchMeta(record)
   }
 

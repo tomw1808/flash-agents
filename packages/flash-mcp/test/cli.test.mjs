@@ -31,6 +31,7 @@ test('defaults are taken from the configuration, not from literals', () => {
   assert.equal(options.diffChars, 99)
   // Untouched limits still come from the shipped defaults.
   assert.equal(options.perItemChars, DEFAULT_CONFIG.limits.perItemChars)
+  assert.equal(options.patchRetentionDays, DEFAULT_CONFIG.limits.patchRetentionDays)
   assert.equal(options.isolate, 'copy')
 })
 
@@ -61,6 +62,9 @@ test('a set environment value and a flag both override the configuration', () =>
   assert.equal(fromFlags.slots, 5)
   assert.equal(fromFlags.isolate, 'none')
   assert.equal(fromFlags.model, 'other:latest')
+
+  const retention = parseOptions(['--patch-retention-days', '3'], {}, config)
+  assert.equal(retention.patchRetentionDays, 3)
 })
 
 test('an unusable option is refused', () => {

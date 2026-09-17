@@ -592,3 +592,99 @@ test('a sweep of a dead owner with a clean slot leaves no patch', async () => {
     next.close()
   }
 })
+
+// ── disk hygiene ─────────────────────────────────────────────────────────────
+
+/** A patch record and its file, laid out exactly as `collect` writes one. */
+function writePatchRecord(patchDir, root, { createdAt, ...extra }) {
+  const patchId = `flash-${randomUUID()}`
+  writeFileSync(join(patchDir, `${patchId}.patch`), 'a stored patch\n')
+  writeFileSync(
+    join(patchDir, `${patchId}.json`),
+    `${JSON.stringify({ patchId, root, base: 'base', filesChanged: [], diffstat: '', createdAt, appliedAt: null, ...extra }, null, 2)}\n`,
+  )
+  return patchId
+}
+
+test('construction prunes patches past the retention window, keeping fresh and recently salvaged work', async () => {
+  const repo = makeRepo()
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-prune-')))
+  const patchDir = join(stateDir, 'calls')
+  mkdirSync(patchDir, { recursive: true })
+  const now = Date.now()
+  const day = 24 * 60 * 60 * 1000
+  const ids = {
+    expired: writePatchRecord(patchDir, repo, { createdAt: now - 30 * day }),
+    fresh: writePatchRecord(patchDir, repo, { createdAt: now - day }),
+    salvaged: writePatchRecord(patchDir, repo, {
+      createdAt: now - 30 * day,
+      salvagedFrom: { pid: 4194303, slotDir: '/gone', sweptAt: now - day },
+    }),
+    oldSalvage: writePatchRecord(patchDir, repo, {
+      createdAt: now - 30 * day,
+      salvagedFrom: { pid: 4194303, slotDir: '/gone', sweptAt: now - 30 * day },
+    }),
+  }
+
+  const isolation = new WorkspaceIsolation({ root: repo, slots: 1, stateDir })
+  try {
+    const gone = (name) => !existsSync(join(patchDir, `${ids[name]}.patch`))
+    assert.equal(gone('expired'), true, 'a patch older than the window is pruned')
+    assert.equal(gone('fresh'), false, 'a patch inside the window is kept')
+    assert.equal(gone('salvaged'), false, 'a patch salvaged inside the window is kept, whatever its createdAt')
+    assert.equal(gone('oldSalvage'), true, 'a patch whose salvage is also old is pruned')
+    // A pruned patch is neither on disk nor offered for apply.
+    const listed = isolation.listPatches().map((record) => record.patchId)
+    assert.equal(listed.includes(ids.expired), false)
+    assert.equal(listed.includes(ids.fresh), true)
+  } finally {
+    isolation.close()
+  }
+})
+
+test('the patch retention window is configurable', async () => {
+  const repo = makeRepo()
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-retain-')))
+  const patchDir = join(stateDir, 'calls')
+  mkdirSync(patchDir, { recursive: true })
+  const id = writePatchRecord(patchDir, repo, { createdAt: Date.now() - 2 * 24 * 60 * 60 * 1000 })
+
+  const wide = new WorkspaceIsolation({ root: repo, slots: 1, stateDir, patchRetentionDays: 14 })
+  try {
+    assert.equal(existsSync(join(patchDir, `${id}.patch`)), true, 'a two-day-old patch survives a 14-day window')
+  } finally {
+    wide.close()
+  }
+  const narrow = new WorkspaceIsolation({ root: repo, slots: 1, stateDir, patchRetentionDays: 1 })
+  try {
+    assert.equal(existsSync(join(patchDir, `${id}.patch`)), false, 'the same patch is pruned by a one-day window')
+  } finally {
+    narrow.close()
+  }
+})
+
+test('startup drops other roots’ empty digest directories and keeps ones with content', async () => {
+  const repo = makeRepo()
+  const anchor = new WorkspaceIsolation({ root: repo, slots: 1 })
+  const base = dirname(dirname(dirname(anchor.stateDir)))
+  anchor.close()
+
+  // A digest left by a throwaway root: only empty directories, no live owner.
+  const emptyDigest = join(base, '00ff00ff00ff')
+  mkdirSync(join(emptyDigest, 'patches'), { recursive: true })
+  // A digest with an owner's tree: not empty, so it is left alone.
+  const usedDigest = join(base, '0f1e2d3c4b5a')
+  const usedSlot = join(usedDigest, '4194303', 'slots', 'slot-0')
+  mkdirSync(usedSlot, { recursive: true })
+  writeFileSync(join(usedSlot, 'left.txt'), 'work\n')
+
+  const next = new WorkspaceIsolation({ root: repo, slots: 1 })
+  try {
+    assert.equal(existsSync(emptyDigest), false, 'an empty digest of another root is removed')
+    assert.equal(existsSync(usedSlot), true, 'a digest holding a tree is kept')
+    assert.equal(existsSync(dirname(dirname(dirname(next.stateDir)))), true, 'this root’s own digest is never a candidate')
+  } finally {
+    next.close()
+  }
+})
+

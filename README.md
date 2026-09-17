@@ -354,6 +354,7 @@ to apply.
 | `--slots <n>` | 2 | how many copies may be in flight; each one is a runtime process |
 | `--state-dir <path>` | private to this root and process | where copies and returned patches live |
 | `--diff-chars <n>` | 20000 | how much of a patch a result carries |
+| `--patch-retention-days <n>` | 14 | how long an unapplied patch is kept before the startup prune removes it |
 | `--log-file <path>` | unset | append every diagnostic line, timestamped, to a file as well as stderr |
 
 The state directory is keyed by root, by process, and by pool:
@@ -371,8 +372,14 @@ processes that no longer exist are swept at startup; a live service's trees neve
 Patches sit one level above that, in `<sha256(root)[0:12]>/patches`, precisely because the sweep
 reclaims a dead owner's directory whole: a self-test lost a finished worker's patch that way when
 the next service started on the same root. A patch therefore outlives the process that issued it,
-and a later service on the same root can still apply it — at the cost of accumulating until you
-delete them.
+and a later service on the same root can still apply it. Patches are not kept forever: each startup
+prunes this root's patches whose `createdAt` is older than `limits.patchRetentionDays` (default
+14 days), never one that was salvaged inside that window, and drops other roots' digest
+directories that hold no files and no live server. `flash-agents clean` reports the layout per root
+digest — live server pids, and the number and MB of slot trees and patches — and reclaims what a
+startup would; `clean --all` also removes the trees of roots with no live server. Patches are never
+removed by `--all`, because a root without a live server is exactly where a caller might still want
+one.
 
 A patch is more than a file. Each one is stored with a record — the root it was computed for, the
 base commit, the files it touches, and whether it has been applied — and `flash_apply` refuses:
@@ -429,7 +436,7 @@ naming the path that is wrong instead of silently falling back to something else
 ```json
 {
   "route": { "provider": "ollama", "model": "deepseek-v4.1-flash:cloud" },
-  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 3600000, "diffChars": 20000 },
+  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 3600000, "diffChars": 20000, "patchRetentionDays": 14 },
   "guard": { "protectedSegments": [".git"], "fenceMutations": true },
   "dsh": { "package": "@deepseek-ai/dsh", "minVersion": "0.1.5" }
 }
