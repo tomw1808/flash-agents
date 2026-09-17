@@ -139,23 +139,154 @@ function processAlive(pid) {
 }
 
 /**
- * Remove the state directories of processes that no longer exist.
+ * Remove the state directories of processes that no longer exist, salvaging unfinished
+ * work first.
  *
  * Only siblings for *this root* are considered, and only directories named after a
  * numeric pid: a live service's trees are never touched, which is the property the
  * constructor's blanket `rm -rf slots` did not have.
  *
+ * A dead owner's tree may hold a worker's mid-task edit, and removing the directory
+ * whole used to lose it with the restart. Every slot under `slots/` — under whatever
+ * name, including the retired `<id>-<n>` generations — is therefore examined before the
+ * owner is removed, and a dirty tree is stored as a patch beside the surviving ones. A
+ * tree that cannot be read is logged and skipped: the sweep's job is to start the next
+ * server, never to wedge on a corpse.
+ *
  * @param {string} root - the canonical service root.
+ * @param {object} options - where to put salvaged patches and how to report.
+ * @param {string} options.patchDir - the root's patch directory.
+ * @param {(message: string) => void} [options.log] - progress log.
  * @returns {void}
  */
-function sweepDeadOwners(root) {
+function sweepDeadOwners(root, { patchDir, log = () => {} } = {}) {
   const parent = join(tmpdir(), 'flash-mcp', rootDigest(root))
   if (!existsSync(parent)) return
   for (const entry of readdirSync(parent)) {
     if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue
     if (processAlive(Number(entry))) continue
-    rmSync(join(parent, entry), { recursive: true, force: true })
+    const ownerDir = join(parent, entry)
+    try {
+      salvageOwner(ownerDir, { root, patchDir, log, pid: Number(entry) })
+    } catch (error) {
+      // Salvage is best-effort: whatever went wrong, the dead directory is still dead
+      // weight and the new server must come up.
+      log(`could not salvage work from dead owner ${entry}: ${messageOf(error)}`)
+    }
+    try {
+      rmSync(ownerDir, { recursive: true, force: true })
+    } catch (error) {
+      // A directory that will not go away is retried by the next sweep; refusing to start
+      // over it would be the wedge this function exists to prevent.
+      log(`could not remove dead owner ${entry}: ${messageOf(error)}`)
+    }
   }
+}
+
+/**
+ * Store every salvageable tree under one dead owner's `slots/` directory.
+ *
+ * Names are not assumed: a slot that was retired once lives at `slot-<id>-1`, and a
+ * future naming change must not silently drop work. The directory is read as a plain
+ * list and every entry is offered to `salvageSlot`.
+ *
+ * @param {string} ownerDir - the dead owner's per-pid directory.
+ * @param {object} options - root, patch directory, log, and the owner's pid.
+ * @returns {void}
+ */
+function salvageOwner(ownerDir, { root, patchDir, log, pid }) {
+  let names
+  try {
+    names = readdirSync(join(ownerDir, 'slots'))
+  } catch {
+    // No `slots/` at all (or an unreadable one) is the common, fast case: nothing to keep.
+    return
+  }
+  const sweptAt = Date.now()
+  for (const name of names) {
+    const slotDir = join(ownerDir, 'slots', name)
+    try {
+      const salvaged = salvageSlot(slotDir, { root, patchDir, pid, sweptAt })
+      if (salvaged !== null) {
+        log(
+          `salvaged ${salvaged.patchId} from dead owner ${String(pid)} slot ${slotDir}: ` +
+            salvaged.diffstat.replace(/\s*\n\s*/g, '; '),
+        )
+      }
+    } catch (error) {
+      // A tree that cannot be read or whose diff fails is named and removed anyway. The
+      // alternative — wedging the next server on a corpse until a human intervenes — is
+      // exactly the failure this sweep exists to avoid.
+      log(`could not salvage ${slotDir} from dead owner ${String(pid)}: ${messageOf(error)}`)
+    }
+  }
+}
+
+/**
+ * Turn one dead slot's uncommitted work into a stored patch.
+ *
+ * The tree is diffed exactly as `collect` diffs a live one: everything is staged with
+ * `git add -A`, and an empty `git status` after that means there is nothing to keep. A
+ * tree without a `flash base` commit was not prepared by this service — an empty or
+ * freshly retired directory, say — so it is left for the removal that follows. That
+ * check keeps the common clean-or-empty case to one cheap `git log`.
+ *
+ * @param {string} slotDir - the tree to salvage.
+ * @param {object} options - the root, patch directory, dead pid, and sweep time.
+ * @returns {{patchId: string, diffstat: string} | null} the stored patch, or null.
+ */
+function salvageSlot(slotDir, { root, patchDir, pid, sweptAt }) {
+  if (!isGitWorkTree(slotDir)) return null
+  const base = findFlashBase(slotDir)
+  if (base === null) return null
+  git(['add', '-A'], slotDir)
+  if (git(['status', '--porcelain'], slotDir).trim() === '') return null
+  const patchId = `flash-${randomUUID()}`
+  const patchPath = join(patchDir, `${patchId}.patch`)
+  const metaPath = join(patchDir, `${patchId}.json`)
+  const diff = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', base], slotDir)
+  const diffstat = git(['diff', '--cached', '--stat', '--no-color', base], slotDir).trim()
+  const names = git(['diff', '--cached', '--name-status', base], slotDir)
+  const filesChanged = names.split('\n').filter((line) => line.trim().length > 0)
+  const record = {
+    patchId,
+    patchPath,
+    metaPath,
+    root,
+    base,
+    filesChanged,
+    diffstat,
+    createdAt: Date.now(),
+    appliedAt: null,
+    // Where this patch came from, so a log line or a listing has an answer to "whose
+    // tree was this, and when did we find it?".
+    salvagedFrom: { pid, slotDir, sweptAt },
+  }
+  mkdirSync(patchDir, { recursive: true })
+  writeFileSync(patchPath, diff)
+  writePatchMeta(record)
+  return { patchId, diffstat }
+}
+
+/**
+ * The base commit `prepare` recorded in a tree, or null when there is none.
+ *
+ * The base is committed with the fixed subject `flash base`, so it can be recognized
+ * from the tree alone — which is all a dead owner leaves behind. The most recent such
+ * commit is used, so a worker that committed on top of the base is still diffed from
+ * the state the call started at.
+ *
+ * @param {string} dir - a git work tree.
+ * @returns {string | null} the base commit id, or null.
+ */
+function findFlashBase(dir) {
+  const log = git(['log', '--format=%H%x09%s'], dir)
+  for (const line of log.split('\n')) {
+    const tab = line.indexOf('\t')
+    if (tab < 0) continue
+    if (line.slice(tab + 1).trim() === 'flash base') return line.slice(0, tab)
+  }
+  return null
 }
 
 /** Arguments that keep a commit in a throwaway copy from running the caller's hooks. */
@@ -186,6 +317,23 @@ function git(args, cwd) {
     const stderr = typeof error?.stderr === 'string' ? error.stderr.trim() : ''
     throw new Error(`git ${args.join(' ')} failed in ${cwd}${stderr.length === 0 ? '' : `: ${stderr}`}`)
   }
+}
+
+/**
+ * Write a patch's record next to it, keeping only the fields a restart must trust.
+ *
+ * `patchPath` and `metaPath` are derivable from the patch directory and the id, so they
+ * are not persisted; `salvagedFrom` is persisted only when it exists, so an ordinary
+ * patch's record keeps its previous shape.
+ *
+ * @param {object} record - the record to store.
+ * @returns {void}
+ */
+function writePatchMeta(record) {
+  const { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt, salvagedFrom } = record
+  const meta = { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt }
+  if (salvagedFrom !== undefined) meta.salvagedFrom = salvagedFrom
+  writeFileSync(record.metaPath, `${JSON.stringify(meta, null, 2)}\n`)
 }
 
 /**
@@ -359,10 +507,15 @@ export class WorkspaceIsolation {
     // Only trees this process owns are cleared. A default state directory is private
     // by construction, so clearing it cannot touch a live service; the dead owners of
     // previous runs are removed too, since their copies are dead weight whose reuse
-    // would hand a worker another call's leftovers.
-    if (this.ownsStateDir) sweepDeadOwners(this.root)
-    rmSync(join(this.stateDir, 'slots'), { recursive: true, force: true })
+    // would hand a worker another call's leftovers. Their unfinished work is stored as a
+    // patch on the way out (see `sweepDeadOwners`), because a restart must not be the end
+    // of a round that was minutes from finishing.
     mkdirSync(this.patchDir, { recursive: true })
+    if (this.ownsStateDir) sweepDeadOwners(this.root, { patchDir: this.patchDir, log: this.log })
+    rmSync(join(this.stateDir, 'slots'), { recursive: true, force: true })
+    // Patches already on disk are made available to `apply` and `listPatches` up front,
+    // so one this sweep just salvaged behaves exactly like one this process collected.
+    this.#loadPatches()
     for (const slot of this.slots) {
       mkdirSync(slot.dir, { recursive: true })
       slot.tmpDir = join(slot.dir, SLOT_TMP)
@@ -372,6 +525,60 @@ export class WorkspaceIsolation {
   /** How many trees may be in flight at once. */
   get size() {
     return this.slots.length
+  }
+
+  /**
+   * Read the patch records already on disk into memory.
+   *
+   * A patch must survive the process that issued it, so the records are the source of
+   * truth and `apply` would re-read one anyway. Loading them on construction makes the
+   * in-memory view match disk: `listPatches` can then answer without touching the
+   * filesystem, and a record salvaged by the sweep is visible immediately.
+   *
+   * Records for another root are skipped: a patch is only applicable to the repository
+   * it was computed for, and keeping a foreign record in `patches` would defeat the
+   * refusal in `#lookupPatch`.
+   *
+   * @returns {void}
+   */
+  #loadPatches() {
+    let names
+    try {
+      names = readdirSync(this.patchDir)
+    } catch {
+      return
+    }
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue
+      const patchId = name.slice(0, -'.json'.length)
+      if (!PATCH_ID.test(patchId) || this.patches.has(patchId)) continue
+      const metaPath = join(this.patchDir, name)
+      let record
+      try {
+        record = JSON.parse(readFileSync(metaPath, 'utf8'))
+      } catch {
+        // A record that cannot be parsed is not a patch anybody can apply; it must not
+        // stop the service from starting.
+        continue
+      }
+      if (record?.patchId !== patchId || record?.root !== this.root) continue
+      record.metaPath = metaPath
+      record.patchPath = join(this.patchDir, `${patchId}.patch`)
+      this.patches.set(patchId, record)
+    }
+  }
+
+  /**
+   * The patches this service can still apply, newest first.
+   *
+   * Newest first is the order a caller reads in: the patch it was just told about, then
+   * the ones from earlier calls — including any a previous server salvaged from a tree
+   * that was mid-task when it died.
+   *
+   * @returns {object[]} the patch records, most recently created first.
+   */
+  listPatches() {
+    return [...this.patches.values()].sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0))
   }
 
   /**
@@ -667,7 +874,10 @@ export class WorkspaceIsolation {
       )
     }
     const held = this.patches.get(patchId)
-    if (held !== undefined) return held
+    if (held !== undefined) {
+      this.#refreshAppliedAt(held)
+      return held
+    }
     const metaPath = join(this.patchDir, `${patchId}.json`)
     if (!existsSync(metaPath)) {
       throw new Error(`no patch ${patchId} is held by this service; patches are kept in ${this.patchDir}`)
@@ -690,16 +900,34 @@ export class WorkspaceIsolation {
   }
 
   /**
+   * Take the recorded apply from disk when a held record does not have one.
+   *
+   * The patch directory is shared by every service over one root, so a record loaded here
+   * at construction can be applied by a sibling instance afterwards. Without this, the
+   * held copy would still say `appliedAt: null` and the "already applied" refusal would
+   * depend on which process won a race. A record this process just wrote is left alone.
+   *
+   * @param {object} record - the held record to refresh in place.
+   * @returns {void}
+   */
+  #refreshAppliedAt(record) {
+    if (record.appliedAt !== null && record.appliedAt !== undefined) return
+    if (typeof record.metaPath !== 'string') return
+    try {
+      const onDisk = JSON.parse(readFileSync(record.metaPath, 'utf8'))
+      if (onDisk?.appliedAt !== null && onDisk?.appliedAt !== undefined) record.appliedAt = onDisk.appliedAt
+    } catch {
+      // An unreadable record keeps its in-memory value; `apply` still checks the patch file.
+    }
+  }
+
+  /**
    * Write a patch's record next to it.
    * @param {object} record - the record to store.
    * @returns {void}
    */
   #writeMeta(record) {
-    const { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt } = record
-    writeFileSync(
-      record.metaPath,
-      `${JSON.stringify({ patchId, root, base, filesChanged, diffstat, createdAt, appliedAt }, null, 2)}\n`,
-    )
+    writePatchMeta(record)
   }
 
   /**

@@ -41,6 +41,41 @@ function makePool(repo, slots = 2) {
   return { isolation, stateDir }
 }
 
+/**
+ * Lay out a dead owner's per-pid directory with one slot tree under `repo`'s default
+ * layout, and return the paths so a test can populate the tree.
+ *
+ * A throwaway default-layout pool is constructed only to learn where the layout keeps
+ * per-pid directories for this root; it is closed before the dead owner is created.
+ *
+ * @param {string} repo - the service root.
+ * @param {object} [options] - dead owner pid and slot name.
+ * @returns {{owner: string, parent: string, slotDir: string}} the dead owner paths.
+ */
+function makeDeadOwner(repo, { pid = 4194303, slot = 'slot-0' } = {}) {
+  const anchor = new WorkspaceIsolation({ root: repo, slots: 1 })
+  const parent = dirname(dirname(anchor.stateDir))
+  anchor.close()
+  const owner = join(parent, String(pid))
+  const slotDir = join(owner, 'slots', slot)
+  mkdirSync(slotDir, { recursive: true })
+  return { owner, parent, slotDir }
+}
+
+/** Make `dir` a git tree sitting on a `flash base` commit, exactly as `prepare` leaves one. */
+function makeFlashBaseTree(dir) {
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir })
+  writeFileSync(join(dir, 'README.md'), '# project\n')
+  writeFileSync(join(dir, 'keep.txt'), 'keep me\n')
+  execFileSync('git', ['add', '-A'], { cwd: dir })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'flash base'], { cwd: dir })
+}
+
+/** A patch record this instance holds that came from a sweep rather than from `collect`. */
+function salvagedPatch(isolation) {
+  return isolation.listPatches().find((record) => record.salvagedFrom !== undefined)
+}
+
 test('a worker writes into a copy, and the caller’s tree is untouched', async () => {
   const repo = makeRepo()
   const { isolation } = makePool(repo)
@@ -481,4 +516,79 @@ test('a sweep reclaims a dead owner’s trees without taking its patches', async
   assert.equal(readFileSync(join(repo, 'from-worker.txt'), 'utf8'), 'work worth keeping\n')
   await first.close()
   await second.close()
+})
+
+test('a sweep salvages a dead owner’s unfinished work as an applicable patch', async () => {
+  // The failure this guards: the host restarts the server, the next server's sweep deletes
+  // every per-pid directory whole, and a worker's forty-minute fix — sitting uncommitted in
+  // a disposable tree — goes with it. The tree is a git work tree with a `flash base`
+  // commit and a modified file: exactly a prepared slot whose call was cut off.
+  const repo = makeRepo()
+  // A retired slot keeps a `<id>-<n>` name, so use one to prove every `slots/` entry is
+  // examined rather than just the generation-zero names.
+  const { owner, slotDir } = makeDeadOwner(repo, { slot: 'slot-0-1' })
+  makeFlashBaseTree(slotDir)
+  writeFileSync(join(slotDir, 'keep.txt'), 'the lost fix\n')
+  writeFileSync(join(slotDir, 'new.txt'), 'also lost\n')
+
+  const logLines = []
+  const next = new WorkspaceIsolation({ root: repo, slots: 1, log: (message) => logLines.push(message) })
+  try {
+    // The directory is still reclaimed, but only after the work was taken out of it.
+    assert.equal(existsSync(owner), false, 'the dead owner directory is removed')
+    assert.equal(existsSync(slotDir), false, 'the slot tree is removed with it')
+
+    const salvaged = salvagedPatch(next)
+    assert.ok(salvaged, 'the salvage leaves a patch record a later apply can use')
+    assert.equal(salvaged.appliedAt, null)
+    assert.equal(salvaged.root, repo)
+    assert.equal(salvaged.salvagedFrom.pid, 4194303)
+    assert.equal(salvaged.salvagedFrom.slotDir, slotDir)
+    assert.equal(typeof salvaged.salvagedFrom.sweptAt, 'number')
+    // The sweep says what it saved, in one line, naming the patch and the diffstat.
+    const salvageLine = logLines.find((line) => line.startsWith('salvaged '))
+    assert.ok(salvageLine, `expected a salvage log line in ${JSON.stringify(logLines)}`)
+    assert.match(salvageLine, new RegExp(salvaged.patchId))
+    assert.doesNotMatch(salvageLine, /\n/)
+    assert.match(salvageLine, /2 files changed/)
+    // The record travels on disk with its provenance, not just in memory.
+    const meta = JSON.parse(readFileSync(join(next.patchDir, `${salvaged.patchId}.json`), 'utf8'))
+    assert.deepEqual(meta.salvagedFrom, salvaged.salvagedFrom)
+
+    // The stored diff is the dead worker's change, tracked files included.
+    assert.match(readFileSync(join(next.patchDir, `${salvaged.patchId}.patch`), 'utf8'), /the lost fix/)
+    assert.match(readFileSync(join(next.patchDir, `${salvaged.patchId}.patch`), 'utf8'), /also lost/)
+    assert.deepEqual(
+      salvaged.filesChanged.map((line) => line.split('\t').at(-1)).sort(),
+      ['keep.txt', 'new.txt'],
+    )
+
+    // The caller's tree never saw the dead owner's edits, which is why the patch matters...
+    assert.equal(readFileSync(join(repo, 'keep.txt'), 'utf8'), 'keep me\n')
+    assert.equal(existsSync(join(repo, 'new.txt')), false)
+
+    // ...and applying it by id to the caller's fresh checkout reproduces the change.
+    const applied = next.apply({ patchId: salvaged.patchId })
+    assert.equal(applied.applied, true)
+    assert.equal(readFileSync(join(repo, 'keep.txt'), 'utf8'), 'the lost fix\n')
+    assert.equal(readFileSync(join(repo, 'new.txt'), 'utf8'), 'also lost\n')
+  } finally {
+    next.close()
+  }
+})
+
+test('a sweep of a dead owner with a clean slot leaves no patch', async () => {
+  const repo = makeRepo()
+  const { owner, slotDir } = makeDeadOwner(repo)
+  // A prepared tree at its base with nothing staged or modified: there is no work to keep.
+  makeFlashBaseTree(slotDir)
+
+  const next = new WorkspaceIsolation({ root: repo, slots: 1 })
+  try {
+    assert.equal(existsSync(owner), false, 'the clean dead owner is still removed')
+    assert.equal(existsSync(slotDir), false)
+    assert.equal(salvagedPatch(next), undefined, 'a clean slot must not produce a patch')
+  } finally {
+    next.close()
+  }
 })
