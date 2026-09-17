@@ -16,7 +16,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, sep } from 'node:path'
 import { test } from 'node:test'
@@ -111,6 +111,42 @@ test('a wrecked tree leaves the repository intact, and the next call starts clea
   assert.equal(existsSync(join(repo, 'junk.txt')), false)
   assert.equal(existsSync(join(repo, 'README.md')), true)
   isolation.close()
+})
+
+test('retiring a tree keeps it in place and moves the slot to a fresh directory', async () => {
+  const repo = makeRepo()
+  const { isolation } = makePool(repo, 1)
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+
+  // The session that ran here holds the tree's path as an absolute string and may still
+  // be writing, so the orphan must keep its name and its contents.
+  writeFileSync(join(slot.dir, 'worker.txt'), 'still being written\n')
+  const first = slot.dir
+  isolation.retire(slot)
+
+  assert.equal(existsSync(first), true, 'the orphaned tree stays at its original path')
+  assert.equal(readFileSync(join(first, 'worker.txt'), 'utf8'), 'still being written\n')
+  assert.deepEqual(slot.orphans, [first], 'the orphan is remembered so close() removes it')
+  // The slot itself points at a fresh directory it has never used, and it is empty.
+  assert.notEqual(slot.dir, first)
+  assert.deepEqual(readdirSync(slot.dir), [])
+
+  // A second retire yields a third distinct path, and keeps the second orphan too.
+  isolation.prepare(slot)
+  writeFileSync(join(slot.dir, 'second.txt'), 'second\n')
+  const second = slot.dir
+  isolation.retire(slot)
+  assert.notEqual(second, first)
+  assert.notEqual(slot.dir, second)
+  assert.deepEqual(slot.orphans, [first, second])
+  assert.equal(existsSync(second), true)
+
+  // close() removes the current tree and every orphan it left behind.
+  isolation.close()
+  assert.equal(existsSync(first), false)
+  assert.equal(existsSync(second), false)
+  assert.equal(existsSync(slot.dir), false)
 })
 
 test('one slot is held by one call at a time, and waiters are served in order', async () => {

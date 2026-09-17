@@ -8,7 +8,7 @@ import test from 'node:test'
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 
 import {
   BATCH_SCRIPT,
@@ -41,6 +41,9 @@ class FakeSdkClient {
     this.running = false
     this.starts = 0
     this.initializes = []
+    /** Every cwd a runtime was booted with, and every shutdown it received. */
+    this.shutdowns = 0
+    this.shutdownCwds = []
     /** When set, the "worker" writes this file into whatever tree it was given. */
     this.writes = undefined
     this.cwd = undefined
@@ -84,6 +87,8 @@ class FakeSdkClient {
   }
 
   async shutdown() {
+    this.shutdowns += 1
+    this.shutdownCwds.push(this.cwd)
     this.running = false
   }
 
@@ -830,8 +835,9 @@ test('the runtime keeps the platform TMPDIR, and the worker is told about .flash
   await service.close()
 })
 
-test('a timed-out isolated call reports what its tree held and retires the tree', async () => {
+test('a timed-out isolated call reports what its tree held, retires the tree, and stops its runtime', async () => {
   const { root, client, service } = makeIsolatedService({ slots: 1, script: 'silent', taskTimeoutMs: 100 })
+  const original = service.isolation.slots[0].dir
   const error = await service.flashTask({ task: 'never finishes', cwd: root }).catch((caught) => caught)
   assert.equal(error.code, 'TIMEOUT')
   // The session cannot be stopped, so the caller is told what the tree held when the
@@ -841,15 +847,25 @@ test('a timed-out isolated call reports what its tree held and retires the tree'
   const stored = /stored as patch (flash-[0-9a-f-]+): 1 file changed, 1 insertion/.exec(error.message)
   assert.ok(stored, `expected a stored patch in: ${error.message}`)
   assert.ok(service.isolation.patches.has(stored[1]), 'the salvaged patch is kept for flash_apply')
-  // The tree the orphaned session may still write to was renamed beside the slot, and
-  // the slot's own directory is empty again, so the next call cannot inherit its edits.
+
+  // The orphaned tree keeps its name and stays put: the session (and any build process it
+  // spawned) holds that path as an absolute string, so renaming it away only sent its
+  // late writes to the empty directory left at the old name. The slot moves instead.
   const slot = service.isolation.slots[0]
-  assert.ok(readdirSync(dirname(slot.dir)).some((name) => name.startsWith('slot-0-orphan-')))
-  assert.deepEqual(readdirSync(slot.dir), [])
-  // The slot went back into the pool: the next call is served a fresh copy at the same path.
+  assert.notEqual(slot.dir, original, 'the slot must move to a path it has never used')
+  assert.equal(existsSync(original), true, 'the orphaned tree must stay at its original path')
+  assert.equal(readFileSync(join(original, 'worker-output.txt'), 'utf8'), 'written by the worker\n')
+  assert.deepEqual(readdirSync(slot.dir), [], 'the slot’s new directory starts empty')
+  assert.deepEqual(slot.orphans, [original], 'the orphan is remembered so close() can remove it')
+
+  // A runtime is keyed by the tree it was rooted at, so the runtime that ran the timed-out
+  // session is the one for the old directory; it is shut down, which is the only
+  // cancellation the service has. The new directory then boots a runtime of its own.
+  assert.ok(client.shutdownCwds.includes(original), `expected a shutdown of ${original}, got ${JSON.stringify(client.shutdownCwds)}`)
   client.script = defaultScript
   await service.flashTask({ task: 'write one file', cwd: root })
-  assert.equal(client.initializes.length, 1, 'the runtime is reused; only the tree is renewed')
+  assert.equal(client.initializes.length, 2, 'the new tree gets a fresh runtime')
+  assert.equal(client.initializes[1].cwd, slot.dir)
   await service.close()
 })
 

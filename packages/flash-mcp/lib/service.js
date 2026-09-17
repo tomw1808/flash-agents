@@ -383,7 +383,7 @@ export class FlashTaskService {
         applied,
       })
     } catch (error) {
-      if (slot !== undefined && error?.code === 'TIMEOUT') this.#salvageTimedOut(pool, slot, error)
+      if (slot !== undefined && error?.code === 'TIMEOUT') await this.#salvageTimedOut(pool, slot, error, profileName)
       throw error
     } finally {
       if (slot !== undefined) pool.release(slot)
@@ -398,11 +398,18 @@ export class FlashTaskService {
    * still editing. Both facts, and any tool refusals seen, go into the error the caller
    * reads: a timeout that says only "timeout" is the one outcome that teaches nothing.
    *
+   * Shutting the runtime down is the only cancellation this service has: the SDK cannot
+   * stop a session, but the service owns the process that runs it. The runtime that
+   * served this call is keyed by the tree it was rooted at, which is still the slot's
+   * directory here; dropping it from the map means the next call on this slot boots a
+   * fresh runtime for the slot's new directory, exactly as it would for any new cwd.
+   *
    * @param {WorkspaceIsolation} pool - the pool the slot belongs to.
    * @param {object} slot - the leased tree.
    * @param {Error} error - the timeout error, whose message is extended in place.
+   * @param {string} profileName - the profile the timed-out call ran on.
    */
-  #salvageTimedOut(pool, slot, error) {
+  async #salvageTimedOut(pool, slot, error, profileName) {
     let note
     try {
       const change = pool.collect(slot, { diffChars: this.diffChars })
@@ -423,6 +430,20 @@ export class FlashTaskService {
       const first = denials[0]
       const reason = first.reason === undefined ? '' : ` (${first.reason})`
       refusals = `; ${String(denials.length)} tool refusal(s), first: ${first.code}${reason} ${first.message.slice(0, 160).replace(/\s+/g, ' ')}`
+    }
+    // Stop the process before the slot moves: the runtime is keyed by the tree it was
+    // rooted at, and `retire` gives the slot a new directory. A session that is still
+    // running can no longer be signalled through the SDK, but killing its runtime takes
+    // the worker processes it spawned with it.
+    const key = this.#runtimeKey(profileName, slot.dir)
+    const run = this.runtimes.get(key)
+    if (run !== undefined) {
+      this.runtimes.delete(key)
+      try {
+        await run.client?.shutdown()
+      } catch (shutdownError) {
+        this.log(`could not shut down the runtime of the timed-out session: ${messageOf(shutdownError)}`)
+      }
     }
     pool.retire(slot)
     this.log(`timeout: ${note}${refusals}`)
@@ -507,7 +528,7 @@ export class FlashTaskService {
         applied,
       })
     } catch (error) {
-      if (slot !== undefined && error?.code === 'TIMEOUT') this.#salvageTimedOut(pool, slot, error)
+      if (slot !== undefined && error?.code === 'TIMEOUT') await this.#salvageTimedOut(pool, slot, error, profileName)
       throw error
     } finally {
       if (slot !== undefined) pool.release(slot)

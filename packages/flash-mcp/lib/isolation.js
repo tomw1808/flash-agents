@@ -23,6 +23,8 @@
  * @typedef {object} Slot
  * @property {number} id - slot number, stable for the life of the pool.
  * @property {string} dir - the disposable tree the worker runs in.
+ * @property {number} dirIndex - how many times the slot has been moved to a fresh path.
+ * @property {string[]} orphans - trees left in place by `retire`, removed when the pool closes.
  * @property {string} tmpDir - a temp directory inside `dir`, for the worker's TMPDIR.
  * @property {string | null} base - commit this call started from, or null without git.
  * @property {boolean} busy - whether a call currently holds the slot.
@@ -41,7 +43,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -55,6 +57,13 @@ const PATCH_ID = /^flash-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 
 /** The temp directory a worker is pointed at, relative to its disposable tree. */
 const SLOT_TMP = '.flash-tmp'
+
+/**
+ * How hard `emptyDirectory` tries when a dying process is still writing inside the tree
+ * it is emptying, and how long it waits between attempts.
+ */
+const EMPTY_RETRIES = 3
+const EMPTY_RETRY_DELAY_MS = 50
 
 /** An error a caller can branch on, carrying the same `code` shape the service uses. */
 export class IsolationError extends Error {
@@ -271,7 +280,7 @@ function excludeFromDiff(dir, name) {
 }
 
 /**
- * Empty a directory without removing it.
+ * Remove a slot's tree without removing the directory that contains it.
  *
  * The directory itself has to survive: a running runtime holds it as its working
  * directory, and its sandbox root is fixed at the path it was started with.
@@ -281,8 +290,34 @@ function excludeFromDiff(dir, name) {
  */
 function emptyDirectory(dir) {
   for (const entry of readdirSync(dir)) {
-    rmSync(join(dir, entry), { recursive: true, force: true })
+    rmSync(join(dir, entry), {
+      recursive: true,
+      force: true,
+      // A process that is still dying (a Harness session, or the `swift build` it
+      // spawned) can create an entry between the readdir above and the removal, and the
+      // removal then fails with ENOTEMPTY. `rmSync` retries exactly that class of error
+      // (ENOTEMPTY/EBUSY/EPERM) with a short backoff, so a straggler cannot wedge the
+      // slot; when the path never empties its own error is kept and propagates.
+      maxRetries: EMPTY_RETRIES,
+      retryDelay: EMPTY_RETRY_DELAY_MS,
+    })
   }
+}
+
+/**
+ * The directory one slot uses at a given generation.
+ *
+ * Generation 0 is `slot-<id>`, the path every state directory has used; each `retire`
+ * moves the slot on to `<id>-1`, `<id>-2`, … so the orphaned tree can keep its own name.
+ *
+ * @param {string} stateDir - the pool's state directory.
+ * @param {number} id - slot number.
+ * @param {number} index - the slot's directory generation.
+ * @returns {string} the slot directory for that generation.
+ */
+function slotDirectory(stateDir, id, index) {
+  const name = index === 0 ? `slot-${String(id)}` : `slot-${String(id)}-${String(index)}`
+  return join(stateDir, 'slots', name)
 }
 
 export class WorkspaceIsolation {
@@ -315,9 +350,11 @@ export class WorkspaceIsolation {
     this.waiting = []
     this.slots = Array.from({ length: Math.max(1, slots) }, (_, id) => ({
       id,
-      dir: join(this.stateDir, 'slots', `slot-${String(id)}`),
+      dirIndex: 0,
+      dir: slotDirectory(this.stateDir, id, 0),
       base: null,
       busy: false,
+      orphans: [],
     }))
     // Only trees this process owns are cleared. A default state directory is private
     // by construction, so clearing it cannot touch a live service; the dead owners of
@@ -456,26 +493,35 @@ export class WorkspaceIsolation {
   /**
    * Take a tree out of service after its call lost track of the worker. The session that
    * ran there cannot be stopped, so it may still write; recycling the directory would
-   * hand its late edits to the next call as that call's own work. The slot keeps its
-   * number and gets an empty directory at the same path; the orphaned tree is renamed
-   * beside it and removed with the rest of this process's state.
+   * hand its late edits to the next call as that call's own work.
+   *
+   * The tree therefore keeps its name and stays exactly where it is. The Harness session
+   * and the build processes it spawned hold that path as an absolute string, so renaming
+   * the tree away only redirects their writes into the fresh empty directory left at the
+   * old name — observed as `ENOTEMPTY` when the next call tried to empty it. The slot is
+   * moved instead: it is given a path it has never used, created empty, and the orphaned
+   * tree is remembered so `close()` still removes it.
    *
    * @param {Slot} slot - the slot whose call timed out.
    */
   retire(slot) {
-    const orphan = `${slot.dir}-orphan-${String(Date.now())}`
+    const orphan = slot.dir
+    const nextIndex = slot.dirIndex + 1
+    const nextDir = slotDirectory(this.stateDir, slot.id, nextIndex)
     try {
-      renameSync(slot.dir, orphan)
+      mkdirSync(nextDir, { recursive: true })
     } catch (error) {
-      this.log(`could not retire ${slot.dir}: ${messageOf(error)}`)
+      this.log(`could not move slot ${String(slot.id)} to a fresh directory: ${messageOf(error)}`)
       return
     }
-    mkdirSync(slot.dir, { recursive: true })
+    slot.dirIndex = nextIndex
+    slot.dir = nextDir
+    slot.orphans.push(orphan)
     slot.base = null
     slot.baseReason = undefined
     slot.tmpDir = undefined
     slot.ignoredBase = undefined
-    this.log(`retired ${slot.dir} as ${orphan}: its session may still be writing there`)
+    this.log(`retired ${orphan} in place: its session may still be writing there; the slot moved to ${nextDir}`)
   }
 
   /**
@@ -677,9 +723,17 @@ export class WorkspaceIsolation {
     slot.base = null
   }
 
-  /** Remove the slot trees. Stored patches stay: an apply may still be coming. */
+  /**
+   * Remove the slot trees and every orphan they left in place. Stored patches stay: an
+   * apply may still be coming.
+   */
   close() {
-    for (const slot of this.slots) rmSync(slot.dir, { recursive: true, force: true })
+    for (const slot of this.slots) {
+      rmSync(slot.dir, { recursive: true, force: true })
+      for (const orphan of slot.orphans) rmSync(orphan, { recursive: true, force: true })
+    }
+    // Belt and braces: everything above lives under `slots`, so this also catches any
+    // orphan a slot no longer names.
     rmSync(join(this.stateDir, 'slots'), { recursive: true, force: true })
   }
 }
