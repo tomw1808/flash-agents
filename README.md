@@ -126,6 +126,16 @@ or, in `.mcp.json`:
 sandbox root, and the fence for the per-call `cwd`. It defaults to the MCP server's own working
 directory.
 
+### The skills
+
+The plugin ships three skills, each a way of working rather than a tool:
+
+| Skill | Use it when |
+|---|---|
+| `/flash-agents:delegate` | The default. A goal should be done by flash workers instead of Claude subagents: it frames, slices, dispatches, verifies every result, reviews with a read-only worker, and fixes in rounds until a review finds nothing real. Also loads on "use flash-agents" or "fan out". |
+| `/flash-agents:gauntlet` | Several genuinely different approaches are plausible and the result can be checked by running something: parallel builders, cheap critics, a blind duel. Costs the orchestrator more; the judge is a frontier-model step. |
+| `/flash-agents:setup` | Once, after installing: checks the harness, Ollama, the model and the profiles, and proves the pipeline with one real task. Manual-only. |
+
 ### The pipeline
 
 ```
