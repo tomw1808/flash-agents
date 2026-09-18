@@ -1127,6 +1127,9 @@ export class WorkspaceIsolation {
     slot.tmpDir = join(slot.dir, SLOT_TMP)
     mkdirSync(slot.tmpDir, { recursive: true })
     excludeFromDiff(slot.dir, SLOT_TMP)
+    // A worker told to keep scratch in `.flash-tmp/` next to its cwd writes it inside the copied repository
+    // when the copy is scoped to one; exclude it there too, so scratch never reaches a patch.
+    if (repoDir !== slot.dir) excludeFromDiff(repoDir, SLOT_TMP)
     if (!isGitWorkTree(repoDir)) {
       slot.baseReason = 'the service root is not a git repository, so no diff could be computed'
       return { base: null, mechanism, scope, reason: slot.baseReason }

@@ -802,3 +802,17 @@ test('the base is recorded without a commit on the branch, so a push cannot carr
   assert.deepEqual(change.filesChanged.map((line) => line.split('\t').at(-1)), ['app.txt'])
   isolation.close()
 })
+
+test('scratch inside a scoped repository never reaches the patch', async () => {
+  const root = makeWorkspace()
+  const { isolation } = makePool(root)
+  const slot = await isolation.lease()
+  isolation.prepare(slot, { cwd: join(root, 'Repos', 'alpha') })
+  const copy = join(slot.dir, 'Repos', 'alpha')
+  mkdirSync(join(copy, '.flash-tmp'), { recursive: true })
+  writeFileSync(join(copy, '.flash-tmp', 'notes.patch'), 'scratch\n')
+  writeFileSync(join(copy, 'app.txt'), 'real change\n')
+  const change = isolation.collect(slot)
+  assert.deepEqual(change.filesChanged.map((line) => line.split('\t').at(-1)), ['app.txt'])
+  isolation.close()
+})
