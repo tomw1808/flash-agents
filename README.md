@@ -464,7 +464,7 @@ naming the path that is wrong instead of silently falling back to something else
 ```json
 {
   "route": { "provider": "ollama", "model": "deepseek-v4.1-flash:cloud" },
-  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 3600000, "diffChars": 20000, "patchRetentionDays": 14 },
+  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 10800000, "idleTimeoutMs": 600000, "diffChars": 20000, "patchRetentionDays": 14 },
   "guard": { "protectedSegments": [".git"], "fenceMutations": true },
   "dsh": { "package": "@deepseek-ai/dsh", "minVersion": "0.1.5" }
 }
@@ -479,9 +479,18 @@ shipped feature.
 The client that launches this server owns its own timeout for a tool call, and that timeout
 must be **longer than the service's task budget** in `flash.config.json` — otherwise the
 client abandons a call the service is still working on. The plugin manifest sets the `flash`
-server's `timeout` to `3900000` ms, above the `3600000` ms budget. The server also sends MCP
-`notifications/progress` every 20 seconds for as long as a call runs, which keeps the client's
-idle clock alive when the worker produces no other output.
+server's `timeout` to `11100000` ms, above the `10800000` ms (three-hour) budget. The server also
+sends MCP `notifications/progress` every 20 seconds for as long as a call runs, which keeps the
+client's idle clock alive when the worker produces no other output; each message names the
+worker's current step, what it is doing and how long ago its last event was.
+
+**Slow is not stuck.** The three-hour budget is a ceiling for honest work — a feature slice
+that builds and tests between steps can take longer than an hour. What ends a *stuck* call is
+`idleTimeoutMs` (default ten minutes, `FLASH_IDLE_TIMEOUT_MS` to override): every event from the
+session or any of its workers — model output, a tool call, a tool result — resets it, so a hung
+model stream or a wedged tool is stopped after ten silent minutes instead of holding a tree for
+hours. Either way the call salvages the worker's change as a patch and says why it stopped
+(`TIMEOUT` or `IDLE`) and where the worker was.
 
 ### Prerequisites
 
@@ -502,7 +511,8 @@ a script or in CI.
 | `FLASH_SERVICE_ROOT` | cwd | sandbox root, runtime working directory, `cwd` fence |
 | `FLASH_SERVICE_PROFILE` | `flash-service` | profile the runtime boots |
 | `FLASH_SERVICE_PROVIDER` / `FLASH_SERVICE_MODEL` | `ollama` / `deepseek-v4.1-flash:cloud` | pinned orchestrator route (the worker route is pinned by the profile) |
-| `FLASH_TASK_TIMEOUT_MS` | `3600000` | per-task wall-clock budget; a coherent feature slice that builds and tests between steps takes real minutes per cycle, and the call returns as soon as the worker finishes |
+| `FLASH_TASK_TIMEOUT_MS` | `10800000` | per-task wall-clock budget; a coherent feature slice that builds and tests between steps takes real minutes per cycle, and the call returns as soon as the worker finishes |
+| `FLASH_IDLE_TIMEOUT_MS` | `600000` | how long a call may go without any event from its session or workers before it is stopped as stuck (`IDLE`); the change so far is salvaged as a patch |
 | `FLASH_RESULT_MAX_CHARS` | `24000` | returned worker-message budget |
 | `FLASH_MAX_TOKENS` | unset | optional output cap for SDK agents |
 | `FLASH_BATCH_TIMEOUT_MS` | `10800000` | per-fleet wall-clock budget |

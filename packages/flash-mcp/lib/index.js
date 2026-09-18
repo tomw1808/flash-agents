@@ -236,6 +236,7 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
     model: config.route.model,
     taskTimeoutMs: numberFrom(env.FLASH_TASK_TIMEOUT_MS, config.limits.taskTimeoutMs),
     batchTimeoutMs: numberFrom(env.FLASH_BATCH_TIMEOUT_MS, config.limits.batchTimeoutMs),
+    idleTimeoutMs: numberFrom(env.FLASH_IDLE_TIMEOUT_MS, config.limits.idleTimeoutMs),
     maxTasks: numberFrom(env.FLASH_MAX_TASKS, config.limits.maxTasks),
     perItemChars: numberFrom(env.FLASH_PER_ITEM_CHARS, config.limits.perItemChars),
     maxResultChars: numberFrom(env.FLASH_RESULT_MAX_CHARS, config.limits.maxResultChars),

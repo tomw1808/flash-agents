@@ -45,7 +45,13 @@ export const DEFAULT_CONFIG = deepFreeze({
     // work does reports "timeout" for work that was going fine and retires a tree
     // the worker was still using; a generous budget costs nothing when the task is
     // small, because the call returns when the worker finishes.
-    taskTimeoutMs: 3_600_000,
+    // Three hours of wall clock, because a coherent slice (a settings window, a
+    // board) can honestly take longer than one; what stops a *stuck* worker is the
+    // idle timeout below, not this.
+    taskTimeoutMs: 10_800_000,
+    // No event from the session or any worker for ten minutes means stuck: a hung
+    // model stream or a wedged tool. A working worker emits events constantly.
+    idleTimeoutMs: 600_000,
     batchTimeoutMs: 10_800_000,
     perItemChars: 12_000,
     maxResultChars: 24_000,

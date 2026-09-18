@@ -457,7 +457,7 @@ test('reports progress to the client on an interval, and stops when the call set
   assert.ok(reports.length >= 2, `expected progress reports, saw ${String(reports.length)}`)
   assert.equal(typeof reports[0].progress, 'number')
   assert.equal(reports[0].total, Math.round(service.taskTimeoutMs / 1000))
-  assert.match(reports[0].message, /^flash_task running \d+m?\d*s; worker session flash-task-.* active$/)
+  assert.match(reports[0].message, /^flash_task running \d+m?\d*s; .*last event \d+m?\d*s ago \(session flash-task-.*\)$/)
   for (let index = 1; index < reports.length; index += 1) {
     assert.ok(reports[index].progress > reports[index - 1].progress, 'progress must move forward')
   }
@@ -494,7 +494,7 @@ test('reports progress while a queued call waits for a free tree', async () => {
   assert.equal(cancelled.code, 'CANCELLED')
   assert.match(cancelled.message, /cancelled while waiting/)
   assert.ok(reports.length >= 2, `expected progress while waiting, saw ${String(reports.length)}`)
-  assert.match(reports[0].message, /worker session flash-task-.* active/)
+  assert.match(reports[0].message, /starting · last event .* ago \(session flash-task-.*\)/)
   // A call that never got a tree is still a call the client must see living; but its
   // interval stops when it is cancelled, and nothing is salvaged because nothing ran.
   const settled = reports.length

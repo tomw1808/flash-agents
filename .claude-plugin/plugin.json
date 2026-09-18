@@ -20,7 +20,7 @@
         "--root",
         "${CLAUDE_PROJECT_DIR}"
       ],
-      "timeout": 3900000,
+      "timeout": 11100000,
       "env": {
         "FLASH_LOG_FILE": "${CLAUDE_PLUGIN_DATA}/flash.log",
         "FLASH_SERVICE_MODEL": "${user_config.model}",

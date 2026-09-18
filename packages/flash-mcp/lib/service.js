@@ -32,6 +32,17 @@ const DEFAULT_TASK_TIMEOUT_MS = 300_000
 /** Default returned size of the child's final message. */
 const DEFAULT_MAX_RESULT_CHARS = 8_000
 
+/**
+ * How long a call may go without a single event from its session or its workers
+ * before it is treated as stuck. A working worker emits events constantly (model
+ * chunks, tool calls, tool results); a hung model stream or a wedged tool emits
+ * none. This, not the wall-clock budget, is what separates "slow" from "stuck".
+ */
+export const DEFAULT_IDLE_TIMEOUT_MS = 600_000
+
+/** How often the idle check looks at the last activity. */
+const IDLE_CHECK_INTERVAL_MS = 15_000
+
 /** Default wall-clock budget for one fleet of delegated tasks. */
 const DEFAULT_BATCH_TIMEOUT_MS = 900_000
 
@@ -154,6 +165,7 @@ export class FlashTaskService {
     model = DEFAULT_MODEL,
     maxTokens,
     taskTimeoutMs = DEFAULT_TASK_TIMEOUT_MS,
+    idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
     maxResultChars = DEFAULT_MAX_RESULT_CHARS,
     batchTimeoutMs = DEFAULT_BATCH_TIMEOUT_MS,
     maxTasks = DEFAULT_MAX_TASKS,
@@ -170,6 +182,7 @@ export class FlashTaskService {
     this.model = model
     this.maxTokens = maxTokens
     this.taskTimeoutMs = taskTimeoutMs
+    this.idleTimeoutMs = idleTimeoutMs
     this.maxResultChars = maxResultChars
     this.batchTimeoutMs = batchTimeoutMs
     this.maxTasks = maxTasks
@@ -358,7 +371,9 @@ export class FlashTaskService {
     // Progress spans the whole call, including a wait for a free tree: that wait is
     // itself work the client must not mistake for a dead server. The interval is
     // stopped on every path out of this method.
+    const activity = createActivity()
     const stopProgress = startProgress({
+      activity,
       progress,
       token: progressToken,
       label: 'flash_task',
@@ -380,6 +395,7 @@ export class FlashTaskService {
       })
       const { state, started } = await this.#runSession({
         sessionId,
+        activity,
         prompt: buildOrchestrationPrompt(childPrompt),
         timeoutMs: this.taskTimeoutMs,
         label: 'flash_task',
@@ -410,7 +426,7 @@ export class FlashTaskService {
         applied,
       })
     } catch (error) {
-      if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'CANCELLED')) {
+      if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'IDLE' || error?.code === 'CANCELLED')) {
         await this.#salvageOrphaned(pool, slot, error, profileName)
       }
       throw error
@@ -514,7 +530,9 @@ export class FlashTaskService {
     // directory exactly as they share a runtime, so they see each other's edits.
     const pool = this.#isolationFor(profileName)
     // As with flash_task, progress spans the whole call, a wait for a free tree included.
+    const activity = createActivity()
     const stopProgress = startProgress({
+      activity,
       progress,
       token: progressToken,
       label: 'flash_batch',
@@ -539,6 +557,7 @@ export class FlashTaskService {
       }))
       const { state, started } = await this.#runSession({
         sessionId,
+        activity,
         prompt: buildBatchPrompt({
           count: items.length,
           script: BATCH_SCRIPT,
@@ -574,7 +593,7 @@ export class FlashTaskService {
         applied,
       })
     } catch (error) {
-      if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'CANCELLED')) {
+      if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'IDLE' || error?.code === 'CANCELLED')) {
         await this.#salvageOrphaned(pool, slot, error, profileName)
       }
       throw error
@@ -647,10 +666,12 @@ export class FlashTaskService {
   }
 
   /** Start one session on the persistent runtime and wait for it to go idle. */
-  async #runSession({ sessionId, prompt, timeoutMs, label, note, signal, profile, cwd = this.root, extraEnv }) {
+  async #runSession({ sessionId, prompt, timeoutMs, label, note, signal, profile, cwd = this.root, extraEnv, activity = createActivity() }) {
     const client = await this.#ensureRuntime(profile, cwd, extraEnv)
     const key = this.#runtimeKey(profile, cwd)
     const state = createObserveState()
+    state.activity = activity
+    activity.at = Date.now()
     const started = Date.now()
     const completion = createDeferred()
     const unsubscribe = client.onNotification((method, params) => {
@@ -665,6 +686,8 @@ export class FlashTaskService {
       this.log(`session ${sessionId} prompted${note === undefined ? '' : ` (${note})`}`)
       await raceWithBudget(completion.promise, {
         timeoutMs,
+        idleTimeoutMs: this.idleTimeoutMs,
+        activity,
         label,
         signal,
         sessionId,
@@ -674,7 +697,7 @@ export class FlashTaskService {
     } catch (error) {
       // A call that times out or is cancelled never builds a result, so the refusals
       // seen so far travel on the error instead; the salvage step reports them from there.
-      if (error?.code === 'TIMEOUT' || error?.code === 'CANCELLED') error.denials = state.denials
+      if (error?.code === 'TIMEOUT' || error?.code === 'IDLE' || error?.code === 'CANCELLED') error.denials = state.denials
       throw error
     } finally {
       unsubscribe()
@@ -990,6 +1013,36 @@ export class FlashTaskService {
 }
 
 /** The observation state for one session. */
+/**
+ * The last sign of life a call has seen: when, which step, and what it was doing.
+ * Shared by the observer (which writes it), the progress heartbeat and the idle
+ * check (which read it), so all three agree on one clock.
+ */
+export function createActivity(now = Date.now()) {
+  return { at: now, step: undefined, what: 'starting', events: 0 }
+}
+
+/** Record one event as activity. */
+function touchActivity(activity, event) {
+  if (activity === undefined) return
+  activity.at = Date.now()
+  activity.events += 1
+  const step = event?.data?.step
+  if (typeof step === 'number') activity.step = step
+  const type = String(event?.type ?? '')
+  if (type === 'tool/call') activity.what = `tool ${String(event.data?.name ?? '?')}`
+  else if (type === 'tool/result') activity.what = 'reading a tool result'
+  else if (type.startsWith('assistant/') || type.startsWith('llm/')) activity.what = 'model responding'
+}
+
+/** One line describing the last activity, for heartbeats and stop reasons. */
+export function describeActivity(activity, now = Date.now()) {
+  if (activity === undefined) return 'no activity recorded'
+  const ago = formatElapsed(now - activity.at)
+  const step = activity.step === undefined ? '' : `step ${String(activity.step)} · `
+  return `${step}${activity.what} · last event ${ago} ago`
+}
+
 export function createObserveState() {
   return {
     sawRunning: false,
@@ -1012,6 +1065,7 @@ export function createObserveState() {
     toolCalls: [],
     toolResults: [],
     eventCount: 0,
+    activity: undefined,
   }
 }
 
@@ -1027,6 +1081,7 @@ function observe(state, method, params, sessionId, completion, log) {
   }
   if (method === 'subagent.started') {
     if (params?.parentSessionId !== sessionId) return
+    touchActivity(state.activity, { type: 'subagent/started' })
     state.subagentStarts += 1
     // Overlap is counted in notification order, not from timestamps: the runtime
     // can report several starts inside one millisecond, and concurrent workers
@@ -1064,6 +1119,8 @@ function observe(state, method, params, sessionId, completion, log) {
   if (method !== 'session.event') return
   const session = params?.sessionId
   const event = params?.event
+  // Any event from this session or one of its workers is a sign of life.
+  if (session === sessionId || state.childIds.has(session)) touchActivity(state.activity, event)
   if (event?.type === 'request/header' && state.childIds.has(session)) {
     // Harness logs the exact call configuration of every request; this is the
     // child's real route, observed rather than assumed.
@@ -1197,7 +1254,7 @@ function truncateText(text, maxChars) {
  * @param {(message: string) => void} [options.log] - diagnostic sink.
  * @returns {() => void} stops the reporting.
  */
-function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs, log = () => {} }) {
+function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs, activity, log = () => {} }) {
   if (token === undefined || token === null || typeof progress !== 'function') return () => {}
   const startedAt = Date.now()
   const timer = setInterval(() => {
@@ -1206,7 +1263,7 @@ function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs
       progress({
         progress: Math.round(elapsedMs) / 1000,
         ...(budgetMs === undefined || budgetMs === null ? {} : { total: Math.round(budgetMs / 1000) }),
-        message: `${label} running ${formatElapsed(elapsedMs)}; worker session ${sessionId} active`,
+        message: `${label} running ${formatElapsed(elapsedMs)}; ${describeActivity(activity)} (session ${sessionId})`,
       })
     } catch (error) {
       // A client that has gone away must not turn a heartbeat into a task failure.
@@ -1226,13 +1283,14 @@ function formatElapsed(ms) {
 }
 
 /** Wait for completion, bounded by the task budget and the client's signal. */
-function raceWithBudget(promise, { timeoutMs, label, signal, sessionId, diagnostics }) {
+export function raceWithBudget(promise, { timeoutMs, idleTimeoutMs, activity, label, signal, sessionId, diagnostics }) {
   return new Promise((resolve, reject) => {
     let settled = false
     const finish = (fn, value) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      clearInterval(idleTimer)
       signal?.removeEventListener('abort', onAbort)
       fn(value)
     }
@@ -1242,11 +1300,25 @@ function raceWithBudget(promise, { timeoutMs, label, signal, sessionId, diagnost
       finish(
         reject,
         new FlashTaskError(
-          `${String(label)} exceeded its ${String(timeoutMs)}ms budget on session ${sessionId}; the session continues inside Harness but is no longer reported${stderrHint(diagnostics)}`,
+          `${String(label)} exceeded its ${String(timeoutMs)}ms budget on session ${sessionId} (${describeActivity(activity)}); the session continues inside Harness but is no longer reported${stderrHint(diagnostics)}`,
           'TIMEOUT',
         ),
       )
     }, timeoutMs)
+    // Stuck, not slow: no event from the session or any worker for the idle window.
+    const idleTimer = idleTimeoutMs > 0 && activity !== undefined
+      ? setInterval(() => {
+          if (Date.now() - activity.at < idleTimeoutMs) return
+          finish(
+            reject,
+            new FlashTaskError(
+              `${String(label)} stopped: no activity for ${formatElapsed(idleTimeoutMs)} on session ${sessionId} (${describeActivity(activity)}); the session continues inside Harness but is no longer reported${stderrHint(diagnostics)}`,
+              'IDLE',
+            ),
+          )
+        }, Math.min(IDLE_CHECK_INTERVAL_MS, Math.max(1, idleTimeoutMs)))
+      : undefined
+    idleTimer?.unref?.()
     const onAbort = () => finish(reject, new FlashTaskCancelled(`${String(label)} was cancelled by the client`))
     if (signal?.aborted === true) onAbort()
     else signal?.addEventListener('abort', onAbort, { once: true })
@@ -1466,7 +1538,7 @@ function describeParent(state) {
 }
 
 function stderrHint(diagnostics) {
-  const tail = diagnostics().trim()
+  const tail = typeof diagnostics === 'function' ? String(diagnostics() ?? '').trim() : ''
   return tail.length === 0 ? '' : `\n--- dsh stderr ---\n${tail}`
 }
 
