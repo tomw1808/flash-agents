@@ -362,6 +362,14 @@ had to be added after the fact. Isolation removes the premise instead:
 4. nothing reaches your repository until a patch is **applied**, by `apply: "auto"` on the call or by
    `flash_apply { patchId }` afterwards.
 
+When the call's `cwd` sits inside a nested git repository of the root (the nearest directory
+between `cwd` and the root with its own `.git` directory), only that repository is copied, at
+the same relative path inside the tree, and the base, the diff and a later apply all run in it.
+A workspace root that holds many independent repositories then costs one repository per call
+instead of all of them, and a nested repository's changes reach the patch at all (the root's own
+`git diff` cannot see them). A linked worktree (a `.git` file pointing elsewhere), a `cwd` at the
+root, or no nested repository keep the whole-root copy.
+
 The copy includes `.git` and your uncommitted work, because a worker that sees the last commit
 instead of your working tree is useless while you are mid-edit. `rm -rf` of everything the worker can
 reach destroys a throwaway copy and shows up as a patch that deletes files — which you then decline

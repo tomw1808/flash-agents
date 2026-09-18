@@ -371,7 +371,7 @@ export class FlashTaskService {
     try {
       slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal)
       const { promptCwd, runtimeCwd, extraEnv } = this.#runLocation(slot, rootCwd, pool)
-      if (slot !== undefined) pool.prepare(slot)
+      if (slot !== undefined) pool.prepare(slot, { cwd: rootCwd })
       const childPrompt = buildChildPrompt({
         cwd: promptCwd,
         task,
@@ -527,7 +527,7 @@ export class FlashTaskService {
     try {
       slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal)
       const { promptCwd, runtimeCwd, extraEnv } = this.#runLocation(slot, rootCwd, pool)
-      if (slot !== undefined) pool.prepare(slot)
+      if (slot !== undefined) pool.prepare(slot, { cwd: rootCwd })
       const copy = slot === undefined ? {} : { copy: true }
       const items = tasks.map((entry, index) => ({
         label: `task-${String(index + 1)}`,

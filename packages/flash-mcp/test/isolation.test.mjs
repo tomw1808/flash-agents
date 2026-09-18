@@ -701,3 +701,80 @@ test('a pool with no configured state directory lives under the canonical temp d
     rmSync(repo, { recursive: true, force: true })
   }
 })
+
+/** A workspace root that is itself a git repository and holds two independent nested repositories. */
+function makeWorkspace() {
+  const root = makeRepo()
+  for (const name of ['alpha', 'beta']) {
+    const dir = join(root, 'Repos', name)
+    mkdirSync(dir, { recursive: true })
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir })
+    writeFileSync(join(dir, 'app.txt'), `${name} app\n`)
+    execFileSync('git', ['add', '-A'], { cwd: dir })
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: dir })
+  }
+  return root
+}
+
+test('a call inside a nested repository copies, diffs and applies only that repository', async () => {
+  const root = makeWorkspace()
+  const { isolation } = makePool(root)
+  const slot = await isolation.lease()
+  const cwd = join(root, 'Repos', 'alpha')
+  const prepared = isolation.prepare(slot, { cwd })
+
+  assert.equal(prepared.scope, join('Repos', 'alpha'))
+  assert.notEqual(prepared.base, null)
+  // Only the working repository was copied: its sibling and the root's own files are absent.
+  assert.equal(existsSync(join(slot.dir, 'Repos', 'alpha', 'app.txt')), true)
+  assert.equal(existsSync(join(slot.dir, 'Repos', 'beta')), false)
+  assert.equal(existsSync(join(slot.dir, 'keep.txt')), false)
+  // The working directory still maps to the same relative path inside the slot.
+  assert.equal(isolation.slotCwd(slot, cwd), join(slot.dir, 'Repos', 'alpha'))
+
+  writeFileSync(join(slot.dir, 'Repos', 'alpha', 'app.txt'), 'changed by the worker\n')
+  const change = isolation.collect(slot)
+  assert.equal(change.available, true)
+  assert.equal(change.scope, join('Repos', 'alpha'))
+  assert.deepEqual(change.filesChanged.map((line) => line.split('\t').at(-1)), ['app.txt'])
+
+  const applied = isolation.apply({ patchId: change.patchId })
+  assert.equal(applied.root, join(root, 'Repos', 'alpha'))
+  assert.equal(readFileSync(join(root, 'Repos', 'alpha', 'app.txt'), 'utf8'), 'changed by the worker\n')
+  assert.equal(readFileSync(join(root, 'Repos', 'beta', 'app.txt'), 'utf8'), 'beta app\n')
+  isolation.close()
+})
+
+test('a linked worktree or a call at the root keeps the whole-root copy', async () => {
+  const root = makeWorkspace()
+  const alpha = join(root, 'Repos', 'alpha')
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'side', join(root, 'Repos', 'alpha-side')], { cwd: alpha })
+  const { isolation } = makePool(root)
+
+  const slot = await isolation.lease()
+  assert.equal(isolation.prepare(slot, { cwd: join(root, 'Repos', 'alpha-side') }).scope, '')
+  assert.equal(existsSync(join(slot.dir, 'keep.txt')), true)
+  isolation.release(slot)
+
+  const again = await isolation.lease()
+  assert.equal(isolation.prepare(again, { cwd: root }).scope, '')
+  assert.equal(isolation.prepare(again).scope, '')
+  isolation.close()
+})
+
+test('a sweep salvages a dead owner’s scoped tree from the recorded repository', async () => {
+  const repo = makeRepo()
+  const { owner, slotDir } = makeDeadOwner(repo, { pid: 4194301 })
+  const inner = join(slotDir, 'Repos', 'alpha')
+  mkdirSync(inner, { recursive: true })
+  makeFlashBaseTree(inner)
+  writeFileSync(join(slotDir, '.flash-scope'), `${join('Repos', 'alpha')}\n`)
+  writeFileSync(join(inner, 'keep.txt'), 'unfinished work\n')
+
+  const isolation = new WorkspaceIsolation({ root: repo, slots: 1 })
+  const record = salvagedPatch(isolation)
+  assert.ok(record, 'the scoped tree was salvaged')
+  assert.equal(record.scope, join('Repos', 'alpha'))
+  assert.equal(existsSync(owner), false)
+  isolation.close()
+})
