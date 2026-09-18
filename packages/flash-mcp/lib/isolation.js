@@ -44,7 +44,7 @@
 
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { join, relative, resolve, sep } from 'node:path'
+import { dirname, join, relative, resolve, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 
@@ -57,6 +57,66 @@ const PATCH_ID = /^flash-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 
 /** The temp directory a worker is pointed at, relative to its disposable tree. */
 const SLOT_TMP = '.flash-tmp'
+
+/**
+ * Marker file at the top of a slot that holds only one nested repository of the root. It
+ * records that repository's path relative to the root, so a sweep that finds the tree after
+ * its owner died still knows where the git state lives. It sits outside the copied
+ * repository, so it never appears in a diff.
+ */
+const SCOPE_MARKER = '.flash-scope'
+
+/**
+ * The nested git repository a call works in, as a path relative to the root, or `''` when
+ * the whole root has to be copied.
+ *
+ * A workspace root often holds many independent repositories. Copying all of them for a
+ * call that works in one of them costs minutes, and the root's own `git diff` cannot see a
+ * nested repository's changes at all, so its patch came back empty. The nearest directory
+ * between `cwd` and the root that carries its own `.git` DIRECTORY is copied instead, at
+ * the same relative path inside the slot, and it is where the base, the diff and the apply
+ * happen.
+ *
+ * A `.git` FILE marks a linked worktree whose git state lives outside that directory; it
+ * cannot travel into a copy, so that case (like a `cwd` at the root, or no nested
+ * repository at all) keeps the whole-root copy.
+ *
+ * @param {string} root - the service root.
+ * @param {string | undefined} cwd - the call's working directory inside the root.
+ * @returns {string} the repository path relative to the root, or `''`.
+ */
+export function repositoryScope(root, cwd) {
+  if (cwd === undefined) return ''
+  const top = resolve(root)
+  let dir = resolve(cwd)
+  while (dir !== top && dir.startsWith(`${top}${sep}`)) {
+    const marker = join(dir, '.git')
+    if (existsSync(marker)) {
+      try {
+        return statSync(marker).isDirectory() ? relative(top, dir) : ''
+      } catch {
+        return ''
+      }
+    }
+    dir = dirname(dir)
+  }
+  return ''
+}
+
+/**
+ * The scope a slot was prepared with, read back from its marker; `''` when there is none.
+ * @param {string} slotDir - a slot tree.
+ * @returns {string} the recorded scope.
+ */
+function readScopeMarker(slotDir) {
+  try {
+    const scope = readFileSync(join(slotDir, SCOPE_MARKER), 'utf8').trim()
+    // Only a plain relative path inside the tree is trusted; anything else is ignored.
+    return scope !== '' && !scope.startsWith('..') && !scope.startsWith(sep) ? scope : ''
+  } catch {
+    return ''
+  }
+}
 
 /**
  * How hard `emptyDirectory` tries when a dying process is still writing inside the tree
@@ -533,23 +593,26 @@ function salvageOwner(ownerDir, { root, patchDir, log, pid }) {
  * @returns {{patchId: string, diffstat: string} | null} the stored patch, or null.
  */
 function salvageSlot(slotDir, { root, patchDir, pid, sweptAt }) {
-  if (!isGitWorkTree(slotDir)) return null
-  const base = findFlashBase(slotDir)
+  const scope = readScopeMarker(slotDir)
+  const repoDir = scope === '' ? slotDir : join(slotDir, scope)
+  if (!isGitWorkTree(repoDir)) return null
+  const base = findFlashBase(repoDir)
   if (base === null) return null
-  git(['add', '-A'], slotDir)
-  if (git(['status', '--porcelain'], slotDir).trim() === '') return null
+  git(['add', '-A'], repoDir)
+  if (git(['status', '--porcelain'], repoDir).trim() === '') return null
   const patchId = `flash-${randomUUID()}`
   const patchPath = join(patchDir, `${patchId}.patch`)
   const metaPath = join(patchDir, `${patchId}.json`)
-  const diff = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', base], slotDir)
-  const diffstat = git(['diff', '--cached', '--stat', '--no-color', base], slotDir).trim()
-  const names = git(['diff', '--cached', '--name-status', base], slotDir)
+  const diff = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', base], repoDir)
+  const diffstat = git(['diff', '--cached', '--stat', '--no-color', base], repoDir).trim()
+  const names = git(['diff', '--cached', '--name-status', base], repoDir)
   const filesChanged = names.split('\n').filter((line) => line.trim().length > 0)
   const record = {
     patchId,
     patchPath,
     metaPath,
     root,
+    scope,
     base,
     filesChanged,
     diffstat,
@@ -630,6 +693,9 @@ function writePatchMeta(record) {
   const { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt, salvagedFrom } = record
   const meta = { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt }
   if (salvagedFrom !== undefined) meta.salvagedFrom = salvagedFrom
+  // Persisted only for a nested repository, so a whole-root record keeps its old shape and
+  // a restarted service still applies a scoped patch inside the repository it came from.
+  if (record.scope) meta.scope = record.scope
   writeFileSync(record.metaPath, `${JSON.stringify(meta, null, 2)}\n`)
 }
 
@@ -1022,10 +1088,21 @@ export class WorkspaceIsolation {
    * @param {Slot} slot - a leased slot.
    * @returns {{base: string | null, mechanism: 'clone' | 'copy', reason?: string}} the base.
    */
-  prepare(slot) {
+  prepare(slot, { cwd } = {}) {
     emptyDirectory(slot.dir)
-    const mechanism = copyTree(this.root, slot.dir)
+    const scope = repositoryScope(this.root, cwd)
+    const repoDir = scope === '' ? slot.dir : join(slot.dir, scope)
+    let mechanism
+    if (scope === '') {
+      mechanism = copyTree(this.root, slot.dir)
+    } else {
+      mkdirSync(repoDir, { recursive: true })
+      mechanism = copyTree(join(this.root, scope), repoDir)
+      writeFileSync(join(slot.dir, SCOPE_MARKER), `${scope}\n`)
+    }
     this.clones += 1
+    slot.scope = scope
+    slot.repoDir = repoDir
     slot.base = null
     slot.baseReason = undefined
     // The worker has nowhere legitimate to name outside its copy — the wall refuses
@@ -1037,22 +1114,22 @@ export class WorkspaceIsolation {
     slot.tmpDir = join(slot.dir, SLOT_TMP)
     mkdirSync(slot.tmpDir, { recursive: true })
     excludeFromDiff(slot.dir, SLOT_TMP)
-    if (!isGitWorkTree(slot.dir)) {
+    if (!isGitWorkTree(repoDir)) {
       slot.baseReason = 'the service root is not a git repository, so no diff could be computed'
-      return { base: null, mechanism, reason: slot.baseReason }
+      return { base: null, mechanism, scope, reason: slot.baseReason }
     }
     try {
-      git(['add', '-A'], slot.dir)
-      git([...COMMIT_CONFIG, 'commit', '-q', '--allow-empty', '--no-verify', '-m', 'flash base'], slot.dir)
-      slot.base = git(['rev-parse', 'HEAD'], slot.dir).trim()
+      git(['add', '-A'], repoDir)
+      git([...COMMIT_CONFIG, 'commit', '-q', '--allow-empty', '--no-verify', '-m', 'flash base'], repoDir)
+      slot.base = git(['rev-parse', 'HEAD'], repoDir).trim()
       // Ignored files are invisible to `git add -A`, so a worker that writes only
       // ignored files would otherwise produce an empty patch and read as "no change".
       // Recording the ignored set at the base makes the additions detectable later.
-      slot.ignoredBase = ignoredPaths(slot.dir)
-      return { base: slot.base, mechanism }
+      slot.ignoredBase = ignoredPaths(repoDir)
+      return { base: slot.base, mechanism, scope }
     } catch (error) {
       slot.baseReason = `the base state could not be recorded: ${error.message}`
-      return { base: null, mechanism, reason: slot.baseReason }
+      return { base: null, mechanism, scope, reason: slot.baseReason }
     }
   }
 
@@ -1087,6 +1164,8 @@ export class WorkspaceIsolation {
     slot.baseReason = undefined
     slot.tmpDir = undefined
     slot.ignoredBase = undefined
+    slot.scope = undefined
+    slot.repoDir = undefined
     this.log(`retired ${orphan} in place: its session may still be writing there; the slot moved to ${nextDir}`)
   }
 
@@ -1099,6 +1178,9 @@ export class WorkspaceIsolation {
    * @returns {Change} the change, ready to be projected into a tool result.
    */
   collect(slot, { diffChars = 20000 } = {}) {
+    // A slot prepared for one nested repository keeps its git state there, not at the top.
+    const repoDir = slot.repoDir ?? slot.dir
+    const scope = slot.scope ?? ''
     if (slot.base === null) {
       return {
         available: false,
@@ -1111,18 +1193,18 @@ export class WorkspaceIsolation {
       }
     }
     try {
-      git(['add', '-A'], slot.dir)
+      git(['add', '-A'], repoDir)
       const patchId = `flash-${randomUUID()}`
       const patchPath = join(this.patchDir, `${patchId}.patch`)
       const metaPath = join(this.patchDir, `${patchId}.json`)
-      const diff = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', slot.base], slot.dir)
-      const diffstat = git(['diff', '--cached', '--stat', '--no-color', slot.base], slot.dir)
-      const names = git(['diff', '--cached', '--name-status', slot.base], slot.dir)
+      const diff = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', slot.base], repoDir)
+      const diffstat = git(['diff', '--cached', '--stat', '--no-color', slot.base], repoDir)
+      const names = git(['diff', '--cached', '--name-status', slot.base], repoDir)
       const filesChanged = names.split('\n').filter((line) => line.trim().length > 0)
       // Work that git ignores is work the patch cannot carry. It is reported rather
       // than silently dropped: a caller told "no change" while the worker wrote a
       // whole build directory has been misled, not informed.
-      const ignored = ignoredPaths(slot.dir).filter((entry) => !(slot.ignoredBase ?? []).includes(entry))
+      const ignored = ignoredPaths(repoDir).filter((entry) => !(slot.ignoredBase ?? []).includes(entry))
       // The record travels with the patch, so a restarted service can still tell which
       // repository the patch was computed for and whether it has already been applied.
       const record = {
@@ -1130,6 +1212,7 @@ export class WorkspaceIsolation {
         patchPath,
         metaPath,
         root: this.root,
+        scope,
         base: slot.base,
         filesChanged,
         diffstat: diffstat.trim(),
@@ -1152,6 +1235,7 @@ export class WorkspaceIsolation {
         diffChars: diff.length,
         patchId,
         patchPath,
+        scope,
       }
     } catch (error) {
       return {
@@ -1193,12 +1277,14 @@ export class WorkspaceIsolation {
       )
     }
     const check = dryRun ? ['--check'] : []
-    if (isGitWorkTree(this.root)) {
+    // A patch computed inside one nested repository applies inside that repository.
+    const target = record.scope ? join(this.root, record.scope) : this.root
+    if (isGitWorkTree(target)) {
       // Without `--index` the caller's index is left alone; only the working tree moves.
-      git(['apply', '--whitespace=nowarn', ...check, record.patchPath], this.root)
+      git(['apply', '--whitespace=nowarn', ...check, record.patchPath], target)
     } else {
       execFileSync('patch', ['-p1', '--batch', '--forward', ...(dryRun ? ['--dry-run'] : []), '-i', record.patchPath], {
-        cwd: this.root,
+        cwd: target,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
     }
@@ -1211,7 +1297,7 @@ export class WorkspaceIsolation {
       patchId,
       applied: !dryRun,
       dryRun,
-      root: this.root,
+      root: target,
       filesChanged: record.filesChanged ?? [],
       diffstat: (record.diffstat ?? '').trim(),
     }
@@ -1313,6 +1399,8 @@ export class WorkspaceIsolation {
   discard(slot) {
     emptyDirectory(slot.dir)
     slot.base = null
+    slot.scope = undefined
+    slot.repoDir = undefined
   }
 
   /**
