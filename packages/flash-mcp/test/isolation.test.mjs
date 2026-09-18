@@ -778,3 +778,27 @@ test('a sweep salvages a dead owner’s scoped tree from the recorded repository
   assert.equal(existsSync(owner), false)
   isolation.close()
 })
+
+test('the base is recorded without a commit on the branch, so a push cannot carry it', async () => {
+  const root = makeWorkspace()
+  const alpha = join(root, 'Repos', 'alpha')
+  const { isolation } = makePool(root)
+  const slot = await isolation.lease()
+  const prepared = isolation.prepare(slot, { cwd: alpha })
+  const copy = join(slot.dir, 'Repos', 'alpha')
+
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: copy, encoding: 'utf8' }).trim()
+  const original = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: alpha, encoding: 'utf8' }).trim()
+  assert.equal(head, original, 'the branch did not move')
+  const subjects = execFileSync('git', ['log', '--format=%s'], { cwd: copy, encoding: 'utf8' })
+  assert.equal(subjects.includes('flash base'), false)
+  const ref = execFileSync('git', ['rev-parse', 'refs/flash/base'], { cwd: copy, encoding: 'utf8' }).trim()
+  assert.equal(ref, prepared.base)
+
+  // A worker that commits its own work still produces the full change against the base.
+  writeFileSync(join(copy, 'app.txt'), 'committed by the worker\n')
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-am', 'worker'], { cwd: copy })
+  const change = isolation.collect(slot)
+  assert.deepEqual(change.filesChanged.map((line) => line.split('\t').at(-1)), ['app.txt'])
+  isolation.close()
+})

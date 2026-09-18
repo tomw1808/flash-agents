@@ -67,6 +67,13 @@ const SLOT_TMP = '.flash-tmp'
 const SCOPE_MARKER = '.flash-scope'
 
 /**
+ * Private ref that holds a slot's base commit. The base is written with `git commit-tree`, so no branch
+ * moves: a worker that commits and pushes from the copy (the only durable route out of a nested
+ * repository) must not carry a "flash base" commit into the caller's history.
+ */
+const BASE_REF = 'refs/flash/base'
+
+/**
  * The nested git repository a call works in, as a path relative to the root, or `''` when
  * the whole root has to be copied.
  *
@@ -640,6 +647,12 @@ function salvageSlot(slotDir, { root, patchDir, pid, sweptAt }) {
  * @returns {string | null} the base commit id, or null.
  */
 function findFlashBase(dir) {
+  try {
+    const recorded = git(['rev-parse', '--verify', '-q', BASE_REF], dir).trim()
+    if (recorded !== '') return recorded
+  } catch {
+    // Trees prepared before the base moved to a private ref carry it as a branch commit instead.
+  }
   const log = git(['log', '--format=%H%x09%s'], dir)
   for (const line of log.split('\n')) {
     const tab = line.indexOf('\t')
@@ -1120,8 +1133,15 @@ export class WorkspaceIsolation {
     }
     try {
       git(['add', '-A'], repoDir)
-      git([...COMMIT_CONFIG, 'commit', '-q', '--allow-empty', '--no-verify', '-m', 'flash base'], repoDir)
-      slot.base = git(['rev-parse', 'HEAD'], repoDir).trim()
+      const tree = git(['write-tree'], repoDir).trim()
+      let parent = []
+      try {
+        parent = ['-p', git(['rev-parse', '--verify', '-q', 'HEAD'], repoDir).trim()]
+      } catch {
+        // A repository without a first commit has no parent to name.
+      }
+      slot.base = git([...COMMIT_CONFIG, 'commit-tree', tree, ...parent, '-m', 'flash base'], repoDir).trim()
+      git(['update-ref', BASE_REF, slot.base], repoDir)
       // Ignored files are invisible to `git add -A`, so a worker that writes only
       // ignored files would otherwise produce an empty patch and read as "no change".
       // Recording the ignored set at the base makes the additions detectable later.
