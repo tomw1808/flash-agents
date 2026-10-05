@@ -316,7 +316,24 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
   return options
 }
 
-const USAGE = `flash-agents — cheap DeepSeek Harness workers over MCP stdio
+/**
+ * The help text, with every default read from the configuration so it cannot drift from it.
+ * A configuration that does not load still gets help; its defaults then point at the file.
+ *
+ * @returns {string} the usage text.
+ */
+function usage() {
+  let config
+  try {
+    config = loadConfig()
+  } catch {
+    config = undefined
+  }
+  const fallback = 'see flash.config.json'
+  const route = config?.route ?? { provider: fallback, model: fallback }
+  const limits = config?.limits ?? {}
+  const value = (key) => limits[key] ?? fallback
+  return `flash-agents — cheap DeepSeek Harness workers over MCP stdio
 
 Usage: flash-agents [serve] [options]           serve the MCP stdio protocol (the default)
        flash-agents doctor [--profile <id>]     check the prerequisites and print the fixes
@@ -327,36 +344,37 @@ Usage: flash-agents [serve] [options]           serve the MCP stdio protocol (th
 Options:
   --root <path>             sandbox root and runtime working directory (default: cwd)
   --profile <id>            dsh profile to boot (default: flash-service)
-  --provider <id>           pinned LLM provider route (default: ollama)
-  --model <id>              pinned model on that route (default: deepseek-v4.1-flash:cloud)
-  --timeout-ms <n>          per-task wall-clock budget (default: 300000)
-  --batch-timeout-ms <n>    per-fleet wall-clock budget (default: 900000)
-  --max-tasks <n>           tasks accepted in one flash_batch call (default: 16)
-  --per-item-chars <n>      returned budget for one worker inside a fleet (default: 4000)
-  --max-result-chars <n>    returned child-message budget (default: 8000)
+  --provider <id>           pinned LLM provider route (default: ${route.provider})
+  --model <id>              pinned model on that route (default: ${route.model})
+  --timeout-ms <n>          per-task wall-clock budget (default: ${value('taskTimeoutMs')})
+  --batch-timeout-ms <n>    per-fleet wall-clock budget (default: ${value('batchTimeoutMs')})
+  --max-tasks <n>           tasks accepted in one flash_batch call (default: ${value('maxTasks')})
+  --per-item-chars <n>      returned budget for one worker inside a fleet (default: ${value('perItemChars')})
+  --max-result-chars <n>    returned child-message budget (default: ${value('maxResultChars')})
   --isolate <mode>          "copy" (default) runs writing calls in a disposable copy of the
                             root; "none" lets workers write to the root directly
-  --slots <n>               disposable trees kept in flight, one runtime each (default: 2)
+  --slots <n>               disposable trees kept in flight, one runtime each (default: ${value('slots')})
   --state-dir <path>        where slot trees and returned patches live (default: a directory
                             private to this root and this process under TMPDIR); a
                             configured directory is shared, so one service per directory
-  --diff-chars <n>          how much of a patch a result carries (default: 20000)
+  --diff-chars <n>          how much of a patch a result carries (default: ${value('diffChars')})
   --patch-retention-days <n>
                             days an unapplied patch is kept before the startup prune
-                            removes it (default: 14)
+                            removes it (default: ${value('patchRetentionDays')})
   --log-file <path>         append every diagnostic line, timestamped, to this file as
                             well as stderr
   -h, --help                show this help
 
 Environment: FLASH_SERVICE_ROOT, FLASH_SERVICE_PROFILE, FLASH_SERVICE_PROVIDER,
-FLASH_SERVICE_MODEL, FLASH_TASK_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS, FLASH_MAX_TASKS,
-FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
+FLASH_SERVICE_MODEL, FLASH_TASK_TIMEOUT_MS, FLASH_IDLE_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS,
+FLASH_MAX_TASKS, FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
 FLASH_STATE_DIR, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_LOG_FILE, FLASH_DSH_BIN.
 
 The route and the numeric limits default to flash.config.json, the one file that owns
 them. An empty environment value counts as unset, so a generated configuration may
 leave a setting blank rather than having to omit it.
 `
+}
 
 /**
  * Start the server on stdio.
@@ -639,18 +657,18 @@ async function main() {
     }
   }
   if (command !== 'serve') {
-    process.stderr.write(`flash-agents: unknown command "${command}"\n\n${USAGE}`)
+    process.stderr.write(`flash-agents: unknown command "${command}"\n\n${usage()}`)
     process.exit(2)
   }
   let options
   try {
     options = parseOptions(argv)
   } catch (error) {
-    process.stderr.write(`flash-agents: ${describeError(error)}\n\n${USAGE}`)
+    process.stderr.write(`flash-agents: ${describeError(error)}\n\n${usage()}`)
     process.exit(2)
   }
   if (options.help) {
-    process.stdout.write(USAGE)
+    process.stdout.write(usage())
     return
   }
   options.root = resolve(options.root)
