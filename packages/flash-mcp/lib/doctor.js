@@ -11,7 +11,9 @@
  * @module flash-mcp/doctor
  */
 
-import { execFileSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
+
+import { resolveDshCommand } from './sdk.js'
 
 /** The check ids in the order they run. */
 export const CHECK_IDS = Object.freeze([
@@ -25,8 +27,19 @@ export const CHECK_IDS = Object.freeze([
   'zstd',
 ])
 
-/** Minimum DeepSeek Harness version the service profile is known to work with. */
-const DEFAULT_MIN_DSH_VERSION = '0.1.5'
+/** The DeepSeek Harness version the profiles are written for and tested against. */
+const DEFAULT_DSH_VERSION = '0.2.0-rc.2'
+
+/**
+ * The oldest Node each release line runs dsh on. dsh starts its CLI behind
+ * `import.meta.main`, which Node 22.18 and 24.2 introduced, and on an older Node it
+ * exits 0 without doing anything; its dependencies also ask for 22.19. A line absent
+ * here and older than the newest one (Node 23, say) does not qualify at all.
+ */
+const NODE_MINIMUMS = Object.freeze({ 22: [22, 19, 0], 24: [24, 2, 0] })
+
+/** The Node requirement as people read it. */
+const NODE_REQUIREMENT = 'Node 22.19 or newer (24.2 or newer on the 24 line)'
 
 /** Endpoint whose answer proves the local Ollama daemon is up. */
 const OLLAMA_TAGS_URL = 'http://127.0.0.1:11434/api/tags'
@@ -34,21 +47,20 @@ const OLLAMA_TAGS_URL = 'http://127.0.0.1:11434/api/tags'
 /**
  * Run one command and report its exit status instead of throwing.
  *
+ * Standard error is kept on success too: `dsh --dump-config` reports a patch that
+ * did not apply on standard error and still exits 0.
+ *
  * @param {string} command - executable to invoke.
  * @param {string[]} args - arguments to pass to it.
  * @param {NodeJS.ProcessEnv} env - environment for the child process.
  * @returns {{status: number, stdout: string, stderr: string}} the captured result.
  */
 function defaultRun(command, args, env) {
-  try {
-    const stdout = execFileSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env })
-    return { status: 0, stdout, stderr: '' }
-  } catch (error) {
-    return {
-      status: typeof error?.status === 'number' ? error.status : 1,
-      stdout: typeof error?.stdout === 'string' ? error.stdout : '',
-      stderr: typeof error?.stderr === 'string' ? error.stderr : '',
-    }
+  const result = spawnSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env })
+  return {
+    status: typeof result.status === 'number' ? result.status : 1,
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? (result.error instanceof Error ? result.error.message : ''),
   }
 }
 
@@ -93,9 +105,30 @@ function compareVersions(left, right) {
   return 0
 }
 
+/**
+ * Whether a Node version can run dsh.
+ *
+ * @param {string} version - a Node version such as `22.19.0` or `v24.1.0`.
+ * @returns {boolean} true when the version meets its release line's minimum.
+ */
+function nodeQualifies(version) {
+  const parsed = parseVersion(version)
+  if (parsed === null) return false
+  const minimum = NODE_MINIMUMS[parsed[0]]
+  if (minimum !== undefined) return compareVersions(parsed, minimum) >= 0
+  return parsed[0] > Math.max(...Object.keys(NODE_MINIMUMS).map(Number))
+}
+
 /** The shell command that installs zstd on this platform. @returns {string} the command. */
 function zstdFix() {
-  return process.platform === 'darwin' ? 'brew install zstd' : 'install zstd'
+  if (process.platform === 'darwin') return 'brew install zstd'
+  if (process.platform === 'win32') return 'winget install Meta.Zstandard'
+  return 'install zstd'
+}
+
+/** The first non-empty line of some output, for a one-line detail. */
+function firstLine(text) {
+  return (text ?? '').split(/\r?\n/).find((line) => line.trim().length > 0)?.trim() ?? ''
 }
 
 /**
@@ -103,13 +136,15 @@ function zstdFix() {
  *
  * @param {object} [options] - injected effects and overrides.
  * @param {(command: string, args: string[]) => {status: number, stdout: string, stderr: string}} [options.run]
- *        Command runner; defaults to execFileSync, reporting a non-zero status instead of throwing.
+ *        Command runner; defaults to spawnSync, reporting a non-zero status instead of throwing.
  * @param {(url: string) => Promise<boolean>} [options.probe] - HTTP reachability probe; defaults to fetch with a short timeout.
  * @param {NodeJS.ProcessEnv} [options.env] - environment for the default runner (default process.env).
  * @param {string} [options.nodeVersion] - Node version to test (default process.versions.node).
  * @param {string} [options.profile] - service profile to compose (default 'flash-service').
  * @param {string} [options.model] - Ollama model to require (default 'deepseek-v4.1-flash:cloud').
- * @param {string} [options.minDshVersion] - minimum accepted dsh version (default '0.1.5').
+ * @param {string} [options.dshVersion] - the dsh version the profiles are written for (default '0.2.0-rc.2').
+ * @param {{command: string, prefix: string[]}} [options.launcher] - how to start dsh; defaults to the
+ *        launcher the server itself resolves, so the doctor checks exactly the dsh the server would run.
  * @returns {Promise<{checks: object[], ok: boolean, failures: number, warnings: number}>} the report.
  */
 export async function runChecks(options = {}) {
@@ -118,7 +153,8 @@ export async function runChecks(options = {}) {
   const nodeVersion = config.nodeVersion ?? process.versions.node
   const profile = config.profile ?? 'flash-service'
   const model = config.model ?? 'deepseek-v4.1-flash:cloud'
-  const minDshVersion = config.minDshVersion ?? DEFAULT_MIN_DSH_VERSION
+  const dshVersion = config.dshVersion ?? DEFAULT_DSH_VERSION
+  const dshInstall = `npm i -g @deepseek-ai/dsh@${dshVersion}`
   const run = config.run ?? ((command, args) => defaultRun(command, args, env))
   const probe = config.probe ?? defaultProbe
 
@@ -144,43 +180,65 @@ export async function runChecks(options = {}) {
   const checks = []
   const record = (id, title, status, detail, fix) => checks.push({ id, title, status, detail, fix })
 
-  const nodeMajor = Number.parseInt(String(nodeVersion).replace(/^v/, '').split('.')[0], 10)
-  if (Number.isInteger(nodeMajor) && nodeMajor >= 20) {
-    record('node', 'Node.js version', 'ok', `Node ${nodeVersion} is at least 20`, '')
+  if (nodeQualifies(nodeVersion)) {
+    record('node', 'Node.js version', 'ok', `Node ${nodeVersion} can run dsh`, '')
   } else {
-    record('node', 'Node.js version', 'fail', `Node ${nodeVersion} is older than the required Node 20`, 'install Node 20 or newer')
+    record('node', 'Node.js version', 'fail', `Node ${nodeVersion} cannot run dsh, which needs ${NODE_REQUIREMENT}`, `install ${NODE_REQUIREMENT}`)
   }
 
-  const dsh = safeRun('dsh', ['--version'])
-  const dshOnPath = dsh.status === 0
-  if (dshOnPath) {
-    record('dsh', 'dsh on PATH', 'ok', 'dsh --version succeeded', '')
+  let launcher = config.launcher
+  let notFound = ''
+  if (launcher === undefined) {
+    try {
+      launcher = resolveDshCommand(env)
+    } catch (error) {
+      notFound = error instanceof Error ? error.message : String(error)
+    }
+  }
+  const runDsh = (args) => safeRun(launcher.command, [...launcher.prefix, ...args])
+
+  const dsh = launcher === undefined ? undefined : runDsh(['--version'])
+  const dshRuns = dsh !== undefined && dsh.status === 0
+  if (dshRuns) {
+    record('dsh', 'dsh launcher', 'ok', 'dsh --version succeeded', '')
+  } else if (dsh === undefined) {
+    record('dsh', 'dsh launcher', 'fail', notFound || 'dsh was not found on PATH', dshInstall)
   } else {
-    record('dsh', 'dsh on PATH', 'fail', 'dsh was not found on PATH', 'npm i -g @deepseek-ai/dsh')
+    const why = firstLine(dsh.stderr)
+    record('dsh', 'dsh launcher', 'fail', `dsh was found but did not start${why === '' ? '' : `: ${why}`}`, dshInstall)
   }
 
-  if (!dshOnPath) {
-    record('dsh-version', 'dsh version', 'warn', 'dsh is not on PATH, so its version could not be determined', 'npm i -g @deepseek-ai/dsh@latest')
+  if (!dshRuns) {
+    record('dsh-version', 'dsh version', 'warn', 'dsh did not start, so its version could not be determined', dshInstall)
   } else {
-    const installed = parseVersion(dsh.stdout)
-    const minimum = parseVersion(minDshVersion)
-    if (installed === null) {
-      record('dsh-version', 'dsh version', 'warn', 'dsh did not report a parsable version', 'npm i -g @deepseek-ai/dsh@latest')
-    } else if (minimum !== null && compareVersions(installed, minimum) < 0) {
-      record('dsh-version', 'dsh version', 'warn', `dsh ${installed.join('.')} is older than the required ${minDshVersion}`, 'npm i -g @deepseek-ai/dsh@latest')
+    const installed = /\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/.exec(dsh.stdout)?.[0]
+    const pinned = parseVersion(dshVersion)
+    if (installed === undefined) {
+      // dsh's CLI runs behind `import.meta.main`; on a Node without it, dsh prints nothing and exits 0.
+      record('dsh-version', 'dsh version', 'fail', `dsh printed no version; dsh does nothing at all on a Node older than ${NODE_REQUIREMENT}`, `install ${NODE_REQUIREMENT}`)
+    } else if (installed === dshVersion) {
+      record('dsh-version', 'dsh version', 'ok', `dsh ${installed} is the version the profiles are written for`, '')
+    } else if (pinned !== null && parseVersion(installed).slice(0, 2).join('.') === pinned.slice(0, 2).join('.')) {
+      record('dsh-version', 'dsh version', 'warn', `dsh ${installed} is not the tested ${dshVersion}; it is on the same release line and will probably work`, dshInstall)
     } else {
-      record('dsh-version', 'dsh version', 'ok', `dsh ${installed.join('.')} meets the ${minDshVersion} minimum`, '')
+      // Before 1.0 a minor release may rename the rows the profiles patch, and a patch
+      // whose row is gone leaves that row at the harness default.
+      record('dsh-version', 'dsh version', 'fail', `dsh ${installed} is not the ${dshVersion} the profiles are written for`, dshInstall)
     }
   }
 
-  if (!dshOnPath) {
-    record('profile', 'service profile', 'warn', `dsh is not on PATH, so the ${profile} profile could not be composed`, 'node install.mjs')
+  if (!dshRuns) {
+    record('profile', 'service profile', 'warn', `dsh did not start, so the ${profile} profile could not be composed`, 'node install.mjs')
   } else {
-    const dump = safeRun('dsh', ['--profile', profile, '--dump-config'])
-    if (dump.status === 0) {
+    const dump = runDsh(['--profile', profile, '--dump-config'])
+    // dsh reports a patch entry it could not apply on stderr and still exits 0, so the
+    // stderr line is what tells a broken composition from a working one.
+    const complaint = (dump.stderr ?? '').split(/\r?\n/).find((line) => line.startsWith('dsh:'))?.trim() ?? ''
+    if (dump.status === 0 && complaint === '') {
       record('profile', 'service profile', 'ok', `the ${profile} profile composes`, '')
     } else {
-      record('profile', 'service profile', 'fail', `the ${profile} profile did not compose`, 'node install.mjs')
+      const why = complaint || firstLine(dump.stderr)
+      record('profile', 'service profile', 'fail', `the ${profile} profile did not compose${why === '' ? '' : `: ${why}`}`, 'node install.mjs')
     }
   }
 

@@ -81,7 +81,7 @@ export const DEFAULT_CONFIG = deepFreeze({
       '.docker/config.json',
     ],
   },
-  dsh: { package: '@deepseek-ai/dsh', minVersion: '0.1.5' },
+  dsh: { package: '@deepseek-ai/dsh', version: '0.2.0-rc.2' },
 })
 
 /**

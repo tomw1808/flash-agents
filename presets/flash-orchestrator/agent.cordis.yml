@@ -181,15 +181,16 @@
     # Goal 5 — bounded parallel fan-out. The engine caps are the hard limits:
     # 4 concurrent `agent()` calls, 32 total children per run, 32 items per call.
     # Goal 2 — every `agent()` child is started through the strict `flash` provider.
-    - id: workflow-worker-thread
-      name: '@deepseek-ai/dsh-workflow-worker-thread'
+    # The engine runs each script in a sandboxed Node process, so it also needs the
+    # host's `ptcRuntime` and `sandboxPolicy`, which the base tree provides.
+    - id: workflow-ptc
+      name: '@deepseek-ai/dsh-workflow-ptc'
       config:
         provider: flash
         maxConcurrentAgents: 4
         maxTotalAgents: 32
         maxItemsPerCall: 32
         syncTimeoutMs: 5000
-        disposeGraceMs: 5000
 
     - id: tool-workflow
       name: '@deepseek-ai/dsh-tool-workflow'

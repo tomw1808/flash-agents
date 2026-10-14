@@ -455,10 +455,11 @@ Honest limits of this design:
 - A **non-git root** is still isolated, but there is no diff to compute, so there is no verdict — only
   the worker's report.
 - Without copy-on-write the copy is a real copy and costs real time and space per call, and
-  `--slots 1` bounds it. The clone is attempted with the platform's own spelling — `cp -cR` on macOS,
-  `cp --reflink=always -R` on Linux — and the fallback is reported as `copy`, not silently as a clone.
-- `apply` writes the patch with `git apply` (or `patch -p1` when the root is not a repository) into
-  the working tree, leaving your index alone. A patch that no longer applies is reported as an error
+  `--slots 1` bounds it. The copy is Node's own, so it needs no `cp`; each file is cloned with
+  `COPYFILE_FICLONE_FORCE` — `clonefile` on APFS, a reflink on Linux — and the fallback is reported
+  as `copy`, not silently as a clone.
+- `apply` writes the patch with `git apply` into the working tree, leaving your index alone; when
+  the root is no longer a repository, git is kept from finding one above it. A patch that no longer applies is reported as an error
   naming the kept patch file, so a conflict is never lost work.
 - `--isolate none` exists for debugging the wall. With it, point `--root` at something you are willing
   to lose: the wall protects `.git` and secrets, but it does not protect your uncommitted source.
@@ -475,7 +476,7 @@ naming the path that is wrong instead of silently falling back to something else
   "route": { "provider": "ollama", "model": "deepseek-v4.1-flash:cloud" },
   "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 10800000, "idleTimeoutMs": 600000, "diffChars": 20000, "patchRetentionDays": 14 },
   "guard": { "protectedSegments": [".git"], "fenceMutations": true },
-  "dsh": { "package": "@deepseek-ai/dsh", "minVersion": "0.1.5" }
+  "dsh": { "package": "@deepseek-ai/dsh", "version": "0.2.0-rc.2" }
 }
 ```
 
@@ -649,7 +650,7 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
 | 2 | V4.1 Flash via the configured Ollama route | row config `provider: ollama`, `model: deepseek-v4.1-flash:cloud`, forced in `start()` |
 | 3 | one narrow delegation tool | `tool-flash` (`@deepseek-ai/dsh-tool-subagent`) — one-shot, `maxDepth: 1`, narrow child persona |
 | 4 | child model independent of parent | the contract drops caller routing, so an expensive parent cannot leak; override a *child route* by using the `spawn` provider instead |
-| 5 | bounded parallel execution | `@deepseek-ai/dsh-tool-workflow` + `@deepseek-ai/dsh-workflow-worker-thread` |
+| 5 | bounded parallel execution | `@deepseek-ai/dsh-tool-workflow` + `@deepseek-ai/dsh-workflow-ptc` |
 | 6 | bounded fresh-agent gauntlet | `@deepseek-ai/dsh-tool-ralph` (shipped fixed script, workspace + structured handoff) |
 | 7 | hard limits | table above |
 | 8 | no unrestricted fs/shell | the preset only selects tools; the sandbox and approval rows stay host-plane, and children inherit them |

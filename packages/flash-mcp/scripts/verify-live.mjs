@@ -70,7 +70,11 @@ async function resolveSdkDir() {
     if (parent === dir) break
     dir = parent
   }
-  throw new Error(`no @modelcontextprotocol/sdk beside ${entry}; tried:\n  ${tried.join('\n  ')}\nset MCP_SDK_DIR to its directory`)
+  // dsh 0.2 no longer ships the SDK, so on a current install this is the usual outcome.
+  throw new Error(
+    `no @modelcontextprotocol/sdk beside ${entry}; tried:\n  ${tried.join('\n  ')}\n` +
+      'install it anywhere (npm i @modelcontextprotocol/sdk@1) and set MCP_SDK_DIR to node_modules/@modelcontextprotocol/sdk there',
+  )
 }
 
 const describe = (error) => (error instanceof Error ? error.message : String(error))

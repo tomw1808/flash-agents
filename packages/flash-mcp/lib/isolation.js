@@ -43,7 +43,20 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  constants,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -670,22 +683,23 @@ const COMMIT_CONFIG = [
   '-c', 'core.hooksPath=/dev/null',
 ]
 
-/**
- * Run one git command and return its standard output.
- *
- * @param {string[]} args - arguments after `git`.
- * @param {string} cwd - directory to run in.
- * @returns {string} standard output.
- * @throws {Error} with git's own message when the command fails.
- */
 /** One error message from an unknown throwable. */
 function messageOf(error) {
   return error instanceof Error ? error.message : String(error)
 }
 
-function git(args, cwd) {
+/**
+ * Run one git command and return its standard output.
+ *
+ * @param {string[]} args - arguments after `git`.
+ * @param {string} cwd - directory to run in.
+ * @param {NodeJS.ProcessEnv} [env] - environment for git (default process.env).
+ * @returns {string} standard output.
+ * @throws {Error} with git's own message when the command fails.
+ */
+function git(args, cwd, env = process.env) {
   try {
-    return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    return execFileSync('git', args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
   } catch (error) {
     const stderr = typeof error?.stderr === 'string' ? error.stderr.trim() : ''
     throw new Error(`git ${args.join(' ')} failed in ${cwd}${stderr.length === 0 ? '' : `: ${stderr}`}`)
@@ -745,36 +759,51 @@ function isGitWorkTree(dir) {
  * Copy the contents of one directory into another.
  *
  * The clone is attempted first: on APFS (and on filesystems with reflink support)
- * `cp -c` shares every block with the source until one side writes, so a large
- * repository copies instantly and costs nothing. Everywhere else the plain copy is
- * used, which is correct and slower.
+ * a cloned file shares every block with the source until one side writes, so a large
+ * repository copies instantly and costs nothing. The first file that cannot be cloned
+ * switches the rest of the tree to a plain copy, which is correct and slower.
+ *
+ * This is Node's own copy rather than `cp`, which Windows does not have. It is not
+ * `fs.cpSync` either: that rewrites a relative symlink into an absolute one pointing
+ * back into the source, so a worker writing through it would reach the caller's tree,
+ * and it throws on a socket or a FIFO left in a working tree. Symlinks are copied as
+ * they are, and anything that is not a file, a directory, or a symlink is skipped.
  *
  * @param {string} from - source directory.
  * @param {string} to - existing destination directory.
  * @returns {'clone' | 'copy'} which mechanism was used.
  */
 function copyTree(from, to) {
-  // `${from}/.` and not `join(from, '.')`: `join` normalizes the trailing `/.` away,
-  // and `cp -R <dir> <dest>` then copies the directory *into* the destination
-  // instead of copying its contents.
-  const source = from.endsWith(sep) ? `${from}.` : `${from}${sep}.`
-  const copy = (args) => execFileSync('cp', [...args, source, to], { stdio: ['ignore', 'ignore', 'pipe'] })
-  // `-c` is macOS's "clone the blocks" flag; on GNU coreutils it means nothing and
-  // would either error or take a different meaning, while `--reflink=always` is the
-  // Linux spelling and refuses rather than silently copying when unsupported. The
-  // `always` form is what makes the returned mechanism honest: a silent fallback
-  // inside `cp --reflink=auto` would be reported as a clone that never happened.
-  try {
-    if (process.platform === 'darwin') {
-      copy(['-cR'])
-    } else {
-      copy(['--reflink=always', '-R'])
+  // FICLONE_FORCE refuses rather than silently copying when the filesystem cannot
+  // clone, which is what makes the returned mechanism honest.
+  let mechanism = 'clone'
+  const copyFile = (source, target) => {
+    if (mechanism === 'clone') {
+      try {
+        copyFileSync(source, target, constants.COPYFILE_FICLONE_FORCE)
+        return
+      } catch {
+        mechanism = 'copy'
+      }
     }
-    return 'clone'
-  } catch {
-    copy(['-R'])
-    return 'copy'
+    copyFileSync(source, target)
   }
+  const walk = (source, target) => {
+    for (const entry of readdirSync(source, { withFileTypes: true })) {
+      const sourcePath = join(source, entry.name)
+      const targetPath = join(target, entry.name)
+      if (entry.isDirectory()) {
+        mkdirSync(targetPath, { recursive: true })
+        walk(sourcePath, targetPath)
+      } else if (entry.isFile()) {
+        copyFile(sourcePath, targetPath)
+      } else if (entry.isSymbolicLink()) {
+        symlinkSync(readlinkSync(sourcePath), targetPath)
+      }
+    }
+  }
+  walk(from, to)
+  return mechanism
 }
 
 /**
@@ -1302,15 +1331,13 @@ export class WorkspaceIsolation {
     const check = dryRun ? ['--check'] : []
     // A patch computed inside one nested repository applies inside that repository.
     const target = record.scope ? join(this.root, record.scope) : this.root
-    if (isGitWorkTree(target)) {
-      // Without `--index` the caller's index is left alone; only the working tree moves.
-      git(['apply', '--whitespace=nowarn', ...check, record.patchPath], target)
-    } else {
-      execFileSync('patch', ['-p1', '--batch', '--forward', ...(dryRun ? ['--dry-run'] : []), '-i', record.patchPath], {
-        cwd: target,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-    }
+    // Without `--index` the caller's index is left alone; only the working tree moves.
+    // `git apply` also works outside a repository, which covers a target whose `.git`
+    // is gone, without needing `patch` (Windows has none). It must then not discover a
+    // repository enclosing the target: inside one, paths in the patch would be read
+    // relative to that repository's top instead of to the target.
+    const env = isGitWorkTree(target) ? undefined : { ...process.env, GIT_CEILING_DIRECTORIES: dirname(target) }
+    git(['apply', '--whitespace=nowarn', ...check, record.patchPath], target, env)
     if (!dryRun) {
       record.appliedAt = Date.now()
       this.#writeMeta(record)

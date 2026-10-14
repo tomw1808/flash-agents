@@ -16,7 +16,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, sep } from 'node:path'
 import { test } from 'node:test'
@@ -105,6 +105,54 @@ test('a worker writes into a copy, and the caller’s tree is untouched', async 
   assert.equal(readFileSync(join(repo, 'worker.txt'), 'utf8'), 'made by the worker\n')
   assert.equal(readFileSync(join(repo, 'keep.txt'), 'utf8'), 'the worker rewrote this\n')
   assert.equal(existsSync(join(repo, 'README.md')), false)
+  isolation.close()
+})
+
+test('a symlink is copied as it is, so it cannot lead back into the caller’s tree', async (t) => {
+  const repo = makeRepo()
+  try {
+    symlinkSync('keep.txt', join(repo, 'link.txt'))
+  } catch {
+    t.skip('this platform cannot create a symlink here')
+    return
+  }
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  // Relative and unchanged: resolved inside the copy, it names the copy's own file.
+  assert.equal(readlinkSync(join(slot.dir, 'link.txt')), 'keep.txt')
+  writeFileSync(join(slot.dir, 'link.txt'), 'written through the link\n')
+  assert.equal(readFileSync(join(slot.dir, 'keep.txt'), 'utf8'), 'written through the link\n')
+  assert.equal(readFileSync(join(repo, 'keep.txt'), 'utf8'), 'keep me\n')
+  isolation.close()
+})
+
+test('a patch applies to a root whose .git is gone, even inside another repository', async () => {
+  // The root sits inside an unrelated repository. Once its own `.git` is gone, a git
+  // that went looking upwards would read the patch's paths against the outer
+  // repository and, from a subdirectory, silently skip every one of them.
+  const outer = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-outer-')))
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: outer })
+  const repo = join(outer, 'inner')
+  mkdirSync(repo)
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repo })
+  writeFileSync(join(repo, 'keep.txt'), 'keep me\n')
+  execFileSync('git', ['add', '-A'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: repo })
+
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  writeFileSync(join(slot.dir, 'worker.txt'), 'made by the worker\n')
+  writeFileSync(join(slot.dir, 'keep.txt'), 'the worker rewrote this\n')
+  const change = isolation.collect(slot)
+  rmSync(join(repo, '.git'), { recursive: true, force: true })
+
+  assert.equal(isolation.apply({ patchId: change.patchId, dryRun: true }).applied, false)
+  assert.equal(isolation.apply({ patchId: change.patchId }).applied, true)
+  assert.equal(readFileSync(join(repo, 'worker.txt'), 'utf8'), 'made by the worker\n')
+  assert.equal(readFileSync(join(repo, 'keep.txt'), 'utf8'), 'the worker rewrote this\n')
+  assert.equal(existsSync(join(outer, 'worker.txt')), false)
   isolation.close()
 })
 

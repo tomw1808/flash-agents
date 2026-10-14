@@ -74,8 +74,9 @@ test('an unusable option is refused', () => {
 })
 
 /** Injected effects for the doctor: no binary is run and no socket is opened. */
-function fakes({ dsh = { status: 0, stdout: '9.9.9\n', stderr: '' }, daemon = true, show = { status: 0, stdout: '', stderr: '' } } = {}) {
+function fakes({ dsh = { status: 0, stdout: `${config.dsh.version}\n`, stderr: '' }, daemon = true, show = { status: 0, stdout: '', stderr: '' } } = {}) {
   return {
+    launcher: { command: 'dsh', prefix: [] },
     run: (command, args) => {
       if (command === 'dsh') return args[0] === '--version' ? dsh : { status: 0, stdout: '', stderr: '' }
       if (command === 'ollama') return show
@@ -104,7 +105,7 @@ test('doctor exits non-zero and prints a fix for each broken prerequisite', asyn
   assert.equal(code, 1)
   const text = lines.join('')
   assert.match(text, /check\(s\) failed/)
-  assert.match(text, /Fix: dsh: npm i -g @deepseek-ai\/dsh/)
+  assert.match(text, /Fix: dsh: npm i -g @deepseek-ai\/dsh@/)
   assert.match(text, /Fix: ollama: ollama serve/)
 })
 

@@ -111,8 +111,11 @@
 
 # The fleet engine. Fan-out, concurrency, the total-child ceiling, and per-item
 # isolation are shipped behaviour; this profile sets their values and pins where
-# the members run.
-- id: workflow-worker-thread
+# the members run. The row id names the engine the pinned harness ships
+# (`dsh.version` in flash.config.json): a harness that renamed it would compose
+# with this row missing, leaving every cap at its default and every fleet member
+# on the unpinned `spawn` provider — which is why the version is pinned.
+- id: workflow-ptc
   config:
     # Every fleet member starts through the strict routing-contract provider, so
     # the route is pinned by construction and a script gains no provider selector.

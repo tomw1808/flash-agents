@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtempSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -148,6 +148,26 @@ test('resolveDshCommand finds dsh on PATH and refuses when it cannot', () => {
   const found = resolveDshCommand({ PATH: process.env.PATH ?? '' })
   assert.match(found.command, /dsh$/)
   assert.throws(() => resolveDshCommand({ PATH: '/nonexistent' }), /cannot find the dsh launcher/)
+})
+
+test('on Windows an npm .cmd shim is run as its JavaScript entry, never spawned itself', () => {
+  // Node refuses to spawn a .cmd without a shell (CVE-2024-27980), so the launcher must
+  // be the entry the shim starts, run with this Node. The shim text is npm's own.
+  const bin = mkdtempSync(join(tmpdir(), 'flash-shim-'))
+  const entry = join(bin, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+  mkdirSync(join(entry, '..'), { recursive: true })
+  writeFileSync(entry, '')
+  writeFileSync(
+    join(bin, 'dsh.cmd'),
+    '@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\n' +
+      'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js" %*\r\n',
+  )
+  const expected = { command: process.execPath, prefix: [entry] }
+  assert.deepEqual(resolveDshCommand({ Path: bin }, 'win32'), expected)
+  assert.deepEqual(resolveDshCommand({ FLASH_DSH_BIN: join(bin, 'dsh.cmd') }, 'win32'), expected)
+
+  writeFileSync(join(bin, 'dsh.cmd'), '@ECHO off\r\nsomething-else.exe %*\r\n')
+  assert.throws(() => resolveDshCommand({ Path: bin }, 'win32'), /cannot spawn a \.cmd.*FLASH_DSH_BIN/)
 })
 
 test('the SDK client surfaces a runtime protocol error and shuts down', async () => {

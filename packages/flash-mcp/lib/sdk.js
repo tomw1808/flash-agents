@@ -14,8 +14,8 @@
  */
 
 import { spawn } from 'node:child_process'
-import { accessSync, constants, existsSync } from 'node:fs'
-import { delimiter, join } from 'node:path'
+import { accessSync, constants, existsSync, readFileSync } from 'node:fs'
+import { delimiter, dirname, join } from 'node:path'
 
 /** Identity the SDK runtime reports at handshake. */
 export const SDK_SERVER_NAME = 'deepseek-harness-sdk-runtime'
@@ -32,36 +32,76 @@ const DEFAULT_STDERR_TAIL_BYTES = 4_096
  * Order: `FLASH_DSH_BIN` (a launcher path, or a JavaScript entry run with the
  * current Node binary), then the first executable `dsh` on `PATH`.
  *
+ * On Windows, npm installs `dsh` as a `dsh.cmd` shim, and Node refuses to spawn a
+ * `.cmd` or `.bat` without a shell (CVE-2024-27980). The shim is therefore resolved
+ * to the JavaScript entry it starts, which is then run with the current Node binary,
+ * exactly as an `FLASH_DSH_BIN` pointing at that entry would be.
+ *
  * @param {Record<string, string | undefined>} [env] - environment to read.
+ * @param {string} [platform] - platform to resolve for (tests).
  * @returns {{command: string, prefix: string[]}} spawn command and leading args.
  */
-export function resolveDshCommand(env = process.env) {
+export function resolveDshCommand(env = process.env, platform = process.platform) {
   const override = env.FLASH_DSH_BIN
   if (typeof override === 'string' && override.trim().length > 0) {
-    return commandFor(override.trim())
+    return commandFor(override.trim(), platform)
   }
-  const found = findOnPath('dsh', env.PATH ?? '')
-  if (found !== undefined) return { command: found, prefix: [] }
+  // Windows spells it `Path`, and a copied environment keeps that spelling.
+  const pathValue = env.PATH ?? (platform === 'win32' ? env.Path : undefined) ?? ''
+  const found = findOnPath('dsh', pathValue, platform)
+  if (found !== undefined) return commandFor(found, platform)
   throw new Error(
     'cannot find the dsh launcher: set FLASH_DSH_BIN to the dsh executable (or to lib/bin.js inside the harness install), or put dsh on PATH',
   )
 }
 
 /** Turn a launcher path into a spawn command, running JavaScript entries with Node. */
-function commandFor(path) {
-  return /\.(c|m)?js$/.test(path)
-    ? { command: process.execPath, prefix: [path] }
-    : { command: path, prefix: [] }
+function commandFor(path, platform) {
+  if (/\.(c|m)?js$/i.test(path)) return { command: process.execPath, prefix: [path] }
+  if (platform === 'win32' && /\.(cmd|bat)$/i.test(path)) {
+    const entry = shimEntry(path)
+    if (entry === undefined) {
+      throw new Error(
+        `cannot start ${path}: Node cannot spawn a .cmd or .bat launcher, and no JavaScript entry was found behind it; set FLASH_DSH_BIN to lib/bin.js inside the harness install`,
+      )
+    }
+    return { command: process.execPath, prefix: [entry] }
+  }
+  return { command: path, prefix: [] }
+}
+
+/**
+ * Find the JavaScript entry behind an npm `.cmd` shim.
+ *
+ * npm's shim ends in `"%dp0%\node_modules\<package>\<bin>.js" %*`, where `%dp0%` is
+ * the shim's own directory, so the entry is read from the shim rather than guessed.
+ *
+ * @param {string} shim - path to the `.cmd` or `.bat` file.
+ * @returns {string | undefined} the entry's path, or undefined when the shim names none that exists.
+ */
+function shimEntry(shim) {
+  let text
+  try {
+    text = readFileSync(shim, 'utf8')
+  } catch {
+    return undefined
+  }
+  const match = /"%~?dp0%?\\([^"]+\.(?:c|m)?js)"/i.exec(text)
+  if (match === null) return undefined
+  const entry = join(dirname(shim), ...match[1].split('\\'))
+  return existsSync(entry) ? entry : undefined
 }
 
 /** Find the first executable candidate on a PATH-style string. */
-function findOnPath(name, pathValue) {
-  const suffixes = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : ['']
-  for (const directory of pathValue.split(delimiter)) {
+function findOnPath(name, pathValue, platform) {
+  const suffixes = platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : ['']
+  for (const directory of pathValue.split(platform === 'win32' ? ';' : delimiter)) {
     if (directory.length === 0) continue
     for (const suffix of suffixes) {
       const candidate = join(directory, name + suffix)
       if (!existsSync(candidate)) continue
+      // Windows has no execute bit: there, a file with the right suffix is a launcher.
+      if (platform === 'win32') return candidate
       try {
         accessSync(candidate, constants.X_OK)
         return candidate

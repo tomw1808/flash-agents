@@ -59,12 +59,12 @@ encodes that loop, so Claude does it without being told.
 
 ## Install
 
-You need **Claude Code**, **Node 20+**, and **[Ollama](https://ollama.com)**. About five minutes.
+You need **Claude Code**, **Node 22.19+** (or 24.2+), and **[Ollama](https://ollama.com)**. About five minutes.
 
 **1. Install the worker runtime and the model**
 
 ```sh
-npm i -g @deepseek-ai/dsh                # DeepSeek Harness: runs the workers and their sandbox
+npm i -g @deepseek-ai/dsh@0.2.0-rc.2     # DeepSeek Harness, the version the profiles are written for
 ollama signin                            # the :cloud model runs on Ollama's cloud, under your account
 ollama pull deepseek-v4.1-flash:cloud
 ```
@@ -144,7 +144,8 @@ To watch workers live, set a log file and `tail -f` it — see
 - **Gitignored output isn't carried in the patch.** It's named in the result instead.
 - **The dispatcher is a cheap model too.** Occasionally it does the work itself instead of
   delegating; that call fails as `NOT_DELEGATED`, nothing from it is kept, and a retry usually works.
-- macOS and Linux. Windows is untested.
+- macOS and Linux. On Windows nothing needs `cp` or `patch` any more and `dsh.cmd` starts, but no
+  worker has run there yet: treat it as experimental.
 
 ## Manual install (without the plugin)
 

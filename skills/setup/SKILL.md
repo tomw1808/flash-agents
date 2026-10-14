@@ -28,12 +28,16 @@ Flash Agents does not reimplement agent machinery; it composes DeepSeek Harness,
 must be installed separately:
 
 ```sh
-npm i -g @deepseek-ai/dsh
+npm i -g @deepseek-ai/dsh@0.2.0-rc.2
 dsh --version
 ```
 
-Node 20 or newer is required. The doctor names the minimum harness version, and warns
-rather than fails when the installed one is older.
+Install exactly this version, not `@latest`: the harness is pre-1.0, a new release may
+rename the rows the profiles patch, and the doctor fails on a harness from another
+release line. The version lives in `dsh.version` in `flash.config.json`.
+
+Node 22.19 or newer is required (24.2 or newer on the 24 line). On an older Node, `dsh`
+prints nothing and exits 0, so `dsh --version` printing nothing means Node is too old.
 
 ## 3. Ollama and a model
 

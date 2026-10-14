@@ -518,19 +518,21 @@ function textFrom(value) {
  * @param {(text: string) => void} [options.write] - output sink.
  * @param {Function} [options.run] - command runner handed to the checks.
  * @param {Function} [options.probe] - HTTP probe handed to the checks.
+ * @param {{command: string, prefix: string[]}} [options.launcher] - dsh launcher handed to the checks.
  * @returns {Promise<number>} the exit code: 0 when nothing failed.
  */
-export async function runDoctor(argv = [], { env = process.env, write, run, probe } = {}) {
+export async function runDoctor(argv = [], { env = process.env, write, run, probe, launcher } = {}) {
   const emit = write ?? ((text) => process.stdout.write(text))
   const config = loadConfig({ env })
   const at = argv.indexOf('--profile')
   const result = await runChecks({
     env,
     model: config.route.model,
-    minDshVersion: config.dsh.minVersion,
+    dshVersion: config.dsh.version,
     profile: at < 0 ? (textFrom(env.FLASH_SERVICE_PROFILE) ?? 'flash-service') : argv[at + 1],
     ...(run === undefined ? {} : { run }),
     ...(probe === undefined ? {} : { probe }),
+    ...(launcher === undefined ? {} : { launcher }),
   })
   emit(`${formatChecks(result)}\n`)
   emit(

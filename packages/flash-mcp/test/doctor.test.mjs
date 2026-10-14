@@ -21,7 +21,7 @@ function find(result, id) {
  * @returns {{options: object, calls: Array<{command: string, args: string[]}>}} the fakes plus a call log.
  */
 function fakeOptions(behaviors = {}, options = {}) {
-  const dsh = behaviors.dsh ?? { status: 0, stdout: '0.2.0\n', stderr: '' }
+  const dsh = behaviors.dsh ?? { status: 0, stdout: '0.2.0-rc.2\n', stderr: '' }
   const profileDump = behaviors.profileDump ?? { status: 0, stdout: '', stderr: '' }
   const ollamaShow = behaviors.ollamaShow ?? { status: 0, stdout: '', stderr: '' }
   const git = behaviors.git ?? { status: 0, stdout: 'git version 2.0.0\n', stderr: '' }
@@ -36,7 +36,8 @@ function fakeOptions(behaviors = {}, options = {}) {
     if (command === 'zstd') return zstd
     return { status: 1, stdout: '', stderr: 'not found' }
   }
-  return { options: { run, probe: async () => daemon, ...options }, calls }
+  const launcher = { command: 'dsh', prefix: [] }
+  return { options: { run, probe: async () => daemon, launcher, nodeVersion: '22.19.0', ...options }, calls }
 }
 
 test('reports eight ok checks for a fully working environment', async () => {
@@ -65,21 +66,56 @@ test('fails when dsh is missing and downgrades the version check', async () => {
   assert.equal(result.warnings, 2)
 })
 
-test('warns on an old dsh version while staying ok', async () => {
-  const { options } = fakeOptions({ dsh: { status: 0, stdout: '0.1.4\n', stderr: '' } })
+test('reports why the launcher could not be found, using the server resolver', async () => {
+  const { options, calls } = fakeOptions({}, { launcher: undefined, env: { PATH: '/nonexistent' } })
   const result = await runChecks(options)
-  const version = find(result, 'dsh-version')
-  assert.equal(version.status, 'warn')
-  assert.match(version.fix, /@deepseek-ai\/dsh@latest/)
-  assert.equal(result.ok, true)
-  assert.equal(result.failures, 0)
-  assert.equal(result.warnings, 1)
+  const dsh = find(result, 'dsh')
+  assert.equal(dsh.status, 'fail')
+  assert.match(dsh.detail, /cannot find the dsh launcher/)
+  assert.equal(calls.filter((entry) => entry.command === 'dsh').length, 0)
 })
 
-test('accepts a pre-release version at the minimum', async () => {
-  const { options } = fakeOptions({ dsh: { status: 0, stdout: '0.1.5-rc.1\n', stderr: '' } })
+test('runs dsh through the launcher, prefix included', async () => {
+  const seen = []
+  const { options } = fakeOptions({}, {
+    launcher: { command: '/usr/bin/node', prefix: ['/opt/dsh/lib/bin.js'] },
+    run: (command, args) => {
+      seen.push([command, ...args])
+      return { status: 0, stdout: args.includes('--version') ? '0.2.0-rc.2\n' : '', stderr: '' }
+    },
+  })
   const result = await runChecks(options)
   assert.equal(find(result, 'dsh-version').status, 'ok')
+  assert.deepEqual(seen[0], ['/usr/bin/node', '/opt/dsh/lib/bin.js', '--version'])
+  assert.deepEqual(seen[1], ['/usr/bin/node', '/opt/dsh/lib/bin.js', '--profile', 'flash-service', '--dump-config'])
+})
+
+test('pins dsh: exact is ok, the same release line warns, another line fails', async () => {
+  const status = async (stdout) => find(await runChecks(fakeOptions({ dsh: { status: 0, stdout, stderr: '' } }).options), 'dsh-version')
+  assert.equal((await status('0.2.0-rc.2\n')).status, 'ok')
+  const sameLine = await status('0.2.1-alpha.3\n')
+  assert.equal(sameLine.status, 'warn')
+  assert.equal(sameLine.fix, 'npm i -g @deepseek-ai/dsh@0.2.0-rc.2')
+  for (const other of ['0.1.5-rc.3\n', '0.3.0\n']) {
+    const version = await status(other)
+    assert.equal(version.status, 'fail', other)
+    assert.equal(version.fix, 'npm i -g @deepseek-ai/dsh@0.2.0-rc.2')
+  }
+})
+
+test('takes the pinned version from the options', async () => {
+  const { options } = fakeOptions({ dsh: { status: 0, stdout: '0.1.5-rc.3\n', stderr: '' } }, { dshVersion: '0.1.5-rc.3' })
+  const result = await runChecks(options)
+  assert.equal(find(result, 'dsh-version').status, 'ok')
+})
+
+test('a dsh that prints no version points at Node, not at reinstalling dsh', async () => {
+  const { options } = fakeOptions({ dsh: { status: 0, stdout: '', stderr: '' } })
+  const result = await runChecks(options)
+  const version = find(result, 'dsh-version')
+  assert.equal(version.status, 'fail')
+  assert.match(version.detail, /Node/)
+  assert.match(version.fix, /^install Node 22\.19/)
 })
 
 test('fails when the service profile does not compose', async () => {
@@ -91,6 +127,16 @@ test('fails when the service profile does not compose', async () => {
   assert.equal(result.ok, false)
   const dump = calls.find((entry) => entry.command === 'dsh' && entry.args[0] === '--profile')
   assert.deepEqual(dump.args, ['--profile', 'flash-service', '--dump-config'])
+})
+
+test('fails when a patch entry is missing even though dsh exits 0', async () => {
+  const stderr = 'dsh: [/home/u/.dsh/profiles/flash-service/cordis.patch.yml] patch: entry "workflow-worker-thread" not found\n'
+  const { options } = fakeOptions({ profileDump: { status: 0, stdout: '# == @deepseek-ai/dsh-base\n', stderr } })
+  const result = await runChecks(options)
+  const profile = find(result, 'profile')
+  assert.equal(profile.status, 'fail')
+  assert.match(profile.detail, /entry "workflow-worker-thread" not found/)
+  assert.equal(result.ok, false)
 })
 
 test('fails when the Ollama daemon is unreachable', async () => {
@@ -124,19 +170,27 @@ test('warns when zstd is missing while staying ok', async () => {
   const zstd = find(result, 'zstd')
   assert.equal(zstd.status, 'warn')
   assert.match(zstd.detail, /sessions/)
-  assert.ok(['brew install zstd', 'install zstd'].includes(zstd.fix))
+  assert.ok(['brew install zstd', 'winget install Meta.Zstandard', 'install zstd'].includes(zstd.fix))
   assert.equal(result.ok, true)
   assert.equal(result.failures, 0)
   assert.equal(result.warnings, 1)
 })
 
-test('fails on Node older than 20', async () => {
-  const { options } = fakeOptions({}, { nodeVersion: '18.20.4' })
-  const result = await runChecks(options)
-  const node = find(result, 'node')
-  assert.equal(node.status, 'fail')
-  assert.equal(node.fix, 'install Node 20 or newer')
-  assert.equal(result.ok, false)
+test('fails on a Node that cannot run dsh', async () => {
+  for (const nodeVersion of ['18.20.4', '20.19.0', '22.16.0', '22.18.0', '23.11.0', '24.1.0']) {
+    const result = await runChecks(fakeOptions({}, { nodeVersion }).options)
+    const node = find(result, 'node')
+    assert.equal(node.status, 'fail', nodeVersion)
+    assert.equal(node.fix, 'install Node 22.19 or newer (24.2 or newer on the 24 line)')
+    assert.equal(result.ok, false)
+  }
+})
+
+test('accepts a Node that can run dsh', async () => {
+  for (const nodeVersion of ['22.19.0', 'v22.23.2', '24.2.0', '26.8.2']) {
+    const result = await runChecks(fakeOptions({}, { nodeVersion }).options)
+    assert.equal(find(result, 'node').status, 'ok', nodeVersion)
+  }
 })
 
 test('formats one line per check and a Fix line per broken one', async () => {
