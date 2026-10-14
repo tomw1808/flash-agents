@@ -27,7 +27,7 @@ import { formatChecks, runChecks } from './doctor.js'
 import { cleanLayout } from './isolation.js'
 
 /** Server identity reported to the MCP client. */
-export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.0' })
+export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.1' })
 
 /** Usage guidance offered to the client model at handshake. */
 const INSTRUCTIONS = [
