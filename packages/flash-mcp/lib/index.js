@@ -27,7 +27,7 @@ import { formatChecks, runChecks } from './doctor.js'
 import { cleanLayout } from './isolation.js'
 
 /** Server identity reported to the MCP client. */
-export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.1' })
+export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.2' })
 
 /** Usage guidance offered to the client model at handshake. */
 const INSTRUCTIONS = [
@@ -246,6 +246,7 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
     stateDir: textFrom(env.FLASH_STATE_DIR),
     diffChars: numberFrom(env.FLASH_DIFF_CHARS, config.limits.diffChars),
     patchRetentionDays: numberFrom(env.FLASH_PATCH_RETENTION_DAYS, config.limits.patchRetentionDays),
+    maxStateBytes: numberFrom(env.FLASH_MAX_STATE_BYTES, config.limits.maxStateBytes),
     logFile: textFrom(env.FLASH_LOG_FILE),
     help: false,
   }
@@ -289,6 +290,9 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
         break
       case '--patch-retention-days':
         options.patchRetentionDays = numberFrom(next(), undefined)
+        break
+      case '--max-state-bytes':
+        options.maxStateBytes = numberFrom(next(), undefined)
         break
       case '--log-file':
         options.logFile = next()
@@ -361,6 +365,9 @@ Options:
   --patch-retention-days <n>
                             days an unapplied patch is kept before the startup prune
                             removes it (default: ${value('patchRetentionDays')})
+  --max-state-bytes <n>     cap on this root's stored patches and retired trees; over it,
+                            retired trees and applied patches are removed, unapplied
+                            patches never (default: ${value('maxStateBytes')})
   --log-file <path>         append every diagnostic line, timestamped, to this file as
                             well as stderr
   -h, --help                show this help
@@ -368,7 +375,8 @@ Options:
 Environment: FLASH_SERVICE_ROOT, FLASH_SERVICE_PROFILE, FLASH_SERVICE_PROVIDER,
 FLASH_SERVICE_MODEL, FLASH_TASK_TIMEOUT_MS, FLASH_IDLE_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS,
 FLASH_MAX_TASKS, FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
-FLASH_STATE_DIR, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_LOG_FILE, FLASH_DSH_BIN.
+FLASH_STATE_DIR, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_MAX_STATE_BYTES, FLASH_LOG_FILE,
+FLASH_DSH_BIN.
 
 The route and the numeric limits default to flash.config.json, the one file that owns
 them. An empty environment value counts as unset, so a generated configuration may
@@ -421,6 +429,7 @@ export function startServer(options, input = process.stdin, output = process.std
       ...(options.stateDir === undefined ? {} : { stateDir: options.stateDir }),
       ...(options.diffChars === undefined ? {} : { diffChars: options.diffChars }),
       ...(options.patchRetentionDays === undefined ? {} : { patchRetentionDays: options.patchRetentionDays }),
+      ...(options.maxStateBytes === undefined ? {} : { maxStateBytes: options.maxStateBytes }),
     },
     log,
   })

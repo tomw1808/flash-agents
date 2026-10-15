@@ -65,6 +65,10 @@ export const DEFAULT_CONFIG = deepFreeze({
     // a two-week window is long enough to come back to a finished call, and short
     // enough that an unused machine does not grow without bound.
     patchRetentionDays: 14,
+    // How much one root's stored patches and retired trees may take. Over it, retired
+    // trees and then applied patches are removed after a call; unapplied patches never
+    // are, since one may be the only copy of finished work. 20 GiB.
+    maxStateBytes: 21_474_836_480,
   },
   guard: {
     protectedSegments: ['.git'],

@@ -16,7 +16,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, sep } from 'node:path'
 import { test } from 'node:test'
@@ -793,20 +793,161 @@ test('a call inside a nested repository copies, diffs and applies only that repo
   isolation.close()
 })
 
-test('a linked worktree or a call at the root keeps the whole-root copy', async () => {
+test('a call in a linked worktree is scoped to it, and the copy is its own repository', async () => {
   const root = makeWorkspace()
   const alpha = join(root, 'Repos', 'alpha')
-  execFileSync('git', ['worktree', 'add', '-q', '-b', 'side', join(root, 'Repos', 'alpha-side')], { cwd: alpha })
+  const side = join(root, 'Repos', 'alpha-side')
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'side', side], { cwd: alpha })
   const { isolation } = makePool(root)
 
   const slot = await isolation.lease()
-  assert.equal(isolation.prepare(slot, { cwd: join(root, 'Repos', 'alpha-side') }).scope, '')
-  assert.equal(existsSync(join(slot.dir, 'keep.txt')), true)
+  const prepared = isolation.prepare(slot, { cwd: side })
+  assert.equal(prepared.scope, join('Repos', 'alpha-side'))
+  assert.notEqual(prepared.base, null)
+  const copy = join(slot.dir, 'Repos', 'alpha-side')
+  // A repository of its own, on the same commit and branch, reading the original's objects.
+  assert.equal(statSync(join(copy, '.git')).isDirectory(), true)
+  const head = (dir) => execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim()
+  assert.equal(head(copy), head(side))
+  assert.equal(execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], { cwd: copy, encoding: 'utf8' }).trim(), 'side')
+
+  writeFileSync(join(copy, 'app.txt'), 'changed in the worktree copy\n')
+  const change = isolation.collect(slot)
+  assert.deepEqual(change.filesChanged.map((line) => line.split('\t').at(-1)), ['app.txt'])
+  // Nothing reached the caller's worktree, its index, or its repository's refs.
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: side, encoding: 'utf8' }), '')
+  assert.throws(() => execFileSync('git', ['rev-parse', '--verify', '-q', 'refs/flash/base'], { cwd: alpha, stdio: 'ignore' }))
+  isolation.apply({ patchId: change.patchId })
+  assert.equal(readFileSync(join(side, 'app.txt'), 'utf8'), 'changed in the worktree copy\n')
   isolation.release(slot)
 
+  // A call at the root keeps the whole-root copy, and the worktree stays out of it: its
+  // absolute pointer would lead a worker's git back to the caller's repository.
   const again = await isolation.lease()
   assert.equal(isolation.prepare(again, { cwd: root }).scope, '')
-  assert.equal(isolation.prepare(again).scope, '')
+  assert.equal(existsSync(join(again.dir, 'keep.txt')), true)
+  assert.equal(existsSync(join(again.dir, 'Repos', 'alpha', 'app.txt')), true)
+  assert.equal(existsSync(join(again.dir, 'Repos', 'alpha-side')), false)
+  isolation.close()
+})
+
+test('a root that is itself a linked worktree never writes to the caller’s repository', async () => {
+  // A Claude Code worktree session: the service root is `.claude/worktrees/<name>`.
+  const main = makeRepo()
+  const root = join(main, '.claude', 'worktrees', 'agent-1')
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'agent-1', root], { cwd: main })
+  const { isolation } = makePool(root)
+  const slot = await isolation.lease()
+  assert.notEqual(isolation.prepare(slot).base, null)
+  writeFileSync(join(slot.dir, 'worker.txt'), 'made by the worker\n')
+  // A worker committing in its copy commits to the copy.
+  execFileSync('git', ['add', 'worker.txt'], { cwd: slot.dir })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'worker'], { cwd: slot.dir })
+  const change = isolation.collect(slot)
+  assert.deepEqual(change.filesChanged.map((line) => line.split('\t').at(-1)), ['worker.txt'])
+
+  // The caller's index was staging the worker's files before this was fixed.
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }), '')
+  assert.equal(execFileSync('git', ['log', '--format=%s', '-1', 'agent-1'], { cwd: main, encoding: 'utf8' }).trim(), 'init')
+  assert.throws(() => execFileSync('git', ['rev-parse', '--verify', '-q', 'refs/flash/base'], { cwd: main, stdio: 'ignore' }))
+  isolation.apply({ patchId: change.patchId })
+  assert.equal(readFileSync(join(root, 'worker.txt'), 'utf8'), 'made by the worker\n')
+  isolation.close()
+})
+
+test('a removed nested worktree cannot fail a whole-root call', async () => {
+  // The handoff's case: agent worktrees under `.claude/worktrees` were copied into every
+  // slot, and once the caller removed them their dangling `.git` files failed `git add -A`.
+  const root = makeRepo()
+  writeFileSync(join(root, '.gitignore'), '.claude/\n')
+  const nested = join(root, '.claude', 'worktrees', 'agent-x')
+  execFileSync('git', ['worktree', 'add', '-q', '-b', 'agent-x', nested], { cwd: root })
+  rmSync(join(root, '.git', 'worktrees'), { recursive: true, force: true })
+  const { isolation } = makePool(root)
+  const slot = await isolation.lease()
+  assert.notEqual(isolation.prepare(slot).base, null)
+  assert.equal(existsSync(join(slot.dir, '.claude', 'worktrees', 'agent-x')), false)
+  writeFileSync(join(slot.dir, 'worker.txt'), 'x\n')
+  const change = isolation.collect(slot)
+  assert.equal(change.available, true)
+  assert.deepEqual(change.filesChanged.map((line) => line.split('\t').at(-1)), ['worker.txt'])
+  isolation.close()
+})
+
+test('a submodule travels with the copy', async () => {
+  const upstream = makeRepo()
+  const root = makeRepo()
+  execFileSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', upstream, 'sub'], { cwd: root })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'sub'], { cwd: root })
+  const { isolation } = makePool(root)
+  const slot = await isolation.lease()
+  assert.notEqual(isolation.prepare(slot).base, null)
+  // Its `.git` file is relative and resolves inside the copy, so it means the same there.
+  assert.equal(readFileSync(join(slot.dir, 'sub', 'keep.txt'), 'utf8'), 'keep me\n')
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: join(slot.dir, 'sub'), encoding: 'utf8' }), '')
+  isolation.close()
+})
+
+test('a dead owner is swept while the pool runs, before the next call and on the timer', async () => {
+  const repo = makeRepo()
+  // Default layout, so the pool owns its state and sweeps its root's dead owners.
+  const isolation = new WorkspaceIsolation({ root: repo, slots: 1, sweepIntervalMs: 0 })
+  const first = makeDeadOwner(repo, { pid: 4194299 })
+  makeFlashBaseTree(first.slotDir)
+  writeFileSync(join(first.slotDir, 'keep.txt'), 'unfinished work\n')
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  assert.equal(existsSync(first.owner), false)
+  // What the sweep salvaged is applicable from this server at once.
+  assert.ok(salvagedPatch(isolation), 'the dead owner’s work was salvaged and loaded')
+  isolation.release(slot)
+  isolation.close()
+
+  const timed = new WorkspaceIsolation({ root: repo, slots: 1, sweepIntervalMs: 20 })
+  const second = makeDeadOwner(repo, { pid: 4194298 })
+  const deadline = Date.now() + 2_000
+  while (existsSync(second.owner) && Date.now() < deadline) await new Promise((done) => setTimeout(done, 20))
+  assert.equal(existsSync(second.owner), false)
+  timed.close()
+})
+
+test('the cap removes retired trees, then applied patches, and never an unapplied one', async () => {
+  const repo = makeRepo()
+  const { isolation } = makePool(repo, 1)
+  const make = async (name, content) => {
+    const slot = await isolation.lease()
+    isolation.prepare(slot)
+    writeFileSync(join(slot.dir, name), content)
+    const change = isolation.collect(slot)
+    isolation.release(slot)
+    return change
+  }
+  const big = 'x'.repeat(20_000)
+  const applied = await make('applied.txt', big)
+  isolation.apply({ patchId: applied.patchId })
+  const kept = await make('kept.txt', big)
+  // A retired tree, as a timed-out call leaves one.
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  writeFileSync(join(slot.dir, 'weight.bin'), big)
+  isolation.retire(slot)
+  const orphan = slot.orphans[0]
+  isolation.release(slot)
+
+  isolation.maxStateBytes = 1
+  const logs = []
+  isolation.log = (line) => logs.push(line)
+  const result = isolation.trim()
+  assert.equal(result.removedTrees, 1)
+  assert.equal(result.removedPatches, 1)
+  assert.equal(existsSync(orphan), false)
+  assert.deepEqual(isolation.listPatches().map((record) => record.patchId), [kept.patchId])
+  assert.equal(existsSync(kept.patchPath), true)
+  assert.ok(logs.some((line) => /over the .* cap/.test(line)), 'the remaining excess is reported')
+
+  // Under the cap nothing goes.
+  isolation.maxStateBytes = 10 * 1024 ** 3
+  assert.deepEqual(isolation.trim(), { bytes: result.bytes, removedTrees: 0, removedPatches: 0 })
   isolation.close()
 })
 

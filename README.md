@@ -141,7 +141,8 @@ To watch workers live, set a log file and `tail -f` it — see
   cancel. You can watch it; you can't redirect it. The idle timeout is what stops a stuck one.
 - **Members of one `flash_batch` share one copy**, so they see each other's edits. Give them
   disjoint files.
-- **Gitignored output isn't carried in the patch.** It's named in the result instead.
+- **Gitignored output isn't carried in the patch.** It's named in the result instead, and the copy
+  it was written in is emptied as soon as the patch is stored, build output included.
 - **The dispatcher is a cheap model too.** Occasionally it does the work itself instead of
   delegating; that call fails as `NOT_DELEGATED`, nothing from it is kept, and a retry usually works.
 - macOS and Linux. On Windows nothing needs `cp` or `patch` any more and `dsh.cmd` starts, but no

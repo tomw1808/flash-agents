@@ -57,7 +57,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 
@@ -97,9 +97,11 @@ const BASE_REF = 'refs/flash/base'
  * the same relative path inside the slot, and it is where the base, the diff and the apply
  * happen.
  *
- * A `.git` FILE marks a linked worktree whose git state lives outside that directory; it
- * cannot travel into a copy, so that case (like a `cwd` at the root, or no nested
- * repository at all) keeps the whole-root copy.
+ * A `.git` FILE — a linked worktree or a submodule — scopes the copy the same way. Its git
+ * state lives outside the directory and cannot travel, so `prepare` gives the copy its own
+ * repository (see `detachGitLink`); a whole-root copy leaves such a directory out
+ * entirely. A `cwd` at the root, or with no nested repository above it, keeps the
+ * whole-root copy.
  *
  * @param {string} root - the service root.
  * @param {string | undefined} cwd - the call's working directory inside the root.
@@ -111,13 +113,7 @@ export function repositoryScope(root, cwd) {
   let dir = resolve(cwd)
   while (dir !== top && dir.startsWith(`${top}${sep}`)) {
     const marker = join(dir, '.git')
-    if (existsSync(marker)) {
-      try {
-        return statSync(marker).isDirectory() ? relative(top, dir) : ''
-      } catch {
-        return ''
-      }
-    }
+    if (existsSync(marker)) return relative(top, dir)
     dir = dirname(dir)
   }
   return ''
@@ -150,6 +146,13 @@ const EMPTY_RETRY_DELAY_MS = 50
  * default; a service overrides it from `limits.patchRetentionDays`.
  */
 export const PATCH_RETENTION_DAYS = 14
+
+/**
+ * How often a running pool looks for dead owners and trims its state. Startup alone was
+ * not enough: with two servers on one root, the survivor never swept the one that died,
+ * and its 35 GB of trees waited for some later server to start.
+ */
+const SWEEP_INTERVAL_MS = 10 * 60 * 1000
 
 /** One day in milliseconds, the unit of the retention window. */
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -335,6 +338,13 @@ function directorySize(dir) {
     }
   }
   return total
+}
+
+/** A byte count in the unit a person reads it in. @param {number} bytes @returns {string} */
+function formatBytes(bytes) {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`
+  return `${String(Math.round(bytes / 1024))} KB`
 }
 
 /**
@@ -769,14 +779,24 @@ function isGitWorkTree(dir) {
  * and it throws on a socket or a FIFO left in a working tree. Symlinks are copied as
  * they are, and anything that is not a file, a directory, or a symlink is skipped.
  *
+ * A nested directory whose `.git` is a file pointing outside the source — a linked
+ * worktree such as `.claude/worktrees/agent-x`, whose pointer is absolute — is left
+ * out. In the copy that pointer would still name the caller's repository, so a worker's
+ * `git commit` there would land on the caller's branch, and once the caller removed the
+ * worktree, `git add -A` in the copy failed on the dangling pointer and lost the call's
+ * whole change. A submodule's pointer is relative and resolves inside the source, so it
+ * travels with the copy and the submodule stays.
+ *
  * @param {string} from - source directory.
  * @param {string} to - existing destination directory.
- * @returns {'clone' | 'copy'} which mechanism was used.
+ * @returns {{mechanism: 'clone' | 'copy', skipped: string[]}} which mechanism was used,
+ *   and the directories left out, relative to `from`.
  */
 function copyTree(from, to) {
   // FICLONE_FORCE refuses rather than silently copying when the filesystem cannot
   // clone, which is what makes the returned mechanism honest.
   let mechanism = 'clone'
+  const skipped = []
   const copyFile = (source, target) => {
     if (mechanism === 'clone') {
       try {
@@ -793,6 +813,10 @@ function copyTree(from, to) {
       const sourcePath = join(source, entry.name)
       const targetPath = join(target, entry.name)
       if (entry.isDirectory()) {
+        if (!gitLinkTravels(sourcePath, from)) {
+          skipped.push(relative(from, sourcePath))
+          continue
+        }
         mkdirSync(targetPath, { recursive: true })
         walk(sourcePath, targetPath)
       } else if (entry.isFile()) {
@@ -803,7 +827,86 @@ function copyTree(from, to) {
     }
   }
   walk(from, to)
-  return mechanism
+  return { mechanism, skipped }
+}
+
+/**
+ * Whether a directory's git link, if it has one, still means the same thing in a copy.
+ *
+ * Only a `.git` FILE is a link. It travels when its `gitdir:` is relative and resolves
+ * inside the tree being copied; an absolute one keeps naming the original location.
+ *
+ * @param {string} dir - a directory inside the tree being copied.
+ * @param {string} top - the top of that tree.
+ * @returns {boolean} false when the directory must be left out of the copy.
+ */
+function gitLinkTravels(dir, top) {
+  let text
+  try {
+    text = readFileSync(join(dir, '.git'), 'utf8')
+  } catch {
+    // No `.git` file (none at all, or a directory): an ordinary directory or a whole
+    // repository, both of which copy as they are.
+    return true
+  }
+  const target = /^gitdir:\s*(.+?)\s*$/m.exec(text)?.[1]
+  if (target === undefined || isAbsolute(target)) return false
+  return resolve(dir, target).startsWith(`${top}${sep}`)
+}
+
+/**
+ * Give a copied repository its own git state when its `.git` is a link to the caller's.
+ *
+ * A repository whose `.git` is a file — the root of a Claude Code worktree session, or a
+ * linked worktree or submodule a call was scoped to — links to git state outside the
+ * copy. Kept as it was, the copy's index, refs and `refs/flash/base` were the caller's:
+ * preparing a call staged the worker's files in the caller's real index. The link is
+ * replaced with a fresh repository that borrows the original's objects read-only through
+ * `objects/info/alternates` and sits on the same commit and branch, so history reads as
+ * before while every write stays inside the copy.
+ *
+ * @param {string} original - the repository in the caller's tree.
+ * @param {string} copy - its copy.
+ * @returns {void}
+ */
+function detachGitLink(original, copy) {
+  const link = join(copy, '.git')
+  try {
+    if (statSync(link).isDirectory()) return
+  } catch {
+    return
+  }
+  const commonDir = resolve(original, git(['rev-parse', '--git-common-dir'], original).trim())
+  const head = gitOrEmpty(['rev-parse', '--verify', '-q', 'HEAD'], original)
+  const branch = gitOrEmpty(['symbolic-ref', '-q', 'HEAD'], original)
+  rmSync(link, { force: true })
+  git(['init', '-q'], copy)
+  writeFileSync(join(copy, '.git', 'objects', 'info', 'alternates'), `${join(commonDir, 'objects')}\n`)
+  // The original's private ignore list decides what `git add -A` sees; without it the
+  // base would absorb files the caller never tracked.
+  const exclude = join(commonDir, 'info', 'exclude')
+  if (existsSync(exclude)) writeFileSync(join(copy, '.git', 'info', 'exclude'), readFileSync(exclude))
+  if (head === '') return
+  if (branch === '') {
+    git(['update-ref', '--no-deref', 'HEAD', head], copy)
+  } else {
+    git(['update-ref', branch, head], copy)
+    git(['symbolic-ref', 'HEAD', branch], copy)
+  }
+}
+
+/**
+ * Run one git command whose failure only means "nothing there".
+ * @param {string[]} args - arguments after `git`.
+ * @param {string} cwd - directory to run in.
+ * @returns {string} trimmed standard output, or `''` when the command failed.
+ */
+function gitOrEmpty(args, cwd) {
+  try {
+    return git(args, cwd).trim()
+  } catch {
+    return ''
+  }
 }
 
 /**
@@ -932,9 +1035,21 @@ export class WorkspaceIsolation {
    *   given: one service per directory is then the deployment's responsibility.
    * @param {number} [options.patchRetentionDays] - how many days an unapplied patch is
    *   kept before the startup prune removes it.
+   * @param {number} [options.maxStateBytes] - how much this root's patches and retired
+   *   trees may take before `trim` removes the reclaimable ones; 0 or omitted: no cap.
+   * @param {number} [options.sweepIntervalMs] - how often a running pool sweeps dead
+   *   owners and trims; 0 turns the timer off.
    * @param {(message: string) => void} [options.log] - progress log.
    */
-  constructor({ root, slots = 2, stateDir, patchRetentionDays = PATCH_RETENTION_DAYS, log = () => {} }) {
+  constructor({
+    root,
+    slots = 2,
+    stateDir,
+    patchRetentionDays = PATCH_RETENTION_DAYS,
+    maxStateBytes = 0,
+    sweepIntervalMs = SWEEP_INTERVAL_MS,
+    log = () => {},
+  }) {
     this.root = resolve(root)
     /** Whether this instance owns a private state directory it may clear. */
     this.ownsStateDir = stateDir === undefined || stateDir === null || stateDir === ''
@@ -946,6 +1061,7 @@ export class WorkspaceIsolation {
      */
     this.patchDir = this.ownsStateDir ? defaultPatchDir(this.root) : join(this.stateDir, 'calls')
     this.patchRetentionDays = patchRetentionDays
+    this.maxStateBytes = maxStateBytes
     this.log = log
     this.clones = 0
     /** Patches kept for a later `flash_apply`. @type {Map<string, object>} */
@@ -987,6 +1103,93 @@ export class WorkspaceIsolation {
       mkdirSync(slot.dir, { recursive: true })
       slot.tmpDir = join(slot.dir, SLOT_TMP)
     }
+    // Unref'd: housekeeping must never be the reason a finished process stays alive.
+    this.sweepTimer =
+      sweepIntervalMs > 0 ? setInterval(() => this.#housekeeping(), sweepIntervalMs).unref() : undefined
+  }
+
+  /** The timer's pass: sweep dead owners, then trim, never throwing into the event loop. */
+  #housekeeping() {
+    try {
+      this.#sweepDeadOwners()
+      this.trim()
+    } catch (error) {
+      this.log(`housekeeping failed: ${messageOf(error)}`)
+    }
+  }
+
+  /**
+   * Salvage and remove dead owners of this root while the pool runs.
+   *
+   * Cheap when there is nothing to do — one directory listing and a signal-0 probe per
+   * owner — so it can run before every `prepare`. Whatever it salvages is loaded at
+   * once, so the patch is applicable from this server without a restart.
+   *
+   * @returns {void}
+   */
+  #sweepDeadOwners() {
+    if (!this.ownsStateDir) return
+    if (sweepDeadOwners(this.root, { patchDir: this.patchDir, log: this.log }) > 0) this.#loadPatches()
+  }
+
+  /**
+   * Keep this root's stored state under `maxStateBytes`.
+   *
+   * What counts is what the pool keeps after a call: stored patches and the trees
+   * `retire` left in place. Retired trees go first: their work was already
+   * collected into a patch when they were retired, so they are pure weight. Applied
+   * patches go next, oldest application first: their change is in the caller's tree.
+   * Unapplied patches are never removed here — one may be the only copy of finished
+   * work, and the retention window already ages them out — so a root still over the
+   * cap after that is reported in the log rather than trimmed further.
+   *
+   * @returns {{bytes: number, removedTrees: number, removedPatches: number}} what is
+   *   left, and what was removed.
+   */
+  trim() {
+    const result = { bytes: 0, removedTrees: 0, removedPatches: 0 }
+    if (!(this.maxStateBytes > 0)) return result
+    const fileSize = (path) => {
+      try {
+        return statSync(path).size
+      } catch {
+        return 0
+      }
+    }
+    const trees = this.slots.flatMap((slot) => slot.orphans.map((dir) => ({ slot, dir, bytes: directorySize(dir) })))
+    const patches = [...this.patches.values()].map((record) => ({
+      record,
+      bytes: fileSize(record.patchPath) + fileSize(record.metaPath),
+    }))
+    let total = [...trees, ...patches].reduce((sum, entry) => sum + entry.bytes, 0)
+    for (const tree of trees) {
+      if (total <= this.maxStateBytes) break
+      rmSync(tree.dir, { recursive: true, force: true })
+      tree.slot.orphans.splice(tree.slot.orphans.indexOf(tree.dir), 1)
+      total -= tree.bytes
+      result.removedTrees += 1
+      this.log(`trim: removed retired tree ${tree.dir} (${formatBytes(tree.bytes)})`)
+    }
+    const applied = patches
+      .filter((entry) => entry.record.appliedAt !== null && entry.record.appliedAt !== undefined)
+      .sort((a, b) => Number(a.record.appliedAt) - Number(b.record.appliedAt))
+    for (const { record, bytes } of applied) {
+      if (total <= this.maxStateBytes) break
+      rmSync(record.patchPath, { force: true })
+      rmSync(record.metaPath, { force: true })
+      this.patches.delete(record.patchId)
+      total -= bytes
+      result.removedPatches += 1
+      this.log(`trim: removed applied patch ${record.patchId} (${formatBytes(bytes)})`)
+    }
+    if (total > this.maxStateBytes) {
+      this.log(
+        `trim: this root's state holds ${formatBytes(total)}, over the ${formatBytes(this.maxStateBytes)} cap; ` +
+          'what is left is unapplied patches, which are kept until they expire',
+      )
+    }
+    result.bytes = total
+    return result
   }
 
   /** How many trees may be in flight at once. */
@@ -1131,16 +1334,20 @@ export class WorkspaceIsolation {
    * @returns {{base: string | null, mechanism: 'clone' | 'copy', reason?: string}} the base.
    */
   prepare(slot, { cwd } = {}) {
+    // A server that died while this one ran leaves its trees behind; the next call is the
+    // cheapest moment to notice, since it is about to need disk anyway.
+    this.#sweepDeadOwners()
     emptyDirectory(slot.dir)
     const scope = repositoryScope(this.root, cwd)
     const repoDir = scope === '' ? slot.dir : join(slot.dir, scope)
-    let mechanism
-    if (scope === '') {
-      mechanism = copyTree(this.root, slot.dir)
-    } else {
+    const original = scope === '' ? this.root : join(this.root, scope)
+    if (scope !== '') {
       mkdirSync(repoDir, { recursive: true })
-      mechanism = copyTree(join(this.root, scope), repoDir)
       writeFileSync(join(slot.dir, SCOPE_MARKER), `${scope}\n`)
+    }
+    const { mechanism, skipped } = copyTree(original, repoDir)
+    if (skipped.length > 0) {
+      this.log(`left ${String(skipped.length)} linked worktree(s) out of the copy, their git state is not this tree's: ${skipped.join(', ')}`)
     }
     this.clones += 1
     slot.scope = scope
@@ -1164,6 +1371,7 @@ export class WorkspaceIsolation {
       return { base: null, mechanism, scope, reason: slot.baseReason }
     }
     try {
+      detachGitLink(original, repoDir)
       git(['add', '-A'], repoDir)
       const tree = git(['write-tree'], repoDir).trim()
       let parent = []
@@ -1230,6 +1438,18 @@ export class WorkspaceIsolation {
    * @returns {Change} the change, ready to be projected into a tool result.
    */
   collect(slot, { diffChars = 20000 } = {}) {
+    const change = this.#collect(slot, { diffChars })
+    // Every call that stored something is the moment to check the cap.
+    try {
+      this.trim()
+    } catch (error) {
+      this.log(`trim failed: ${messageOf(error)}`)
+    }
+    return change
+  }
+
+  /** `collect` without the trim. @param {Slot} slot @param {{diffChars: number}} options @returns {Change} */
+  #collect(slot, { diffChars }) {
     // A slot prepared for one nested repository keeps its git state there, not at the top.
     const repoDir = slot.repoDir ?? slot.dir
     const scope = slot.scope ?? ''
@@ -1458,6 +1678,7 @@ export class WorkspaceIsolation {
    * apply may still be coming.
    */
   close() {
+    if (this.sweepTimer !== undefined) clearInterval(this.sweepTimer)
     for (const slot of this.slots) {
       rmSync(slot.dir, { recursive: true, force: true })
       for (const orphan of slot.orphans) rmSync(orphan, { recursive: true, force: true })

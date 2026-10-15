@@ -892,9 +892,9 @@ test('the runtime keeps the platform TMPDIR, and the worker is told about .flash
   // scratch files while `touch` in the same directory succeeded. So the environment
   // the runtime boots with is left alone.
   assert.equal(client.extraEnv, undefined)
-  // The tree still has a scratch directory of its own, and the worker learns of it in
-  // the prompt rather than through the environment.
-  assert.equal(existsSync(join(client.initializes[0].cwd, '.flash-tmp')), true)
+  // The tree still has a scratch directory of its own (created by `prepare`, see the
+  // isolation tests), and the worker learns of it in the prompt rather than through the
+  // environment.
   assert.match(client.prompts[0].text, /\.flash-tmp/)
   await service.close()
 })
@@ -1016,4 +1016,27 @@ test('a patch that was applied is refused as already applied', async () => {
   }
   assert.equal(forced instanceof Error ? /already applied/.test(forced.message) : false, false)
   await service.close()
+})
+
+test('a finished call empties its tree once the patch is stored, and keeps one it could not collect', async () => {
+  const { root, client, service } = makeIsolatedService({ slots: 1 })
+  const result = await service.flashTask({ task: 'write one file', cwd: root })
+  const tree = service.isolation.slots[0].dir
+  // An idle server used to hold a full copy, build output included, per slot.
+  assert.equal(result.change.available, true)
+  assert.deepEqual(readdirSync(tree), [])
+  service.isolation.apply({ patchId: result.change.patchId })
+  assert.equal(readFileSync(join(root, client.writes), 'utf8'), 'written by the worker\n')
+  await service.close()
+
+  // Without git there is no patch, and the tree is the only place the work exists.
+  const plain = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-plain-')))
+  writeFileSync(join(plain, 'README.md'), '# not a repository\n')
+  const logs = []
+  const other = makeIsolatedService({ slots: 1, root: plain, log: (line) => logs.push(line) })
+  const kept = await other.service.flashTask({ task: 'write one file', cwd: plain })
+  assert.equal(kept.change.available, false)
+  assert.equal(existsSync(join(other.service.isolation.slots[0].dir, other.client.writes)), true)
+  assert.ok(logs.some((line) => /kept .* could not be collected/.test(line)), 'the kept tree is named in the log')
+  await other.service.close()
 })

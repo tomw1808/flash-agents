@@ -372,12 +372,22 @@ had to be added after the fact. Isolation removes the premise instead:
    `flash_apply { patchId }` afterwards.
 
 When the call's `cwd` sits inside a nested git repository of the root (the nearest directory
-between `cwd` and the root with its own `.git` directory), only that repository is copied, at
+between `cwd` and the root with its own `.git`), only that repository is copied, at
 the same relative path inside the tree, and the base, the diff and a later apply all run in it.
 A workspace root that holds many independent repositories then costs one repository per call
 instead of all of them, and a nested repository's changes reach the patch at all (the root's own
-`git diff` cannot see them). A linked worktree (a `.git` file pointing elsewhere), a `cwd` at the
-root, or no nested repository keep the whole-root copy.
+`git diff` cannot see them). A `cwd` at the root, or with no nested repository above it, keeps
+the whole-root copy.
+
+A repository whose `.git` is a *file* — a linked worktree, a submodule, or the root itself in a
+Claude Code worktree session — links to git state outside the copy. Copied as it was, that link
+made the "disposable" copy share the caller's index and refs: preparing a call staged the
+worker's files in the caller's real index, and a worker's `git commit` landed on the caller's
+branch. Such a copy is therefore given a repository of its own, on the same commit and branch,
+that borrows the original's objects read-only through `objects/info/alternates`. A whole-root
+copy leaves out any nested directory whose link would not resolve inside the copy (agent
+worktrees under `.claude/worktrees`, whose links are absolute); a submodule's relative link
+does resolve, so submodules stay.
 
 The copy includes `.git` and your uncommitted work, because a worker that sees the last commit
 instead of your working tree is useless while you are mid-edit. `rm -rf` of everything the worker can
@@ -392,6 +402,7 @@ to apply.
 | `--state-dir <path>` | private to this root and process | where copies and returned patches live |
 | `--diff-chars <n>` | 20000 | how much of a patch a result carries |
 | `--patch-retention-days <n>` | 14 | how long an unapplied patch is kept before the startup prune removes it |
+| `--max-state-bytes <n>` | 20 GiB | cap on this root's stored patches and retired trees (see below) |
 | `--log-file <path>` | unset | append every diagnostic line, timestamped, to a file as well as stderr |
 
 The state directory is keyed by root, by process, and by pool:
@@ -404,7 +415,20 @@ A *shared* default was a data-loss bug: a second service deleted the first one's
 and then handed the same path to a different worker, so one call's patch could carry another
 call's work. A configured `--state-dir` is used as given — persistence across a restart, at the
 cost of the deployment owning that guarantee (one service per directory). Trees belonging to
-processes that no longer exist are swept at startup; a live service's trees never are.
+processes that no longer exist are swept at startup, before every `prepare`, and every ten
+minutes; a live service's trees never are. Sweeping only at startup let a dead server's 35 GB
+wait for some later server, because the one still running never looked.
+
+A tree is emptied as soon as its change is stored as a patch, rather than at the start of the next
+call in its slot: an idle server used to hold a full copy plus the worker's build output per slot,
+indefinitely. A tree whose change could not be collected (no git, or a failed diff) is the only copy
+of that work, so it stays, named in the log, until the slot is needed again.
+
+After every call, `limits.maxStateBytes` (default 20 GiB) bounds what this root keeps: stored
+patches plus the trees a timed-out call retired. Over it, retired trees go first (their work was
+already collected into a patch), then applied patches, oldest application first. Unapplied patches
+are never removed by the cap, because one may be the only copy of finished work; a root still over
+it is reported in the log, and the retention window ages those out.
 
 Patches sit one level above that, in `<sha256(root)[0:12]>/patches`, precisely because the sweep
 reclaims a dead owner's directory whole: a self-test lost a finished worker's patch that way when
@@ -474,7 +498,7 @@ naming the path that is wrong instead of silently falling back to something else
 ```json
 {
   "route": { "provider": "ollama", "model": "deepseek-v4.1-flash:cloud" },
-  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 10800000, "idleTimeoutMs": 600000, "diffChars": 20000, "patchRetentionDays": 14 },
+  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 10800000, "idleTimeoutMs": 600000, "diffChars": 20000, "patchRetentionDays": 14, "maxStateBytes": 21474836480 },
   "guard": { "protectedSegments": [".git"], "fenceMutations": true },
   "dsh": { "package": "@deepseek-ai/dsh", "version": "0.2.0-rc.2" }
 }

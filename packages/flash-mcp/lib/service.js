@@ -224,6 +224,7 @@ export class FlashTaskService {
             // cleared another's in-flight tree and reused its path.
             ...(isolate.stateDir === undefined ? {} : { stateDir: isolate.stateDir }),
             ...(isolate.patchRetentionDays === undefined ? {} : { patchRetentionDays: isolate.patchRetentionDays }),
+            ...(isolate.maxStateBytes === undefined ? {} : { maxStateBytes: isolate.maxStateBytes }),
             log,
           })
     this.stateDir = this.isolation?.stateDir ?? resolve(isolate.stateDir ?? join(canonicalTmpdir(), 'flash-mcp'))
@@ -383,6 +384,7 @@ export class FlashTaskService {
       log: this.log,
     })
     let slot
+    let change
     try {
       slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal)
       const { promptCwd, runtimeCwd, extraEnv } = this.#runLocation(slot, rootCwd, pool)
@@ -413,7 +415,7 @@ export class FlashTaskService {
         )
       }
       this.#logToolTrace(state)
-      const change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars })
+      change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars })
       const applied = change?.available === true && apply === 'auto' ? this.#applyChange(change) : undefined
       return this.#buildResult({
         state,
@@ -432,8 +434,35 @@ export class FlashTaskService {
       throw error
     } finally {
       stopProgress()
-      if (slot !== undefined) pool.release(slot)
+      if (slot !== undefined) this.#settleSlot(pool, slot, change)
     }
+  }
+
+  /**
+   * Hand a slot back, emptied when its work is safely stored.
+   *
+   * A finished tree used to stay until the next call in its slot emptied it, so an idle
+   * server held a full copy of the repository plus whatever the worker built, per slot,
+   * indefinitely — 34 GB on one machine. Once the change is collected the patch is the
+   * record and the tree is weight. A tree whose change could not be collected is the
+   * opposite: it may be the only copy of the work, so it stays (and is named in the log)
+   * until the next call needs the slot.
+   *
+   * @param {WorkspaceIsolation} pool - the pool the slot belongs to.
+   * @param {object} slot - the leased tree.
+   * @param {object | undefined} change - what `collect` returned, if it ran.
+   */
+  #settleSlot(pool, slot, change) {
+    if (change?.available === true) {
+      try {
+        pool.discard(slot)
+      } catch (error) {
+        this.log(`could not empty ${slot.dir} after its patch was stored: ${messageOf(error)}`)
+      }
+    } else if (change !== undefined) {
+      this.log(`kept ${slot.dir} until the next call in this slot: its change could not be collected (${change.reason})`)
+    }
+    pool.release(slot)
   }
 
   /**
@@ -542,6 +571,7 @@ export class FlashTaskService {
       log: this.log,
     })
     let slot
+    let change
     try {
       slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal)
       const { promptCwd, runtimeCwd, extraEnv } = this.#runLocation(slot, rootCwd, pool)
@@ -579,7 +609,7 @@ export class FlashTaskService {
         )
       }
       this.#logToolTrace(state)
-      const change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars })
+      change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars })
       const applied = change?.available === true && apply === 'auto' ? this.#applyChange(change) : undefined
       return this.#buildBatchResult({
         state,
@@ -599,7 +629,7 @@ export class FlashTaskService {
       throw error
     } finally {
       stopProgress()
-      if (slot !== undefined) pool.release(slot)
+      if (slot !== undefined) this.#settleSlot(pool, slot, change)
     }
   }
 
