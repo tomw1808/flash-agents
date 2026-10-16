@@ -13,6 +13,96 @@ function find(result, id) {
   return result.checks.find((check) => check.id === id)
 }
 
+/** The fake install paths the native-module scenarios are built from. */
+const DSH_DIR = '/fake/global/lib/node_modules/@deepseek-ai/dsh'
+const DSH_ENTRY = `${DSH_DIR}/lib/bin.js`
+const DSH_MANIFEST = `${DSH_DIR}/package.json`
+const NODE_PTY_DIR = `${DSH_DIR}/node_modules/node-pty`
+const NODE_PTY_MANIFEST = `${NODE_PTY_DIR}/package.json`
+
+/**
+ * A filesystem probe over an in-memory tree, so the native-module check can run
+ * without a real harness install.
+ *
+ * `files` maps an absolute path to its contents (or null for a binary),
+ * `executables` lists the paths that also carry the execute bit, `realpaths`
+ * maps a launcher path to the entry it resolves to, and `resolve` maps one
+ * `request from fromFile` key to the manifest that resolves it.
+ *
+ * @param {object} [tree] - the in-memory tree.
+ * @returns {{probe: object, resolved: Array<{request: string, fromFile: string}>}} the probe and its call log.
+ */
+function fakeFs({ files = {}, executables = [], realpaths = {}, resolve = {} } = {}) {
+  const resolved = []
+  return {
+    probe: {
+      realpath: (path) => {
+        if (path in realpaths) return realpaths[path]
+        throw new Error(`ENOENT: no such file or directory, realpath '${path}'`)
+      },
+      exists: (path) => path in files,
+      executable: (path) => executables.includes(path),
+      readText: (path) => {
+        if (!(path in files)) throw new Error(`ENOENT: no such file or directory, open '${path}'`)
+        return files[path]
+      },
+      resolvePackage: (request, fromFile) => {
+        resolved.push({ request, fromFile })
+        const key = `${request} from ${fromFile}`
+        if (key in resolve) return resolve[key]
+        throw new Error(`Cannot find module '${request}' from '${fromFile}'`)
+      },
+    },
+    resolved,
+  }
+}
+
+/**
+ * One fake harness install for the native-module check.
+ *
+ * @param {object} [spec] - which native pieces exist.
+ * @param {'prebuild'|'build'|'none'} [spec.pty] - where the pty binary lives (default 'prebuild').
+ * @param {'executable'|'present'|'missing'} [spec.helper] - state of darwin's spawn-helper (default 'executable').
+ * @param {boolean} [spec.locateDsh] - false to model an install that cannot be found (default true).
+ * @param {boolean} [spec.resolveNodePty] - false to model node-pty that cannot be resolved (default true).
+ * @param {string} [spec.platform] - platform for the prebuild directory (default 'darwin').
+ * @param {string} [spec.arch] - architecture for the prebuild directory (default 'arm64').
+ * @param {{command: string, prefix: string[]}} [spec.launcher] - launcher to hand the check (default dsh on PATH).
+ * @param {string} [spec.entry] - the launcher path that resolves to the install (default the launcher command).
+ * @returns {object} `fs`, `platform`, `arch` and `launcher` to merge into the check options.
+ */
+function nativeInstall(spec = {}) {
+  const platform = spec.platform ?? 'darwin'
+  const arch = spec.arch ?? 'arm64'
+  const launcher = spec.launcher ?? { command: 'dsh', prefix: [] }
+  const entry = spec.entry ?? launcher.command
+  const locateDsh = spec.locateDsh ?? true
+  const resolveNodePty = spec.resolveNodePty ?? true
+  const pty = spec.pty ?? 'prebuild'
+  const helper = spec.helper ?? 'executable'
+  const prebuildDir = `${NODE_PTY_DIR}/prebuilds/${platform}-${arch}`
+  const buildDir = `${NODE_PTY_DIR}/build/Release`
+  const loadedDir = pty === 'build' ? buildDir : prebuildDir
+  const files = {}
+  const executables = []
+  if (locateDsh) files[DSH_MANIFEST] = JSON.stringify({ name: '@deepseek-ai/dsh' })
+  if (pty === 'prebuild') files[`${prebuildDir}/pty.node`] = null
+  if (pty === 'build') files[`${buildDir}/pty.node`] = null
+  if (pty !== 'none' && platform === 'darwin' && helper !== 'missing') {
+    files[`${loadedDir}/spawn-helper`] = null
+    if (helper === 'executable') executables.push(`${loadedDir}/spawn-helper`)
+  }
+  const resolve = {}
+  if (locateDsh && resolveNodePty) resolve[`node-pty/package.json from ${DSH_MANIFEST}`] = NODE_PTY_MANIFEST
+  const { probe } = fakeFs({
+    files,
+    executables,
+    realpaths: locateDsh ? { [entry]: DSH_ENTRY } : {},
+    resolve,
+  })
+  return { fs: probe, platform, arch, launcher }
+}
+
 /**
  * Build fully injected run/probe fakes for one scenario.
  *
@@ -36,14 +126,14 @@ function fakeOptions(behaviors = {}, options = {}) {
     if (command === 'zstd') return zstd
     return { status: 1, stdout: '', stderr: 'not found' }
   }
-  const launcher = { command: 'dsh', prefix: [] }
-  return { options: { run, probe: async () => daemon, launcher, nodeVersion: '22.19.0', ...options }, calls }
+  const native = nativeInstall()
+  return { options: { run, probe: async () => daemon, nodeVersion: '22.19.0', ...native, ...options }, calls }
 }
 
-test('reports eight ok checks for a fully working environment', async () => {
+test('reports nine ok checks for a fully working environment', async () => {
   const { options } = fakeOptions()
   const result = await runChecks(options)
-  assert.equal(result.checks.length, 8)
+  assert.equal(result.checks.length, 9)
   assert.deepEqual(result.checks.map((check) => check.id), [...CHECK_IDS])
   assert.ok(result.checks.every((check) => check.status === 'ok'))
   assert.equal(result.ok, true)
@@ -116,6 +206,73 @@ test('a dsh that prints no version points at Node, not at reinstalling dsh', asy
   assert.equal(version.status, 'fail')
   assert.match(version.detail, /Node/)
   assert.match(version.fix, /^install Node 22\.19/)
+})
+
+test('dsh native modules: a prebuilt pty.node is ok', async () => {
+  const result = await runChecks(fakeOptions({}, nativeInstall()).options)
+  const native = find(result, 'dsh-native')
+  assert.equal(native.status, 'ok')
+  assert.match(native.detail, /prebuilds\/darwin-arm64\/pty\.node/)
+})
+
+test('dsh native modules: a compiled build/Release pty.node is ok too', async () => {
+  const result = await runChecks(fakeOptions({}, nativeInstall({ pty: 'build' })).options)
+  const native = find(result, 'dsh-native')
+  assert.equal(native.status, 'ok')
+  assert.match(native.detail, /build\/Release\/pty\.node/)
+})
+
+test('dsh native modules: a missing pty.node fails and points at node-gyp', async () => {
+  const result = await runChecks(fakeOptions({}, nativeInstall({ pty: 'none' })).options)
+  const native = find(result, 'dsh-native')
+  assert.equal(native.status, 'fail')
+  assert.ok(native.detail.includes(NODE_PTY_DIR), native.detail)
+  assert.match(native.fix, /install scripts allowed/)
+  assert.match(native.fix, /node-gyp rebuild/)
+  assert.ok(native.fix.includes(NODE_PTY_DIR), native.fix)
+  assert.equal(result.ok, false)
+})
+
+test('dsh native modules: a non-executable spawn-helper fails with a chmod fix', async () => {
+  const result = await runChecks(fakeOptions({}, nativeInstall({ pty: 'prebuild', helper: 'present' })).options)
+  const native = find(result, 'dsh-native')
+  assert.equal(native.status, 'fail')
+  assert.match(native.detail, /not executable/)
+  assert.equal(native.fix, `chmod +x ${NODE_PTY_DIR}/prebuilds/darwin-arm64/spawn-helper`)
+  assert.equal(result.ok, false)
+})
+
+test('dsh native modules: an unlocatable install only warns', async () => {
+  const result = await runChecks(fakeOptions({}, nativeInstall({ locateDsh: false })).options)
+  const native = find(result, 'dsh-native')
+  assert.equal(native.status, 'warn')
+  assert.match(native.detail, /could not locate/)
+  assert.equal(find(result, 'dsh').status, 'ok')
+})
+
+test('dsh native modules: unresolvable node-pty only warns, naming the reason', async () => {
+  const result = await runChecks(fakeOptions({}, nativeInstall({ resolveNodePty: false })).options)
+  const native = find(result, 'dsh-native')
+  assert.equal(native.status, 'warn')
+  assert.match(native.detail, /node-pty could not be resolved/)
+  assert.match(native.detail, /Cannot find module/)
+  assert.equal(find(result, 'dsh').status, 'ok')
+})
+
+test('dsh native modules: a Windows shim resolves the JS entry behind it', async () => {
+  const entry = 'C:/Users/dev/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/lib/bin.js'
+  const spec = nativeInstall({
+    platform: 'win32',
+    arch: 'x64',
+    launcher: { command: '/nonexistent/node', prefix: [entry] },
+    entry,
+  })
+  // The launcher command is not `dsh` here, so every command answers the same way.
+  const run = (command, args) => ({ status: 0, stdout: args.includes('--version') ? '0.2.0-rc.2\n' : '', stderr: '' })
+  const result = await runChecks(fakeOptions({}, { ...spec, run }).options)
+  const native = find(result, 'dsh-native')
+  assert.equal(native.status, 'ok')
+  assert.match(native.detail, /win32-x64\/pty\.node/)
 })
 
 test('fails when the service profile does not compose', async () => {
@@ -203,7 +360,8 @@ test('formats one line per check and a Fix line per broken one', async () => {
   const lines = text.split('\n')
   const checkLines = lines.filter((line) => /^(ok|warn|fail)\s/.test(line))
   assert.equal(checkLines.length, 8)
-  for (const id of CHECK_IDS) assert.ok(text.includes(id), `missing ${id}`)
+  // dsh did not start here, so its native-module check is not run at all.
+  for (const id of CHECK_IDS.filter((id) => id !== 'dsh-native')) assert.ok(text.includes(id), `missing ${id}`)
   const fixLines = lines.filter((line) => line.startsWith('Fix:'))
   const broken = result.checks.filter((check) => check.status !== 'ok')
   assert.equal(fixLines.length, broken.length)

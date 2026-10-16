@@ -12,6 +12,9 @@
  */
 
 import { spawnSync } from 'node:child_process'
+import { accessSync, constants, existsSync, readFileSync, realpathSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { dirname, join } from 'node:path'
 
 import { resolveDshCommand } from './sdk.js'
 
@@ -20,6 +23,7 @@ export const CHECK_IDS = Object.freeze([
   'node',
   'dsh',
   'dsh-version',
+  'dsh-native',
   'profile',
   'ollama',
   'model',
@@ -43,6 +47,28 @@ const NODE_REQUIREMENT = 'Node 22.19 or newer (24.2 or newer on the 24 line)'
 
 /** Endpoint whose answer proves the local Ollama daemon is up. */
 const OLLAMA_TAGS_URL = 'http://127.0.0.1:11434/api/tags'
+
+/**
+ * The filesystem primitives the native-module check reads.
+ *
+ * These are lookups only: nothing here spawns a process or loads a native
+ * module, and the whole set is injectable through `options.fs`, so the check can
+ * be exercised without a real harness install.
+ */
+const REAL_FS = Object.freeze({
+  realpath: (path) => realpathSync(path),
+  exists: (path) => existsSync(path),
+  executable: (path) => {
+    try {
+      accessSync(path, constants.X_OK)
+      return true
+    } catch {
+      return false
+    }
+  },
+  readText: (path) => readFileSync(path, 'utf8'),
+  resolvePackage: (request, fromFile) => createRequire(fromFile).resolve(request),
+})
 
 /**
  * Run one command and report its exit status instead of throwing.
@@ -131,6 +157,135 @@ function firstLine(text) {
   return (text ?? '').split(/\r?\n/).find((line) => line.trim().length > 0)?.trim() ?? ''
 }
 
+/** The message of a thrown value, for a warning that has to name its reason. */
+function reasonOf(error) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Find the harness package that owns a resolved dsh entry.
+ *
+ * Homebrew and `npm link` make the launcher a symlink, so the entry is realpath'd
+ * before walking up from `lib/` to the manifest whose name is `@deepseek-ai/dsh`.
+ * There is deliberately no fallback to a guessed global prefix: guessing would
+ * inspect some other install and hide the real problem.
+ *
+ * @param {string} entry - the launcher path, or the JavaScript entry behind a Windows shim.
+ * @param {object} fs - filesystem probe.
+ * @returns {string | undefined} the package directory, or undefined when no manifest names it.
+ */
+function findDshPackage(entry, fs) {
+  let real
+  try {
+    real = fs.realpath(entry)
+  } catch {
+    return undefined
+  }
+  let dir = dirname(real)
+  for (;;) {
+    const manifest = join(dir, 'package.json')
+    if (fs.exists(manifest)) {
+      try {
+        if (JSON.parse(fs.readText(manifest))?.name === '@deepseek-ai/dsh') return dir
+      } catch {
+        // A manifest we cannot read is not ours; keep walking rather than guess.
+      }
+    }
+    const parent = dirname(dir)
+    if (parent === dir) return undefined
+    dir = parent
+  }
+}
+
+/**
+ * Check that the node-pty native pieces beside a dsh install are usable.
+ *
+ * dsh runs every worker shell command through node-pty. npm 11 blocks dependency
+ * install scripts by default, and those scripts are what build `pty.node` or
+ * restore the execute bit on macOS's `spawn-helper`, so a script that silently
+ * did not run turns into every worker command failing. This only looks at paths;
+ * it never loads the module or starts a process.
+ *
+ * @param {string} entry - the resolved dsh entry point.
+ * @param {string} platform - platform whose prebuild directory to inspect.
+ * @param {string} arch - architecture whose prebuild directory to inspect.
+ * @param {object} fs - filesystem probe.
+ * @param {string} install - the command that reinstalls dsh.
+ * @returns {{status: string, detail: string, fix: string}} the check to record.
+ */
+function checkNativeModules(entry, platform, arch, fs, install) {
+  const dshDir = findDshPackage(entry, fs)
+  if (dshDir === undefined) {
+    return {
+      status: 'warn',
+      detail: `could not locate the @deepseek-ai/dsh install behind ${entry}, so its native modules could not be inspected`,
+      fix: install,
+    }
+  }
+
+  const manifest = join(dshDir, 'package.json')
+  let nodePtyDir
+  let why = ''
+  try {
+    nodePtyDir = dirname(fs.resolvePackage('node-pty/package.json', manifest))
+  } catch {
+    try {
+      // node-pty is a dependency of the subprocess package; resolving from that
+      // manifest finds a copy hoisted anywhere above it.
+      const subprocess = fs.resolvePackage('@deepseek-ai/dsh-subprocess-local/package.json', manifest)
+      nodePtyDir = dirname(fs.resolvePackage('node-pty/package.json', subprocess))
+    } catch (error) {
+      why = reasonOf(error)
+    }
+  }
+  if (nodePtyDir === undefined) {
+    return {
+      status: 'warn',
+      detail: `node-pty could not be resolved from ${dshDir}${why === '' ? '' : `: ${why}`}`,
+      fix: install,
+    }
+  }
+
+  // node-pty loads build/Release before prebuilds, so the same order decides
+  // which spawn-helper pairs with the binary that actually runs.
+  const buildDir = join(nodePtyDir, 'build', 'Release')
+  const prebuildDir = join(nodePtyDir, 'prebuilds', `${platform}-${arch}`)
+  const loadedDir = [buildDir, prebuildDir].find((dir) => fs.exists(join(dir, 'pty.node')))
+  if (loadedDir === undefined) {
+    return {
+      status: 'fail',
+      detail: `node-pty has no pty.node in ${prebuildDir} or ${buildDir}, so dsh cannot run a worker command`,
+      fix: `reinstall @deepseek-ai/dsh with install scripts allowed (npm 11 blocks them by default); or build node-pty in place: cd ${nodePtyDir} && npx --yes node-gyp rebuild`,
+    }
+  }
+
+  const ptyNode = join(loadedDir, 'pty.node')
+  if (platform === 'darwin') {
+    const helper = join(loadedDir, 'spawn-helper')
+    if (!fs.exists(helper)) {
+      return {
+        status: 'fail',
+        detail: `node-pty's ${ptyNode} has no spawn-helper beside it, which macOS needs to start a shell`,
+        fix: `cd ${nodePtyDir} && npx --yes node-gyp rebuild`,
+      }
+    }
+    let helperRuns = false
+    try {
+      helperRuns = fs.executable(helper) === true
+    } catch {
+      helperRuns = false
+    }
+    if (!helperRuns) {
+      return {
+        status: 'fail',
+        detail: `node-pty's spawn-helper at ${helper} is not executable, so dsh cannot run a worker command`,
+        fix: `chmod +x ${helper}`,
+      }
+    }
+  }
+  return { status: 'ok', detail: `node-pty can load ${ptyNode}`, fix: '' }
+}
+
 /**
  * Run every prerequisite check in order.
  *
@@ -143,6 +298,10 @@ function firstLine(text) {
  * @param {string} [options.profile] - service profile to compose (default 'flash-service').
  * @param {string} [options.model] - Ollama model to require (default 'deepseek-v4.1-flash:cloud').
  * @param {string} [options.dshVersion] - the dsh version the profiles are written for (default '0.2.0-rc.2').
+ * @param {string} [options.platform] - platform whose node-pty prebuild to inspect (default process.platform).
+ * @param {string} [options.arch] - architecture whose node-pty prebuild to inspect (default process.arch).
+ * @param {object} [options.fs] - filesystem probe with realpath/exists/executable/readText/resolvePackage;
+ *        defaults to the node:fs calls, and is injectable so the check needs no real harness install.
  * @param {{command: string, prefix: string[]}} [options.launcher] - how to start dsh; defaults to the
  *        launcher the server itself resolves, so the doctor checks exactly the dsh the server would run.
  * @returns {Promise<{checks: object[], ok: boolean, failures: number, warnings: number}>} the report.
@@ -157,6 +316,9 @@ export async function runChecks(options = {}) {
   const dshInstall = `npm i -g @deepseek-ai/dsh@${dshVersion}`
   const run = config.run ?? ((command, args) => defaultRun(command, args, env))
   const probe = config.probe ?? defaultProbe
+  const platform = config.platform ?? process.platform
+  const arch = config.arch ?? process.arch
+  const fs = config.fs ?? REAL_FS
 
   /** Never let a broken injected runner escape as a rejection. */
   const safeRun = (command, args) => {
@@ -225,6 +387,19 @@ export async function runChecks(options = {}) {
       // whose row is gone leaves that row at the harness default.
       record('dsh-version', 'dsh version', 'fail', `dsh ${installed} is not the ${dshVersion} the profiles are written for`, dshInstall)
     }
+  }
+
+  if (dshRuns) {
+    // The Windows shim is resolved to a JavaScript entry, which is where the
+    // harness install actually lives; elsewhere the launcher is the binary itself.
+    const entry = launcher.prefix.length > 0 ? launcher.prefix[0] : launcher.command
+    let native
+    try {
+      native = checkNativeModules(entry, platform, arch, fs, dshInstall)
+    } catch (error) {
+      native = { status: 'warn', detail: `the dsh native-module check could not run: ${reasonOf(error)}`, fix: dshInstall }
+    }
+    record('dsh-native', 'dsh native modules', native.status, native.detail, native.fix)
   }
 
   if (!dshRuns) {

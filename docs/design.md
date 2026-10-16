@@ -191,17 +191,25 @@ Claude Code ──MCP stdio──► flash-mcp ──SDK stdio JSON-RPC──►
 
 ### The tools
 
-Three doors, and nothing else:
+Two doors that start work, and five that only look at, land, or stop work already started:
 
 | Tool | Required | Purpose |
 |---|---|---|
 | `flash_task` | `task`, `cwd` | one self-contained task on one worker |
 | `flash_batch` | `tasks` | a fleet the caller has already split, one worker per task |
-| `flash_apply` | `patchId` | put the change an earlier call produced into the workspace (`dryRun?`, `force?`) |
+| `flash_apply` | `patchId` | put the change an earlier call produced into the workspace (`dryRun?`, `force?`, `threeWay?`) |
+| `flash_patch` | `patchId` | read a stored patch whole, by file (`files?`), or by page (`offset?`, `maxChars?`) |
+| `flash_status` | — | the state of one background job (`jobId?`), or of all of them |
+| `flash_result` | `jobId` | a background job's result, waiting up to `waitSeconds?` (≤ 600) for it |
+| `flash_cancel` | `jobId` | stop a background job; its tree is retired as on a timeout |
 
 Optional on `flash_task` / `flash_batch`: `acceptance` (one string, or per task in `flash_batch`),
-`cwd`, `mode` (`workspace-write` — the default — or `read-only`), and `apply` (`none` — the default —
-or `auto`). There is no model, provider, effort, or permission parameter: the route is not a caller
+`cwd`, `mode` (`workspace-write` — the default — or `read-only`), `apply` (`none` — the default —,
+`auto`, or `discard`: report the change, store nothing), `source` (`working-tree` — the default — or
+`head`: start the copy from the last commit, keeping ignored files), and `background` (answer at once
+with a job id; the job owns its own abort signal, so the starting request ending cannot cancel it).
+Jobs are in memory: they do not survive a restart, but a finished writing call's work is still
+salvaged as a patch by the next server. There is no model, provider, effort, or permission parameter: the route is not a caller
 capability, and neither is the sandbox. Unknown arguments are ignored rather than forwarded.
 
 A writing call does not run in your repository. It runs in a **disposable copy** of it and returns the
@@ -223,6 +231,7 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
   "durationMs": 8123,
   "mode": "workspace-write",
   "runtime": { "pid": 98476, "booted": true, "uptimeMs": 13323, "sessions": 1, "profile": "flash-service" },
+  "usage": { "inputTokens": 48211, "outputTokens": 1893, "totalTokens": 50104, "modelCalls": 9 },
   "isolation": { "mode": "copy", "slot": 0 },
   "change": {
     "available": true,
@@ -231,14 +240,26 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
     "diff": "diff --git a/flash-mcp-probe.txt …",
     "diffTruncated": false,
     "applied": false,
-    "patchId": "flash-9d1c…"
+    "patchId": "flash-9d1c…",
+    "patchPath": "/var/folders/…/flash-mcp/<digest>/patches/flash-9d1c….patch"
   }
 }
 ```
 
 - `change` is computed by the service from the copy, not reported by the worker: `filesChanged` comes
-  from `git diff --name-status`, `diffstat` from `--stat`, and `diff` is the patch itself (clipped to
-  `--diff-chars`, with `diffTruncated` saying whether it was). A worker's own account of what it did
+  from `git diff --name-status`, `diffstat` from `--stat`, and `diff` is the patch itself, clipped to
+  `--diff-chars` at a file boundary — never mid-line. When it was clipped, `diffTruncated` is true and
+  `diffOmitted` names the files not (or not wholly) in it; `flash_patch` reads them from the stored
+  patch at `patchPath`.
+- `usage` sums the token counts the Harness attaches to each completed model response
+  (`assistant/message` events) across the call's own session and every worker it started; in a fleet,
+  each result entry also carries its own worker's share. It is absent, never zero, when no response
+  reported any.
+  `inputTokens` counts uncached input only; cache hits are in `cacheReadTokens`, which is why
+  `totalTokens` (as the Harness reports it) exceeds `inputTokens + outputTokens` on a warm cache.
+- `isolation.uncommittedAtStart` (`{ count, files }`, only when non-zero) lists what was uncommitted in
+  your tree when the copy was made. The copy's index mirrors yours, so the worker sees that work the
+  way you left it, and its prompt says the work is not its own. A worker's own account of what it did
   is in `result` and is **not** evidence that it did it.
 - Without git in the root the copy still isolates, but there is no diff to compute: `change.available`
   is `false` and `change.reason` says why.
@@ -487,6 +508,57 @@ Honest limits of this design:
   naming the kept patch file, so a conflict is never lost work.
 - `--isolate none` exists for debugging the wall. With it, point `--root` at something you are willing
   to lose: the wall protects `.git` and secrets, but it does not protect your uncommitted source.
+
+#### What the copy holds, and what it leaves out
+
+- **Vanishing files.** A build running in your tree while a call starts rewrites its output under the
+  copy's feet. An entry that disappears between listing and copying is skipped and counted (the log
+  names how many), not fatal; any other copy failure names the path and suggests a retry.
+- **`.flash-agents.json`** at the root is read once when the server starts. `copyExclude` names
+  paths to leave out — a bare name at any depth, a name with a slash from the root — and a match is
+  honoured only where `git check-ignore` reports it ignored and `git ls-files` lists nothing under it,
+  so tracked source can never go missing and read to the worker as its own deletion. `slotEnv` maps
+  environment variables to folders inside the slot: `home:<name>` under `.flash-home/`, emptied every
+  call, and `cache:<name>` under `.flash-cache/`, which `prepare` keeps between calls in the same slot
+  and retire, sweep and close remove with the slot. Both folders are excluded from the diff like
+  `.flash-tmp/`. `TMPDIR`, `TMP`, `TEMP` and `HOME` are refused: the sandbox derives its writable roots
+  from the runtime's temp dir (see above), and every toolchain reads `HOME`.
+- **The index mirrors yours.** The base is recorded through a private index (`GIT_INDEX_FILE`, seeded
+  from the copy's own), so `git status` in the copy shows your staged, unstaged and untracked work
+  exactly as you left it. Recording it on the real index used to make every uncommitted edit look
+  staged, and workers reported "pre-existing staged modifications" that no one had staged.
+- **`source: "head"`** resets the copy's tracked files to `HEAD` and removes untracked, non-ignored
+  files (`git clean -fd`, deliberately without `-x`, so dependencies and build output stay).
+- **A symlinked `.git`** (a git dir kept elsewhere) is detached like a `.git` file: copied verbatim,
+  the link made the copy's git dir the caller's, so the worker's files were staged in the caller's
+  real index. A nested repository whose `.git` is an absolute symlink is left out of the copy, like a
+  linked worktree. An exclusion inside a nested repository is judged by that repository's own
+  ignore rules and index.
+
+#### Applying a patch whose context moved
+
+A plain `git apply` is always tried first, and never touches your index. With `threeWay: true` a
+patch that no longer applies is merged instead. `git apply --3way` was rejected for this: it implies
+`--index`, so it refuses any file with unstaged changes ("does not match index") — the normal state
+when sessions work in parallel — and it stages its result in your index. It also needs the patch's
+preimage blobs, which for a copy made from uncommitted work exist only in the copy, and the copy is
+emptied after the call.
+
+So `#collect` packs the preimage blobs next to the stored patch (`<patchId>.blobs/`), and the merge
+runs in a scratch repository that borrows those objects (and your repository's) as alternates: base
+from the preimage entries, theirs = base plus the patch, ours = your current files at the touched
+paths, merged by `git merge-tree --write-tree` (git 2.38+). The merged files are written back to your
+working tree; conflicts leave markers in the named files and are listed in `conflicts`, and the
+apply is recorded so a second one is refused. `dryRun` runs the same merge and predicts the
+conflicts without writing.
+
+Before anything is written, every target is checked: no write goes through a symlinked directory
+(plain `git apply` refuses the same), a file replaces a caller directory only when every file in it
+is one of the merge's own deletions, and a path whose parent is a caller file is refused. A refusal
+writes nothing. Submodules are never touched: "ours" records a checkout as a gitlink at its HEAD,
+as `git add` would, and a merged pointer move or removal is named in the result, not acted on.
+Written files keep the caller's permission bits and get the line endings the caller's git config
+asks for (`cat-file --filters`, the inverse of the `hash-object --path` that read them).
 
 ### Configuration
 

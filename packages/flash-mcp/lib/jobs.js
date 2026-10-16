@@ -1,0 +1,396 @@
+/**
+ * Background jobs for `flash_task` and `flash_batch`.
+ *
+ * A synchronous flash_task holds the caller's turn for its whole run — minutes in
+ * practice — during which the caller cannot run tests, review an earlier patch, or
+ * cancel anything. A background call answers at once with a job id, and the work
+ * continues under a signal the *job* owns, so finishing or cancelling the starting
+ * request cannot reach it. Three tools (`flash_status`, `flash_result`,
+ * `flash_cancel`) report on, collect, and stop those jobs.
+ *
+ * The registry is deliberately in-memory and process-local. A job's result only means
+ * anything to the process that ran it, and a finished writing call's change is already
+ * stored on disk as a patch, which a later server salvages and `flash_apply` applies.
+ * Nothing here writes to disk or starts a timer that keeps the process alive, and time
+ * comes from an injected clock, so tests can advance it.
+ *
+ * @module flash-mcp/jobs
+ */
+
+import { randomUUID } from 'node:crypto'
+
+/** How many ended jobs the registry keeps before it evicts the oldest. */
+export const MAX_ENDED_JOBS = 50
+
+/** How long an ended job is kept. Old ones are dropped lazily, never by a timer. */
+export const ENDED_RETENTION_MS = 6 * 60 * 60 * 1000
+
+/**
+ * The three tools that work on background jobs.
+ *
+ * Same shape as the service's other tool descriptors. None can start work, so none
+ * carries a task: they only observe, collect, and cancel a job that `background: true`
+ * already started.
+ *
+ * @type {Array<object>}
+ */
+export const JOB_TOOLS = [
+  {
+    name: 'flash_status',
+    description: [
+      'Report the state of a background flash_task or flash_batch call started with `background: true`.',
+      '',
+      'With a jobId, returns that job\'s state ("running", "ok", "failed", or "cancelled"), its label,',
+      'when it started and (once ended) when it ended, how long it has run, and its most recent',
+      'progress line. Without a jobId, returns every job this server has run, newest first.',
+      '',
+      'This reports status only: it never returns a job\'s result — use flash_result for that. A job',
+      'id is meaningful only to the server process that created it, and jobs do not survive a restart.',
+      'After a restart, a finished writing call\'s work is still salvaged as a patch by the next server,',
+      'and flash_apply can apply it by id.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: {
+          type: 'string',
+          description: 'The job to report on. Omit it to list every job this server has run.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'flash_result',
+    description: [
+      'Collect the result of a background flash_task or flash_batch call started with `background: true`.',
+      '',
+      'Returns the same result a synchronous call would have returned, plus the job id, state, and',
+      'elapsed time. With the default `waitSeconds: 0` it answers at once: a finished job returns its',
+      'result, and a running job returns its current state. Pass `waitSeconds` (up to 600) to wait for',
+      'the job to end — prefer waiting in chunks (e.g. waitSeconds: 300) between other work, so you',
+      'stay responsive and can report progress instead of blocking on one long call.',
+      '',
+      'If the request carrying this call is cancelled, the wait stops and the job keeps running. A call',
+      'that failed or was cancelled comes back as an error with the same message the synchronous call',
+      'would have produced. A result stays available after it is read, so reading twice returns the same',
+      'thing, but it is kept in memory only: an ended job is dropped six hours after it ended, and once',
+      'more than 50 have ended, results you have already collected and failed or cancelled jobs may be',
+      'evicted sooner. A successful result you have not collected is never evicted by that count. None',
+      'survives a restart — the finished work is salvaged as a patch instead.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: {
+          type: 'string',
+          description: 'The job whose result to collect.',
+        },
+        waitSeconds: {
+          type: 'integer',
+          minimum: 0,
+          maximum: 600,
+          description:
+            'How long to wait for the job to end before answering with its current state. Defaults to 0, which answers at once.',
+        },
+      },
+      required: ['jobId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'flash_cancel',
+    description: [
+      'Stop a running background flash_task or flash_batch call and return its resulting status.',
+      '',
+      'Aborts the job and waits up to 30 seconds for the call to settle. Cancellation follows the same',
+      'path as cancelling a synchronous call: the service abandons the lease, or shuts the runtime down',
+      'and retires the tree. A cancelled writing call\'s tree is therefore retired and its partial work',
+      'is not returned — only a later salvage turns it into a patch. The state reported is "cancelled",',
+      'or whatever the call had already ended as if it finished first.',
+      '',
+      'A job that has already ended is returned unchanged, with a note saying so. Cancelling does not',
+      'undo a change that was already applied with `apply: "auto"`.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: {
+          type: 'string',
+          description: 'The running job to stop.',
+        },
+      },
+      required: ['jobId'],
+      additionalProperties: false,
+    },
+  },
+]
+
+/**
+ * In-memory registry of background calls.
+ *
+ * A job owns its `AbortController`, not the request that started it, so `flash_cancel`
+ * and a dropped starting request pull different levers. `run` is invoked once, its
+ * outcome captured; nothing in the registry ever awaits it, which is what lets the
+ * starting request answer immediately.
+ */
+export class JobRegistry {
+  /**
+   * @param {object} [options] - registry wiring.
+   * @param {(message: string) => void} [options.log] - diagnostic sink.
+   * @param {() => number} [options.now] - clock, injectable for tests.
+   * @param {number} [options.maxEnded] - ended jobs kept before the oldest are evicted.
+   * @param {number} [options.retentionMs] - how long an ended job is kept.
+   */
+  constructor({ log = () => {}, now = Date.now, maxEnded = MAX_ENDED_JOBS, retentionMs = ENDED_RETENTION_MS } = {}) {
+    this.log = log
+    this.now = now
+    this.maxEnded = maxEnded
+    this.retentionMs = retentionMs
+    /** @type {Map<string, object>} jobs by id, in start order. */
+    this.jobs = new Map()
+  }
+
+  /**
+   * Start a job and return it at once. `run` is called with the job's own signal, its id
+   * (which the dispatcher passes to the service as a progress token), and a recorder for
+   * its progress. It must resolve with the call's result or reject with its error; its
+   * outcome is captured, never awaited here.
+   *
+   * @param {object} options - the job to start.
+   * @param {'flash_task' | 'flash_batch'} options.kind - the tool the job runs.
+   * @param {string} options.label - one-line description shown in status and logs.
+   * @param {(call: {signal: AbortSignal, jobId: string, progress: (report: object) => void}) => Promise<object>} options.run - the call.
+   * @returns {object} the running job record.
+   */
+  start({ kind, label, run }) {
+    this.#sweep()
+    const startedMs = this.now()
+    const jobId = this.#newJobId()
+    const job = {
+      jobId,
+      kind,
+      label,
+      state: 'running',
+      startedMs,
+      startedAt: new Date(startedMs).toISOString(),
+      endedMs: undefined,
+      endedAt: undefined,
+      lastProgress: undefined,
+      result: undefined,
+      error: undefined,
+      /** Whether flash_result has already handed this job's result to the caller. */
+      collected: false,
+      controller: new AbortController(),
+      settled: undefined,
+    }
+    // Enter the map and log the start *before* invoking `run`, so even a run that rejects
+    // synchronously cannot settle before the job is observable or log "ended" first.
+    this.jobs.set(jobId, job)
+    this.log(`job ${jobId} ${kind} started: ${label}`)
+    job.settled = (async () => {
+      try {
+        job.result = await run({
+          signal: job.controller.signal,
+          jobId,
+          progress: (report) => this.#recordProgress(job, report),
+        })
+      } catch (error) {
+        job.error = error
+      }
+      this.#finish(job)
+    })()
+    return job
+  }
+
+  /**
+   * The job record for an id, or undefined. This is the internal view: it carries the
+   * result payload, so only `flash_result` should read it. `status` is the safe projection.
+   *
+   * @param {string} jobId - the job to find.
+   * @returns {object | undefined} the job.
+   */
+  get(jobId) {
+    this.#sweep()
+    return this.jobs.get(jobId)
+  }
+
+  /**
+   * The status of one job, never its result.
+   *
+   * @param {string} jobId - the job to report on.
+   * @returns {object | undefined} the status, or undefined when the id is not known.
+   */
+  status(jobId) {
+    const job = this.get(jobId)
+    return job === undefined ? undefined : this.#project(job)
+  }
+
+  /**
+   * The status projection of a job the caller already holds.
+   *
+   * `waitFor` resolves the job it was holding, but `status(jobId)` looks it up again — and
+   * the sweep may have evicted it in between, so the second lookup can be undefined and the
+   * dispatcher then throws a TypeError out of the request. Projecting the held job is the
+   * same answer with no second lookup and no race.
+   *
+   * @param {object} job - a job record.
+   * @returns {object} the status projection.
+   */
+  statusOf(job) {
+    return this.#project(job)
+  }
+
+  /**
+   * Every job's status, newest first. Ties on start time fall back to start order, so a
+   * test clock that does not advance still lists deterministically.
+   *
+   * @returns {Array<object>} the statuses.
+   */
+  list() {
+    this.#sweep()
+    return [...this.jobs.values()]
+      .map((job, index) => ({ job, index }))
+      .sort((a, b) => b.job.startedMs - a.job.startedMs || b.index - a.index)
+      .map(({ job }) => this.#project(job))
+  }
+
+  /**
+   * Abort a running job's own controller. Nothing else: the service's cancellation path
+   * retires the tree and shuts the runtime down when the call reacts to the signal. Returns
+   * the job so the caller can wait for it to settle.
+   *
+   * @param {string} jobId - the job to stop.
+   * @returns {object | undefined} the job, running or already ended, or undefined.
+   */
+  cancel(jobId) {
+    const job = this.get(jobId)
+    if (job === undefined || job.state !== 'running') return job
+    job.controller.abort()
+    return job
+  }
+
+  /**
+   * Wait for a job to end, up to `waitMs`, or until `signal` aborts. Resolves with the job
+   * either way; the caller reads its state. The timer is unref'd and cleared, so a wait is
+   * never the thing keeping the process alive, and a cancelled request stops waiting at once.
+   *
+   * @param {string} jobId - the job to wait on.
+   * @param {number} waitMs - the longest to wait.
+   * @param {AbortSignal} [signal] - the waiting request's cancellation.
+   * @returns {Promise<object | undefined>} the job, or undefined when it is gone.
+   */
+  waitFor(jobId, waitMs, signal) {
+    const job = this.get(jobId)
+    if (job === undefined) return Promise.resolve(undefined)
+    if (job.state !== 'running' || waitMs <= 0 || signal?.aborted === true) return Promise.resolve(job)
+    return new Promise((resolve) => {
+      let done = false
+      const finish = () => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', finish)
+        resolve(this.jobs.get(jobId) ?? job)
+      }
+      const timer = setTimeout(finish, waitMs)
+      // A pending wait must never by itself keep the process alive.
+      timer.unref?.()
+      signal?.addEventListener('abort', finish, { once: true })
+      job.settled.then(finish, finish)
+    })
+  }
+
+  /**
+   * Drop ended jobs nobody can collect any more: first those past their retention window,
+   * then, under the cap, only the ones whose result is safe to lose. Running jobs are never
+   * evicted — their work is still in flight and their result may be the only handle on it.
+   * Called from every public operation, so retention needs no timer.
+   */
+  #sweep() {
+    const now = this.now()
+    for (const [id, job] of this.jobs) {
+      if (job.state !== 'running' && now - job.endedMs >= this.retentionMs) this.jobs.delete(id)
+    }
+    const ended = [...this.jobs.values()].filter((job) => job.state !== 'running')
+    if (ended.length <= this.maxEnded) return
+    // An `ok` result nobody collected is the one thing here that cannot be reconstructed:
+    // the change is on disk as a patch, but the call's result envelope is in memory only.
+    // A collected result was already delivered, and a failure or cancellation can be
+    // retried, so those are evicted first, oldest first. An uncollected `ok` job is left to
+    // the retention window above and is never removed by the cap.
+    const evictable = ended
+      .filter((job) => job.collected === true || job.state !== 'ok')
+      .sort((a, b) => a.endedMs - b.endedMs)
+    const excess = ended.length - this.maxEnded
+    for (const job of evictable.slice(0, excess)) this.jobs.delete(job.jobId)
+  }
+
+  /** A fresh id unique within this registry: `job-` and 8 lowercase hex characters. */
+  #newJobId() {
+    for (;;) {
+      const id = `job-${randomUUID().slice(0, 8)}`
+      if (!this.jobs.has(id)) return id
+    }
+  }
+
+  /**
+   * Record the newest progress line for a running job. The service's heartbeat fires at its
+   * own interval; only the latest one is kept, which is all `flash_status` shows. A report
+   * without a message is not worth showing and is ignored.
+   *
+   * @param {object} job - the running job.
+   * @param {object} report - the service's progress report.
+   */
+  #recordProgress(job, report) {
+    if (job.state !== 'running') return
+    if (report === null || typeof report !== 'object') return
+    if (typeof report.message !== 'string' || report.message.length === 0) return
+    job.lastProgress = {
+      message: report.message,
+      ...(typeof report.progress === 'number' ? { progress: report.progress } : {}),
+      ...(typeof report.total === 'number' ? { total: report.total } : {}),
+      at: new Date(this.now()).toISOString(),
+    }
+  }
+
+  /**
+   * Settle a job exactly once. A call that rejected after its own controller was aborted is a
+   * cancellation whatever error the service raised; the service's own CANCELLED code is
+   * honoured too, so a cancellation that raced the abort is still named as one.
+   *
+   * @param {object} job - the job to settle.
+   */
+  #finish(job) {
+    if (job.state !== 'running') return
+    const endedMs = this.now()
+    job.endedMs = endedMs
+    job.endedAt = new Date(endedMs).toISOString()
+    if (job.error === undefined) job.state = 'ok'
+    else if (job.controller.signal.aborted || job.error?.code === 'CANCELLED') job.state = 'cancelled'
+    else job.state = 'failed'
+    this.log(`job ${job.jobId} ${job.kind} ended ${job.state} in ${formatMinutes(endedMs - job.startedMs)} min`)
+  }
+
+  /** The status projection: identity, state, timing, latest progress — never the result. */
+  #project(job) {
+    return {
+      jobId: job.jobId,
+      kind: job.kind,
+      label: job.label,
+      state: job.state,
+      startedAt: job.startedAt,
+      ...(job.endedAt === undefined ? {} : { endedAt: job.endedAt }),
+      elapsedMs: Math.max(0, (job.endedMs ?? this.now()) - job.startedMs),
+      ...(job.lastProgress === undefined
+        ? {}
+        : { lastProgress: { message: job.lastProgress.message, at: job.lastProgress.at } }),
+      resultReady: job.state === 'ok',
+    }
+  }
+}
+
+/** Render an elapsed span in minutes with one decimal, the way the log reads it. */
+function formatMinutes(ms) {
+  return (Math.max(0, ms) / 60_000).toFixed(1)
+}

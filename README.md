@@ -69,6 +69,12 @@ ollama signin                            # the :cloud model runs on Ollama's clo
 ollama pull deepseek-v4.1-flash:cloud
 ```
 
+npm 11 skips dependency install scripts and lists the ones it blocked (`node-pty`,
+`@deepseek-ai/dsh-subprocess-local`, `koffi`, `protobufjs`, `@google/genai`). On macOS and the
+common Linux and Windows machines that is harmless: `node-pty` ships prebuilt binaries, and the
+others are not needed here. The setup's doctor checks the one piece that matters (that `node-pty`
+can start a worker's shell) and prints the exact fix if it can't.
+
 **2. Add the plugin in Claude Code**
 
 ```
@@ -104,13 +110,29 @@ in rounds, and applies the patches it accepts.
 |---|---|
 | `flash_task` | One coherent task on one worker. Returns its report and a patch. |
 | `flash_batch` | Several independent tasks at once; results come back in task order. |
-| `flash_apply` | Land a patch from an earlier call (`dryRun` to check it first). |
+| `flash_apply` | Land a patch from an earlier call (`dryRun` to check it first, `threeWay` to merge one whose context moved). |
+| `flash_patch` | Read a stored patch whole, by file, or page by page — for a diff too long for the result. |
+| `flash_status` · `flash_result` · `flash_cancel` | Follow, collect, and stop calls started with `background: true`. |
 | `/flash-agents:delegate` | The everyday loop: frame → slice → dispatch → verify → review → fix → apply. |
 | `/flash-agents:gauntlet` | Several competing builders, cheap critics, and a blind A/B judged by Claude. For problems with more than one plausible approach and a result you can run. |
 | `/flash-agents:setup` | One-time install check and smoke test. |
 
 Pass `mode: "read-only"` for reviews and codebase maps: that call runs in a second process whose
-sandbox refuses every write.
+sandbox refuses every write — including the writes a build or a test run makes. For a review that
+has to build or run tests, use a writing call with `apply: "discard"`: it runs in a throwaway copy,
+reports what it changed, and keeps nothing.
+
+Pass `background: true` and a call returns at once with a job id, so Claude can run tests or
+review an earlier patch while workers run; `flash_result` collects the result (and can wait for
+it), `flash_cancel` stops it.
+
+Every result reports the tokens the call used (`usage`), and lists any uncommitted files the copy
+started with (`isolation.uncommittedAtStart`). If another session has uncommitted work in the same
+tree, `source: "head"` starts the copy from the last commit instead.
+
+Project facts every worker needs — layout, check commands, style rules — go in an `AGENTS.md` (or
+`CLAUDE.md`) in your repository. The harness loads it into every worker, from the repository root
+down to the worker's directory, so tasks don't have to repeat it.
 
 ## Safety, in one paragraph
 
@@ -132,13 +154,51 @@ Limits live in [`flash.config.json`](flash.config.json). The defaults: a call is
 **10 minutes without any activity** (stuck), or 3 hours in total (a ceiling for honest work);
 either way, the change so far is salvaged as a patch.
 
+### Per-repository settings
+
+A `.flash-agents.json` at the repository root tunes the disposable copy for that repository. It
+is read when the server starts, so restart Claude Code after changing it.
+
+```json
+{
+  "copyExclude": ["target"],
+  "slotEnv": {
+    "CARGO_TARGET_DIR": "cache:cargo-target",
+    "XDG_CONFIG_HOME": "home:config"
+  }
+}
+```
+
+- **`copyExclude`** — paths left out of each copy. A bare name matches at any depth (`target`,
+  `node_modules`); a name with a slash is a path from the root. A match is left out only where git
+  ignores it and tracks nothing under it, so source is never dropped. For a Rust workspace with a
+  multi-gigabyte `target/`, this is the difference between a copy that takes half a minute and one
+  that takes a second.
+- **`slotEnv`** — environment variables pointing the worker at writable folders inside its copy,
+  for tools that otherwise write to your (read-only, to a worker) home folder. `home:<name>` is
+  emptied for every call; `cache:<name>` is kept between calls in the same slot, so
+  `CARGO_TARGET_DIR: "cache:cargo-target"` keeps incremental builds warm without copying `target/`.
+  `HOME` and `TMPDIR` can't be moved.
+
+| Tool | Writes to | Variable to move |
+|---|---|---|
+| wrangler | `~/.config/.wrangler` | `XDG_CONFIG_HOME: "home:config"` |
+| cargo, new crates | `~/.cargo` | `CARGO_HOME: "cache:cargo-home"` (downloads once per slot; your `~/.cargo/config.toml` is not seen) |
+| cargo, build output | `target/` | `CARGO_TARGET_DIR: "cache:cargo-target"` |
+| Go | its build cache and `~/go/pkg/mod` | `GOCACHE: "cache:go-build"`, `GOMODCACHE: "cache:go-mod"` |
+| npm | `~/.npm` | `npm_config_cache: "cache:npm"` |
+| pip | `~/.cache/pip` | `PIP_CACHE_DIR: "cache:pip"` |
+
+`FLASH_COPY_EXCLUDE` (comma-separated) or `--copy-exclude` add to `copyExclude` for one server.
+
 To watch workers live, set a log file and `tail -f` it — see
 [Observing a run](docs/design.md#observing-a-run).
 
 ## Honest limits
 
-- **A running worker can't be steered or cancelled** — the harness protocol has no attach or
-  cancel. You can watch it; you can't redirect it. The idle timeout is what stops a stuck one.
+- **A running worker can't be steered** — the harness protocol has no attach. A background call
+  can be cancelled, which stops its runtime and retires its copy (the partial work is not returned);
+  the idle timeout is what stops a stuck one.
 - **Members of one `flash_batch` share one copy**, so they see each other's edits. Give them
   disjoint files.
 - **Gitignored output isn't carried in the patch.** It's named in the result instead, and the copy

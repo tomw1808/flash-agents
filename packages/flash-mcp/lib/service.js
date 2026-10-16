@@ -57,6 +57,13 @@ const DEFAULT_PER_ITEM_CHARS = 4_000
  * eat the caller's context: the whole patch stays on disk either way.
  */
 const DEFAULT_DIFF_CHARS = 20_000
+
+/**
+ * The most characters one `flash_patch` page may return. A page exists so a caller can
+ * page through a patch it could not read whole; a page that eats the caller's context
+ * defeats that, so the requested `maxChars` is capped rather than trusted.
+ */
+const MAX_PATCH_PAGE_CHARS = 200_000
 /**
  * How many disposable trees may be in flight at once. Each one costs a runtime
  * process, so this is a memory budget as much as a concurrency limit.
@@ -225,6 +232,11 @@ export class FlashTaskService {
             ...(isolate.stateDir === undefined ? {} : { stateDir: isolate.stateDir }),
             ...(isolate.patchRetentionDays === undefined ? {} : { patchRetentionDays: isolate.patchRetentionDays }),
             ...(isolate.maxStateBytes === undefined ? {} : { maxStateBytes: isolate.maxStateBytes }),
+            // The copy's exclusions and the worker's per-slot environment belong to the
+            // repository, so a pool takes them from `.flash-agents.json` and from these
+            // options; the options win per entry.
+            ...(isolate.copyExclude === undefined ? {} : { copyExclude: isolate.copyExclude }),
+            ...(isolate.slotEnv === undefined ? {} : { slotEnv: isolate.slotEnv }),
             log,
           })
     this.stateDir = this.isolation?.stateDir ?? resolve(isolate.stateDir ?? join(canonicalTmpdir(), 'flash-mcp'))
@@ -317,16 +329,21 @@ export class FlashTaskService {
     if (slot === undefined || pool === undefined) {
       return { promptCwd: rootCwd, runtimeCwd: rootCwd, extraEnv: undefined }
     }
-    // The runtime's environment is deliberately left alone. Pointing TMPDIR into the
-    // tree looked tidy, but the Harness derives the sandbox's writable roots from the
-    // runtime's `os.tmpdir()`, which reads that same variable: the per-user temp area
-    // (`/private/var/folders/…/T` on macOS) vanished from the grant, and `swift build`
-    // failed with EPERM while `touch` in the same directory succeeded. The tree's own
-    // scratch directory still exists and the worker is told about it in its prompt.
+    // The runtime's environment is deliberately left alone apart from the per-slot paths
+    // the repository's settings ask for. Pointing TMPDIR into the tree looked tidy, but the
+    // Harness derives the sandbox's writable roots from the runtime's `os.tmpdir()`, which
+    // reads that same variable: the per-user temp area (`/private/var/folders/…/T` on
+    // macOS) vanished from the grant, and `swift build` failed with EPERM while `touch` in
+    // the same directory succeeded. The tree's own scratch directory still exists and the
+    // worker is told about it in its prompt.
+    const slotEnv = pool.slotEnvFor(slot)
     return {
       promptCwd: pool.slotCwd(slot, rootCwd),
       runtimeCwd: slot.dir,
-      extraEnv: undefined,
+      // Resolved from `slot.dir`, which is stable for the life of the slot, so this is the
+      // same set of paths the slot was prepared with. Undefined when nothing is configured,
+      // exactly as before: the runtime's environment is then untouched.
+      extraEnv: Object.keys(slotEnv).length === 0 ? undefined : slotEnv,
     }
   }
 
@@ -369,6 +386,20 @@ export class FlashTaskService {
     const sessionId = `flash-task-${randomUUID()}`
     const profileName = this.#profileForMode(args?.mode)
     const pool = this.#isolationFor(profileName)
+    // `source` selects what the copy starts from. "head" is the escape hatch for running a
+    // call while another session has uncommitted work in the same tree: the copy is reset to
+    // the last commit instead of carrying that work. A read-only call is not isolated at all,
+    // so there is nothing to reset — and it must not be told otherwise.
+    const source = args?.source ?? 'working-tree'
+    if (source !== 'working-tree' && source !== 'head') {
+      throw new FlashTaskError(
+        `source ${JSON.stringify(source)} is not available; use "working-tree" (default) or "head"`,
+        'SOURCE_UNAVAILABLE',
+      )
+    }
+    if (source === 'head' && pool === undefined) {
+      throw new FlashTaskError('source "head" applies only to writing calls; a read-only call is not isolated', 'SOURCE_UNAVAILABLE')
+    }
     // Progress spans the whole call, including a wait for a free tree: that wait is
     // itself work the client must not mistake for a dead server. The interval is
     // stopped on every path out of this method.
@@ -388,12 +419,22 @@ export class FlashTaskService {
     try {
       slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal)
       const { promptCwd, runtimeCwd, extraEnv } = this.#runLocation(slot, rootCwd, pool)
-      if (slot !== undefined) pool.prepare(slot, { cwd: rootCwd })
+      if (slot !== undefined) {
+        try {
+          pool.prepare(slot, { cwd: rootCwd, source })
+        } catch (error) {
+          // `prepare` reports "head needs a git repository" as an IsolationError so the pool
+          // can raise it where the scope is known; a caller of the tool must read a
+          // FlashTaskError like every other refusal.
+          if (error instanceof IsolationError) throw new FlashTaskError(error.message, error.code)
+          throw error
+        }
+      }
       const childPrompt = buildChildPrompt({
         cwd: promptCwd,
         task,
         acceptance,
-        ...(slot === undefined ? {} : { copy: true }),
+        ...(slot === undefined ? {} : { copy: true, uncommitted: slot.uncommitted, slotEnv: extraEnv }),
       })
       const { state, started } = await this.#runSession({
         sessionId,
@@ -415,7 +456,7 @@ export class FlashTaskService {
         )
       }
       this.#logToolTrace(state)
-      change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars })
+      change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars, store: apply !== 'discard' })
       const applied = change?.available === true && apply === 'auto' ? this.#applyChange(change) : undefined
       return this.#buildResult({
         state,
@@ -558,6 +599,17 @@ export class FlashTaskService {
     // A fleet is one call and therefore one tree: its members share a working
     // directory exactly as they share a runtime, so they see each other's edits.
     const pool = this.#isolationFor(profileName)
+    // A fleet's copy starts from the same place a single task's does; see flashTask.
+    const source = args?.source ?? 'working-tree'
+    if (source !== 'working-tree' && source !== 'head') {
+      throw new FlashTaskError(
+        `source ${JSON.stringify(source)} is not available; use "working-tree" (default) or "head"`,
+        'SOURCE_UNAVAILABLE',
+      )
+    }
+    if (source === 'head' && pool === undefined) {
+      throw new FlashTaskError('source "head" applies only to writing calls; a read-only call is not isolated', 'SOURCE_UNAVAILABLE')
+    }
     // As with flash_task, progress spans the whole call, a wait for a free tree included.
     const activity = createActivity()
     const stopProgress = startProgress({
@@ -575,8 +627,15 @@ export class FlashTaskService {
     try {
       slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal)
       const { promptCwd, runtimeCwd, extraEnv } = this.#runLocation(slot, rootCwd, pool)
-      if (slot !== undefined) pool.prepare(slot, { cwd: rootCwd })
-      const copy = slot === undefined ? {} : { copy: true }
+      if (slot !== undefined) {
+        try {
+          pool.prepare(slot, { cwd: rootCwd, source })
+        } catch (error) {
+          if (error instanceof IsolationError) throw new FlashTaskError(error.message, error.code)
+          throw error
+        }
+      }
+      const copy = slot === undefined ? {} : { copy: true, uncommitted: slot.uncommitted, slotEnv: extraEnv }
       const items = tasks.map((entry, index) => ({
         label: `task-${String(index + 1)}`,
         prompt: [
@@ -609,7 +668,7 @@ export class FlashTaskService {
         )
       }
       this.#logToolTrace(state)
-      change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars })
+      change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars, store: apply !== 'discard' })
       const applied = change?.available === true && apply === 'auto' ? this.#applyChange(change) : undefined
       return this.#buildBatchResult({
         state,
@@ -647,7 +706,7 @@ export class FlashTaskService {
     } catch (error) {
       throw new FlashTaskError(
         `the worker changed files, but the patch did not apply to ${this.root}: ${messageOf(error)}. ` +
-          `The patch is kept at ${String(change.patchPath)}.`,
+          `The patch is kept at ${String(change.patchPath)}; call flash_apply with threeWay: true to merge it.`,
         'APPLY_FAILED',
       )
     }
@@ -660,6 +719,7 @@ export class FlashTaskService {
    * @param {string} args.patchId - the id from an earlier result.
    * @param {boolean} [args.dryRun] - check that it applies without changing anything.
    * @param {boolean} [args.force] - apply again even though the record says it was applied.
+   * @param {boolean} [args.threeWay] - merge three ways, without touching the index, when the plain apply fails.
    * @returns {object} the apply outcome.
    */
   flashApply(args) {
@@ -671,28 +731,78 @@ export class FlashTaskService {
       )
     }
     try {
-      return this.isolation.apply({ patchId, dryRun: args?.dryRun === true, force: args?.force === true })
+      return this.isolation.apply({
+        patchId,
+        dryRun: args?.dryRun === true,
+        force: args?.force === true,
+        threeWay: args?.threeWay === true,
+      })
     } catch (error) {
       throw new FlashTaskError(messageOf(error), 'APPLY_FAILED')
     }
   }
 
   /**
-   * Read the `apply` argument. Only an explicit `auto` applies anything: the
-   * default leaves the caller's tree alone until it asks.
+   * Read a stored patch, whole or as one page, for review before applying it.
+   *
+   * @param {object} args - the MCP tool arguments.
+   * @param {string} args.patchId - the change.patchId from an earlier result.
+   * @param {string[]} [args.files] - read only these files' sections.
+   * @param {number} [args.offset] - character offset into the selected text, default 0.
+   * @param {number} [args.maxChars] - page size, default the service's diff limit.
+   * @returns {object} the patch page.
+   */
+  flashPatch(args) {
+    const patchId = requireText(args?.patchId, 'patchId')
+    if (this.isolation === undefined) {
+      throw new FlashTaskError(
+        'this service runs without isolation (--isolate none), so its calls have no patch to read',
+        'ISOLATION_DISABLED',
+      )
+    }
+    const files = args?.files
+    if (files !== undefined && (!Array.isArray(files) || files.some((name) => typeof name !== 'string'))) {
+      throw new FlashTaskError('files must be an array of file paths when present', 'INVALID_ARGUMENT')
+    }
+    const offset = args?.offset
+    if (offset !== undefined && (!Number.isInteger(offset) || offset < 0)) {
+      throw new FlashTaskError('offset must be an integer greater than or equal to 0', 'INVALID_ARGUMENT')
+    }
+    const maxChars = args?.maxChars
+    if (maxChars !== undefined && (!Number.isInteger(maxChars) || maxChars <= 0)) {
+      throw new FlashTaskError('maxChars must be a positive integer when present', 'INVALID_ARGUMENT')
+    }
+    const pageChars = Math.min(maxChars ?? this.diffChars, MAX_PATCH_PAGE_CHARS)
+    try {
+      return this.isolation.readPatch({ patchId, files, offset: offset ?? 0, maxChars: pageChars })
+    } catch (error) {
+      throw new FlashTaskError(messageOf(error), 'PATCH_UNAVAILABLE')
+    }
+  }
+
+  /**
+   * Read the `apply` argument. Only an explicit `auto` applies anything, and only an
+   * explicit `discard` throws the patch away: the default leaves the caller's tree
+   * alone and keeps what the worker produced.
    *
    * @param {unknown} value - the requested mode.
-   * @returns {'none' | 'auto'} what to do with the patch.
+   * @returns {'none' | 'auto' | 'discard'} what to do with the patch.
    */
   #resolveApply(value) {
     if (value === undefined || value === null || value === 'none') return 'none'
-    if (value === 'auto') {
+    if (value === 'auto' || value === 'discard') {
       if (this.isolation === undefined) {
-        throw new FlashTaskError('apply "auto" needs isolation, but this service runs with --isolate none', 'ISOLATION_DISABLED')
+        throw new FlashTaskError(
+          `apply "${value}" needs isolation, but this service runs with --isolate none`,
+          'ISOLATION_DISABLED',
+        )
       }
-      return 'auto'
+      return value
     }
-    throw new FlashTaskError(`apply ${JSON.stringify(value)} is not available; use "none" (default) or "auto"`, 'APPLY_UNAVAILABLE')
+    throw new FlashTaskError(
+      `apply ${JSON.stringify(value)} is not available; use "none" (default), "auto", or "discard"`,
+      'APPLY_UNAVAILABLE',
+    )
   }
 
   /** Start one session on the persistent runtime and wait for it to go idle. */
@@ -852,8 +962,9 @@ export class FlashTaskService {
    */
   #changeFields({ profileName, slot, change, applied }) {
     const isolated = this.isolation !== undefined && profileName === this.profile
-    const fields = { isolation: { mode: isolated ? 'copy' : 'none', slot: slot?.id ?? null } }
+    const fields = { isolation: { mode: isolated ? 'copy' : 'none', slot: slot?.id ?? null, ...(slot?.uncommitted?.count > 0 ? { uncommittedAtStart: slot.uncommitted } : {}) } }
     if (change === undefined) return fields
+    const omitted = change.diffOmitted ?? []
     return {
       ...fields,
       change: {
@@ -865,9 +976,15 @@ export class FlashTaskService {
         ...((change.ignored ?? []).length === 0 ? {} : { ignored: change.ignored }),
         diffstat: change.diffstat,
         diff: change.diff,
-        diffTruncated: change.diff.length < change.diffChars,
+        // Truncation is measured by what the clipping left out, not by the returned text's
+        // length: a diff that ends at a file boundary can be far shorter than the limit and
+        // still be incomplete.
+        diffTruncated: omitted.length > 0,
+        ...(omitted.length === 0 ? {} : { diffOmitted: omitted }),
         applied: applied !== undefined,
         ...(change.patchId === undefined ? {} : { patchId: change.patchId }),
+        ...(change.patchPath === undefined ? {} : { patchPath: change.patchPath }),
+        ...(change.stored === false ? { stored: false } : {}),
       },
     }
   }
@@ -904,6 +1021,20 @@ export class FlashTaskService {
         .map((denial) => ({ index, ...denial }))
       return mine.length === 0 ? {} : { denials: mine }
     }
+    // A member's tokens are attributed the same way its refusals are, through the
+    // engine's own label-to-child mapping, never by completion order. A worker no
+    // event can tie to a label still reaches the fleet total below; it just cannot be
+    // charged to a task here, and saying so is better than splitting it at random.
+    const usageFields = (index) => {
+      const childId = members.get(index)?.childId
+      if (childId === undefined) return {}
+      const root = String(childId)
+      const buckets = [...state.usage.bySession]
+        .filter(([session]) => descendsFrom(state, session, root))
+        .map(([, bucket]) => bucket)
+      const usage = usageOf(mergeUsageBuckets(buckets))
+      return usage === undefined ? {} : { usage }
+    }
 
     // The script returns its entries in task order, so the pairing is the
     // script's own arithmetic rather than an inference from completion order.
@@ -920,7 +1051,7 @@ export class FlashTaskService {
         const member = members.get(index)
         if (found === undefined) {
           warnings.push(`task ${String(index + 1)} has no worker entry in the workflow return value`)
-          return { index, status: 'unknown', result: '', resultTruncated: false, ...memberFields(member, childById), ...refusals(index) }
+          return { index, status: 'unknown', result: '', resultTruncated: false, ...memberFields(member, childById), ...refusals(index), ...usageFields(index) }
         }
         const clipped = truncate(typeof found.result === 'string' ? found.result : '', this.maxResultChars)
         return {
@@ -930,6 +1061,7 @@ export class FlashTaskService {
           resultTruncated: clipped.truncated,
           ...memberFields(member, childById),
           ...refusals(index),
+          ...usageFields(index),
         }
       })
     } else if (members.size === tasks.length) {
@@ -948,6 +1080,7 @@ export class FlashTaskService {
           resultTruncated: clipped.truncated,
           ...memberFields(member, childById),
           ...refusals(index),
+          ...usageFields(index),
         }
       })
     } else {
@@ -971,6 +1104,10 @@ export class FlashTaskService {
     for (const route of state.childRoutes.values()) {
       if (!routes.some((known) => known.provider === route.provider && known.model === route.model)) routes.push(route)
     }
+    // The fleet total is always reported when anything reported usage: it is the honest
+    // number even when a member could not be tied to its task, and it is what a caller
+    // weighing a fleet against doing the work itself needs to compare.
+    const usage = usageTotal(state)
 
     return {
       status,
@@ -993,6 +1130,7 @@ export class FlashTaskService {
       sessionId,
       mode: profile.endsWith('-readonly') ? 'read-only' : 'workspace-write',
       durationMs: Date.now() - started,
+      ...(usage === undefined ? {} : { usage }),
       runtime: this.#runtimeInfo(profile, cwd),
       ...this.#changeFields({ profileName: profile, slot, change, applied }),
       ...(warnings.length === 0 ? {} : { warnings }),
@@ -1014,6 +1152,7 @@ export class FlashTaskService {
       }
     })
     const primary = children[children.length - 1]
+    const usage = usageTotal(state)
     const warnings = []
     if (children.length > 1) warnings.push(`the orchestrator delegated ${String(children.length)} times; the last child is reported as the result`)
     if (primary.status !== 'ok') warnings.push(`the worker ended with status "${String(primary.status)}"`)
@@ -1034,6 +1173,7 @@ export class FlashTaskService {
       sessionId,
       mode: profile.endsWith('-readonly') ? 'read-only' : 'workspace-write',
       durationMs: Date.now() - started,
+      ...(usage === undefined ? {} : { usage }),
       runtime: this.#runtimeInfo(profile, cwd),
       ...this.#changeFields({ profileName: profile, slot, change, applied }),
       ...(warnings.length === 0 ? {} : { warnings }),
@@ -1080,6 +1220,11 @@ export function createObserveState() {
     status: 'unknown',
     children: [],
     childIds: new Set(),
+    // Worker sessions the workflow engine started under a task label, and every
+    // worker's parent. Both exist only so a member's tokens can be tied to its task
+    // even when its events arrive under its own or a nested session id.
+    workflowChildIds: new Set(),
+    sessionParents: new Map(),
     childRoutes: new Map(),
     childTimeline: [],
     subagentStarts: 0,
@@ -1095,8 +1240,202 @@ export function createObserveState() {
     toolCalls: [],
     toolResults: [],
     eventCount: 0,
+    usage: createUsageState(),
     activity: undefined,
   }
+}
+
+/**
+ * One call's token ledger, split by the session that reported it.
+ *
+ * The Harness can put a `TokenUsage` object on a session event's `data`, and
+ * `summarizeEvent` below already notices it — but nothing in this repository fixes
+ * which event type carries it, or whether one object is one response or a running
+ * total: no fixture emits usage, and the SDK protocol notes here stop at the event
+ * names. The assumption, written down so a live run can correct it, is that **one
+ * usage object describes one model response**, and that the same response can surface
+ * on more than one event (a streaming update and the final message). Usage is
+ * therefore counted from `assistant/message` — the only event in this repository that
+ * carries a completed model response, which `observe` already reads — and, when an
+ * event offers a stable message or response id, from any event type, de-duplicated by
+ * that id so a response reported twice is summed once. Counting a *cumulative* usage
+ * object this way would overcount, which is exactly the risk this note makes visible.
+ *
+ * @returns {{seen: Set<string>, bySession: Map<string, object>}} the empty ledger.
+ */
+function createUsageState() {
+  return { seen: new Set(), bySession: new Map() }
+}
+
+/** One session's slice of the ledger; `everyTotal` tracks the reported-total contract. */
+function createUsageBucket() {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    reasoningTokens: 0,
+    totalTokensReported: 0,
+    modelCalls: 0,
+    sawCacheRead: false,
+    sawCacheWrite: false,
+    sawReasoning: false,
+    everyTotal: true,
+  }
+}
+
+/** A token field, only when the event really carried a count. */
+function tokenCount(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+/** Fold one response's usage object into a bucket. */
+function addUsage(bucket, usage) {
+  const input = tokenCount(usage.inputTokens)
+  const output = tokenCount(usage.outputTokens)
+  // "no recognised field" is not "zero tokens": a usage object with neither inputTokens nor
+  // outputTokens (an empty `{}`, or a provider spelling this service does not know such as
+  // `promptTokens`) says nothing about a response, so counting it as one model call would
+  // report "unknown" as a confident zero.
+  if (input === undefined && output === undefined) return
+  const total = tokenCount(usage.totalTokens)
+  const cacheRead = tokenCount(usage.cacheReadTokens)
+  const cacheWrite = tokenCount(usage.cacheWriteTokens)
+  const reasoning = tokenCount(usage.reasoningTokens)
+  if (input !== undefined) bucket.inputTokens += input
+  if (output !== undefined) bucket.outputTokens += output
+  if (cacheRead !== undefined) {
+    bucket.cacheReadTokens += cacheRead
+    bucket.sawCacheRead = true
+  }
+  if (cacheWrite !== undefined) {
+    bucket.cacheWriteTokens += cacheWrite
+    bucket.sawCacheWrite = true
+  }
+  if (reasoning !== undefined) {
+    bucket.reasoningTokens += reasoning
+    bucket.sawReasoning = true
+  }
+  // The provider's own total is reported only when *every* counted response carried
+  // one; a mix of totals and partials would otherwise quietly understate the call.
+  if (total === undefined) bucket.everyTotal = false
+  else bucket.totalTokensReported += total
+  bucket.modelCalls += 1
+}
+
+/** Sum several sessions' buckets into one, preserving the reported-total contract. */
+function mergeUsageBuckets(buckets) {
+  const merged = createUsageBucket()
+  for (const bucket of buckets) {
+    merged.inputTokens += bucket.inputTokens
+    merged.outputTokens += bucket.outputTokens
+    merged.cacheReadTokens += bucket.cacheReadTokens
+    merged.cacheWriteTokens += bucket.cacheWriteTokens
+    merged.reasoningTokens += bucket.reasoningTokens
+    merged.totalTokensReported += bucket.totalTokensReported
+    merged.modelCalls += bucket.modelCalls
+    merged.sawCacheRead = merged.sawCacheRead || bucket.sawCacheRead
+    merged.sawCacheWrite = merged.sawCacheWrite || bucket.sawCacheWrite
+    merged.sawReasoning = merged.sawReasoning || bucket.sawReasoning
+    merged.everyTotal = merged.everyTotal && bucket.everyTotal
+  }
+  return merged
+}
+
+/**
+ * The public shape of a ledger slice, or undefined when nothing was reported. A call
+ * with no usage must not claim zero tokens: "unknown" and "free" are not the same
+ * answer, and a caller weighing delegation needs to tell them apart.
+ */
+function usageOf(bucket) {
+  if (bucket.modelCalls === 0) return undefined
+  return {
+    inputTokens: bucket.inputTokens,
+    outputTokens: bucket.outputTokens,
+    totalTokens: bucket.everyTotal ? bucket.totalTokensReported : bucket.inputTokens + bucket.outputTokens,
+    modelCalls: bucket.modelCalls,
+    ...(bucket.sawCacheRead ? { cacheReadTokens: bucket.cacheReadTokens } : {}),
+    ...(bucket.sawCacheWrite ? { cacheWriteTokens: bucket.cacheWriteTokens } : {}),
+    ...(bucket.sawReasoning ? { reasoningTokens: bucket.reasoningTokens } : {}),
+  }
+}
+
+/** The call's whole ledger, orchestrator and every worker it started. */
+function usageTotal(state) {
+  return usageOf(mergeUsageBuckets([...state.usage.bySession.values()]))
+}
+
+/** The token totals appended to the line a finished call logs, or nothing when none arrived. */
+function usageLogSuffix(usage) {
+  if (usage === undefined) return ''
+  return ` (${String(usage.inputTokens)} in / ${String(usage.outputTokens)} out tokens, ${String(usage.modelCalls)} model call(s))`
+}
+
+/**
+ * The stable id a usage-bearing event offers, if any. Only fields that name a
+ * *response* qualify: `step` and `seq` advance per event, so using them would make
+ * every update of one response look like a new model call.
+ */
+function usageResponseId(event) {
+  const data = event?.data
+  for (const candidate of [
+    data?.message?.id,
+    data?.message?.messageId,
+    data?.messageId,
+    data?.responseId,
+    data?.usage?.id,
+    data?.usage?.messageId,
+    data?.usage?.responseId,
+  ]) {
+    if (typeof candidate === 'string' && candidate.length > 0) return candidate
+  }
+  return undefined
+}
+
+/** Count one event's usage, unless the same response was already counted. */
+function recordUsage(state, session, event) {
+  const usage = event?.data?.usage
+  if (usage === null || typeof usage !== 'object' || Array.isArray(usage)) return
+  const id = usageResponseId(event)
+  if (id !== undefined) {
+    if (state.usage.seen.has(id)) return
+    state.usage.seen.add(id)
+  } else if (event?.type !== 'assistant/message') {
+    // No stable id and not the completed-assistant-message marker: assume this is an
+    // update of a response a later event will report too, and do not count it.
+    return
+  }
+  let bucket = state.usage.bySession.get(session)
+  if (bucket === undefined) {
+    bucket = createUsageBucket()
+    state.usage.bySession.set(session, bucket)
+  }
+  addUsage(bucket, usage)
+}
+
+/** Whether a session belongs to this call: its own, a worker's, or a worker's child. */
+function sessionInCall(state, session, sessionId) {
+  if (typeof session !== 'string') return false
+  let current = session
+  for (let hop = 0; hop <= state.sessionParents.size; hop += 1) {
+    if (current === sessionId || state.childIds.has(current) || state.workflowChildIds.has(current)) return true
+    const parent = state.sessionParents.get(current)
+    if (parent === undefined) return false
+    current = parent
+  }
+  return false
+}
+
+/** Whether `session` is `root` itself or one of its descendants. */
+function descendsFrom(state, session, root) {
+  let current = session
+  for (let hop = 0; hop <= state.sessionParents.size; hop += 1) {
+    if (current === root) return true
+    const parent = state.sessionParents.get(current)
+    if (parent === undefined) return false
+    current = parent
+  }
+  return false
 }
 
 /** Collect one session's progress from runtime notifications. */
@@ -1105,11 +1444,23 @@ function observe(state, method, params, sessionId, completion, log) {
     if (params?.sessionId !== sessionId) return
     state.status = String(params.status)
     if (state.status === 'running') state.sawRunning = true
+    if (state.status === 'idle' && state.sawRunning) {
+      // The call is over, so this is the one line it logs: the caller reading the
+      // service log learns what it spent alongside what it got. The fleet's ledger is
+      // complete here because every worker has finished before its run does.
+      log(`session ${state.status}${usageLogSuffix(usageTotal(state))}`)
+      completion.resolve()
+      return
+    }
     log(`session ${state.status}`)
-    if (state.status === 'idle' && state.sawRunning) completion.resolve()
     return
   }
   if (method === 'subagent.started') {
+    // Recorded for every start, even one this call did not initiate: a worker can
+    // itself be the parent of a nested worker, and its tokens still belong to the task.
+    if (typeof params?.childSessionId === 'string' && typeof params?.parentSessionId === 'string') {
+      state.sessionParents.set(params.childSessionId, params.parentSessionId)
+    }
     if (params?.parentSessionId !== sessionId) return
     touchActivity(state.activity, { type: 'subagent/started' })
     state.subagentStarts += 1
@@ -1151,6 +1502,9 @@ function observe(state, method, params, sessionId, completion, log) {
   const event = params?.event
   // Any event from this session or one of its workers is a sign of life.
   if (session === sessionId || state.childIds.has(session)) touchActivity(state.activity, event)
+  // Usage can ride on any event of the call; the ledger keeps it per session so a
+  // fleet can later attribute it to the task whose worker reported it.
+  if (sessionInCall(state, session, sessionId)) recordUsage(state, session, event)
   if (event?.type === 'request/header' && state.childIds.has(session)) {
     // Harness logs the exact call configuration of every request; this is the
     // child's real route, observed rather than assumed.
@@ -1202,15 +1556,23 @@ function observe(state, method, params, sessionId, completion, log) {
     const tools = event.data?.header?.tools
     state.toolsOffered = Array.isArray(tools) ? tools.map((tool) => String(tool?.name)) : []
   }
-  if (event?.type === 'tool-workflow/agent-start') {
+  // Notifications are broadcast to every observer sharing a runtime, so a concurrent call's
+  // members arrive here too. Only a session this call owns — its own, a worker's, or a
+  // worker's child — may contribute: accepting another call's agent-start would put its child
+  // in this call's `workflowChildIds`, and `sessionInCall` would then count that call's tokens
+  // as this one's.
+  const mine = sessionInCall(state, session, sessionId)
+  if (mine && event?.type === 'tool-workflow/agent-start') {
     // The engine reports the label this service generated for each member, which
-    // is what makes a per-task pairing possible without guessing.
+    // is what makes a per-task pairing possible without guessing; the child session
+    // it names is also how that member's tokens are reached.
     const label = event.data?.label
     if (typeof label === 'string') {
       state.workflowAgents.set(label, { childId: event.data?.childId, outcome: undefined, seq: event.data?.seq })
     }
+    if (typeof event.data?.childId === 'string') state.workflowChildIds.add(event.data.childId)
   }
-  if (event?.type === 'tool-workflow/agent-end') {
+  if (mine && event?.type === 'tool-workflow/agent-end') {
     const seq = event.data?.seq
     const agent = [...state.workflowAgents.values()].find((entry) => entry.seq === seq)
     if (agent !== undefined) agent.outcome = event.data?.outcome
@@ -1499,10 +1861,32 @@ function warnAboutIgnoredArguments(args, toolName, log) {
   }
 }
 
+/**
+ * Two instructions every worker carries, isolated or not.
+ *
+ * A commit hides the work from the service: the patch is read from the working tree, so a
+ * committed change reads as unrelated or as nothing at all. And an escape hatch — unsafe
+ * code, a lint silenced instead of fixed, a test weakened so it passes — is exactly the kind
+ * of thing a later reader cannot see from the diff, so naming it in the final report is the
+ * only place it survives.
+ */
+export const WORKER_INSTRUCTIONS = [
+  'Do not commit unless the task explicitly asks: the service reads the change from the working tree, and a commit only confuses the report.',
+  'If the work reaches for an escape hatch (unsafe code, a disabled or suppressed check or lint, a skipped or weakened test), name each one in the final report with the reason.',
+]
+
+/** How many of the copy's uncommitted paths are worth naming in the prompt. */
+const PROMPT_UNCOMMITTED_LIMIT = 20
+
 /** The worker-facing task text. */
-export function buildChildPrompt({ cwd, task, acceptance, copy }) {
+export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slotEnv }) {
+  const started = Number(uncommitted?.count) > 0
+  const startedFiles = started ? (uncommitted.files ?? []).slice(0, PROMPT_UNCOMMITTED_LIMIT) : []
+  const envNames = slotEnv === undefined || slotEnv === null ? [] : Object.keys(slotEnv)
   return [
     `Working directory: ${cwd}`,
+    '',
+    ...WORKER_INSTRUCTIONS,
     ...(copy === true
       ? [
           '',
@@ -1513,6 +1897,19 @@ export function buildChildPrompt({ cwd, task, acceptance, copy }) {
           'it already exists and is left out of the reported change.',
         ]
       : []),
+    ...(started
+      ? [
+          '',
+          `The copy started with ${String(uncommitted.count)} uncommitted change(s) from the caller's working tree` +
+            `${startedFiles.length < uncommitted.count ? ` (first ${String(startedFiles.length)}):` : ':'}`,
+          ...startedFiles.map((file) => `- ${file}`),
+          "They are the caller's work in progress, not yours: git status shows them exactly as the caller left them (staged only where the caller staged them). Leave them alone unless the task is about them.",
+        ]
+      : []),
+    ...(envNames.length === 0
+      ? []
+      : ['', `The environment sets ${envNames.join(', ')} to writable per-slot directories; use them for caches and tool state.`]),
+    '',
     'Task:',
     task,
     ...(acceptance === undefined ? [] : ['', 'Acceptance criteria:', acceptance]),

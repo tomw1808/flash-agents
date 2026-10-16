@@ -116,7 +116,7 @@ function prepareWorkspace() {
 
 const workspace = prepareWorkspace()
 const ROOT = workspace.root
-const ONLY = flag('--only', 'boot,lazy,task,route,hostile,reuse,local,batch,isolation,guard,readonly,fence,escape').split(',')
+const ONLY = flag('--only', 'boot,lazy,task,route,hostile,reuse,local,batch,isolation,jobs,guard,readonly,fence,escape').split(',')
 const TIMEOUT_MS = Number(flag('--timeout-ms', '300000'))
 if (!Number.isSafeInteger(TIMEOUT_MS) || TIMEOUT_MS <= 0) throw new Error('--timeout-ms must be a positive integer')
 
@@ -208,14 +208,14 @@ try {
     check('boot', 'server returns non-empty usage instructions', (client.getInstructions() ?? '').length > 0)
     const tools = await client.listTools()
     const names = tools.tools.map((tool) => tool.name)
-    check('boot', 'the task, fleet, and apply tools are exposed', JSON.stringify(names) === '["flash_task","flash_batch","flash_apply"]', names.join(', '))
+    check('boot', 'the task, fleet, patch, and job tools are exposed', JSON.stringify(names) === '["flash_task","flash_batch","flash_apply","flash_patch","flash_status","flash_result","flash_cancel"]', names.join(', '))
     const schema = tools.tools[0].inputSchema
     check('boot', 'task and cwd are required, acceptance is optional', JSON.stringify(schema.required) === '["task","cwd"]', JSON.stringify(schema.required))
     const batchSchema = tools.tools[1].inputSchema
     check('boot', 'a fleet is addressed by tasks only', JSON.stringify(batchSchema.required) === '["tasks"]', JSON.stringify(batchSchema.required))
     const properties = [...Object.keys(schema.properties ?? {}), ...Object.keys(batchSchema.properties ?? {})]
     check('boot', 'no model-selection surface exists', !properties.some((key) => /provider|model|route|effort/i.test(key)), properties.join(', '))
-    check('boot', 'a writing call changes nothing unless it is asked to', JSON.stringify(schema.properties?.apply?.enum) === '["none","auto"]', JSON.stringify(schema.properties?.apply?.enum))
+    check('boot', 'a writing call changes nothing unless it is asked to', JSON.stringify(schema.properties?.apply?.enum) === '["none","auto","discard"]', JSON.stringify(schema.properties?.apply?.enum))
     const applyTool = tools.tools[2]
     check('boot', 'applying work takes a patch id, not a task', JSON.stringify(applyTool.inputSchema.required) === '["patchId"]' && applyTool.inputSchema.properties?.task === undefined, JSON.stringify(applyTool.inputSchema.required))
   }
@@ -239,7 +239,7 @@ try {
     check('task', 'worker stop reason is reported', typeof payload.stopReason === 'string', String(payload.stopReason))
     check('task', 'result carries the worker final message', typeof payload.result === 'string' && payload.result.length > 0, JSON.stringify(payload.result ?? '').slice(0, 160))
     check('task', 'result carries the child session id', typeof payload.childSessionId === 'string' && payload.childSessionId.length > 0, String(payload.childSessionId))
-    check('task', 'no transcript is returned', payload.children === undefined && Object.keys(payload).every((key) => ['status','stopReason','provider','route','result','resultTruncated','childSessionId','sessionId','durationMs','runtime','warnings','children','mode','isolation','change'].includes(key)), Object.keys(payload).join(', '))
+    check('task', 'no transcript is returned', payload.children === undefined && Object.keys(payload).every((key) => ['status','stopReason','provider','route','result','resultTruncated','childSessionId','sessionId','durationMs','usage','runtime','warnings','children','mode','isolation','change'].includes(key)), Object.keys(payload).join(', '))
     check('task', 'runtime facts are reported', typeof payload.runtime?.pid === 'number' && payload.runtime.sessions === 1, JSON.stringify(payload.runtime))
 
     // The worker wrote the file into its own disposable tree — this is the property
@@ -249,6 +249,11 @@ try {
     check('task', 'the change is reported as machine-generated file names', Array.isArray(payload.change?.filesChanged) && payload.change.filesChanged.includes('flash-mcp-probe.txt'), JSON.stringify(payload.change?.filesChanged))
     check('task', 'the change carries the patch itself, not a claim about it', typeof payload.change?.diff === 'string' && payload.change.diff.includes('worker was here'), String(payload.change?.diff ?? '').slice(0, 120))
     check('task', 'the change is not applied unless asked', payload.change?.applied === false, String(payload.change?.applied))
+    // Token usage is read from the Harness's own events: a call that ran a model reports it.
+    check('task', 'the call reports the tokens it used', payload.usage?.modelCalls > 0 && payload.usage.inputTokens > 0 && payload.usage.outputTokens > 0, JSON.stringify(payload.usage))
+    check('task', 'the result names where the full patch is stored', typeof payload.change?.patchPath === 'string' && existsSync(payload.change.patchPath), String(payload.change?.patchPath))
+    const read = await callTool('flash_patch', { patchId: payload.change?.patchId, files: ['flash-mcp-probe.txt'] })
+    check('task', 'flash_patch reads one file of the stored patch', read.response.isError !== true && String(read.payload.diff).includes('worker was here') && read.payload.nextOffset === null, JSON.stringify(read.payload).slice(0, 160))
 
     // Applying it is the only path by which the work reaches the caller.
     const applied = await callTool('flash_apply', { patchId: payload.change?.patchId })
@@ -389,6 +394,27 @@ try {
     check('isolation', 'a dry run changes nothing', existsSync(readme) && readFileSync(readme, 'utf8') === before, readme)
 
     rmSync(sentinel, { force: true })
+  }
+
+  if (stage('jobs')) {
+    // A background call answers at once with a job id; the work continues under the job.
+    const started = Date.now()
+    const { response, payload } = await flashTask({ task: 'Reply with the single word: ready', cwd: ROOT, background: true })
+    check('jobs', 'a background call answers at once with a job id', response.isError !== true && /^job-[0-9a-f]{8}$/.test(String(payload.jobId)) && Date.now() - started < 5_000, JSON.stringify(payload).slice(0, 160))
+    const status = await callTool('flash_status', { jobId: payload.jobId })
+    check('jobs', 'flash_status reports the job without its result', ['running', 'ok'].includes(status.payload.state) && status.payload.result === undefined, JSON.stringify(status.payload).slice(0, 160))
+    let result = await callTool('flash_result', { jobId: payload.jobId, waitSeconds: 600 })
+    for (let round = 0; round < 5 && result.payload.state === 'running'; round += 1) {
+      result = await callTool('flash_result', { jobId: payload.jobId, waitSeconds: 600 })
+    }
+    check('jobs', 'flash_result returns the call\'s own result', result.response.isError !== true && result.payload.status === 'ok' && /ready/i.test(String(result.payload.result)) && result.payload.job?.state === 'ok', JSON.stringify(result.payload).slice(0, 200))
+
+    // apply "discard": a writing call in a throwaway copy that reports its change and keeps nothing.
+    const scratch = 'flash-mcp-discard-probe.txt'
+    const discarded = await flashTask({ task: `Create a file named ${scratch} containing the line: thrown away. Reply done.`, cwd: ROOT, apply: 'discard' })
+    check('jobs', 'a discarded call reports its change', discarded.payload.change?.filesChanged?.includes(scratch) === true, JSON.stringify(discarded.payload.change?.filesChanged))
+    check('jobs', 'a discarded call stores no patch', discarded.payload.change?.stored === false && discarded.payload.change?.patchId === undefined, JSON.stringify({ stored: discarded.payload.change?.stored, patchId: discarded.payload.change?.patchId }))
+    check('jobs', 'a discarded call leaves the caller\'s tree alone', !existsSync(join(ROOT, scratch)), scratch)
   }
 
   if (stage('guard')) {

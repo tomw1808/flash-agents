@@ -188,18 +188,28 @@ test('the SDK client surfaces a runtime protocol error and shuts down', async ()
   assert.equal(client.running, false)
 })
 
-test('exposes the three tools, none able to select a route', async () => {
+test('exposes the tools, none able to select a route', async () => {
   const { server, request } = await connect()
   try {
     const { result } = await request('tools/list')
-    // `flash_apply` is a fourth door onto the *same* work a call already produced,
-    // not a way to start work: it carries a patch id, never a task.
-    assert.deepEqual(result.tools.map((tool) => tool.name), ['flash_task', 'flash_batch', 'flash_apply'])
+    // `flash_apply` and `flash_patch` are doors onto the *same* work a call already
+    // produced, not ways to start work: both carry a patch id, never a task. The job
+    // tools observe, collect, and cancel a background call; none of them starts work either.
+    assert.deepEqual(result.tools.map((tool) => tool.name), [
+      'flash_task',
+      'flash_batch',
+      'flash_apply',
+      'flash_patch',
+      'flash_status',
+      'flash_result',
+      'flash_cancel',
+    ])
     assert.deepEqual(result.tools[1].inputSchema.required, ['tasks'])
     assert.deepEqual(result.tools[2].inputSchema.required, ['patchId'])
+    assert.deepEqual(result.tools[3].inputSchema.required, ['patchId'])
     // A writing call's change is opt-in, and the default is to change nothing.
-    assert.deepEqual(result.tools[0].inputSchema.properties.apply.enum, ['none', 'auto'])
-    assert.deepEqual(result.tools[1].inputSchema.properties.apply.enum, ['none', 'auto'])
+    assert.deepEqual(result.tools[0].inputSchema.properties.apply.enum, ['none', 'auto', 'discard'])
+    assert.deepEqual(result.tools[1].inputSchema.properties.apply.enum, ['none', 'auto', 'discard'])
     for (const tool of result.tools) {
       assert.equal(tool.inputSchema.additionalProperties, false)
       assert.equal(JSON.stringify(tool.inputSchema).match(/provider|model|reasoning/i), null)

@@ -22,12 +22,13 @@ import { pathToFileURL } from 'node:url'
 
 import { serveStdio, describeError } from './mcp.js'
 import { FlashTaskService } from './service.js'
+import { JobRegistry, JOB_TOOLS } from './jobs.js'
 import { loadConfig } from './config.js'
 import { formatChecks, runChecks } from './doctor.js'
 import { cleanLayout } from './isolation.js'
 
 /** Server identity reported to the MCP client. */
-export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.2' })
+export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.3' })
 
 /** Usage guidance offered to the client model at handshake. */
 const INSTRUCTIONS = [
@@ -51,7 +52,15 @@ const INSTRUCTIONS = [
   'result carries the change it made (`change.filesChanged`, `change.diffstat`, `change.diff`).',
   'Nothing reaches your tree until you apply it — pass `apply: "auto"` to apply a call\'s change',
   'immediately, or call `flash_apply` with the `change.patchId` afterwards. Review the diff; the',
-  'worker\'s own account of what it did is not evidence that it did it.',
+  'worker\'s own account of what it did is not evidence that it did it. A long diff is clipped',
+  'at a file boundary; `flash_patch` reads the stored patch whole or by file.',
+  '',
+  'Project facts every worker needs (layout, check commands, style rules) belong in an',
+  '`AGENTS.md` or `CLAUDE.md` in the repository: the Harness loads those into every worker',
+  'from the repository root down to its working directory, so a task need not repeat them.',
+  '',
+  'A read-only call cannot build or run tests (both write). For a review that must, run a',
+  'writing call with `apply: "discard"`: it works in a throwaway copy and stores nothing.',
 ].join('\n')
 
 /**
@@ -95,12 +104,21 @@ export function listTools() {
           mode: {
             type: 'string',
             enum: ['workspace-write', 'read-only'],
-            description: 'Optional narrowing of what this call may change. "workspace-write" (the default) confines writes to the service root; "read-only" runs the call in a process whose file sandbox denies every mutation, so it cannot change anything. No mode can widen the standing confinement.',
+            description: 'Optional narrowing of what this call may change. "workspace-write" (the default) confines writes to the service root; "read-only" runs the call in a process whose file sandbox denies every mutation, so it cannot change anything — which also means it cannot build or run tests, since compilers and test runners write (cargo, for one, takes a lock file in target/). For a review that must build or test, use the default mode with apply: "discard" instead. No mode can widen the standing confinement.',
           },
           apply: {
             type: 'string',
-            enum: ['none', 'auto'],
-            description: 'What to do with the change the worker made in its disposable copy. "none" (the default) returns the diff and leaves your tree untouched; "auto" applies it to the service root before returning. Read change.diff before trusting either — and note that a diff is clipped when change.diffTruncated is true, while flash_apply always uses the stored full patch.',
+            enum: ['none', 'auto', 'discard'],
+            description: 'What to do with the change the worker made in its disposable copy. "none" (the default) stores the patch and leaves your tree untouched; "auto" applies it to the service root before returning; "discard" reports the change but stores nothing — for a review that has to build or run tests, which a read-only call cannot. Read change.diff before trusting any of them. A long diff is clipped at a file boundary: change.diffTruncated is then true, change.diffOmitted names the files left out, and flash_patch reads the stored patch whole.',
+          },
+          source: {
+            type: 'string',
+            enum: ['working-tree', 'head'],
+            description: 'What the disposable copy starts from. "working-tree" (the default) copies your tree as it is, uncommitted edits included, and the result lists them under isolation.uncommittedAtStart. "head" starts from the last commit (ignored files such as dependencies and build output are kept), for a call that must not pick up uncommitted work — for instance another session\'s, in the same tree.',
+          },
+          background: {
+            type: 'boolean',
+            description: 'Return at once with a jobId instead of holding your turn while the worker runs (minutes, often). Collect the result with flash_result, watch it with flash_status, stop it with flash_cancel. Meanwhile you can run tests or review an earlier patch.',
           },
         },
         required: ['task', 'cwd'],
@@ -158,12 +176,21 @@ export function listTools() {
           mode: {
             type: 'string',
             enum: ['workspace-write', 'read-only'],
-            description: 'Optional narrowing of what this call may change. "workspace-write" (the default) confines writes to the service root; "read-only" runs the call in a process whose file sandbox denies every mutation, so it cannot change anything. No mode can widen the standing confinement.',
+            description: 'Optional narrowing of what this call may change. "workspace-write" (the default) confines writes to the service root; "read-only" runs the call in a process whose file sandbox denies every mutation, so it cannot change anything — which also means it cannot build or run tests, since compilers and test runners write (cargo, for one, takes a lock file in target/). For a review that must build or test, use the default mode with apply: "discard" instead. No mode can widen the standing confinement.',
           },
           apply: {
             type: 'string',
-            enum: ['none', 'auto'],
-            description: 'What to do with the change the fleet made in its disposable copy. "none" (the default) returns the diff and leaves your tree untouched; "auto" applies it to the service root before returning. Every member shares one copy, so the fleet produces one patch.',
+            enum: ['none', 'auto', 'discard'],
+            description: 'What to do with the change the fleet made in its disposable copy. "none" (the default) stores the patch and leaves your tree untouched; "auto" applies it to the service root before returning; "discard" reports the change but stores nothing. Every member shares one copy, so the fleet produces one patch.',
+          },
+          source: {
+            type: 'string',
+            enum: ['working-tree', 'head'],
+            description: 'What the shared copy starts from: "working-tree" (the default, uncommitted edits included) or "head" (the last commit, ignored files kept).',
+          },
+          background: {
+            type: 'boolean',
+            description: 'Return at once with a jobId instead of holding your turn while the fleet runs; collect it with flash_result.',
           },
         },
         required: ['tasks'],
@@ -191,6 +218,13 @@ export function listTools() {
         'Pass `dryRun: true` to check that it still applies without changing anything. A patch that',
         'was already applied is refused; pass `force: true` to apply it again anyway. Patches do not',
         'cross repositories: one computed for another root is refused.',
+        '',
+        'A patch whose surrounding lines moved meanwhile — another session edited or committed the',
+        'same file while the worker ran — fails a plain apply. Pass `threeWay: true` to merge it',
+        'instead: the plain apply is still tried first, and the merge uses the base the worker',
+        'started from, which the service keeps with the patch. Your index is never touched; a',
+        'conflict leaves conflict markers in the named files and is listed in `conflicts`.',
+        '`dryRun` with `threeWay` predicts the conflicts without writing anything.',
       ].join('\n'),
       inputSchema: {
         type: 'object',
@@ -207,11 +241,58 @@ export function listTools() {
             type: 'boolean',
             description: 'Apply the patch even though the record says it was already applied to this root.',
           },
+          threeWay: {
+            type: 'boolean',
+            description: 'When the plain apply fails, merge the patch three ways against the base it was made from.',
+          },
         },
         required: ['patchId'],
         additionalProperties: false,
       },
     },
+    {
+      name: 'flash_patch',
+      description: [
+        'Read the stored patch a previous flash_task or flash_batch call left behind, whole or one page at a time.',
+        '',
+        'This reads the same *stored* patch that flash_apply applies — not the possibly-truncated',
+        '`change.diff` in the result — so a change too long to read there can still be reviewed before',
+        'it is applied. Use it when `change.diffTruncated` is true, or pass `files` to review one file',
+        'of a change. It changes nothing.',
+        '',
+        'Pages end at a file boundary where one fits, so a page never splits a line; pass the returned',
+        '`nextOffset` back as `offset` to read the rest, and stop when `nextOffset` is null. `files`',
+        'names the files each page covers.',
+      ].join('\n'),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          patchId: {
+            type: 'string',
+            description: 'The change.patchId from the result of the call whose patch should be read.',
+          },
+          files: {
+            type: 'array',
+            items: { type: 'string' },
+            description: "Optional: read only these files' sections, named as in change.filesChanged.",
+          },
+          offset: {
+            type: 'integer',
+            minimum: 0,
+            description: "Character offset into the selected text; use the previous page's nextOffset to continue. Defaults to 0.",
+          },
+          maxChars: {
+            type: 'integer',
+            minimum: 1,
+            maximum: 200000,
+            description: 'Page size in characters. Defaults to the service diff limit, capped at 200000.',
+          },
+        },
+        required: ['patchId'],
+        additionalProperties: false,
+      },
+    },
+    ...JOB_TOOLS,
   ]
 }
 
@@ -244,6 +325,7 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
     isolate: textFrom(env.FLASH_ISOLATE) ?? 'copy',
     slots: numberFrom(env.FLASH_SLOTS, config.limits.slots),
     stateDir: textFrom(env.FLASH_STATE_DIR),
+    copyExclude: listFrom(env.FLASH_COPY_EXCLUDE),
     diffChars: numberFrom(env.FLASH_DIFF_CHARS, config.limits.diffChars),
     patchRetentionDays: numberFrom(env.FLASH_PATCH_RETENTION_DAYS, config.limits.patchRetentionDays),
     maxStateBytes: numberFrom(env.FLASH_MAX_STATE_BYTES, config.limits.maxStateBytes),
@@ -284,6 +366,9 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
         break
       case '--state-dir':
         options.stateDir = next()
+        break
+      case '--copy-exclude':
+        options.copyExclude = listFrom(next())
         break
       case '--diff-chars':
         options.diffChars = numberFrom(next(), undefined)
@@ -361,6 +446,10 @@ Options:
   --state-dir <path>        where slot trees and returned patches live (default: a directory
                             private to this root and this process under TMPDIR); a
                             configured directory is shared, so one service per directory
+  --copy-exclude <a,b,c>    names left out of a disposable copy: a bare name matches at any
+                            depth, one with a slash is a path relative to the root; a match
+                            is left out only where git ignores it and tracks nothing under it
+                            (default: none; .flash-agents.json may set copyExclude)
   --diff-chars <n>          how much of a patch a result carries (default: ${value('diffChars')})
   --patch-retention-days <n>
                             days an unapplied patch is kept before the startup prune
@@ -375,13 +464,234 @@ Options:
 Environment: FLASH_SERVICE_ROOT, FLASH_SERVICE_PROFILE, FLASH_SERVICE_PROVIDER,
 FLASH_SERVICE_MODEL, FLASH_TASK_TIMEOUT_MS, FLASH_IDLE_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS,
 FLASH_MAX_TASKS, FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
-FLASH_STATE_DIR, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_MAX_STATE_BYTES, FLASH_LOG_FILE,
+FLASH_STATE_DIR, FLASH_COPY_EXCLUDE, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_MAX_STATE_BYTES, FLASH_LOG_FILE,
 FLASH_DSH_BIN.
 
 The route and the numeric limits default to flash.config.json, the one file that owns
 them. An empty environment value counts as unset, so a generated configuration may
 leave a setting blank rather than having to omit it.
 `
+}
+
+/**
+ * Build the MCP tool dispatcher.
+ *
+ * The synchronous door is unchanged: a call runs on the request's signal and its result is
+ * rendered in full. The job door is bolted on in front of it. `background: true` strips the
+ * flag and hands the call to a job that owns its own signal and records its progress, then
+ * answers with the job id; `background: false` or absent falls through to the synchronous
+ * path exactly as before. The three job tools then work on jobs alone.
+ *
+ * Exported so the dispatch can be driven with a fake service, without a stdio connection.
+ *
+ * @param {object} options - dispatch wiring.
+ * @param {object} options.service - the FlashTaskService, or a stand-in in tests.
+ * @param {JobRegistry} options.jobs - the background job registry.
+ * @param {(message: string) => void} [options.log] - diagnostic sink.
+ * @returns {(name: string, args: object, ctx: {
+ *   signal: AbortSignal,
+ *   progressToken: string | number | undefined,
+ *   sendProgress: (report: object) => void,
+ * }) => Promise<object>} the tool caller.
+ */
+export function createToolCaller({ service, jobs, log = () => {} }) {
+  // A thunk, not a call: `flashApply` and `flashPatch` throw synchronously on a bad id, and
+  // that throw must land inside the caller's try rather than escape the dispatcher.
+  const runFor = (name, args, { signal, progress, progressToken }) =>
+    name === 'flash_task'
+      ? () => service.flashTask(args, { signal, progress, progressToken })
+      : name === 'flash_batch'
+        ? () => service.flashBatch(args, { signal, progress, progressToken })
+        : name === 'flash_apply'
+          ? () => service.flashApply(args)
+          : name === 'flash_patch'
+            ? () => service.flashPatch(args)
+            : undefined
+
+  /**
+   * Turn one background call into a running job and answer with its id. The service runs
+   * under the job's own signal, so the starting request ending — or being cancelled —
+   * cannot reach it, and its progress is recorded on the job instead of notified.
+   */
+  const startJob = (name, args) => {
+    const job = jobs.start({
+      kind: name,
+      label: jobLabel(name, args),
+      run: ({ signal, jobId, progress }) =>
+        runFor(name, args, {
+          signal,
+          progress,
+          // The service starts its progress timer only when a request carried a token, and
+          // only reads whether one is present. There is no client here, so the job's own id
+          // stands in, and every heartbeat reaches the job's recorder.
+          progressToken: jobId,
+        })(),
+    })
+    return okResult({
+      jobId: job.jobId,
+      kind: job.kind,
+      state: 'running',
+      startedAt: job.startedAt,
+      label: job.label,
+      note:
+        'Running in the background. Use flash_result with this jobId (optionally waitSeconds) to ' +
+        'collect its result, flash_status to see its progress, or flash_cancel to stop it.',
+    })
+  }
+
+  const unknownJob = (tool, jobId) =>
+    errorResult(
+      `${tool} failed: unknown job ${JSON.stringify(jobId)}. Job ids look like job-xxxxxxxx ` +
+        '(8 lowercase hex characters) and live only in the server process that made them: jobs do ' +
+        "not survive a restart. After a restart, the call's finished work is still salvaged as a " +
+        'patch by the next server, and flash_apply can apply it by id.',
+    )
+
+  const statusTool = (args) => {
+    const jobId = args?.jobId
+    if (jobId === undefined) return okResult({ jobs: jobs.list() })
+    if (typeof jobId !== 'string' || jobId.length === 0) {
+      return errorResult(`flash_status failed: jobId must be a non-empty string; got ${JSON.stringify(jobId)}`)
+    }
+    const status = jobs.status(jobId)
+    return status === undefined ? unknownJob('flash_status', jobId) : okResult(status)
+  }
+
+  const resultTool = async (args, signal) => {
+    const jobId = args?.jobId
+    if (typeof jobId !== 'string' || jobId.length === 0) {
+      return errorResult(`flash_result failed: jobId must be a non-empty string; got ${JSON.stringify(jobId)}`)
+    }
+    const waitSeconds = args?.waitSeconds ?? 0
+    if (!Number.isInteger(waitSeconds) || waitSeconds < 0 || waitSeconds > 600) {
+      return errorResult(
+        `flash_result failed: waitSeconds must be an integer between 0 and 600; got ${JSON.stringify(args?.waitSeconds)}`,
+      )
+    }
+    if (jobs.get(jobId) === undefined) return unknownJob('flash_result', jobId)
+    // Waiting is on the *request's* signal: cancelling this call stops the wait, and the job
+    // is left untouched, still running.
+    const job = waitSeconds > 0 ? await jobs.waitFor(jobId, waitSeconds * 1000, signal) : jobs.get(jobId)
+    if (job === undefined) return unknownJob('flash_result', jobId)
+    // Project the job already held rather than looking it up again by id: the sweep may have
+    // evicted it while this request waited, and a second lookup that comes back undefined
+    // used to throw a TypeError straight out of the dispatcher.
+    const status = jobs.statusOf(job)
+    if (job.state === 'running') {
+      return okResult({
+        jobId: job.jobId,
+        state: 'running',
+        elapsedMs: status.elapsedMs,
+        ...(status.lastProgress === undefined ? {} : { lastProgress: status.lastProgress }),
+      })
+    }
+    if (job.state === 'ok') {
+      // The caller has the result now; the cap may reclaim the job under pressure, so the
+      // one result it is allowed to drop is the one already delivered.
+      job.collected = true
+      // The call's full result, exactly as the synchronous call would have returned it, plus
+      // the job's identity so the caller can tie it back to the id it holds.
+      return okResult({ ...job.result, job: { jobId: job.jobId, state: 'ok', elapsedMs: status.elapsedMs } })
+    }
+    // Failed or cancelled: the same message the synchronous dispatch would have produced.
+    return errorResult(`${job.kind} failed: ${describeError(job.error)} (job ${job.jobId})`)
+  }
+
+  const cancelTool = async (args) => {
+    const jobId = args?.jobId
+    if (typeof jobId !== 'string' || jobId.length === 0) {
+      return errorResult(`flash_cancel failed: jobId must be a non-empty string; got ${JSON.stringify(jobId)}`)
+    }
+    const job = jobs.get(jobId)
+    if (job === undefined) return unknownJob('flash_cancel', jobId)
+    if (job.state !== 'running') {
+      return okResult({
+        ...jobs.statusOf(job),
+        note: `the job had already ended as ${job.state}; flash_cancel did nothing`,
+      })
+    }
+    jobs.cancel(jobId)
+    // The service's cancellation path retires a writing call's tree and shuts its runtime
+    // down; the call normally settles at once, but a runtime shutdown can take longer, so the
+    // wait is bounded and the status is returned either way. `waitFor` hands back the job it
+    // held, and projecting that (rather than a fresh lookup) is what keeps an evicted job
+    // from turning into a TypeError here.
+    const settled = (await jobs.waitFor(jobId, 30_000)) ?? job
+    const status = jobs.statusOf(settled)
+    return okResult({
+      ...status,
+      note:
+        status.state === 'running'
+          ? 'the job is still running; its call has not settled yet'
+          : 'the job settled after cancellation',
+    })
+  }
+
+  return async function callTool(name, args = {}, { signal, progressToken, sendProgress } = {}) {
+    // Jobs first. A background call must answer at once and must not own the starting
+    // request's signal, and the three job tools are about jobs rather than one synchronous call.
+    if (name === 'flash_task' || name === 'flash_batch') {
+      const background = args.background
+      if (background !== undefined) {
+        if (typeof background !== 'boolean') {
+          return errorResult(`${name} failed: background must be a boolean; got ${JSON.stringify(background)}`)
+        }
+        args = omit(args, 'background')
+        if (background) return startJob(name, args)
+      }
+    }
+    if (name === 'flash_status') return statusTool(args)
+    if (name === 'flash_result') return await resultTool(args, signal)
+    if (name === 'flash_cancel') return await cancelTool(args)
+
+    const run = runFor(name, args, { signal, progress: sendProgress, progressToken })
+    if (run === undefined) return errorResult(`unknown tool "${name}"`)
+    try {
+      return okResult(await run())
+    } catch (error) {
+      log(`${name} failed: ${describeError(error)}`)
+      return errorResult(`${name} failed: ${describeError(error)}`)
+    }
+  }
+}
+
+/** One MCP tool result, in the shape the synchronous path uses. */
+function okResult(result) {
+  return {
+    content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+    structuredContent: result,
+  }
+}
+
+/** One MCP tool error, formatted like the synchronous path's failures. */
+function errorResult(text) {
+  return { content: [{ type: 'text', text }], isError: true }
+}
+
+/** A shallow copy of `args` without one property; never mutates the caller's object. */
+function omit(args, key) {
+  if (args === null || typeof args !== 'object') return {}
+  const { [key]: _dropped, ...rest } = args
+  return rest
+}
+
+/**
+ * The one-line label a job carries into `flash_status` and the log. It is read from the raw
+ * arguments, before the service validates them, because a background call must answer at
+ * once; a malformed call ends failed and keeps this label.
+ */
+function jobLabel(kind, args) {
+  if (kind === 'flash_batch') {
+    const count = Array.isArray(args?.tasks) ? args.tasks.length : 0
+    return `${String(count)} tasks`
+  }
+  const firstLine = typeof args?.task === 'string' ? args.task.split('\n')[0].trim() : ''
+  return clip(firstLine.length === 0 ? '(untitled task)' : firstLine, 80)
+}
+
+/** Bound a label to the width a status line is read at. */
+function clip(text, maxChars) {
+  return text.length <= maxChars ? text : text.slice(0, maxChars)
 }
 
 /**
@@ -427,6 +737,7 @@ export function startServer(options, input = process.stdin, output = process.std
       mode: options.isolate,
       ...(options.slots === undefined ? {} : { slots: options.slots }),
       ...(options.stateDir === undefined ? {} : { stateDir: options.stateDir }),
+      ...(options.copyExclude === undefined ? {} : { copyExclude: options.copyExclude }),
       ...(options.diffChars === undefined ? {} : { diffChars: options.diffChars }),
       ...(options.patchRetentionDays === undefined ? {} : { patchRetentionDays: options.patchRetentionDays }),
       ...(options.maxStateBytes === undefined ? {} : { maxStateBytes: options.maxStateBytes }),
@@ -450,32 +761,7 @@ export function startServer(options, input = process.stdin, output = process.std
     log,
     input,
     output,
-    async callTool(name, args, { signal, progressToken, sendProgress }) {
-      const run =
-        name === 'flash_task'
-          ? () => service.flashTask(args, { signal, progress: sendProgress, progressToken })
-          : name === 'flash_batch'
-            ? () => service.flashBatch(args, { signal, progress: sendProgress, progressToken })
-            : name === 'flash_apply'
-              ? () => service.flashApply(args)
-              : undefined
-      if (run === undefined) {
-        return { content: [{ type: 'text', text: `unknown tool "${name}"` }], isError: true }
-      }
-      try {
-        const result = await run()
-        return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-          structuredContent: result,
-        }
-      } catch (error) {
-        log(`${name} failed: ${describeError(error)}`)
-        return {
-          content: [{ type: 'text', text: `${name} failed: ${describeError(error)}` }],
-          isError: true,
-        }
-      }
-    },
+    callTool: createToolCaller({ service, jobs: new JobRegistry({ log }), log }),
   })
 
   const done = new Promise((resolveDone) => {
@@ -513,6 +799,25 @@ function numberFrom(value, fallback) {
  */
 function textFrom(value) {
   return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/**
+ * Read a comma-separated list setting, where an unset or empty value means "no list at all".
+ *
+ * Entries are trimmed and empty ones dropped, so `--copy-exclude target, node_modules` and
+ * `FLASH_COPY_EXCLUDE=target,node_modules` parse the same; an empty string stays `undefined`
+ * rather than becoming `[]`, so a caller can tell "unset" from "explicitly nothing".
+ *
+ * @param {unknown} value - the raw environment value or flag argument.
+ * @returns {string[] | undefined} the entries, or undefined when there are none.
+ */
+function listFrom(value) {
+  if (typeof value !== 'string' || value.length === 0) return undefined
+  const entries = value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+  return entries.length === 0 ? undefined : entries
 }
 
 /**

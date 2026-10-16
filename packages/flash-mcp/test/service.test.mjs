@@ -14,6 +14,7 @@ import {
   BATCH_SCRIPT,
   FlashTaskService,
   FlashTaskError,
+  WORKER_INSTRUCTIONS,
   WORKER_RULES,
   buildBatchPrompt,
   buildChildPrompt,
@@ -527,7 +528,8 @@ test('reports extra children rather than hiding them', async () => {
 
 test('prompt builders keep the dispatcher on a single delegation', () => {
   const child = buildChildPrompt({ cwd: '/w', task: 'do it', acceptance: 'done' })
-  assert.equal(child, 'Working directory: /w\nTask:\ndo it\n\nAcceptance criteria:\ndone')
+  // The two worker instructions travel with every call, copy or not; see WORKER_INSTRUCTIONS.
+  assert.equal(child, `Working directory: /w\n\n${WORKER_INSTRUCTIONS.join('\n')}\n\nTask:\ndo it\n\nAcceptance criteria:\ndone`)
   const prompt = buildOrchestrationPrompt(child)
   assert.match(prompt, /<<<TASK\nWorking directory: \/w/)
   assert.match(prompt, /TASK$/)

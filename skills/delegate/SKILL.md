@@ -37,7 +37,12 @@ acceptance, verification and judgement. Everything else goes out.
 - Every call starts with **zero context**. The task text is all it knows.
 - A writing call runs in a **disposable copy** of the repository (uncommitted work included) and
   returns a patch. Nothing reaches the tree until `flash_apply`. Its summary of what it did is not
-  evidence; the diff and your own verification are.
+  evidence; the diff and your own verification are. The result lists the uncommitted files the
+  copy started with (`isolation.uncommittedAtStart`); when another session has work in progress in
+  the same tree, `source: "head"` starts the copy from the last commit instead.
+- Project facts every task would repeat (layout, check commands, style rules) belong in the
+  repository's `AGENTS.md` or `CLAUDE.md`: the harness loads it into every worker. Keep task text
+  for the slice.
 - The service root is fixed at the project; `cwd` selects a directory inside it.
 
 ## 2. The loop
@@ -54,10 +59,14 @@ acceptance, verification and judgement. Everything else goes out.
 4. **Verify yourself.** Apply the patch to the working tree (it stays uncommitted), then run the
    project's real gates: the full test suite, the wiring/invariant scripts, a build of every
    target, the mutation controls where the project has them. Read the diff — all of it, and the
-   semantic core twice (§1). A worker that reports green has still only tested its copy, and
+   semantic core twice (§1). When `change.diffTruncated` is true, read the rest with `flash_patch`
+   (by file or by page) before applying. A patch that no longer applies because a file moved
+   meanwhile takes `flash_apply` with `threeWay: true`; it merges without touching the index and
+   names any conflicts. A worker that reports green has still only tested its copy, and
    "no warnings in the files I created" says nothing about the files it changed.
 5. **Review independently.** Send the diff to a **read-only** worker with the review template
-   (§5). Merge its findings with yours; keep only what you can confirm from the code.
+   (§5). A read-only worker cannot build or run tests — both write. When the review must, send it
+   as a writing call with `apply: "discard"`: it runs in a throwaway copy and stores nothing. Merge its findings with yours; keep only what you can confirm from the code.
 6. **Fix round.** One task carrying every confirmed defect, each with "add a test that fails
    before and passes after". Apply, verify, review again. Stop when a review pass finds nothing
    real. Expect one to two rounds; three means the slice was framed badly — reframe it.
@@ -106,7 +115,10 @@ Rules that held up:
   Toolchains with a sandbox of their own cannot start it inside the worker's sandbox: SwiftPM
   needs `--disable-sandbox` on every `swift build`/`swift test`, or the worker reports
   `Operation not permitted` and cannot verify anything. A cold build in the copy is usually
-  seconds to a minute. Keep the recipe in project memory so every task carries it verbatim.
+  seconds to a minute. Where it is not (a large Rust workspace), the repository's
+  `.flash-agents.json` can leave `target/` out of the copy and keep a warm per-slot one instead
+  (`"slotEnv": { "CARGO_TARGET_DIR": "cache:cargo-target" }`), and give tools that write to the
+  home folder a writable one (see the README's per-repository settings). Keep the recipe in project memory so every task carries it verbatim.
 - **Ask for verbatim output** and for a "deviations" section. Workers use both honestly; that is
   where the real information is.
 - Use `acceptance` for the one-sentence definition of done; the body carries the how.
@@ -125,6 +137,10 @@ Rules that held up:
   note of which files each running worker owns so the next task you write does not touch them.
 - Read-only work (maps, reviews) uses `mode: "read-only"`; it cannot change anything and needs no
   patch.
+- `background: true` returns a job id at once. Use it when there is something to do meanwhile —
+  verifying the previous patch, writing the next task — and collect with `flash_result`
+  (`waitSeconds: 300` per wait); `flash_status` shows progress, `flash_cancel` stops a call whose
+  framing turned out wrong.
 
 ## 5. The review task
 
@@ -155,8 +171,12 @@ remarks. Then confirm each finding yourself before it enters a fix round.
 - `NOT_DELEGATED`: the dispatcher did the work itself instead of delegating; re-run the call.
 - Refusals appear in the result's `denials` and in the log with their reason; a worker that hit
   the wall says so in its reply.
-- The result's `change.diff` may be truncated; `flash_apply` always uses the stored full patch.
-  Review on the tree after applying (`git diff`), not from the truncated result.
+- The result's `change.diff` is clipped at a file boundary when it is long; `change.diffOmitted`
+  names the files left out, `change.patchPath` is the full patch on disk, and `flash_patch` reads
+  it. `flash_apply` always uses the stored full patch.
+- `usage` in every result is the call's token count (`inputTokens`, `outputTokens`,
+  `modelCalls`; cache hits are separate, in `cacheReadTokens`), for weighing a delegation against
+  doing the work yourself.
 - A read-only worker is a good security reviewer of a bounded surface: given an OAuth/MCP client
   and RFC citations it returned eleven real findings in one pass. It is not a substitute for
   your own read of the same surface; the two lists differ, and both matter.
