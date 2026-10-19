@@ -1,12 +1,12 @@
 /**
  * Prerequisite checks for the flash-agent stack.
  *
- * Each check only observes: it runs a command or probes an HTTP endpoint, and
- * reports the exact shell command that would repair the problem. Every effect is
- * injected through `run` and `probe`, so the checks can be exercised without a
- * real binary or the network. A failed prerequisite never removes a dependent
- * check from the report: the dependent degrades to a warning that names why it
- * could not run.
+ * Each check only observes: it runs a command, probes an HTTP endpoint or sends a
+ * one-token model request, and reports the exact shell command that would repair
+ * the problem. Every effect is injected through `run`, `probe` and `generate`, so
+ * the checks can be exercised without a real binary or the network. A failed
+ * prerequisite never removes a dependent check from the report: the dependent
+ * degrades to a warning that names why it could not run.
  *
  * @module flash-mcp/doctor
  */
@@ -47,6 +47,63 @@ const NODE_REQUIREMENT = 'Node 22.19 or newer (24.2 or newer on the 24 line)'
 
 /** Endpoint whose answer proves the local Ollama daemon is up. */
 const OLLAMA_TAGS_URL = 'http://127.0.0.1:11434/api/tags'
+
+/** Endpoint that proves a cloud model is signed in, not merely installed. */
+const OLLAMA_GENERATE_URL = 'http://127.0.0.1:11434/api/generate'
+
+/** How long the doctor waits for one token from a cloud model. */
+const GENERATE_TIMEOUT_MS = 30_000
+
+/**
+ * The child script that proves node-pty can start a shell.
+ *
+ * It runs in a separate Node process because node-pty is a native module: a crash
+ * in it must not take the doctor down. The script loads node-pty from the
+ * directory it is given, spawns a shell that prints `flash-pty-ok`, and exits 0
+ * only when that output arrived through `onData` and the shell exited cleanly. It
+ * exits 1 when the shell has not proved itself within ten seconds or the output or
+ * exit code did not match, and 2 when node-pty could not be loaded or the spawn threw.
+ */
+const PTY_PROBE_SCRIPT = `
+const { writeSync } = require('node:fs')
+const { createRequire } = require('node:module')
+const os = require('node:os')
+const { join } = require('node:path')
+
+const nodePtyDir = process.argv[1]
+const platform = process.argv[2]
+let output = ''
+let settled = false
+
+const finish = (status) => {
+  if (settled) return
+  settled = true
+  try {
+    writeSync(1, output)
+  } catch {}
+  process.exit(status)
+}
+
+setTimeout(() => finish(1), 10_000)
+
+try {
+  const pty = createRequire(join(nodePtyDir, 'package.json'))(nodePtyDir)
+  const command = platform === 'win32' ? 'cmd.exe' : '/bin/sh'
+  const args = platform === 'win32' ? ['/c', 'echo flash-pty-ok'] : ['-c', 'echo flash-pty-ok']
+  const terminal = pty.spawn(command, args, { cols: 80, rows: 24, cwd: os.tmpdir() })
+  terminal.onData((data) => { output += data })
+  // On Windows the console host can deliver the last output after the exit event, so a
+  // clean exit without the marker yet gets a moment for it to arrive.
+  terminal.onExit(({ exitCode }) => {
+    if (exitCode !== 0) return finish(1)
+    if (output.includes('flash-pty-ok')) return finish(0)
+    setTimeout(() => finish(output.includes('flash-pty-ok') ? 0 : 1), 1_000)
+  })
+} catch (error) {
+  process.stderr.write(String((error && error.message) || error))
+  finish(2)
+}
+`
 
 /**
  * The filesystem primitives the native-module check reads.
@@ -102,6 +159,38 @@ async function defaultProbe(url) {
     return response.ok
   } catch {
     return false
+  }
+}
+
+/**
+ * Ask a cloud model for one token, to prove the account is signed in.
+ *
+ * The request is deliberately tiny (`num_predict: 1`) so it neither loads a local
+ * model nor spends a meaningful amount of the cloud quota. It never throws: a
+ * refused connection, a timeout and an HTTP error all come back as a report so the
+ * model check can turn them into a warning or a failure.
+ *
+ * @param {string} model - the Ollama model to ask.
+ * @returns {Promise<{ok: boolean, status: number, error?: string, ms?: number}>} the answer.
+ */
+async function defaultGenerate(model) {
+  const started = Date.now()
+  try {
+    const response = await fetch(OLLAMA_GENERATE_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model, prompt: 'Reply with OK.', stream: false, options: { num_predict: 1 } }),
+      signal: AbortSignal.timeout(GENERATE_TIMEOUT_MS),
+    })
+    const body = await response.json().catch(() => undefined)
+    const ms = Date.now() - started
+    if (!response.ok) {
+      const error = typeof body?.error === 'string' && body.error !== '' ? body.error : `HTTP ${String(response.status)}`
+      return { ok: false, status: response.status, error, ms }
+    }
+    return { ok: true, status: response.status, ms }
+  } catch (error) {
+    return { ok: false, status: 0, error: reasonOf(error), ms: Date.now() - started }
   }
 }
 
@@ -198,22 +287,82 @@ function findDshPackage(entry, fs) {
 }
 
 /**
- * Check that the node-pty native pieces beside a dsh install are usable.
+ * The native binary node-pty loads for a platform.
  *
- * dsh runs every worker shell command through node-pty. npm 11 blocks dependency
- * install scripts by default, and those scripts are what build `pty.node` or
- * restore the execute bit on macOS's `spawn-helper`, so a script that silently
- * did not run turns into every worker command failing. This only looks at paths;
- * it never loads the module or starts a process.
+ * node-pty's binding.gyp builds only `conpty.node` and `conpty_console_list.node`
+ * when the target OS is Windows; `pty.node` exists only on the Unix builds.
+ *
+ * @param {string} platform - the platform whose install is being inspected.
+ * @returns {string} the file the install must contain.
+ */
+function ptyBinaryName(platform) {
+  return platform === 'win32' ? 'conpty.node' : 'pty.node'
+}
+
+/**
+ * The installed npm's major version, or null when npm does not answer.
+ *
+ * npm 11 and later only run dependency install scripts when they are allowed, and
+ * that clause explains a missing native binary; older npm does not, so blaming it
+ * would send the user down the wrong path.
+ *
+ * @param {(command: string, args: string[]) => {status: number, stdout: string, stderr: string}} run
+ *        the injected command runner, already wrapped so it cannot throw.
+ * @param {string} platform - platform whose npm executable to call.
+ * @returns {number | null} the major version, or null when it could not be read.
+ */
+function npmMajorVersion(run, platform) {
+  // npm is a `.cmd` shim on Windows, and Node refuses to start one without a shell
+  // (CVE-2024-27980), so it is asked through cmd.exe there.
+  const result = platform === 'win32' ? run('cmd.exe', ['/d', '/s', '/c', 'npm --version']) : run('npm', ['--version'])
+  if (typeof result.status !== 'number' || result.status !== 0) return null
+  const match = /(\d+)\./.exec(result.stdout ?? '')
+  return match === null ? null : Number(match[1])
+}
+
+/**
+ * The repair text for a dsh whose node-pty native pieces cannot be used.
+ *
+ * Reinstalling with install scripts allowed is always the first move. The npm-11
+ * clause is added only when the npm that is actually installed blocks scripts, so
+ * a user on npm 10 is not sent chasing the wrong cause. Building node-pty in place
+ * is offered only off Windows, where it needs the Visual Studio build tools.
+ *
+ * @param {(command: string, args: string[]) => {status: number, stdout: string, stderr: string}} run
+ *        the injected command runner, already wrapped so it cannot throw.
+ * @param {string} platform - platform the dsh install runs on.
+ * @param {string} nodePtyDir - the resolved node-pty package directory.
+ * @returns {string} the fix to record.
+ */
+function nativeFix(run, platform, nodePtyDir) {
+  const major = npmMajorVersion(run, platform)
+  const clause = major !== null && major >= 11 ? ` (npm ${major} blocks dependency install scripts by default)` : ''
+  const reinstall = `reinstall @deepseek-ai/dsh with install scripts allowed${clause}`
+  if (platform === 'win32') return reinstall
+  return `${reinstall}; or build node-pty in place: cd ${nodePtyDir} && npx --yes node-gyp rebuild`
+}
+
+/**
+ * Check that the node-pty native pieces beside a dsh install can start a shell.
+ *
+ * dsh runs every worker shell command through node-pty. npm 11 and later block
+ * dependency install scripts by default, and those scripts are what build the
+ * platform's addon (`pty.node`, or `conpty.node` on Windows) or restore the
+ * execute bit on macOS's `spawn-helper`, so a script that silently did not run
+ * turns into every worker command failing. The path checks come first; once they
+ * pass, a child Node process loads node-pty and starts a short command, because a
+ * binary that exists can still be the wrong one or the wrong architecture.
  *
  * @param {string} entry - the resolved dsh entry point.
  * @param {string} platform - platform whose prebuild directory to inspect.
  * @param {string} arch - architecture whose prebuild directory to inspect.
  * @param {object} fs - filesystem probe.
  * @param {string} install - the command that reinstalls dsh.
+ * @param {{run: Function, nodePath: string}} probeDeps - the injected runner used for
+ *        `npm --version` and the pty probe, and the Node executable that runs the probe script.
  * @returns {{status: string, detail: string, fix: string}} the check to record.
  */
-function checkNativeModules(entry, platform, arch, fs, install) {
+function checkNativeModules(entry, platform, arch, fs, install, { run, nodePath }) {
   const dshDir = findDshPackage(entry, fs)
   if (dshDir === undefined) {
     return {
@@ -248,18 +397,19 @@ function checkNativeModules(entry, platform, arch, fs, install) {
 
   // node-pty loads build/Release before prebuilds, so the same order decides
   // which spawn-helper pairs with the binary that actually runs.
+  const binary = ptyBinaryName(platform)
   const buildDir = join(nodePtyDir, 'build', 'Release')
   const prebuildDir = join(nodePtyDir, 'prebuilds', `${platform}-${arch}`)
-  const loadedDir = [buildDir, prebuildDir].find((dir) => fs.exists(join(dir, 'pty.node')))
+  const loadedDir = [buildDir, prebuildDir].find((dir) => fs.exists(join(dir, binary)))
   if (loadedDir === undefined) {
     return {
       status: 'fail',
-      detail: `node-pty has no pty.node in ${prebuildDir} or ${buildDir}, so dsh cannot run a worker command`,
-      fix: `reinstall @deepseek-ai/dsh with install scripts allowed (npm 11 blocks them by default); or build node-pty in place: cd ${nodePtyDir} && npx --yes node-gyp rebuild`,
+      detail: `node-pty has no ${binary} in ${prebuildDir} or ${buildDir}, so dsh cannot run a worker command`,
+      fix: nativeFix(run, platform, nodePtyDir),
     }
   }
 
-  const ptyNode = join(loadedDir, 'pty.node')
+  const ptyNode = join(loadedDir, binary)
   if (platform === 'darwin') {
     const helper = join(loadedDir, 'spawn-helper')
     if (!fs.exists(helper)) {
@@ -283,7 +433,18 @@ function checkNativeModules(entry, platform, arch, fs, install) {
       }
     }
   }
-  return { status: 'ok', detail: `node-pty can load ${ptyNode}`, fix: '' }
+
+  const probe = run(nodePath, ['-e', PTY_PROBE_SCRIPT, nodePtyDir, platform])
+  const probeStatus = typeof probe.status === 'number' ? probe.status : 1
+  if (probeStatus === 0) {
+    return { status: 'ok', detail: `node-pty started a shell through ${ptyNode}`, fix: '' }
+  }
+  const whyItFailed = firstLine(probe.stderr) || 'no output'
+  return {
+    status: 'fail',
+    detail: `node-pty is installed but could not start a shell: ${whyItFailed}`,
+    fix: nativeFix(run, platform, nodePtyDir),
+  }
 }
 
 /**
@@ -293,6 +454,8 @@ function checkNativeModules(entry, platform, arch, fs, install) {
  * @param {(command: string, args: string[]) => {status: number, stdout: string, stderr: string}} [options.run]
  *        Command runner; defaults to spawnSync, reporting a non-zero status instead of throwing.
  * @param {(url: string) => Promise<boolean>} [options.probe] - HTTP reachability probe; defaults to fetch with a short timeout.
+ * @param {(model: string) => Promise<{ok: boolean, status: number, error?: string, ms?: number}>} [options.generate]
+ *        One-token request to a cloud model; defaults to fetch with a 30 s timeout, and never throws.
  * @param {NodeJS.ProcessEnv} [options.env] - environment for the default runner (default process.env).
  * @param {string} [options.nodeVersion] - Node version to test (default process.versions.node).
  * @param {string} [options.profile] - service profile to compose (default 'flash-service').
@@ -300,6 +463,7 @@ function checkNativeModules(entry, platform, arch, fs, install) {
  * @param {string} [options.dshVersion] - the dsh version the profiles are written for (default '0.2.0-rc.2').
  * @param {string} [options.platform] - platform whose node-pty prebuild to inspect (default process.platform).
  * @param {string} [options.arch] - architecture whose node-pty prebuild to inspect (default process.arch).
+ * @param {string} [options.nodePath] - Node executable that runs the pty probe (default process.execPath).
  * @param {object} [options.fs] - filesystem probe with realpath/exists/executable/readText/resolvePackage;
  *        defaults to the node:fs calls, and is injectable so the check needs no real harness install.
  * @param {{command: string, prefix: string[]}} [options.launcher] - how to start dsh; defaults to the
@@ -316,8 +480,10 @@ export async function runChecks(options = {}) {
   const dshInstall = `npm i -g @deepseek-ai/dsh@${dshVersion}`
   const run = config.run ?? ((command, args) => defaultRun(command, args, env))
   const probe = config.probe ?? defaultProbe
+  const generate = config.generate ?? defaultGenerate
   const platform = config.platform ?? process.platform
   const arch = config.arch ?? process.arch
+  const nodePath = config.nodePath ?? process.execPath
   const fs = config.fs ?? REAL_FS
 
   /** Never let a broken injected runner escape as a rejection. */
@@ -336,6 +502,17 @@ export async function runChecks(options = {}) {
       return (await probe(url)) === true
     } catch {
       return false
+    }
+  }
+
+  /** Never let a broken injected generator escape as a rejection. */
+  const safeGenerate = async (name) => {
+    try {
+      const answer = await generate(name)
+      if (answer === null || typeof answer !== 'object') return { ok: false, status: 0, error: 'no answer' }
+      return answer
+    } catch (error) {
+      return { ok: false, status: 0, error: reasonOf(error) }
     }
   }
 
@@ -395,7 +572,7 @@ export async function runChecks(options = {}) {
     const entry = launcher.prefix.length > 0 ? launcher.prefix[0] : launcher.command
     let native
     try {
-      native = checkNativeModules(entry, platform, arch, fs, dshInstall)
+      native = checkNativeModules(entry, platform, arch, fs, dshInstall, { run: safeRun, nodePath })
     } catch (error) {
       native = { status: 'warn', detail: `the dsh native-module check could not run: ${reasonOf(error)}`, fix: dshInstall }
     }
@@ -430,10 +607,31 @@ export async function runChecks(options = {}) {
     record('model', 'Ollama model', 'warn', `the Ollama daemon is not reachable, so ${model} could not be checked${cloudNote}`, `ollama pull ${model}`)
   } else {
     const show = safeRun('ollama', ['show', model])
-    if (show.status === 0) {
+    if (show.status !== 0) {
+      record('model', 'Ollama model', 'fail', `${model} is not available${cloudNote}`, `ollama pull ${model}`)
+    } else if (!cloud) {
+      // A local model only answers after it is loaded, which is slow; its files
+      // being present is all this check needs to establish.
       record('model', 'Ollama model', 'ok', `${model} is available${cloudNote}`, '')
     } else {
-      record('model', 'Ollama model', 'fail', `${model} is not available${cloudNote}`, `ollama pull ${model}`)
+      const started = Date.now()
+      const answer = await safeGenerate(model)
+      const elapsed = typeof answer.ms === 'number' ? answer.ms : Date.now() - started
+      const seconds = (elapsed / 1000).toFixed(1)
+      const error = typeof answer.error === 'string' && answer.error.trim() !== '' ? answer.error.trim() : `HTTP ${String(answer.status ?? 0)}`
+      if (answer.ok === true) {
+        record('model', 'Ollama model', 'ok', `${model} is available and answered a one-token request in ${seconds} s`, '')
+      } else if (answer.status === 401 || answer.status === 403 || /unauthori[sz]ed|sign ?in|signin/i.test(error)) {
+        record('model', 'Ollama model', 'fail', `${model} is installed but the cloud refused a request: ${error}`, 'ollama signin')
+      } else {
+        record(
+          'model',
+          'Ollama model',
+          'warn',
+          `${model} is installed, but a one-token request failed: ${error}`,
+          'ollama signin; a slow or busy cloud can also time out',
+        )
+      }
     }
   }
 

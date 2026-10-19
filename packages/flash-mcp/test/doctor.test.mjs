@@ -1,9 +1,17 @@
 /**
- * Prerequisite-check tests: every effect is injected, so no real binary is run
- * and no network endpoint is touched. Each scenario is one fake command table.
+ * Prerequisite-check tests: nearly every effect is injected, so no real binary is
+ * run and no network endpoint is touched. Each scenario is one fake command table.
+ * The exceptions are the two pty-probe tests near the end: one really starts a
+ * shell through the globally installed node-pty, one uses a stand-in so the probe
+ * script's success path also runs where the host forbids allocating a pty.
  */
 
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import test from 'node:test'
 
 import { CHECK_IDS, formatChecks, runChecks } from '../lib/doctor.js'
@@ -62,6 +70,7 @@ function fakeFs({ files = {}, executables = [], realpaths = {}, resolve = {} } =
  *
  * @param {object} [spec] - which native pieces exist.
  * @param {'prebuild'|'build'|'none'} [spec.pty] - where the pty binary lives (default 'prebuild').
+ * @param {string} [spec.binary] - the addon file to place (default `pty.node`, or `conpty.node` on win32).
  * @param {'executable'|'present'|'missing'} [spec.helper] - state of darwin's spawn-helper (default 'executable').
  * @param {boolean} [spec.locateDsh] - false to model an install that cannot be found (default true).
  * @param {boolean} [spec.resolveNodePty] - false to model node-pty that cannot be resolved (default true).
@@ -79,6 +88,7 @@ function nativeInstall(spec = {}) {
   const locateDsh = spec.locateDsh ?? true
   const resolveNodePty = spec.resolveNodePty ?? true
   const pty = spec.pty ?? 'prebuild'
+  const binary = spec.binary ?? (platform === 'win32' ? 'conpty.node' : 'pty.node')
   const helper = spec.helper ?? 'executable'
   const prebuildDir = `${NODE_PTY_DIR}/prebuilds/${platform}-${arch}`
   const buildDir = `${NODE_PTY_DIR}/build/Release`
@@ -86,8 +96,8 @@ function nativeInstall(spec = {}) {
   const files = {}
   const executables = []
   if (locateDsh) files[DSH_MANIFEST] = JSON.stringify({ name: '@deepseek-ai/dsh' })
-  if (pty === 'prebuild') files[`${prebuildDir}/pty.node`] = null
-  if (pty === 'build') files[`${buildDir}/pty.node`] = null
+  if (pty === 'prebuild') files[`${prebuildDir}/${binary}`] = null
+  if (pty === 'build') files[`${buildDir}/${binary}`] = null
   if (pty !== 'none' && platform === 'darwin' && helper !== 'missing') {
     files[`${loadedDir}/spawn-helper`] = null
     if (helper === 'executable') executables.push(`${loadedDir}/spawn-helper`)
@@ -104,7 +114,12 @@ function nativeInstall(spec = {}) {
 }
 
 /**
- * Build fully injected run/probe fakes for one scenario.
+ * Build fully injected run/probe/generate fakes for one scenario.
+ *
+ * The node probe (the command named by `nodePath`) succeeds by default, so a
+ * working environment reports nine ok checks; a scenario makes it fail by naming
+ * a `ptyProbe` result. `npm` answers "not found" by default, which is the state
+ * in which no npm-11 hint can be justified.
  *
  * @param {object} [behaviors] - per-command results and the daemon probe answer.
  * @param {object} [options] - extra options to merge into the injected set.
@@ -114,20 +129,26 @@ function fakeOptions(behaviors = {}, options = {}) {
   const dsh = behaviors.dsh ?? { status: 0, stdout: '0.2.0-rc.2\n', stderr: '' }
   const profileDump = behaviors.profileDump ?? { status: 0, stdout: '', stderr: '' }
   const ollamaShow = behaviors.ollamaShow ?? { status: 0, stdout: '', stderr: '' }
+  const npm = behaviors.npm ?? { status: 1, stdout: '', stderr: 'npm: not found' }
+  const ptyProbe = behaviors.ptyProbe ?? { status: 0, stdout: 'flash-pty-ok\r\n', stderr: '' }
+  const generate = behaviors.generate ?? (async () => ({ ok: true, status: 200, ms: 42 }))
   const git = behaviors.git ?? { status: 0, stdout: 'git version 2.0.0\n', stderr: '' }
   const zstd = behaviors.zstd ?? { status: 0, stdout: 'zstd 1.5.5\n', stderr: '' }
   const daemon = behaviors.daemon ?? true
+  const nodePath = options.nodePath ?? '/fake/node'
   const calls = []
   const run = (command, args) => {
     calls.push({ command, args })
+    if (command === nodePath) return ptyProbe
     if (command === 'dsh') return args[0] === '--version' ? dsh : profileDump
     if (command === 'ollama') return ollamaShow
+    if (command === 'npm' || (command === 'cmd.exe' && args.at(-1) === 'npm --version')) return npm
     if (command === 'git') return git
     if (command === 'zstd') return zstd
     return { status: 1, stdout: '', stderr: 'not found' }
   }
   const native = nativeInstall()
-  return { options: { run, probe: async () => daemon, nodeVersion: '22.19.0', ...native, ...options }, calls }
+  return { options: { run, probe: async () => daemon, generate, nodePath, nodeVersion: '22.19.0', ...native, ...options }, calls }
 }
 
 test('reports nine ok checks for a fully working environment', async () => {
@@ -139,7 +160,7 @@ test('reports nine ok checks for a fully working environment', async () => {
   assert.equal(result.ok, true)
   assert.equal(result.failures, 0)
   assert.equal(result.warnings, 0)
-  assert.match(find(result, 'model').detail, /signin/)
+  assert.match(find(result, 'model').detail, /answered a one-token request/)
 })
 
 test('fails when dsh is missing and downgrades the version check', async () => {
@@ -176,8 +197,10 @@ test('runs dsh through the launcher, prefix included', async () => {
   })
   const result = await runChecks(options)
   assert.equal(find(result, 'dsh-version').status, 'ok')
-  assert.deepEqual(seen[0], ['/usr/bin/node', '/opt/dsh/lib/bin.js', '--version'])
-  assert.deepEqual(seen[1], ['/usr/bin/node', '/opt/dsh/lib/bin.js', '--profile', 'flash-service', '--dump-config'])
+  // The pty probe runs between the two dsh calls, so only the launcher calls are compared.
+  const dshCalls = seen.filter((args) => args.includes('/opt/dsh/lib/bin.js'))
+  assert.deepEqual(dshCalls[0], ['/usr/bin/node', '/opt/dsh/lib/bin.js', '--version'])
+  assert.deepEqual(dshCalls[1], ['/usr/bin/node', '/opt/dsh/lib/bin.js', '--profile', 'flash-service', '--dump-config'])
 })
 
 test('pins dsh: exact is ok, the same release line warns, another line fails', async () => {
@@ -272,7 +295,267 @@ test('dsh native modules: a Windows shim resolves the JS entry behind it', async
   const result = await runChecks(fakeOptions({}, { ...spec, run }).options)
   const native = find(result, 'dsh-native')
   assert.equal(native.status, 'ok')
-  assert.match(native.detail, /win32-x64\/pty\.node/)
+  assert.match(native.detail, /win32-x64\/conpty\.node/)
+})
+
+test('dsh native modules: a Windows prebuild ships conpty.node, not pty.node', async () => {
+  const { options } = fakeOptions({}, nativeInstall({ platform: 'win32', arch: 'x64' }))
+  const result = await runChecks(options)
+  const native = find(result, 'dsh-native')
+  assert.equal(native.status, 'ok')
+  assert.match(native.detail, /prebuilds\/win32-x64\/conpty\.node/)
+})
+
+test('dsh native modules: a win32 build/Release conpty.node is ok too', async () => {
+  const { options } = fakeOptions({}, nativeInstall({ platform: 'win32', arch: 'x64', pty: 'build' }))
+  const result = await runChecks(options)
+  const native = find(result, 'dsh-native')
+  assert.equal(native.status, 'ok')
+  assert.match(native.detail, /build\/Release\/conpty\.node/)
+})
+
+test('dsh native modules: a win32 layout without conpty.node fails and never suggests node-gyp', async () => {
+  for (const spec of [
+    { platform: 'win32', arch: 'x64', binary: 'pty.node' },
+    { platform: 'win32', arch: 'x64', pty: 'none' },
+  ]) {
+    const { options } = fakeOptions({}, nativeInstall(spec))
+    const result = await runChecks(options)
+    const native = find(result, 'dsh-native')
+    assert.equal(native.status, 'fail')
+    assert.match(native.detail, /no conpty\.node/)
+    assert.ok(native.detail.includes(`${NODE_PTY_DIR}/prebuilds/win32-x64`), native.detail)
+    assert.ok(native.detail.includes(`${NODE_PTY_DIR}/build/Release`), native.detail)
+    assert.match(native.fix, /install scripts allowed/)
+    assert.doesNotMatch(native.fix, /node-gyp/)
+    assert.equal(result.ok, false)
+  }
+})
+
+test('dsh native modules: the npm-11 clause follows the npm that is actually installed', async () => {
+  const failingFix = async (npm) =>
+    find(await runChecks(fakeOptions({ npm }, nativeInstall({ pty: 'none' })).options), 'dsh-native').fix
+  const eleven = await failingFix({ status: 0, stdout: '11.19.1\n', stderr: '' })
+  assert.match(eleven, /npm 11 blocks dependency install scripts by default/)
+  assert.match(eleven, /node-gyp rebuild/)
+  const ten = await failingFix({ status: 0, stdout: '10.9.8\n', stderr: '' })
+  assert.doesNotMatch(ten, /npm \d+ blocks/)
+  assert.match(ten, /install scripts allowed/)
+  const missing = await failingFix({ status: 1, stdout: '', stderr: 'npm: not found' })
+  assert.doesNotMatch(missing, /npm \d+ blocks/)
+  assert.match(missing, /install scripts allowed/)
+})
+
+test('dsh native modules: Windows asks npm for its version through cmd.exe', async () => {
+  const { options, calls } = fakeOptions(
+    { npm: { status: 0, stdout: '11.19.1\n', stderr: '' } },
+    nativeInstall({ platform: 'win32', arch: 'x64', pty: 'none' }),
+  )
+  const result = await runChecks(options)
+  const native = find(result, 'dsh-native')
+  assert.match(native.fix, /npm 11 blocks dependency install scripts by default/)
+  assert.ok(calls.some((entry) => entry.command === 'cmd.exe' && entry.args.at(-1) === 'npm --version'), JSON.stringify(calls))
+  assert.ok(!calls.some((entry) => entry.command === 'npm'), JSON.stringify(calls))
+  assert.doesNotMatch(native.fix, /node-gyp/)
+})
+
+test('dsh native modules: the pty probe runs the child script through nodePath', async () => {
+  const { options, calls } = fakeOptions({}, nativeInstall())
+  const result = await runChecks(options)
+  const probe = calls.find((entry) => entry.command === '/fake/node')
+  assert.ok(probe, JSON.stringify(calls))
+  assert.equal(probe.args[0], '-e')
+  assert.match(probe.args[1], /createRequire/)
+  assert.match(probe.args[1], /flash-pty-ok/)
+  assert.match(probe.args[1], /10_000/)
+  assert.equal(probe.args[2], NODE_PTY_DIR)
+  assert.equal(probe.args[3], 'darwin')
+  assert.match(find(result, 'dsh-native').detail, /started a shell through/)
+})
+
+test('dsh native modules: a probe that cannot start a shell fails with the stderr line', async () => {
+  const stderr = 'Error: posix_spawn failed\nat load (node:internal)\n'
+  const { options } = fakeOptions({ ptyProbe: { status: 2, stdout: '', stderr } })
+  const result = await runChecks(options)
+  const native = find(result, 'dsh-native')
+  assert.equal(native.status, 'fail')
+  assert.equal(native.detail, 'node-pty is installed but could not start a shell: Error: posix_spawn failed')
+  assert.match(native.fix, /reinstall @deepseek-ai\/dsh/)
+  assert.equal(result.ok, false)
+})
+
+test('dsh native modules: a silent probe failure names "no output"', async () => {
+  const { options } = fakeOptions({ ptyProbe: { status: 1, stdout: '', stderr: '' } })
+  const native = find(await runChecks(options), 'dsh-native')
+  assert.equal(native.status, 'fail')
+  assert.match(native.detail, /could not start a shell: no output/)
+})
+
+test('dsh native modules: the probe is not run when the binary is missing', async () => {
+  const { options, calls } = fakeOptions({}, nativeInstall({ pty: 'none' }))
+  await runChecks(options)
+  assert.equal(calls.filter((entry) => entry.command === '/fake/node').length, 0)
+})
+
+test('dsh native modules: the probe is not run when the spawn-helper is unusable', async () => {
+  const { options, calls } = fakeOptions({}, nativeInstall({ pty: 'prebuild', helper: 'present' }))
+  const native = find(await runChecks(options), 'dsh-native')
+  assert.equal(native.status, 'fail')
+  assert.equal(calls.filter((entry) => entry.command === '/fake/node').length, 0)
+})
+
+/** The globally installed dsh and the node-pty it uses, or undefined when either is absent. */
+function globalDsh() {
+  const npm = spawnSync('npm', ['root', '-g'], { encoding: 'utf8', shell: process.platform === 'win32' })
+  if (npm.status !== 0) return undefined
+  const root = (npm.stdout ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+    .pop()
+  if (root === undefined) return undefined
+  const dshDir = join(root, '@deepseek-ai', 'dsh')
+  if (!existsSync(join(dshDir, 'package.json'))) return undefined
+  try {
+    const manifest = createRequire(join(dshDir, 'package.json')).resolve('node-pty/package.json')
+    return { dshDir, nodePtyDir: dirname(manifest) }
+  } catch {
+    return undefined
+  }
+}
+
+test('the pty probe script really starts a shell through the installed node-pty', async (t) => {
+  const found = globalDsh()
+  if (found === undefined) {
+    t.skip('the globally installed @deepseek-ai/dsh and its node-pty could not be located')
+    return
+  }
+  const realFs = {
+    realpath: (path) => realpathSync(path),
+    exists: (path) => existsSync(path),
+    executable: (path) => {
+      try {
+        accessSync(path, constants.X_OK)
+        return true
+      } catch {
+        return false
+      }
+    },
+    readText: (path) => readFileSync(path, 'utf8'),
+    resolvePackage: (request, fromFile) => createRequire(fromFile).resolve(request),
+  }
+  const realProbe = (command, args) => {
+    const result = spawnSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000 })
+    return {
+      status: typeof result.status === 'number' ? result.status : 1,
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? (result.error instanceof Error ? result.error.message : ''),
+    }
+  }
+  const entry = join(found.dshDir, 'lib', 'bin.js')
+  const { options: base } = fakeOptions({}, {
+    fs: realFs,
+    platform: process.platform,
+    arch: process.arch,
+    nodePath: process.execPath,
+    launcher: { command: entry, prefix: [] },
+  })
+  const options = {
+    ...base,
+    run: (command, args) => (command === process.execPath ? realProbe(command, args) : base.run(command === entry ? 'dsh' : command, args)),
+  }
+  const result = await runChecks(options)
+  const native = find(result, 'dsh-native')
+  if (native.status === 'fail' && /posix_openpt|Operation not permitted|EPERM/.test(native.detail)) {
+    // A sandbox that denies /dev/ptmx cannot run this probe at all; the assertion
+    // below still holds wherever the host lets a process allocate a pty.
+    t.skip(`this host forbids allocating a pty: ${native.detail}`)
+    return
+  }
+  assert.equal(native.status, 'ok', native.detail)
+  assert.match(native.detail, /^node-pty started a shell through /)
+  assert.ok(native.detail.includes(found.nodePtyDir), native.detail)
+})
+
+test('the pty probe script exits 0 when the shell prints the marker', async () => {
+  // A stand-in node-pty, so the success path of the probe script can be exercised
+  // even where the host forbids allocating a real pty.
+  const root = mkdtempSync(join(tmpdir(), 'flash-pty-probe-'))
+  try {
+    const nodePtyDir = join(root, 'node-pty')
+    const dshDir = join(root, 'dsh')
+    mkdirSync(nodePtyDir)
+    mkdirSync(join(dshDir, 'lib'), { recursive: true })
+    const nodePtyManifest = join(nodePtyDir, 'package.json')
+    writeFileSync(nodePtyManifest, JSON.stringify({ name: 'node-pty', version: '0.0.0', main: 'index.js' }))
+    writeFileSync(
+      join(nodePtyDir, 'index.js'),
+      [
+        "const { spawn } = require('node:child_process')",
+        'exports.spawn = (command, args, options) => {',
+        '  const child = spawn(command, args, { cwd: options.cwd })',
+        '  const dataHandlers = []',
+        '  const exitHandlers = []',
+        "  let output = ''",
+        "  child.stdout.on('data', (chunk) => {",
+        '    output += chunk',
+        '    for (const handler of dataHandlers) handler(String(chunk))',
+        '  })',
+        "  child.on('exit', (code) => {",
+        '    for (const handler of exitHandlers) handler({ exitCode: code ?? 1 })',
+        '  })',
+        '  return {',
+        "    onData: (handler) => { dataHandlers.push(handler); if (output !== '') handler(output) },",
+        '    onExit: (handler) => { exitHandlers.push(handler) },',
+        '  }',
+        '}',
+      ].join('\n'),
+    )
+    const dshManifest = join(dshDir, 'package.json')
+    const entry = join(dshDir, 'lib', 'bin.js')
+    const prebuildDir = join(nodePtyDir, 'prebuilds', `${process.platform}-${process.arch}`)
+    const files = {
+      [dshManifest]: JSON.stringify({ name: '@deepseek-ai/dsh' }),
+      [entry]: '',
+      [nodePtyManifest]: JSON.stringify({ name: 'node-pty' }),
+      [join(prebuildDir, process.platform === 'win32' ? 'conpty.node' : 'pty.node')]: null,
+    }
+    const executables = []
+    if (process.platform === 'darwin') {
+      files[join(prebuildDir, 'spawn-helper')] = null
+      executables.push(join(prebuildDir, 'spawn-helper'))
+    }
+    const { probe } = fakeFs({
+      files,
+      executables,
+      realpaths: { [entry]: entry },
+      resolve: { [`node-pty/package.json from ${dshManifest}`]: nodePtyManifest },
+    })
+    const { options: base } = fakeOptions({}, {
+      fs: probe,
+      platform: process.platform,
+      arch: process.arch,
+      nodePath: process.execPath,
+      launcher: { command: entry, prefix: [] },
+    })
+    const options = {
+      ...base,
+      run: (command, args) => {
+        if (command !== process.execPath) return base.run(command === entry ? 'dsh' : command, args)
+        const result = spawnSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000 })
+        return {
+          status: typeof result.status === 'number' ? result.status : 1,
+          stdout: result.stdout ?? '',
+          stderr: result.stderr ?? (result.error instanceof Error ? result.error.message : ''),
+        }
+      },
+    }
+    const native = find(await runChecks(options), 'dsh-native')
+    assert.equal(native.status, 'ok', native.detail)
+    assert.match(native.detail, /started a shell through .*pty\.node$/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('fails when the service profile does not compose', async () => {
@@ -319,6 +602,64 @@ test('mentions signin for a :cloud model', async () => {
   const { options } = fakeOptions({ ollamaShow: { status: 1, stdout: '', stderr: '' } })
   const result = await runChecks(options)
   assert.match(find(result, 'model').detail, /ollama signin/)
+})
+
+test('model: a cloud model that answers reports the seconds it took', async () => {
+  const asked = []
+  const generate = async (model) => {
+    asked.push(model)
+    return { ok: true, status: 200, ms: 1234 }
+  }
+  const result = await runChecks(fakeOptions({}, { generate }).options)
+  const model = find(result, 'model')
+  assert.equal(model.status, 'ok')
+  assert.equal(model.detail, 'deepseek-v4.1-flash:cloud is available and answered a one-token request in 1.2 s')
+  assert.deepEqual(asked, ['deepseek-v4.1-flash:cloud'])
+  assert.equal(result.ok, true)
+})
+
+test('model: a cloud that refuses the request fails with ollama signin', async () => {
+  const generate = async () => ({ ok: false, status: 401, error: 'unauthorized' })
+  const result = await runChecks(fakeOptions({}, { generate }).options)
+  const model = find(result, 'model')
+  assert.equal(model.status, 'fail')
+  assert.match(model.detail, /installed but the cloud refused a request: unauthorized/)
+  assert.equal(model.fix, 'ollama signin')
+  assert.equal(result.ok, false)
+})
+
+test('model: an "unauthorized" error text fails even behind a 500 status', async () => {
+  const generate = async () => ({ ok: false, status: 500, error: 'Unauthorized: please sign in to your account' })
+  const result = await runChecks(fakeOptions({}, { generate }).options)
+  const model = find(result, 'model')
+  assert.equal(model.status, 'fail')
+  assert.match(model.detail, /cloud refused a request/)
+  assert.equal(model.fix, 'ollama signin')
+})
+
+test('model: a timed-out one-token request only warns and still suggests signin', async () => {
+  const generate = async () => ({ ok: false, status: 0, error: 'The operation was aborted due to timeout' })
+  const result = await runChecks(fakeOptions({}, { generate }).options)
+  const model = find(result, 'model')
+  assert.equal(model.status, 'warn')
+  assert.match(model.detail, /installed, but a one-token request failed: The operation was aborted due to timeout/)
+  assert.match(model.fix, /ollama signin/)
+  assert.match(model.fix, /time out/)
+  assert.equal(result.ok, true)
+  assert.equal(result.warnings, 1)
+})
+
+test('model: a non-cloud model never sends a request', async () => {
+  let asked = false
+  const generate = async () => {
+    asked = true
+    return { ok: true, status: 200 }
+  }
+  const result = await runChecks(fakeOptions({}, { generate, model: 'llama3.2' }).options)
+  const model = find(result, 'model')
+  assert.equal(model.status, 'ok')
+  assert.equal(model.detail, 'llama3.2 is available')
+  assert.equal(asked, false)
 })
 
 test('warns when zstd is missing while staying ok', async () => {

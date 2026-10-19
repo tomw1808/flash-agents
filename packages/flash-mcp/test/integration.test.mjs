@@ -207,9 +207,25 @@ test('exposes the tools, none able to select a route', async () => {
     assert.deepEqual(result.tools[1].inputSchema.required, ['tasks'])
     assert.deepEqual(result.tools[2].inputSchema.required, ['patchId'])
     assert.deepEqual(result.tools[3].inputSchema.required, ['patchId'])
+    // `task` and `taskFile` are alternatives the service enforces, so neither is required by
+    // the schema; the file alternative is offered everywhere a task is.
+    assert.deepEqual(result.tools[0].inputSchema.required, ['cwd'])
+    assert.equal(result.tools[0].inputSchema.properties.taskFile.type, 'string')
+    assert.match(result.tools[0].inputSchema.properties.taskFile.description, /resolves against the service root/)
+    const batchItem = result.tools[1].inputSchema.properties.tasks.items.oneOf[1]
+    assert.equal(batchItem.properties.taskFile.type, 'string')
+    assert.equal(batchItem.required, undefined)
     // A writing call's change is opt-in, and the default is to change nothing.
     assert.deepEqual(result.tools[0].inputSchema.properties.apply.enum, ['none', 'auto', 'discard'])
     assert.deepEqual(result.tools[1].inputSchema.properties.apply.enum, ['none', 'auto', 'discard'])
+    // A call may continue from an earlier call's stored patch, and the schema says what that
+    // means: the patch lands in the copy, and the patch this call returns is cumulative.
+    for (const tool of [result.tools[0], result.tools[1]]) {
+      assert.equal(tool.inputSchema.properties.basePatch.type, 'string')
+      assert.match(tool.inputSchema.properties.basePatch.description, /applied to this call's copy before/)
+      assert.match(tool.inputSchema.properties.basePatch.description, /contains both that change and the new work/)
+      assert.match(tool.inputSchema.properties.basePatch.description, /not applied to your tree/)
+    }
     for (const tool of result.tools) {
       assert.equal(tool.inputSchema.additionalProperties, false)
       assert.equal(JSON.stringify(tool.inputSchema).match(/provider|model|reasoning/i), null)
@@ -255,6 +271,27 @@ test('a fleet whose workflow value is unreadable still pairs tasks by member rec
     assert.deepEqual(payload.results.map((entry) => entry.childSessionId !== undefined), [true, true])
     assert.equal(payload.workers.length, 2)
     assert.match(payload.warnings.join('\n'), /come from the engine's member records/)
+  } finally {
+    await server.service.close()
+  }
+})
+
+test('a task brief can be sent from a file, and both task forms at once are refused', async () => {
+  const { server, call, cwd } = await connect()
+  try {
+    writeFileSync(join(cwd, 'brief.md'), '# Brief\n\nDo the thing, once, as written.\n')
+    const single = await call('flash_task', { taskFile: 'brief.md', cwd })
+    assert.equal(single.frame.result.isError, undefined)
+    assert.equal(single.payload.status, 'ok')
+
+    const fleet = await call('flash_batch', { tasks: [{ taskFile: 'brief.md', acceptance: 'done' }], cwd })
+    assert.equal(fleet.frame.result.isError, undefined)
+    assert.equal(fleet.payload.status, 'ok')
+    assert.equal(fleet.payload.requested, 1)
+
+    const both = await call('flash_task', { task: 'inline text', taskFile: 'brief.md', cwd })
+    assert.equal(both.frame.result.isError, true)
+    assert.match(both.payload.error, /task and taskFile cannot both be given/)
   } finally {
     await server.service.close()
   }

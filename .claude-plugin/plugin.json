@@ -1,7 +1,7 @@
 {
   "name": "flash-agents",
   "displayName": "Flash Agents",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "author": {
     "name": "Thomas Wiesner",
     "url": "https://github.com/tomw1808"
@@ -26,7 +26,8 @@
         "FLASH_SERVICE_MODEL": "${user_config.model}",
         "FLASH_SLOTS": "${user_config.slots}",
         "FLASH_ISOLATE": "${user_config.isolate}",
-        "FLASH_STATE_DIR": "${user_config.state_dir}"
+        "FLASH_STATE_DIR": "${user_config.state_dir}",
+        "FLASH_ALLOW_SLOT_SETUP": "${user_config.allow_slot_setup}"
       }
     }
   },
@@ -51,6 +52,13 @@
       "description": "\"copy\" runs every writing call in a disposable copy and returns a patch. \"none\" lets workers write to your repository directly, and leaves the deterministic wall as the only defence.",
       "default": "copy",
       "options": ["copy", "none"]
+    },
+    "allow_slot_setup": {
+      "type": "string",
+      "title": "Run slotSetup commands",
+      "description": "\"on\" lets a repository's .flash-agents.json run its slotSetup commands (uv sync, bun install, …) in each copy before a worker starts. They run on your machine outside the worker sandbox, so only turn this on for repositories you trust.",
+      "default": "off",
+      "options": ["off", "on"]
     },
     "state_dir": {
       "type": "directory",

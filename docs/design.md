@@ -195,18 +195,21 @@ Two doors that start work, and five that only look at, land, or stop work alread
 
 | Tool | Required | Purpose |
 |---|---|---|
-| `flash_task` | `task`, `cwd` | one self-contained task on one worker |
+| `flash_task` | `task` or `taskFile`, `cwd` | one self-contained task on one worker |
 | `flash_batch` | `tasks` | a fleet the caller has already split, one worker per task |
 | `flash_apply` | `patchId` | put the change an earlier call produced into the workspace (`dryRun?`, `force?`, `threeWay?`) |
 | `flash_patch` | `patchId` | read a stored patch whole, by file (`files?`), or by page (`offset?`, `maxChars?`) |
-| `flash_status` | — | the state of one background job (`jobId?`), or of all of them |
-| `flash_result` | `jobId` | a background job's result, waiting up to `waitSeconds?` (≤ 600) for it |
+| `flash_status` | — | the state of one background job (`jobId?`), or a listing: running jobs first, then up to `limit?` (default 10) ended ones; `state?` filters |
+| `flash_result` | `jobId` | a background job's result, waiting up to `waitSeconds?` (≤ 600) for it; `wait.endedBy` says what ended the wait |
 | `flash_cancel` | `jobId` | stop a background job; its tree is retired as on a timeout |
 
 Optional on `flash_task` / `flash_batch`: `acceptance` (one string, or per task in `flash_batch`),
 `cwd`, `mode` (`workspace-write` — the default — or `read-only`), `apply` (`none` — the default —,
 `auto`, or `discard`: report the change, store nothing), `source` (`working-tree` — the default — or
-`head`: start the copy from the last commit, keeping ignored files), and `background` (answer at once
+`head`: start the copy from the last commit, keeping ignored files), `basePatch` (a patchId whose change
+is applied to the copy before the worker starts, merged three ways if the tree moved on; the call's
+own patch is then cumulative and replaces it), `taskFile` (instead of `task`: a file inside the root,
+at most 256 KB, sent exactly as written; per task in `flash_batch`), and `background` (answer at once
 with a job id; the job owns its own abort signal, so the starting request ending cannot cancel it).
 Jobs are in memory: they do not survive a restart, but a finished writing call's work is still
 salvaged as a patch by the next server. There is no model, provider, effort, or permission parameter: the route is not a caller
@@ -265,6 +268,17 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
   is `false` and `change.reason` says why.
 - `isolation.mode` is `copy` for a writing call and `none` for a `read-only` call (which cannot write,
   and therefore reads your real tree instead of a copy of it).
+- `status` is the worker's own, with one exception: a worker that ends with an empty final message
+  and no change comes back as `error` with `emptyResult: true`. An empty message with a change keeps
+  its status, sets `emptyResult`, and warns that the account of the change is missing.
+- `durationMs` is the session's own run time. A call that waited for a free copy reports the wait
+  as `queuedMs`; while it waits, its progress line reads `queued …: waiting for a free tree`.
+- `instructions` (`{ files, bytes, budgetBytes, overBudget, approxTokens }`) is the service's
+  estimate of the project instruction files the harness injected into the worker (`AGENTS.md`,
+  `CLAUDE.md`, their `.local` overlays and `$DSH_HOME/AGENTS.md`, root to cwd). The harness renders
+  at most 64 KB of them, most specific first; over that, a warning says the worker saw only part.
+- `basePatch` (`{ patchId, applied, threeWay, conflicts, note }`) appears when the call continued
+  from a stored patch.
 
 `flash_batch { tasks, cwd?, acceptance?, mode? }` returns one entry per task, **in task order**, so
 `results[i]` always answers `tasks[i]`:
@@ -515,9 +529,13 @@ Honest limits of this design:
   copy's feet. An entry that disappears between listing and copying is skipped and counted (the log
   names how many), not fatal; any other copy failure names the path and suggests a retry.
 - **`.flash-agents.json`** at the root is read once when the server starts. `copyExclude` names
-  paths to leave out — a bare name at any depth, a name with a slash from the root — and a match is
+  paths to leave out — a bare name at any depth, a bare name ending in `*` as a prefix, a name with a
+  slash from the root — and a match is
   honoured only where `git check-ignore` reports it ignored and `git ls-files` lists nothing under it,
-  so tracked source can never go missing and read to the worker as its own deletion. `slotEnv` maps
+  so tracked source can never go missing and read to the worker as its own deletion. `.env`,
+  `.env.*` and `.mcp.json` are on that list by default (`"copyExcludeDefaults": false` removes
+  them); the wall already refuses a worker's read of `.env`, so a copy of one only ever added another
+  file holding the secret. `slotEnv` maps
   environment variables to folders inside the slot: `home:<name>` under `.flash-home/`, emptied every
   call, and `cache:<name>` under `.flash-cache/`, which `prepare` keeps between calls in the same slot
   and retire, sweep and close remove with the slot. Both folders are excluded from the diff like
@@ -534,6 +552,26 @@ Honest limits of this design:
   real index. A nested repository whose `.git` is an absolute symlink is left out of the copy, like a
   linked worktree. An exclusion inside a nested repository is judged by that repository's own
   ignore rules and index.
+- **Symlinks and junctions.** A relative link keeps its text. An absolute link whose target is inside
+  the copied tree is re-pointed at the same path in the copy — verbatim, it named your live tree —
+  and the copy's base is recorded after that, so the re-pointing never shows in a patch or in
+  `uncommittedAtStart`. An absolute link outside the tree keeps its text. On Windows a symlink needs
+  Developer Mode or the symlink privilege; when creating one is refused, a directory link inside the
+  tree becomes a junction to the copy's path (pnpm's `node_modules` is made of them), and any other
+  refused link is left out and logged rather than failing the call.
+- **`port:<base>[/<stride>]`** in `slotEnv` hands each slot `base + slot.id × stride` (stride 10 by
+  default); an entry whose highest slot would pass 65535 is refused at startup.
+- **`slotSetup`** steps (`run` argv, `inputs`, `keep`, `timeoutSeconds`) run after the copy and the
+  `source` reset and before the base patch, asynchronously and in their own process group (a timeout
+  or a cancel kills the whole tree). The base is recorded again after a step ran, so what a step
+  writes is starting state, never the worker's change. A sha256 stamp over argv, platform and the
+  `inputs` lives in `.flash-cache/setup/`; `keep` paths must be ignored and untracked, are left out of
+  the copy, and wait in `.flash-cache/keep/` while the slot is idle. The steps run on the host,
+  outside the sandbox, so they need the server's opt-in (`--allow-slot-setup`,
+  `FLASH_ALLOW_SLOT_SETUP=1`, or the plugin setting); without it every writing result says so.
+- **`flash-agents doctor --copy`** makes one copy of a root the way a writing call would, in a
+  throwaway state directory, and prints its time, size, what was left out and the largest entries.
+  `doctor --e2e` runs one real writing call in a throwaway repository and checks its patch.
 
 #### Applying a patch whose context moved
 
@@ -861,6 +899,11 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
   cleanup; `find . -delete` and `find . -type f -delete` are not, because nothing bounds what they
   reach. If you would rather refuse every deletion that does not name its targets with `rm`, narrow
   `FIND_NARROWING` in the row's source — but expect more denials, not fewer.
+- **Copies are not machines.** Parallel slots share ports, the keyring and every per-user service;
+  a test server on a fixed port can answer another slot's tests.
+- **macOS copies are byte copies.** `COPYFILE_FICLONE_FORCE` returns `ENOSYS` on macOS in Node, so the
+  clone path never runs there and the walk falls back to a plain copy on the first file; size the
+  copy with `copyExclude`, not with APFS clones in mind.
 - **A running task cannot be interrupted.** The SDK protocol has no cancel method, so a cancelled
   MCP request or a timed-out task stops being *waited on* while the session keeps running inside
   Harness, and its later notifications are ignored.

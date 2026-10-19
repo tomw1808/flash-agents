@@ -41,8 +41,13 @@ acceptance, verification and judgement. Everything else goes out.
   copy started with (`isolation.uncommittedAtStart`); when another session has work in progress in
   the same tree, `source: "head"` starts the copy from the last commit instead.
 - Project facts every task would repeat (layout, check commands, style rules) belong in the
-  repository's `AGENTS.md` or `CLAUDE.md`: the harness loads it into every worker. Keep task text
-  for the slice.
+  repository's `AGENTS.md` or `CLAUDE.md`: the harness loads it into every worker, up to 64 KB (the
+  most specific files first; the rest is cut). Keep task text for the slice — but repeat the
+  project's hard rules (no silent defaults, no `unsafe`, …) in the task's checklist: a long
+  instructions file alone does not make them stick.
+- It **builds exactly the brief**, gaps included. A slice built faithfully from a design note with
+  a hole in it ships the hole, well tested. Review the design a brief carries before it goes out,
+  not only the result after.
 - The service root is fixed at the project; `cwd` selects a directory inside it.
 
 ## 2. The loop
@@ -118,9 +123,28 @@ Rules that held up:
   seconds to a minute. Where it is not (a large Rust workspace), the repository's
   `.flash-agents.json` can leave `target/` out of the copy and keep a warm per-slot one instead
   (`"slotEnv": { "CARGO_TARGET_DIR": "cache:cargo-target" }`), and give tools that write to the
-  home folder a writable one (see the README's per-repository settings). Keep the recipe in project memory so every task carries it verbatim.
+  home folder a writable one (see the README's per-repository settings). A project whose tests
+  need an environment built inside the copy (a Python venv with editable installs, `node_modules`)
+  can have it built once per slot with `slotSetup`; ask the user before enabling it, because those
+  commands run outside the sandbox. Keep the recipe in project memory so every task carries it verbatim.
 - **Ask for verbatim output** and for a "deviations" section. Workers use both honestly; that is
-  where the real information is.
+  where the real information is. Every worker is already told to say first when it built a
+  different interface than the task names, to report a contract that looks wrong instead of
+  working around it, and to say why it stopped when it stops early.
+- **Make the tests go through the real entry point.** A test of a security rule must enter where
+  real input enters: one worker "tested" that an agent key cannot send a reviewed post by passing
+  the sender's kind into the store by hand, so the receive path that labelled every sender a person
+  was never run. Ask for that explicitly.
+- **Ask for real-shaped test data**: real id lengths, many items, real sizes. Short made-up ids let
+  a 64-character limit and a 50-character `LIKE` pattern pass every test and fail in production.
+  Add "no cap, prefix or truncation unless the task asks for one" — workers reach for them (a copy
+  count capped at 99, folders named by an 8-character id prefix).
+- **When two slices share a contract built in parallel**, tell both: "if the contract looks wrong,
+  report it and stop that part". Otherwise each works around the flaw its own way and the two
+  sides stop matching.
+- **Send a long brief with `taskFile`**, not pasted: write it to a file inside the repository and
+  pass the path. Never pass shell syntax such as `$(cat brief.md)` as the task — the worker gets
+  that literal text.
 - Use `acceptance` for the one-sentence definition of done; the body carries the how.
 
 ## 4. `flash_task` versus `flash_batch`
@@ -155,8 +179,8 @@ remarks. Then confirm each finding yourself before it enters a fix round.
 
 ## 6. Budgets and what to expect
 
-- Per-task and per-fleet budgets are in `flash.config.json` (an hour and three hours by
-  default). A timed-out call still stores the change so far as a patch and names the refusals it
+- Per-task and per-fleet budgets are in `flash.config.json` (three hours each by default, and
+  ten minutes without any activity stops a stuck call). A timed-out call still stores the change so far as a patch and names the refusals it
   saw; the tree it used is retired, never recycled.
 - A slice of a few hundred lines with tests typically returns in two to six minutes; a coherent
   feature slice of 1,000–1,500 lines with tests in thirty to forty; a fix round of ten findings
@@ -169,6 +193,11 @@ remarks. Then confirm each finding yourself before it enters a fix round.
   waiting. The idle abort at 30 minutes is covered by progress notifications and the plugin's
   own timeout, but a long call still needs the server reconnected after any plugin edit.
 - `NOT_DELEGATED`: the dispatcher did the work itself instead of delegating; re-run the call.
+- A worker that **stopped partway** (it says why, first) left a good start: send the next task
+  with `basePatch: <that patchId>` and say what is left. The copy starts with that change already
+  applied, and the new patch is cumulative — apply it instead of the old one, never both.
+- `emptyResult: true` with `status: "error"`: the worker ended without a report and without a
+  change. Treat it as failed and send the task again.
 - Refusals appear in the result's `denials` and in the log with their reason; a worker that hit
   the wall says so in its reply.
 - The result's `change.diff` is clipped at a file boundary when it is long; `change.diffOmitted`

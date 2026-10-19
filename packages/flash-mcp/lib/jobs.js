@@ -42,7 +42,10 @@ export const JOB_TOOLS = [
       '',
       'With a jobId, returns that job\'s state ("running", "ok", "failed", or "cancelled"), its label,',
       'when it started and (once ended) when it ended, how long it has run, and its most recent',
-      'progress line. Without a jobId, returns every job this server has run, newest first.',
+      'progress line. Without a jobId, lists jobs: the ones still running (newest first), then the',
+      'most recently ended ones, up to `limit` of them (default 10), together with how many are',
+      'running, how many have ended, and how many ended ones were left out. Pass `state: "running"`',
+      'or `state: "ended"` to see only one group, and a larger `limit` (up to 50) to see more.',
       '',
       'This reports status only: it never returns a job\'s result — use flash_result for that. A job',
       'id is meaningful only to the server process that created it, and jobs do not survive a restart.',
@@ -54,7 +57,18 @@ export const JOB_TOOLS = [
       properties: {
         jobId: {
           type: 'string',
-          description: 'The job to report on. Omit it to list every job this server has run.',
+          description: 'The job to report on. Omit it to list jobs: running first, then the recently ended ones.',
+        },
+        state: {
+          type: 'string',
+          enum: ['running', 'ended', 'all'],
+          description: 'Which jobs a listing shows. "all" (the default) is running ones first, then ended ones.',
+        },
+        limit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 50,
+          description: 'How many ended jobs a listing shows at most. Defaults to 10; running jobs are never capped.',
         },
       },
       additionalProperties: false,
@@ -71,13 +85,16 @@ export const JOB_TOOLS = [
       'the job to end — prefer waiting in chunks (e.g. waitSeconds: 300) between other work, so you',
       'stay responsive and can report progress instead of blocking on one long call.',
       '',
-      'If the request carrying this call is cancelled, the wait stops and the job keeps running. A call',
-      'that failed or was cancelled comes back as an error with the same message the synchronous call',
-      'would have produced. A result stays available after it is read, so reading twice returns the same',
-      'thing, but it is kept in memory only: an ended job is dropped six hours after it ended, and once',
-      'more than 50 have ended, results you have already collected and failed or cancelled jobs may be',
-      'evicted sooner. A successful result you have not collected is never evicted by that count. None',
-      'survives a restart — the finished work is salvaged as a patch instead.',
+      'If the request carrying this call is cancelled, the wait stops and the job keeps running; some',
+      'clients cancel a long tool call on their own timeout, so a wait can end before `waitSeconds`.',
+      'The answer\'s `wait.endedBy` says what ended it: "job-ended", "timeout", "request-cancelled", or',
+      '"not-waited". A call that failed or was cancelled comes back as an error with the same message',
+      'the synchronous call would have produced. A result stays available after it is read, so',
+      'reading twice returns the same thing, but it is kept in memory only: an ended job is',
+      'dropped six hours after it ended, and once more than 50 have ended, results you have',
+      'already collected and failed or cancelled jobs may be evicted sooner. A successful result',
+      'you have not collected is never evicted by that count. None survives a restart — the',
+      'finished work is salvaged as a patch instead.',
     ].join('\n'),
     inputSchema: {
       type: 'object',
@@ -242,17 +259,44 @@ export class JobRegistry {
   }
 
   /**
-   * Every job's status, newest first. Ties on start time fall back to start order, so a
-   * test clock that does not advance still lists deterministically.
+   * Job statuses for a status listing: running jobs first, then ended ones, each newest first.
    *
-   * @returns {Array<object>} the statuses.
+   * The registry keeps every job of a long-lived server, so an unfiltered listing grew into
+   * a wall of history while a couple of calls were live. Running jobs are what a caller can
+   * act on, so they always come first and are never capped; ended jobs are capped by `limit`
+   * and reported as omitted when there are more. Ties on start time fall back to start
+   * order, so a test clock that does not advance still lists deterministically.
+   *
+   * @param {object} [options] - what to list.
+   * @param {'running' | 'ended' | 'all'} [options.state] - which jobs to include.
+   * @param {number} [options.limit] - how many ended jobs to include at most.
+   * @returns {Array<object>} the statuses, running first.
    */
-  list() {
+  list({ state = 'all', limit = 10 } = {}) {
     this.#sweep()
-    return [...this.jobs.values()]
-      .map((job, index) => ({ job, index }))
-      .sort((a, b) => b.job.startedMs - a.job.startedMs || b.index - a.index)
-      .map(({ job }) => this.#project(job))
+    const entries = [...this.jobs.values()].map((job, index) => ({ job, index }))
+    const newestFirst = (a, b) => b.job.startedMs - a.job.startedMs || b.index - a.index
+    const running = state === 'ended' ? [] : entries.filter(({ job }) => job.state === 'running').sort(newestFirst)
+    const ended =
+      state === 'running'
+        ? []
+        : entries.filter(({ job }) => job.state !== 'running').sort(newestFirst).slice(0, Math.max(0, limit))
+    return [...running, ...ended].map(({ job }) => this.#project(job))
+  }
+
+  /**
+   * How many jobs are running and how many have ended, after the lazy sweep.
+   *
+   * A status listing reports both alongside the page it shows, so the counts must describe
+   * the registry and not the page: `omittedEnded` is then the difference, honestly.
+   *
+   * @returns {{running: number, ended: number}} the counts.
+   */
+  counts() {
+    this.#sweep()
+    let running = 0
+    for (const job of this.jobs.values()) if (job.state === 'running') running += 1
+    return { running, ended: this.jobs.size - running }
   }
 
   /**
@@ -271,33 +315,45 @@ export class JobRegistry {
   }
 
   /**
-   * Wait for a job to end, up to `waitMs`, or until `signal` aborts. Resolves with the job
-   * either way; the caller reads its state. The timer is unref'd and cleared, so a wait is
-   * never the thing keeping the process alive, and a cancelled request stops waiting at once.
+   * Wait for a job to end, up to `waitMs`, until `signal` aborts, or until the timer expires.
+   *
+   * Resolves with `{ job, endedBy }` either way; the caller reads the job's state and, when
+   * the wait was not the thing that decided the answer, why it stopped. `endedBy` is
+   * `'job-ended'` when the call settled, `'timeout'` when `waitMs` ran out first,
+   * `'request-cancelled'` when the waiting request's signal aborted, and `'not-waited'` when
+   * the job was already over (or gone) before the wait began. The timer is unref'd and
+   * cleared, so a wait is never the thing keeping the process alive, and a cancelled request
+   * stops waiting at once.
    *
    * @param {string} jobId - the job to wait on.
    * @param {number} waitMs - the longest to wait.
    * @param {AbortSignal} [signal] - the waiting request's cancellation.
-   * @returns {Promise<object | undefined>} the job, or undefined when it is gone.
+   * @returns {Promise<{job: object | undefined, endedBy: 'job-ended' | 'timeout' | 'request-cancelled' | 'not-waited'}>}
+   *   the job (or undefined when it is gone) and what ended the wait.
    */
   waitFor(jobId, waitMs, signal) {
     const job = this.get(jobId)
-    if (job === undefined) return Promise.resolve(undefined)
-    if (job.state !== 'running' || waitMs <= 0 || signal?.aborted === true) return Promise.resolve(job)
+    if (job === undefined) return Promise.resolve({ job: undefined, endedBy: 'not-waited' })
+    if (job.state !== 'running' || waitMs <= 0) return Promise.resolve({ job, endedBy: 'not-waited' })
+    if (signal?.aborted === true) return Promise.resolve({ job, endedBy: 'request-cancelled' })
     return new Promise((resolve) => {
       let done = false
-      const finish = () => {
+      const finish = (endedBy) => {
         if (done) return
         done = true
         clearTimeout(timer)
-        signal?.removeEventListener('abort', finish)
-        resolve(this.jobs.get(jobId) ?? job)
+        signal?.removeEventListener('abort', onAbort)
+        resolve({ job: this.jobs.get(jobId) ?? job, endedBy })
       }
-      const timer = setTimeout(finish, waitMs)
+      const onAbort = () => finish('request-cancelled')
+      const timer = setTimeout(() => finish('timeout'), waitMs)
       // A pending wait must never by itself keep the process alive.
       timer.unref?.()
-      signal?.addEventListener('abort', finish, { once: true })
-      job.settled.then(finish, finish)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      job.settled.then(
+        () => finish('job-ended'),
+        () => finish('job-ended'),
+      )
     })
   }
 

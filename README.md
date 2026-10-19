@@ -124,7 +124,14 @@ reports what it changed, and keeps nothing.
 
 Pass `background: true` and a call returns at once with a job id, so Claude can run tests or
 review an earlier patch while workers run; `flash_result` collects the result (and can wait for
-it), `flash_cancel` stops it.
+it), `flash_cancel` stops it. `flash_status` lists running jobs first, then the last few that
+ended; a call still waiting for a free copy says so (`queued … waiting for a free tree`).
+
+A long brief can be written to a file and sent with `taskFile` instead of `task` — exactly as
+written, once. When a worker stopped partway, `basePatch: <its patchId>` starts the next call
+from that work: the patch is applied to the new copy first (merged if your tree moved on), and
+the new call's patch holds both, so you apply only the last one. A call whose worker ends with an empty report and no change comes back as
+`status: "error"` with `emptyResult: true`, not as a quiet success.
 
 Every result reports the tokens the call used (`usage`), and lists any uncommitted files the copy
 started with (`isolation.uncommittedAtStart`). If another session has uncommitted work in the same
@@ -132,7 +139,9 @@ tree, `source: "head"` starts the copy from the last commit instead.
 
 Project facts every worker needs — layout, check commands, style rules — go in an `AGENTS.md` (or
 `CLAUDE.md`) in your repository. The harness loads it into every worker, from the repository root
-down to the worker's directory, so tasks don't have to repeat it.
+down to the worker's directory, so tasks don't have to repeat it. It loads at most **64 KB** of
+these files per worker, the most specific first; a longer file is cut, so keep a short one for
+workers, and repeat the rules that must hold in the brief itself.
 
 ## Safety, in one paragraph
 
@@ -170,15 +179,39 @@ is read when the server starts, so restart Claude Code after changing it.
 ```
 
 - **`copyExclude`** — paths left out of each copy. A bare name matches at any depth (`target`,
-  `node_modules`); a name with a slash is a path from the root. A match is left out only where git
-  ignores it and tracks nothing under it, so source is never dropped. For a Rust workspace with a
-  multi-gigabyte `target/`, this is the difference between a copy that takes half a minute and one
-  that takes a second.
+  `node_modules`), a bare name ending in `*` matches a prefix (`build-*`), and a name with a slash
+  is a path from the root. A match is left out only where git ignores it and tracks nothing under
+  it, so source is never dropped. For a Rust workspace with a multi-gigabyte `target/`, this is the
+  difference between a copy that takes half a minute and one that takes a second.
+- **Secrets are left out by default**: `.env`, `.env.*` and `.mcp.json`, under the same rule (a
+  tracked `.env.example` is still copied). `"copyExcludeDefaults": false` copies them again, for a
+  repository whose tests really need them.
 - **`slotEnv`** — environment variables pointing the worker at writable folders inside its copy,
   for tools that otherwise write to your (read-only, to a worker) home folder. `home:<name>` is
   emptied for every call; `cache:<name>` is kept between calls in the same slot, so
   `CARGO_TARGET_DIR: "cache:cargo-target"` keeps incremental builds warm without copying `target/`.
-  `HOME` and `TMPDIR` can't be moved.
+  `port:<base>` gives each slot its own port base (`base + slot × 10`; `port:41000/100` for a
+  stride of 100), for test servers that would otherwise share a fixed port. `HOME` and `TMPDIR`
+  can't be moved.
+- **`slotSetup`** — commands that build what the copy needs before the worker starts, such as a
+  virtual environment whose editable installs must point into the copy, not into your checkout:
+
+  ```json
+  "slotSetup": [
+    { "run": ["uv", "sync", "--frozen"], "inputs": ["uv.lock", "pyproject.toml"], "keep": [".venv"] },
+    { "run": ["bun", "install", "--frozen-lockfile"], "inputs": ["bun.lock"], "keep": ["node_modules"] }
+  ]
+  ```
+
+  A step runs in the copy on the first call in a slot, and again only when one of its `inputs`
+  changes or a `keep` path is gone; `keep` paths (which must be git-ignored) survive between calls
+  in the same slot and are not copied from your tree. A step with no `keep` runs on every call,
+  since nothing it wrote in the copy survives. `run` is an argv, not a shell line (on Windows
+  a `.cmd` tool needs `["cmd", "/c", …]`); `timeoutSeconds` defaults to 900. A failing step fails
+  the call with its output. **These commands run on your machine outside the worker sandbox**, so
+  they only run when you turn on the plugin setting **Run slotSetup commands** (`/plugin` →
+  flash-agents; `FLASH_ALLOW_SLOT_SETUP=1` or `--allow-slot-setup` for a manual install); otherwise
+  every result says they were skipped.
 
 | Tool | Writes to | Variable to move |
 |---|---|---|
@@ -205,8 +238,17 @@ To watch workers live, set a log file and `tail -f` it — see
   it was written in is emptied as soon as the patch is stored, build output included.
 - **The dispatcher is a cheap model too.** Occasionally it does the work itself instead of
   delegating; that call fails as `NOT_DELEGATED`, nothing from it is kept, and a retry usually works.
-- macOS and Linux. On Windows nothing needs `cp` or `patch` any more and `dsh.cmd` starts, but no
-  worker has run there yet: treat it as experimental.
+- **Copies are separate folders, not separate machines.** Two workers in parallel share ports, the
+  keyring and other per-user services: a test server on a fixed port can answer the other copy's
+  tests. Pick a free port per run.
+- **Parallel slices don't know about each other.** Five workers once picked the same database
+  migration number on one day. Give each parallel slice its own range of numbered files, or number
+  them yourself at apply time.
+- **A nested repository the root's git ignores is read-only in effect**: a worker can edit it in its
+  copy, but the change can't travel in the root's patch. Point `cwd` into that repository to work
+  on it.
+- macOS and Linux are what we test on. Windows 11 works in daily use by at least one user; directory
+  junctions are recreated as junctions inside the copy.
 
 ## Manual install (without the plugin)
 

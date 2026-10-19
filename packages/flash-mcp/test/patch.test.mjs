@@ -107,6 +107,8 @@ class FakeSdkClient {
     this.running = false
     this.cwd = undefined
     this.diagnostics = ''
+    /** Every dispatched prompt, so a test can read what the worker was told. */
+    this.prompts = []
     this.notificationHandlers = new Set()
     this.exitHandlers = new Set()
   }
@@ -121,7 +123,8 @@ class FakeSdkClient {
     return { name: 'fake-runtime', version: '0' }
   }
 
-  async prompt({ sessionId }) {
+  async prompt({ sessionId, text }) {
+    this.prompts.push({ sessionId, text })
     queueMicrotask(() => this.#replay(sessionId))
     return { messageId: 'msg-1' }
   }
@@ -1052,5 +1055,366 @@ test('a threeWay apply over a moved submodule pointer reports no conflict the ca
   assert.deepEqual(applied.conflicts, [])
   assert.equal(readFileSync(join(repo, 'f.txt'), 'utf8'), 'l1\nl2 WORKER\nl3\nl4 ROOT\nl5\nl6\n')
   assert.equal(readFileSync(join(sub, 'inner.txt'), 'utf8'), 'inner\n', 'the merge never moves a checkout')
+  isolation.close()
+})
+
+// ── continuing from a stored patch (basePatch) ───────────────────────────────
+//
+// A worker that stopped partway leaves a patch. The next call can start from it: the patch
+// is planted in that call's copy before the worker runs, and the change the call leaves
+// behind is cumulative — it replaces the base patch for the caller's tree.
+
+/** The plain path of every entry `collect` reported: `STATUS<TAB>path` becomes `path`. */
+function plainNames(change) {
+  return change.filesChanged.map((line) => line.split('\t').at(-1))
+}
+
+/** One patch record as it sits on disk. */
+function readRecord(isolation, patchId) {
+  return JSON.parse(readFileSync(join(isolation.patchDir, `${patchId}.json`), 'utf8'))
+}
+
+test('a base patch lands in the copy, and the collected patch holds both changes', async () => {
+  const repo = makeRepo({ 'a.txt': 'a1\na2\na3\n' })
+  const { isolation } = makePool(repo)
+  const first = await finishedChange(isolation, (dir) => {
+    writeFileSync(join(dir, 'a.txt'), 'a1 CHANGED BY A\na2\na3\n')
+    writeFileSync(join(dir, 'b.txt'), 'made by A\n')
+  })
+  assert.deepEqual(plainNames(first).sort(), ['a.txt', 'b.txt'])
+
+  const slot = await isolation.lease()
+  const prepared = isolation.prepare(slot)
+  // The base is what the *caller's* tree held, read before the base patch is planted.
+  assert.deepEqual(prepared.uncommitted, { count: 0, files: [] })
+  const base = isolation.applyBasePatch(slot, first.patchId)
+  assert.equal(base.applied, true)
+  assert.equal(base.threeWay, false)
+  assert.deepEqual(base.conflicts, [])
+  assert.deepEqual(base.filesChanged.sort(), ['a.txt', 'b.txt'])
+  // The copy holds A's change before the worker starts...
+  assert.equal(readFileSync(join(slot.dir, 'a.txt'), 'utf8'), 'a1 CHANGED BY A\na2\na3\n')
+  assert.equal(readFileSync(join(slot.dir, 'b.txt'), 'utf8'), 'made by A\n')
+  // ...and the caller's tree does not.
+  assert.equal(readFileSync(join(repo, 'a.txt'), 'utf8'), 'a1\na2\na3\n')
+  assert.equal(existsSync(join(repo, 'b.txt')), false)
+  assert.equal(gitOut(repo, 'status', '--porcelain'), '')
+
+  writeFileSync(join(slot.dir, 'a.txt'), 'a1 CHANGED BY A\na2 CHANGED BY B\na3\n')
+  writeFileSync(join(slot.dir, 'c.txt'), 'made by B\n')
+  const change = isolation.collect(slot)
+  assert.equal(change.available, true)
+  assert.deepEqual(plainNames(change).sort(), ['a.txt', 'b.txt', 'c.txt'])
+  const stored = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.match(stored.diff, /a1 CHANGED BY A/)
+  assert.match(stored.diff, /made by A/)
+  assert.match(stored.diff, /made by B/)
+
+  // The base patch reached a throwaway tree, so its record is not marked applied: it is
+  // still the caller's to apply, or to supersede by applying this cumulative one.
+  assert.equal(readRecord(isolation, first.patchId).appliedAt, null)
+  isolation.discard(slot)
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('a base patch three-way merges into the copy when the caller tree moved on nearby', async () => {
+  const repo = makeRepo({ 'f.txt': 'l1\nl2\nl3\nl4\nl5\nl6\n' })
+  const { isolation } = makePool(repo)
+  const first = await finishedChange(isolation, (dir) => {
+    writeFileSync(join(dir, 'f.txt'), 'l1\nl2 WORKER\nl3\nl4\nl5\nl6\n')
+  })
+  // Another session commits a neighbouring line of the same file, so the patch's context no
+  // longer matches and only a merge can land it.
+  writeFileSync(join(repo, 'f.txt'), 'l1\nl2\nl3\nl4 ROOT\nl5\nl6\n')
+  commit(repo, 'the caller moves on')
+
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  const base = isolation.applyBasePatch(slot, first.patchId)
+  assert.equal(base.threeWay, true)
+  assert.deepEqual(base.conflicts, [])
+  assert.equal(readFileSync(join(slot.dir, 'f.txt'), 'utf8'), 'l1\nl2 WORKER\nl3\nl4 ROOT\nl5\nl6\n')
+  assert.equal(readRecord(isolation, first.patchId).appliedAt, null, 'the merge into the copy records nothing')
+  isolation.discard(slot)
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('a conflicting base patch leaves markers in the copy and is never recorded as applied', async () => {
+  const repo = makeRepo({ 'f.txt': 'l1\nl2\nl3\nl4\n' })
+  const { isolation } = makePool(repo)
+  const first = await finishedChange(isolation, (dir) => writeFileSync(join(dir, 'f.txt'), 'l1\nl2 WORKER\nl3\nl4\n'))
+  writeFileSync(join(repo, 'f.txt'), 'l1\nl2 ROOT\nl3\nl4\n')
+  commit(repo, 'the caller takes the same line')
+
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  const base = isolation.applyBasePatch(slot, first.patchId)
+  assert.equal(base.threeWay, true)
+  assert.deepEqual(base.conflicts, ['f.txt'])
+  const copy = readFileSync(join(slot.dir, 'f.txt'), 'utf8')
+  assert.match(copy, /<<<<<<< /)
+  assert.match(copy, /WORKER/)
+  assert.match(copy, /ROOT/)
+  // A conflict in the copy is not an error and not an apply into the caller's tree.
+  assert.equal(readRecord(isolation, first.patchId).appliedAt, null)
+  assert.equal(readFileSync(join(repo, 'f.txt'), 'utf8'), 'l1\nl2 ROOT\nl3\nl4\n')
+  assert.equal(gitOut(repo, 'status', '--porcelain'), '')
+  isolation.discard(slot)
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('a base patch that is unknown, foreign, or from another scope is refused', async () => {
+  const repo = makeRepo({ 'README.md': '# project\n' })
+  const sub = join(repo, 'sub')
+  mkdirSync(sub)
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: sub })
+  writeFileSync(join(sub, 'inner.txt'), 'inner\n')
+  commit(sub, 'inner')
+  commit(repo, 'add sub')
+  const { isolation } = makePool(repo)
+  const scoped = await finishedChange(isolation, (dir) => writeFileSync(join(dir, 'other.txt'), 'root work\n'))
+  const nestedSlot = await isolation.lease()
+  isolation.prepare(nestedSlot, { cwd: sub })
+  writeFileSync(join(nestedSlot.dir, 'sub', 'inner.txt'), 'inner changed\n')
+  const nestedChange = isolation.collect(nestedSlot)
+  isolation.discard(nestedSlot)
+  isolation.release(nestedSlot)
+  // A record naming another repository, as a shared patch directory can hold.
+  const foreignId = `flash-${randomUUID()}`
+  storeRawPatch(isolation, foreignId, 'diff --git a/x b/x\n', [], { root: join(tmpdir(), 'flash-elsewhere') })
+
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  assert.throws(
+    () => isolation.applyBasePatch(slot, `flash-${randomUUID()}`),
+    (error) => /no patch .* is held by this service/.test(error.message),
+  )
+  assert.throws(
+    () => isolation.applyBasePatch(slot, foreignId),
+    (error) => /was computed for .*not for/.test(error.message),
+  )
+  assert.throws(
+    () => isolation.applyBasePatch(slot, nestedChange.patchId),
+    (error) =>
+      /was computed for the repository sub/.test(error.message) &&
+      /this call's cwd resolves to the service root/.test(error.message) &&
+      /same repository as the call/.test(error.message),
+  )
+  // A refusal leaves the copy exactly as `prepare` left it: no patch was planted.
+  assert.equal(readFileSync(join(slot.dir, 'README.md'), 'utf8'), '# project\n')
+  assert.equal(existsSync(join(slot.dir, 'other.txt')), false, 'the refused patches were not applied')
+  isolation.discard(slot)
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('source "head" resets first, then the base patch lands on top', async () => {
+  const repo = makeRepo({ 'f.txt': 'l1\nl2\nl3\nl4\n' })
+  const { isolation } = makePool(repo)
+  const first = await finishedChange(isolation, (dir) => writeFileSync(join(dir, 'f.txt'), 'l1\nl2 FROM A\nl3\nl4\n'))
+  // The caller's tree is dirty with work the call must not pick up; HEAD still holds the
+  // state the base patch was computed from.
+  writeFileSync(join(repo, 'f.txt'), 'l1\nl2 CALLER DIRTY\nl3\nl4\n')
+  writeFileSync(join(repo, 'untracked.txt'), 'caller only\n')
+
+  const slot = await isolation.lease()
+  const prepared = isolation.prepare(slot, { source: 'head' })
+  // The reset happens first, so the base patch is the only uncommitted change in the copy.
+  assert.deepEqual(prepared.uncommitted, { count: 0, files: [] })
+  const base = isolation.applyBasePatch(slot, first.patchId)
+  assert.equal(base.applied, true)
+  assert.equal(readFileSync(join(slot.dir, 'f.txt'), 'utf8'), 'l1\nl2 FROM A\nl3\nl4\n')
+  assert.equal(existsSync(join(slot.dir, 'untracked.txt')), false, 'the reset still leaves the caller’s work out')
+
+  const change = isolation.collect(slot)
+  assert.deepEqual(plainNames(change), ['f.txt'], 'measured from HEAD, so it is the base patch alone')
+  assert.equal(readFileSync(join(repo, 'f.txt'), 'utf8'), 'l1\nl2 CALLER DIRTY\nl3\nl4\n', 'the caller’s tree is untouched')
+  assert.equal(readFileSync(join(repo, 'untracked.txt'), 'utf8'), 'caller only\n')
+  isolation.discard(slot)
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('ignored files a base patch creates are part of the copy’s state, not the worker’s', async () => {
+  const repo = makeRepo({ '.gitignore': 'dist/\n', 'README.md': '# project\n' })
+  const { isolation } = makePool(repo)
+  // `collect` cannot store an ignored file, so this patch is written the way a record from a
+  // repository whose ignore rules differ could hold one.
+  const source = realpathSync(mkdtempSync(join(tmpdir(), 'flash-base-ignored-')))
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: source })
+  mkdirSync(join(source, 'dist'))
+  writeFileSync(join(source, 'dist', 'out.js'), 'built\n')
+  execFileSync('git', ['add', '-A'], { cwd: source })
+  const patchId = `flash-${randomUUID()}`
+  storeRawPatch(isolation, patchId, gitOut(source, 'diff', '--cached', '--binary'), ['A\tdist/out.js'])
+
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  isolation.applyBasePatch(slot, patchId)
+  assert.equal(readFileSync(join(slot.dir, 'dist', 'out.js'), 'utf8'), 'built\n')
+  const change = isolation.collect(slot)
+  // Without a refreshed baseline this reads as "the worker created a path git ignores".
+  assert.deepEqual(change.ignored, [])
+  isolation.discard(slot)
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('flash_task continues from a base patch and stores one cumulative change', async () => {
+  const repo = makeRepo({ 'a.txt': 'a1\na2\na3\n' })
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-base-svc-')))
+  const first = makeIsoService({ root: repo, stateDir, writes: { 'a.txt': 'a1 FROM A\na2\na3\n', 'b.txt': 'made by A\n' } })
+  const done = await first.service.flashTask({ task: 'first half', cwd: repo })
+  assert.equal(done.change.available, true)
+  assert.deepEqual([...done.change.filesChanged].sort(), ['a.txt', 'b.txt'])
+  await first.service.close()
+
+  const second = makeIsoService({ root: repo, stateDir, writes: { 'c.txt': 'made by B\n' } })
+  const result = await second.service.flashTask({ task: 'the rest', cwd: repo, basePatch: done.change.patchId })
+
+  assert.equal(result.basePatch.patchId, done.change.patchId)
+  assert.equal(result.basePatch.applied, true)
+  assert.equal(result.basePatch.threeWay, false)
+  assert.deepEqual(result.basePatch.conflicts, [])
+  assert.match(result.basePatch.note, /cumulative/)
+  // The call's own patch holds A's change and B's, and replaces the base patch.
+  assert.deepEqual([...result.change.filesChanged].sort(), ['a.txt', 'b.txt', 'c.txt'])
+  const stored = second.service.flashPatch({ patchId: result.change.patchId, maxChars: 1_000_000 })
+  assert.match(stored.diff, /a1 FROM A/)
+  assert.match(stored.diff, /made by A/)
+  assert.match(stored.diff, /made by B/)
+  assert.notEqual(result.change.patchId, done.change.patchId)
+  // The caller's tree was never touched, and the base patch's files are not its work in progress.
+  assert.equal(result.isolation.uncommittedAtStart, undefined)
+  assert.equal(readFileSync(join(repo, 'a.txt'), 'utf8'), 'a1\na2\na3\n')
+  assert.equal(existsSync(join(repo, 'b.txt')), false)
+  assert.equal(existsSync(join(repo, 'c.txt')), false)
+  assert.equal(gitOut(repo, 'status', '--porcelain'), '')
+  // The base patch is still the caller's to apply.
+  assert.equal(readRecord(second.service.isolation, done.change.patchId).appliedAt, null)
+
+  // The worker is told what the copy already holds, and to continue rather than redo it.
+  const prompt = second.client.prompts[0].text
+  assert.match(prompt, new RegExp(`The copy already contains the change from an earlier call \\(patch ${done.change.patchId}\\), applied before you started: a\\.txt, b\\.txt\\. Continue from it; do not redo it\\.`))
+  assert.doesNotMatch(prompt, /It did not apply cleanly/)
+  await second.service.close()
+})
+
+test('a conflicting base patch names the file in the result and tells the worker to resolve it', async () => {
+  const repo = makeRepo({ 'f.txt': 'l1\nl2\nl3\nl4\n' })
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-base-conflict-')))
+  const first = makeIsoService({ root: repo, stateDir, writes: { 'f.txt': 'l1\nl2 FROM A\nl3\nl4\n' } })
+  const done = await first.service.flashTask({ task: 'first half', cwd: repo })
+  await first.service.close()
+  writeFileSync(join(repo, 'f.txt'), 'l1\nl2 FROM CALLER\nl3\nl4\n')
+  commit(repo, 'caller takes the line')
+
+  const second = makeIsoService({ root: repo, stateDir, writes: { 'g.txt': 'new work\n' } })
+  const result = await second.service.flashTask({ task: 'the rest', cwd: repo, basePatch: done.change.patchId })
+
+  assert.equal(result.basePatch.threeWay, true)
+  assert.deepEqual(result.basePatch.conflicts, ['f.txt'])
+  assert.match(second.client.prompts[0].text, /It did not apply cleanly: f\.txt hold conflict markers\. Resolve them first\./)
+  // The conflict is inside the copy and reaches the caller only through the cumulative patch.
+  const stored = second.service.flashPatch({ patchId: result.change.patchId, maxChars: 1_000_000 })
+  assert.match(stored.diff, /<<<<<<< /)
+  assert.equal(readFileSync(join(repo, 'f.txt'), 'utf8'), 'l1\nl2 FROM CALLER\nl3\nl4\n')
+  await second.service.close()
+})
+
+test('flash_batch continues every member from the same base patch', async () => {
+  const repo = makeRepo({ 'a.txt': 'a1\n' })
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-base-batch-')))
+  const first = makeIsoService({ root: repo, stateDir, writes: { 'a.txt': 'a1 FROM A\n' } })
+  const done = await first.service.flashTask({ task: 'first half', cwd: repo })
+  await first.service.close()
+
+  const second = makeIsoService({ root: repo, stateDir, writes: { 'b.txt': 'made by the fleet\n' } })
+  const result = await second.service.flashBatch({ tasks: ['one', 'two'], cwd: repo, basePatch: done.change.patchId })
+
+  assert.equal(result.basePatch.patchId, done.change.patchId)
+  assert.equal(result.basePatch.applied, true)
+  // One copy, one collect: the fleet's change is cumulative too.
+  assert.deepEqual([...result.change.filesChanged].sort(), ['a.txt', 'b.txt'])
+  // Every member's prompt carries the paragraph, since they share the copy.
+  assert.equal(second.client.prompts[0].text.match(/The copy already contains the change from an earlier call/g)?.length, 2)
+  assert.equal(readRecord(second.service.isolation, done.change.patchId).appliedAt, null)
+  await second.service.close()
+})
+
+test('a read-only call cannot continue from a base patch', async () => {
+  const repo = makeRepo({ 'a.txt': 'a1\n' })
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-base-readonly-')))
+  const { service } = makeIsoService({ root: repo, stateDir })
+  const patchId = `flash-${randomUUID()}`
+  await assert.rejects(
+    service.flashTask({ task: 'x', cwd: repo, mode: 'read-only', basePatch: patchId }),
+    (error) => error instanceof FlashTaskError && error.code === 'BASE_PATCH_UNAVAILABLE' && /read-only/.test(error.message),
+  )
+  await assert.rejects(
+    service.flashBatch({ tasks: ['x'], cwd: repo, mode: 'read-only', basePatch: patchId }),
+    (error) => error instanceof FlashTaskError && error.code === 'BASE_PATCH_UNAVAILABLE' && /read-only/.test(error.message),
+  )
+  await service.close()
+})
+
+test('the uncommitted-at-start list describes the caller’s tree, not the base patch', async () => {
+  const repo = makeRepo({ 'a.txt': 'a1\n', 'mine.txt': 'committed\n' })
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-base-dirty-')))
+  const first = makeIsoService({ root: repo, stateDir, writes: { 'b.txt': 'made by A\n' } })
+  const done = await first.service.flashTask({ task: 'first half', cwd: repo })
+  await first.service.close()
+  // The caller is mid-edit on a different file when the next call continues from A's patch.
+  writeFileSync(join(repo, 'mine.txt'), 'caller edit\n')
+
+  const second = makeIsoService({ root: repo, stateDir, writes: { 'c.txt': 'made by B\n' } })
+  const result = await second.service.flashTask({ task: 'the rest', cwd: repo, basePatch: done.change.patchId })
+
+  // The base patch's b.txt is the copy's state, not the caller's work in progress.
+  assert.deepEqual(result.isolation.uncommittedAtStart, { count: 1, files: ['mine.txt'] })
+  assert.deepEqual([...result.change.filesChanged].sort(), ['b.txt', 'c.txt'])
+  assert.match(second.client.prompts[0].text, /started with 1 uncommitted change\(s\)/)
+  assert.doesNotMatch(second.client.prompts[0].text, /- b\.txt/)
+  await second.service.close()
+})
+
+test('a base patch that cannot be applied is refused before the worker, and the slot is freed', async () => {
+  const repo = makeRepo({ 'a.txt': 'a1\n' })
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-base-early-')))
+  const { service, client } = makeIsoService({ root: repo, stateDir })
+
+  await assert.rejects(
+    service.flashTask({ task: 'x', cwd: repo, basePatch: `flash-${randomUUID()}` }),
+    (error) => error instanceof FlashTaskError && error.code === 'BASE_PATCH_UNAVAILABLE' && /no patch/.test(error.message),
+  )
+  assert.equal(client.prompts.length, 0, 'the worker was never started')
+  assert.equal(service.isolation.inUse, 0, 'the tree went back to the pool as on any other early failure')
+  await service.close()
+})
+
+test('a base patch with no saved blobs fails the call, naming it and offering a way forward', async () => {
+  const repo = makeRepo({ 'f.txt': 'l1\nl2\nl3\nl4\n' })
+  const { isolation } = makePool(repo)
+  const patchId = `flash-${randomUUID()}`
+  // A record from before blobs were saved, and a patch whose context no longer matches, so
+  // only the three-way merge could land it — and it has no base to merge against.
+  const diff = 'diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n l1\n-l2 OLD\n+l2 NEW\n'
+  storeRawPatch(isolation, patchId, diff, ['M\tf.txt'])
+
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  assert.throws(
+    () => isolation.applyBasePatch(slot, patchId),
+    (error) =>
+      error.message.includes(patchId) &&
+      /not available for a three-way merge/.test(error.message) &&
+      /source: "head"/.test(error.message) &&
+      /flash_apply/.test(error.message),
+  )
+  isolation.discard(slot)
+  isolation.release(slot)
   isolation.close()
 })

@@ -44,7 +44,7 @@
  * @property {string} [patchPath] - where the patch was stored.
  */
 
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import {
   chmodSync,
   constants,
@@ -57,6 +57,7 @@ import {
   readFileSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -105,6 +106,15 @@ const SLOT_CACHE = '.flash-cache'
 const SETTINGS_FILE = '.flash-agents.json'
 
 /**
+ * Names left out of every copy unless a repository opts out with
+ * `"copyExcludeDefaults": false`. They are the usual homes of secrets: a worker has no use
+ * for an access token, and every copy of one is another file holding it on disk. The
+ * git-safety rule still applies, so only an ignored, untracked match is left out; a tracked
+ * `.env.example` is copied as before.
+ */
+export const DEFAULT_COPY_EXCLUDE = Object.freeze(['.env', '.env.*', '.mcp.json'])
+
+/**
  * Environment names a `slotEnv` entry may never name. The runtime's sandbox derives its
  * writable roots from the runtime's own `TMPDIR`, and every toolchain reads its own `HOME`;
  * pointing either at the copy withdrew grants the worker depends on (see `#runLocation` in
@@ -112,8 +122,58 @@ const SETTINGS_FILE = '.flash-agents.json'
  */
 const FORBIDDEN_SLOT_ENV = new Set(['TMPDIR', 'TMP', 'TEMP', 'HOME'])
 
-/** A `slotEnv` value: `home:<name>` or `cache:<name>`, where `<name>` is one path segment. */
+/** A `slotEnv` value pointing at one per-slot directory: `home:<name>` or `cache:<name>`. */
 const SLOT_ENV_VALUE = /^(home|cache):(.+)$/
+
+/**
+ * A `slotEnv` value reserving a range of TCP ports for the slot: `port:<base>` or
+ * `port:<base>/<stride>`. A slot is a separate directory, not a separate machine, so two
+ * workers in parallel otherwise race for the same fixed port; the slot's id selects one
+ * number out of the range and the value is therefore stable for the life of the slot.
+ */
+const PORT_ENV_VALUE = /^port:(\d+)(?:\/(\d+))?$/
+
+/** Smallest port a `port:` entry may hand out; below this is the privileged range. */
+const PORT_BASE_MIN = 1024
+
+/** Largest port that exists. */
+const PORT_BASE_MAX = 65535
+
+/** Smallest and largest gap between consecutive slots' ports. */
+const PORT_STRIDE_MIN = 1
+const PORT_STRIDE_MAX = 10000
+
+/** The gap between slots when `port:<base>` names none. */
+const PORT_STRIDE_DEFAULT = 10
+
+/** How long a `slotSetup` step may run when it does not say. */
+const SETUP_DEFAULT_TIMEOUT_SECONDS = 900
+
+/** The longest a `slotSetup` step may run, whatever it asks for. */
+const SETUP_MAX_TIMEOUT_SECONDS = 3600
+
+/** How much of a setup step's output the failure message keeps, from the end. */
+const SETUP_OUTPUT_TAIL_BYTES = 4096
+/**
+ * How long a step's output pipes get to close after the step itself exited, so a failure's
+ * tail can be read. A background child the step deliberately left running keeps those pipes
+ * open; the step's exit code decides regardless after this.
+ */
+const SETUP_CLOSE_WAIT_MS = 2000
+
+/** Where kept paths wait while the slot is idle, under `.flash-cache`. */
+const SETUP_KEEP_DIR = 'keep'
+
+/** Where setup stamps live, under `.flash-cache`. */
+const SETUP_STAMP_DIR = 'setup'
+
+/**
+ * The one line a server started without `--allow-slot-setup` reports: in its startup log,
+ * and in the warnings of every writing call whose repository configures a setup step.
+ */
+export const SETUP_NOT_ALLOWED_WARNING =
+  '.flash-agents.json configures slotSetup, but this server was not started with --allow-slot-setup (or FLASH_ALLOW_SLOT_SETUP=1), so it did not run'
+
 
 /** Bound on the paths a result names when the copy started dirty. The count is not capped. */
 const UNCOMMITTED_FILES = 100
@@ -962,16 +1022,33 @@ function isGitWorkTree(dir) {
 /**
  * Copy the contents of one directory into another.
  *
- * The clone is attempted first: on APFS (and on filesystems with reflink support)
- * a cloned file shares every block with the source until one side writes, so a large
+ * The clone is attempted first: on a filesystem with reflink support (Btrfs, XFS) a
+ * cloned file shares every block with the source until one side writes, so a large
  * repository copies instantly and costs nothing. The first file that cannot be cloned
- * switches the rest of the tree to a plain copy, which is correct and slower.
+ * switches the rest of the tree to a plain copy, which is correct and slower. On macOS
+ * Node answers the forced clone with ENOSYS even on APFS, so there it is always a copy.
  *
  * This is Node's own copy rather than `cp`, which Windows does not have. It is not
  * `fs.cpSync` either: that rewrites a relative symlink into an absolute one pointing
  * back into the source, so a worker writing through it would reach the caller's tree,
- * and it throws on a socket or a FIFO left in a working tree. Symlinks are copied as
- * they are, and anything that is not a file, a directory, or a symlink is skipped.
+ * and it throws on a socket or a FIFO left in a working tree.
+ *
+ * Symlinks are recreated one at a time. A relative link keeps its text, because the whole
+ * tree moved together and the text still resolves inside the copy. An absolute link that
+ * names a path inside the source is re-pointed at the same path inside the copy: left
+ * verbatim, it would still name the caller's live tree, so a worker reading through it
+ * would read the caller's files and writing through it would reach the caller's tree. An
+ * absolute link that names something outside the source is kept verbatim, since the copy
+ * holds nothing that could take its place.
+ *
+ * On Windows a symlink needs Developer Mode or the symlink privilege, so a directory link
+ * whose plain creation is refused (EPERM/EACCES) becomes a junction instead, which needs
+ * neither; the junction is given an absolute path inside the copy. Any other refused link —
+ * a file link, or a directory outside the copy, where a junction would hand the worker a
+ * write path out of its copy — is left out of the copy and reported rather than failing the
+ * whole call. A junction reads back as `\\?\C:\...`, and that prefix is stripped before the
+ * text is treated as a path. Anything that is not a file, a directory, or a symlink is
+ * skipped.
  *
  * A nested directory whose `.git` is a file pointing outside the source — a linked
  * worktree such as `.claude/worktrees/agent-x`, whose pointer is absolute — is left
@@ -991,15 +1068,21 @@ function isGitWorkTree(dir) {
  * @param {string} to - existing destination directory.
  * @param {object} [options] - copy settings.
  * @param {object} [options.fs] - an `fs`-like override (readdirSync, copyFileSync, readlinkSync,
- *   symlinkSync, mkdirSync). Used by tests to make an entry vanish deterministically.
+ *   symlinkSync, mkdirSync, statSync, realpathSync). Used by tests to make an entry vanish
+ *   deterministically, and to observe the link calls.
+ * @param {string} [options.platform] - `process.platform`; tests pass `'win32'` to exercise
+ *   the junction fallback.
  * @param {string[]} [options.exclude] - normalized exclude entries (see `normalizeExclude`).
  * @param {(relPath: string) => {omit: boolean, reason?: string}} [options.consider] - asked once
  *   per matched path whether it may be left out; the git-safety decision lives with the caller.
  * @returns {{mechanism: 'clone' | 'copy', skipped: string[], vanished: number,
- *   excluded: string[], kept: {path: string, reason?: string}[]}} which mechanism was used, the
- *   directories left out, how many entries vanished mid-walk, and which entries were excluded.
+ *   excluded: string[], kept: {path: string, reason?: string}[], linksRepointed: number,
+ *   repointed: string[], linksSkipped: {path: string, target: string, reason: string}[]}} which mechanism was used,
+ *   the directories left out, how many entries vanished mid-walk, which entries were excluded,
+ *   how many absolute links were re-pointed into the copy, and which links could not be
+ *   recreated for the copy.
  */
-export function copyTree(from, to, { fs = {}, exclude = [], consider } = {}) {
+export function copyTree(from, to, { fs = {}, exclude = [], consider, platform = process.platform } = {}) {
   // FICLONE_FORCE refuses rather than silently copying when the filesystem cannot
   // clone, which is what makes the returned mechanism honest.
   const readdir = fs.readdirSync ?? readdirSync
@@ -1007,10 +1090,16 @@ export function copyTree(from, to, { fs = {}, exclude = [], consider } = {}) {
   const readlink = fs.readlinkSync ?? readlinkSync
   const link = fs.symlinkSync ?? symlinkSync
   const mkdir = fs.mkdirSync ?? mkdirSync
+  const stat = fs.statSync ?? statSync
+  // The native realpath: Node's JavaScript one keeps whatever case it was given, so on a
+  // case-insensitive volume two spellings of one directory would still compare unequal.
+  const realpath = fs.realpathSync ?? realpathSync.native
   let mechanism = 'clone'
   const skipped = []
   const excluded = []
   const kept = []
+  const linksSkipped = []
+  const repointed = []
   let vanished = 0
   const copyFile = (source, target) => {
     if (mechanism === 'clone') {
@@ -1026,6 +1115,97 @@ export function copyTree(from, to, { fs = {}, exclude = [], consider } = {}) {
     }
     write(source, target)
   }
+  // macOS reaches a temp directory through /var, a symlink to /private/var, so the same tree
+  // has two spellings and an absolute link may carry either. Both are computed once here.
+  let realFrom = from
+  try {
+    realFrom = realpath(from)
+  } catch {
+    // A missing source is the walk's error to report, naming the path the caller passed.
+  }
+  /** Whether a resolved link target names a directory, where a junction is possible at all. */
+  const isDirectoryTarget = (target) => {
+    try {
+      return stat(target).isDirectory()
+    } catch {
+      // A dangling link is not a directory: it is skipped rather than becoming a junction
+      // to nothing.
+      return false
+    }
+  }
+  /**
+   * Recreate one symlink in the copy, re-pointing an absolute in-tree target and falling
+   * back to a junction for a Windows directory link.
+   */
+  const copyLink = (sourcePath, targetPath, relPath) => {
+    const raw = readlink(sourcePath)
+    // A Windows junction reads back as `\\?\C:\...`; the prefix spells the same path and is
+    // not part of it.
+    const text = platform === 'win32' && raw.startsWith('\\\\?\\') ? raw.slice(4) : raw
+    // A relative link is resolved against the link's own directory. The copy's own link
+    // resolves against its directory, which mirrors it, so the text can stay as it is.
+    const sourceTarget = isAbsolute(text) ? text : resolve(dirname(sourcePath), text)
+    // "Inside the tree" is decided on the target's real path, not on its text. A
+    // case-insensitive volume spells the same directory with any case, and a symlinked
+    // ancestor spells it through another name; both would have failed a string comparison
+    // and been copied verbatim, so a write through the copy's link reached the caller's
+    // tree. A dangling target has no real path; it keeps the string comparison.
+    let realTarget
+    try {
+      realTarget = realpath(sourceTarget)
+    } catch {
+      realTarget = undefined
+    }
+    const withinTree =
+      realTarget === undefined ? isWithin(from, sourceTarget) || isWithin(realFrom, sourceTarget) : isWithin(realFrom, realTarget)
+    // An absolute link into the caller's tree would still name that tree from inside the
+    // copy; the equivalent path inside the copy is what it must point at.
+    const isRepointed = isAbsolute(text) && withinTree
+    // The in-tree path is taken from the real paths too, so a case variant or an alias
+    // spelling lands at the same place inside the copy.
+    const inTreeRel =
+      realTarget === undefined
+        ? isWithin(from, sourceTarget)
+          ? relative(from, sourceTarget)
+          : relative(realFrom, sourceTarget)
+        : relative(realFrom, realTarget)
+    const newTarget = isRepointed ? join(to, inTreeRel) : text
+    try {
+      link(newTarget, targetPath)
+    } catch (error) {
+      const refused = error?.code === 'EPERM' || error?.code === 'EACCES'
+      if (platform !== 'win32' || !refused) throw error
+      // Windows refuses a symlink without Developer Mode or the symlink privilege; a
+      // junction needs neither. Only a directory target inside the copy may become one: a
+      // junction anywhere else would hand the worker a write path out of its copy.
+      const directory = isDirectoryTarget(sourceTarget)
+      if (!directory || !withinTree) {
+        linksSkipped.push({
+          path: relPath,
+          target: sourceTarget,
+          reason: directory ? 'it names a path outside the copy' : 'a file link needs Developer Mode or the symlink privilege',
+        })
+        return
+      }
+      // Node resolves a junction's relative target against the process cwd, not the link's
+      // directory, so the target handed to the junction is always absolute. The guard above
+      // asked about the source-side target; the junction is created at a different place,
+      // so its own absolute target is checked here as well. A relative link such as
+      // `../repo/pkg` can leave the copy's state directory and re-enter it by name: the
+      // junction would then be a write path outside the copy.
+      const copyTarget = isRepointed ? resolve(newTarget) : resolve(dirname(targetPath), text)
+      if (!isWithin(resolve(to), copyTarget)) {
+        linksSkipped.push({
+          path: relPath,
+          target: copyTarget,
+          reason: 'its target is outside the copy',
+        })
+        return
+      }
+      link(copyTarget, targetPath, 'junction')
+    }
+    if (isRepointed) repointed.push(relPath.split(sep).join('/'))
+  }
   const walk = (source, target, top) => {
     let entries
     try {
@@ -1040,7 +1220,8 @@ export function copyTree(from, to, { fs = {}, exclude = [], consider } = {}) {
       const sourcePath = join(source, entry.name)
       const targetPath = join(target, entry.name)
       const relPath = relative(from, sourcePath)
-      if (matchesExclude(relPath, entry.name, exclude)) {
+      // Exclude entries are written with `/`; on Windows `relative` answers with `\`.
+      if (matchesExclude(relPath.split(sep).join('/'), entry.name, exclude)) {
         const decision = consider === undefined ? { omit: true } : consider(relPath)
         if (decision.omit) {
           excluded.push(relPath)
@@ -1059,7 +1240,7 @@ export function copyTree(from, to, { fs = {}, exclude = [], consider } = {}) {
         } else if (entry.isFile()) {
           copyFile(sourcePath, targetPath)
         } else if (entry.isSymbolicLink()) {
-          link(readlink(sourcePath), targetPath)
+          copyLink(sourcePath, targetPath, relPath)
         }
       } catch (error) {
         if (!isGone(error)) throw error
@@ -1068,7 +1249,21 @@ export function copyTree(from, to, { fs = {}, exclude = [], consider } = {}) {
     }
   }
   walk(from, to, true)
-  return { mechanism, skipped, vanished, excluded, kept }
+  return { mechanism, skipped, vanished, excluded, kept, linksRepointed: repointed.length, repointed, linksSkipped }
+}
+
+/**
+ * Whether one path is a base directory itself or lies inside it.
+ *
+ * `path.relative` is used instead of a string prefix so `/tmp/a` does not contain `/tmp/ab`,
+ * and so a base reached through a symlinked prefix compares correctly.
+ * @param {string} base - the directory.
+ * @param {string} candidate - the path to test.
+ * @returns {boolean} true when `candidate` is `base` or a path under it.
+ */
+function isWithin(base, candidate) {
+  const rel = relative(base, candidate)
+  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`))
 }
 
 /** Whether a throwable is the "the entry is gone" class the copy tolerates. @param {unknown} error */
@@ -1104,7 +1299,8 @@ function normalizeExclude(entries) {
  * Whether one entry of a copied tree is named by an exclude entry.
  *
  * A bare name matches a file or directory of that exact name at any depth (`target`,
- * `node_modules`); a name containing `/` matches one path relative to the copied top. The
+ * `node_modules`), and a bare name ending in `*` matches every name that starts with the
+ * rest (`.env.*`); a name containing `/` matches one path relative to the copied top. The
  * check runs once per directory entry and compares strings — never a git call per file —
  * because the whole point is that a copy stays cheap.
  *
@@ -1117,6 +1313,8 @@ function matchesExclude(relPath, name, exclude) {
   for (const entry of exclude) {
     if (entry.includes('/')) {
       if (entry === relPath) return true
+    } else if (entry.endsWith('*')) {
+      if (name.startsWith(entry.slice(0, -1))) return true
     } else if (entry === name) {
       return true
     }
@@ -1134,7 +1332,8 @@ function matchesExclude(relPath, name, exclude) {
  *
  * @param {string} root - the service root.
  * @param {(message: string) => void} log - where to name a problem.
- * @returns {{copyExclude?: string[], slotEnv?: object}} the settings that did pass.
+ * @returns {{copyExclude?: string[], copyExcludeDefaults?: boolean, slotEnv?: object,
+ *   slotSetup?: object[]}} the settings that did pass.
  */
 function readRepoSettings(root, log) {
   const path = join(root, SETTINGS_FILE)
@@ -1164,12 +1363,31 @@ function readRepoSettings(root, log) {
         continue
       }
       settings.copyExclude = value
+    } else if (key === 'copyExcludeDefaults') {
+      if (typeof value !== 'boolean') {
+        log(`${path}: copyExcludeDefaults must be true or false; ignoring it`)
+        continue
+      }
+      settings.copyExcludeDefaults = value
     } else if (key === 'slotEnv') {
       if (value === null || typeof value !== 'object' || Array.isArray(value) || !Object.values(value).every((entry) => typeof entry === 'string')) {
         log(`${path}: slotEnv must be an object of string values; ignoring it`)
         continue
       }
       settings.slotEnv = value
+    } else if (key === 'slotSetup') {
+      if (!Array.isArray(value)) {
+        log(`${path}: slotSetup must be an array of setup steps; ignoring it`)
+        continue
+      }
+      const steps = []
+      for (const [index, entry] of value.entries()) {
+        const step = readSetupStep(entry, `${path}: slotSetup[${String(index)}]`, log)
+        if (step !== undefined) steps.push(step)
+      }
+      // A setting whose every entry was refused is not a setting at all: keeping an empty
+      // array would make the server announce a setup that can never run.
+      if (steps.length > 0) settings.slotSetup = steps
     } else {
       log(`${path}: ${key} is not a known setting; ignoring it`)
     }
@@ -1178,24 +1396,109 @@ function readRepoSettings(root, log) {
 }
 
 /**
+ * Read one `slotSetup` entry, or drop it with the reason.
+ *
+ * A setup step is host code run with the user's privileges, so its shape is checked
+ * strictly: the argv must be a non-empty array of non-empty strings (there is no shell to
+ * split a command line), every input and kept path must be a plain relative path inside the
+ * repository, and the timeout is a positive number of seconds capped at the maximum. One
+ * bad entry is named and dropped; the other entries still apply.
+ *
+ * @param {unknown} entry - the raw step.
+ * @param {string} label - where the step came from, for the log line.
+ * @param {(message: string) => void} log - where to name a problem.
+ * @returns {{run: string[], inputs: string[], keep: string[], timeoutSeconds: number} | undefined}
+ *   the step, or undefined when it cannot be used.
+ */
+function readSetupStep(entry, label, log) {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+    log(`${label} must be an object; ignoring it`)
+    return undefined
+  }
+  for (const key of Object.keys(entry)) {
+    if (key !== 'run' && key !== 'inputs' && key !== 'keep' && key !== 'timeoutSeconds') {
+      log(`${label}.${key} is not a known setting; ignoring it`)
+    }
+  }
+  if (!Array.isArray(entry.run) || entry.run.length === 0 || !entry.run.every((part) => typeof part === 'string' && part.length > 0)) {
+    log(`${label}.run must be a non-empty array of strings (an argv, not a shell command); ignoring the entry`)
+    return undefined
+  }
+  const paths = (value, field, fallback) => {
+    if (value === undefined) return fallback
+    if (!Array.isArray(value)) {
+      log(`${label}.${field} must be an array of paths relative to the repository; ignoring the entry`)
+      return undefined
+    }
+    const out = []
+    for (const raw of value) {
+      const path = typeof raw === 'string' ? normalizeRepoPath(raw) : undefined
+      if (path === undefined) {
+        log(`${label}.${field} names ${JSON.stringify(raw)}, which is not a relative path inside the repository; ignoring the entry`)
+        return undefined
+      }
+      out.push(path)
+    }
+    return out
+  }
+  const inputs = paths(entry.inputs, 'inputs', [])
+  if (inputs === undefined) return undefined
+  const keep = paths(entry.keep, 'keep', [])
+  if (keep === undefined) return undefined
+  let timeoutSeconds = SETUP_DEFAULT_TIMEOUT_SECONDS
+  if (entry.timeoutSeconds !== undefined) {
+    if (typeof entry.timeoutSeconds !== 'number' || !Number.isFinite(entry.timeoutSeconds) || entry.timeoutSeconds <= 0) {
+      log(`${label}.timeoutSeconds must be a positive number of seconds; ignoring the entry`)
+      return undefined
+    }
+    timeoutSeconds = Math.min(entry.timeoutSeconds, SETUP_MAX_TIMEOUT_SECONDS)
+    if (entry.timeoutSeconds > SETUP_MAX_TIMEOUT_SECONDS) {
+      log(`${label}.timeoutSeconds ${String(entry.timeoutSeconds)} is above the ${String(SETUP_MAX_TIMEOUT_SECONDS)} s maximum; using ${String(SETUP_MAX_TIMEOUT_SECONDS)}`)
+    }
+  }
+  return { run: [...entry.run], inputs, keep, timeoutSeconds }
+}
+
+/**
+ * Normalize one repository-relative path from a setup step, or refuse it.
+ *
+ * The same spelling rules as an exclude entry are used — a leading `./` or `/` and a
+ * trailing `/` are not part of the path — and the result must stay inside the repository.
+ *
+ * @param {string} raw - the raw path.
+ * @returns {string | undefined} the normalized path, or undefined when it is not usable.
+ */
+function normalizeRepoPath(raw) {
+  const text = raw.trim()
+  // Unlike an exclude entry, a setup path is never absolute: `/etc/passwd` is not a
+  // convenient spelling of `etc/passwd` when the program will run on the host.
+  if (text.length === 0 || isAbsolute(text) || /^[A-Za-z]:[\\/]/.test(text) || text.startsWith('\\\\')) return undefined
+  const path = text.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '')
+  return scopeIsSafe(path) ? path : undefined
+}
+
+/**
  * Merge the per-slot environment from the file and the pool options, validating each entry.
  *
  * Options are applied last, so a pool option wins per variable. A name that may not be
- * redirected (see FORBIDDEN_SLOT_ENV), a value that is not `home:<name>`/`cache:<name>` or a
- * `<name>` that is not one path segment is named and dropped; the entry never makes it into
+ * redirected (see FORBIDDEN_SLOT_ENV), a value that is not `home:<name>`, `cache:<name>` or
+ * `port:<base>[/<stride>]`, a `<name>` that is not one path segment, or a port range whose
+ * highest slot would not fit below 65536 is named and dropped; the entry never makes it into
  * the environment the worker boots with.
  *
  * @param {object} fromFile - the `slotEnv` object from the settings file, if any.
  * @param {unknown} fromOptions - the `slotEnv` pool option, if any.
  * @param {(message: string) => void} log - where to name a rejected entry.
- * @returns {Record<string, {kind: 'home' | 'cache', segment: string}>} the accepted entries.
+ * @param {number} slotCount - how many slots the pool has, for the highest-port check.
+ * @returns {Record<string, {kind: 'home' | 'cache', segment: string} |
+ *   {kind: 'port', base: number, stride: number}>} the accepted entries.
  */
-function mergeSlotEnv(fromFile, fromOptions, log) {
+function mergeSlotEnv(fromFile, fromOptions, log, slotCount) {
   const merged = {}
   const apply = (source, label) => {
     if (source === undefined || source === null) return
     if (typeof source !== 'object' || Array.isArray(source)) {
-      log(`ignoring ${label}: slotEnv must be an object of "home:<name>" or "cache:<name>" values`)
+      log(`ignoring ${label}: slotEnv must be an object of "home:<name>", "cache:<name>" or "port:<base>[/<stride>]" values`)
       return
     }
     for (const [name, value] of Object.entries(source)) {
@@ -1206,11 +1509,38 @@ function mergeSlotEnv(fromFile, fromOptions, log) {
         continue
       }
       const match = typeof value === 'string' ? SLOT_ENV_VALUE.exec(value) : null
-      if (match === null || !isPathSegment(match[2])) {
-        log(`ignoring ${label}.${name}: expected "home:<name>" or "cache:<name>" with one path segment, got ${JSON.stringify(value)}`)
+      if (match !== null) {
+        if (!isPathSegment(match[2])) {
+          log(`ignoring ${label}.${name}: expected "home:<name>" or "cache:<name>" with one path segment, got ${JSON.stringify(value)}`)
+          continue
+        }
+        merged[name] = { kind: match[1], segment: match[2] }
         continue
       }
-      merged[name] = { kind: match[1], segment: match[2] }
+      const port = typeof value === 'string' ? PORT_ENV_VALUE.exec(value) : null
+      if (port === null) {
+        log(`ignoring ${label}.${name}: expected "home:<name>", "cache:<name>" or "port:<base>[/<stride>]", got ${JSON.stringify(value)}`)
+        continue
+      }
+      const base = Number(port[1])
+      const stride = port[2] === undefined ? PORT_STRIDE_DEFAULT : Number(port[2])
+      if (!Number.isInteger(base) || base < PORT_BASE_MIN || base > PORT_BASE_MAX) {
+        log(`ignoring ${label}.${name}: the port base must be a whole number in ${String(PORT_BASE_MIN)}..${String(PORT_BASE_MAX)}, got ${String(base)}`)
+        continue
+      }
+      if (!Number.isInteger(stride) || stride < PORT_STRIDE_MIN || stride > PORT_STRIDE_MAX) {
+        log(`ignoring ${label}.${name}: the port stride must be a whole number in ${String(PORT_STRIDE_MIN)}..${String(PORT_STRIDE_MAX)}, got ${String(stride)}`)
+        continue
+      }
+      const highest = base + (slotCount - 1) * stride
+      if (highest > PORT_BASE_MAX) {
+        log(
+          `ignoring ${label}.${name}: port:${String(base)}/${String(stride)} reaches ${String(highest)} at slot ${String(slotCount - 1)}, ` +
+            `past ${String(PORT_BASE_MAX)}`,
+        )
+        continue
+      }
+      merged[name] = { kind: 'port', base, stride }
     }
   }
   apply(fromFile, SETTINGS_FILE)
@@ -1297,9 +1627,11 @@ function enclosingRepository(top, relPath) {
  * much was there even when naming all of it would flood the result.
  *
  * @param {string} dir - a git work tree.
+ * @param {Set<string>} [repointed] - re-pointed links the caller's own tree reports clean,
+ *   as git-style paths; their copy-only change is not the caller's work in progress.
  * @returns {{count: number, files: string[]}} the true count and the first UNCOMMITTED_FILES paths.
  */
-function uncommittedIn(dir) {
+function uncommittedIn(dir, repointed = new Set()) {
   let raw
   try {
     raw = git(['status', '--porcelain=v1', '-z', '--untracked-files=all'], dir)
@@ -1313,11 +1645,46 @@ function uncommittedIn(dir) {
     const entry = entries[index]
     // `XY path`: a rename/copy is followed by its source path as a bare, status-less entry.
     if (entry.length < 4 || entry[2] !== ' ') continue
+    // A link `copyTree` re-pointed into the copy differs from HEAD only because of that, in
+    // the work tree alone; it is not the caller's work in progress. Only the paths the
+    // caller's own tree reports clean are passed here (see `changedInCaller`).
+    if (entry[0] === ' ' && repointed.has(entry.slice(3))) continue
     count += 1
     if (files.length < UNCOMMITTED_FILES) files.push(entry.slice(3))
     if (entry.startsWith('R') || entry.startsWith('C')) index += 1
   }
   return { count, files }
+}
+
+/**
+ * Which re-pointed links the caller had already changed in its own tree.
+ *
+ * `copyTree` re-points absolute links so the copy cannot write back into the caller's tree;
+ * `git status` in the copy therefore lists such a link as modified although the caller did
+ * nothing. Skipping every re-pointed path hid a link the caller had retargeted themselves
+ * before the call, which is real uncommitted work and belongs in the report and the prompt.
+ * One `git status -- <paths>` over just the re-pointed paths tells the two cases apart.
+ *
+ * @param {string} dir - the caller's tree that was copied.
+ * @param {string[]} paths - git-style paths relative to `dir`.
+ * @returns {Set<string>} the paths git lists as changed in the caller's tree.
+ */
+function changedInCaller(dir, paths) {
+  if (paths.length === 0) return new Set()
+  let raw
+  try {
+    raw = git(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ...paths], dir)
+  } catch {
+    // A git that cannot answer must not hide the caller's edit: report every re-pointed
+    // link rather than none.
+    return new Set(paths)
+  }
+  const changed = new Set()
+  for (const entry of raw.split('\0')) {
+    if (entry.length < 4 || entry[2] !== ' ') continue
+    changed.add(entry.slice(3))
+  }
+  return changed
 }
 
 /**
@@ -2147,9 +2514,13 @@ export class WorkspaceIsolation {
    *   owners and trims; 0 turns the timer off.
    * @param {string[]} [options.copyExclude] - names or relative paths left out of the copy
    *   where it is safe; merged over `.flash-agents.json`, options last.
-   * @param {Record<string, string>} [options.slotEnv] - `ENV_NAME: "home:<name>" | "cache:<name>"`
-   *   entries pointing the worker's runtime at writable per-slot directories; options win
-   *   per variable over the settings file.
+   * @param {Record<string, string>} [options.slotEnv] - `ENV_NAME: "home:<name>" | "cache:<name>" |
+   *   "port:<base>[/<stride>]"` entries pointing the worker's runtime at writable per-slot
+   *   directories, or reserving a per-slot port range; options win per variable over the
+   *   settings file.
+   * @param {boolean} [options.allowSlotSetup] - whether the `slotSetup` steps in
+   *   `.flash-agents.json` may run on the host. Off by default: a setup step is host code
+   *   outside the worker's sandbox, so it needs an explicit opt-in.
    * @param {(message: string) => void} [options.log] - progress log.
    */
   constructor({
@@ -2158,6 +2529,7 @@ export class WorkspaceIsolation {
     stateDir,
     copyExclude,
     slotEnv,
+    allowSlotSetup = false,
     patchRetentionDays = PATCH_RETENTION_DAYS,
     maxStateBytes = 0,
     sweepIntervalMs = SWEEP_INTERVAL_MS,
@@ -2183,15 +2555,59 @@ export class WorkspaceIsolation {
     if (copyExclude !== undefined && !Array.isArray(copyExclude)) {
       this.log('ignoring the copyExclude option: it must be an array of strings')
     }
-    this.copyExclude = normalizeExclude([...(settings.copyExclude ?? []), ...(Array.isArray(copyExclude) ? copyExclude : [])])
-    /** Accepted `slotEnv` entries, resolved per slot by `slotEnvFor`. @type {Record<string, {kind: string, segment: string}>} */
-    this.slotEnv = mergeSlotEnv(settings.slotEnv, slotEnv, this.log)
+    const slotCount = Math.max(1, slots)
+    /**
+     * Accepted `slotEnv` entries, resolved per slot by `slotEnvFor`. A `port` entry creates
+     * no directory; its value is derived from `slot.id` alone.
+     *
+     * @type {Record<string, {kind: string, segment?: string, base?: number, stride?: number}>}
+     */
+    this.slotEnv = mergeSlotEnv(settings.slotEnv, slotEnv, this.log, slotCount)
+    /** Whether `.flash-agents.json`'s `slotSetup` steps may run on the host. */
+    this.slotSetupAllowed = allowSlotSetup === true
+    /**
+     * The setup steps that passed validation, in configuration order. A kept path that the
+     * caller's own git does not ignore — or that it tracks — is refused here, so the step
+     * still runs but cannot move tracked source out of the copy.
+     *
+     * @type {{run: string[], inputs: string[], keep: string[], timeoutSeconds: number}[]}
+     */
+    this.slotSetup = (settings.slotSetup ?? []).map((step) => ({
+      ...step,
+      keep: step.keep.filter((relPath) => {
+        const decision = this.#excludeDecision(this.root, relPath)
+        if (decision.omit) return true
+        this.log(
+          `not keeping ${relPath} for slotSetup (${step.run.join(' ')}): ${decision.reason ?? 'it is not ignored'}; ` +
+            'the step still runs, without it',
+        )
+        return false
+      }),
+    }))
+    /** The warning every result carries when steps are configured but not allowed. */
+    this.slotSetupWarning = undefined
+    if (this.slotSetup.length > 0 && !this.slotSetupAllowed) {
+      this.slotSetupWarning = SETUP_NOT_ALLOWED_WARNING
+      this.log(SETUP_NOT_ALLOWED_WARNING)
+    }
+    // A kept path is left out of the copy as well: there is no point copying the caller's
+    // `node_modules` only to replace it with the slot's own.
+    const keptPaths = this.slotSetup.flatMap((step) => step.keep)
+    this.copyExclude = normalizeExclude([
+      ...(settings.copyExcludeDefaults === false ? [] : DEFAULT_COPY_EXCLUDE),
+      ...(settings.copyExclude ?? []),
+      ...(Array.isArray(copyExclude) ? copyExclude : []),
+      ...keptPaths,
+    ])
+    // A default that git keeps (a tracked `.env.example`) is the expected case, not news
+    // worth a log line on every call; only the entries someone asked for are reported.
+    this.namedExclude = normalizeExclude([...(settings.copyExclude ?? []), ...(Array.isArray(copyExclude) ? copyExclude : []), ...keptPaths])
     this.clones = 0
     /** Patches kept for a later `flash_apply`. @type {Map<string, object>} */
     this.patches = new Map()
     /** Callers waiting for a slot, oldest first. @type {Function[]} */
     this.waiting = []
-    this.slots = Array.from({ length: Math.max(1, slots) }, (_, id) => ({
+    this.slots = Array.from({ length: slotCount }, (_, id) => ({
       id,
       dirIndex: 0,
       dir: slotDirectory(this.stateDir, id, 0),
@@ -2324,6 +2740,11 @@ export class WorkspaceIsolation {
   /** How many trees may be in flight at once. */
   get size() {
     return this.slots.length
+  }
+
+  /** How many trees a call holds right now: the slots whose `busy` is true. */
+  get inUse() {
+    return this.slots.filter((slot) => slot.busy).length
   }
 
   /**
@@ -2471,6 +2892,11 @@ export class WorkspaceIsolation {
     // A server that died while this one ran leaves its trees behind; the next call is the
     // cheapest moment to notice, since it is about to need disk anyway.
     this.#sweepDeadOwners()
+    // A kept path still sits inside the previous copy. It belongs to the slot cache, not to
+    // this call's starting state, so it is moved back before the copy is emptied — that is
+    // what makes the next call find it, and what keeps the worker's changes to it across
+    // calls.
+    this.#stashKeepPaths(slot)
     emptyDirectory(slot.dir)
     const scope = repositoryScope(this.root, cwd)
     const repoDir = scope === '' ? slot.dir : join(slot.dir, scope)
@@ -2502,14 +2928,28 @@ export class WorkspaceIsolation {
           'If the tree was changing while it was copied (a build running), a retry usually works.',
       )
     }
-    const { mechanism, skipped, vanished, excluded, kept } = copied
+    const { mechanism, skipped, vanished, excluded, kept, linksRepointed, repointed, linksSkipped } = copied
     if (vanished > 0) {
       this.log(`skipped ${String(vanished)} file(s) that vanished while the copy was made (a build was writing in ${original})`)
     }
     if (skipped.length > 0) {
       this.log(`left ${String(skipped.length)} linked worktree(s) out of the copy, their git state is not this tree's: ${skipped.join(', ')}`)
     }
+    if (linksRepointed > 0) {
+      this.log(`re-pointed ${String(linksRepointed)} absolute symlink(s) at the same path inside the copy, they named ${original}`)
+    }
+    if (linksSkipped.length > 0) {
+      // A worker that cannot see a link it was not told about reads as a missing dependency;
+      // an out-of-tree junction would be worse, a write path back into the caller's tree.
+      this.log(
+        `left ${String(linksSkipped.length)} symlink(s) out of the copy, Windows refused to recreate them ` +
+          '(that needs Developer Mode or the symlink privilege): ' +
+          linksSkipped.map((entry) => `${entry.path} -> ${entry.target} (${entry.reason})`).join(', '),
+      )
+    }
     for (const entry of kept) {
+      const name = entry.path.split(sep).pop()
+      if (!matchesExclude(entry.path.split(sep).join('/'), name, this.namedExclude)) continue
       this.log(`not leaving out ${entry.path}: ${entry.reason ?? 'it is not ignored'}`)
     }
     if (excluded.length > 0) {
@@ -2540,9 +2980,13 @@ export class WorkspaceIsolation {
       detachGitLink(original, repoDir)
       // Exclusions go in *after* the link is detached: a linked worktree gets a fresh .git
       // here, and an exclusion written before that would not be in it. `.flash-tmp` always
-      // exists; `.flash-home` and `.flash-cache` are named only when a `slotEnv` entry
-      // creates them, so an ordinary copy's ignore list stays exactly what it was.
-      const slotNames = Object.keys(this.slotEnv).length === 0 ? [SLOT_TMP] : [SLOT_TMP, SLOT_HOME, SLOT_CACHE]
+      // exists; `.flash-home` is named only when a `slotEnv` entry creates it, and
+      // `.flash-cache` when one does or when a setup step keeps something in the slot, so
+      // an ordinary copy's ignore list stays exactly what it was.
+      const hasDirEnv = Object.values(this.slotEnv).some((spec) => spec.kind !== 'port')
+      const slotNames = [SLOT_TMP]
+      if (hasDirEnv) slotNames.push(SLOT_HOME)
+      if (hasDirEnv || this.slotSetup.length > 0) slotNames.push(SLOT_CACHE)
       for (const name of slotNames) {
         excludeFromDiff(slot.dir, name)
         // A worker told to keep scratch next to its cwd writes inside the copied repository
@@ -2561,43 +3005,64 @@ export class WorkspaceIsolation {
       // What the caller's tree held when the copy was made, read before the base is
       // recorded so the worker's own later work cannot be mixed into it. With `head` the
       // reset above removed it, so the copy starts with nothing uncommitted.
-      slot.uncommitted = uncommittedIn(repoDir)
-      // Record the base without disturbing the copy's index. `git add -A` on the real index
-      // left every uncommitted edit of the caller looking staged in the copy, so workers
-      // reported "pre-existing staged modifications" that were never the caller's index
-      // state. A private index seeded from the real one produces the same tree and leaves
-      // the real index exactly as the caller had it; `#collect` stages the real index later
-      // and diffs against this base, which is unchanged behaviour.
-      const indexFile = join(slot.tmpDir, `base-index-${randomUUID()}`)
-      const realIndex = resolve(repoDir, git(['rev-parse', '--git-path', 'index'], repoDir).trim())
-      let tree
-      try {
-        if (existsSync(realIndex)) copyFileSync(realIndex, indexFile)
-        const env = { ...process.env, GIT_INDEX_FILE: indexFile }
-        git(['add', '-A'], repoDir, env)
-        tree = git(['write-tree'], repoDir, env).trim()
-      } finally {
-        // The temp index is a copy of the caller's and holds nothing worth keeping; a
-        // failure to remove it must not turn a prepared slot into a failed call.
-        rmSync(indexFile, { force: true })
-      }
-      let parent = []
-      try {
-        parent = ['-p', git(['rev-parse', '--verify', '-q', 'HEAD'], repoDir).trim()]
-      } catch {
-        // A repository without a first commit has no parent to name.
-      }
-      slot.base = git([...COMMIT_CONFIG, 'commit-tree', tree, ...parent, '-m', 'flash base'], repoDir).trim()
-      git(['update-ref', BASE_REF, slot.base], repoDir)
-      // Ignored files are invisible to `git add -A`, so a worker that writes only
-      // ignored files would otherwise produce an empty patch and read as "no change".
-      // Recording the ignored set at the base makes the additions detectable later.
-      slot.ignoredBase = ignoredPaths(repoDir)
+      //
+      // A re-pointed link is skipped only when the CALLER's tree reports it clean: the copy
+      // moved it, so the copy's status lists it, but one the caller retargeted themselves is
+      // their uncommitted work and must stay in the report.
+      const callerChanged = changedInCaller(original, repointed)
+      const copyOnly = new Set(repointed.filter((path) => !callerChanged.has(path)))
+      slot.uncommitted = uncommittedIn(repoDir, copyOnly)
+      slot.base = this.#recordBase(slot)
       return { base: slot.base, mechanism, scope, excluded, uncommitted: slot.uncommitted }
     } catch (error) {
       slot.baseReason = `the base state could not be recorded: ${error.message}`
       return { base: null, mechanism, scope, excluded, uncommitted: slot.uncommitted, reason: slot.baseReason }
     }
+  }
+
+  /**
+   * Record where the copy currently is, without disturbing the copy's index.
+   *
+   * `git add -A` on the real index left every uncommitted edit of the caller looking staged
+   * in the copy, so workers reported "pre-existing staged modifications" that were never the
+   * caller's index state. A private index seeded from the real one produces the same tree and
+   * leaves the real index exactly as the caller had it; `#collect` stages the real index
+   * later and diffs against this base, which is unchanged behaviour.
+   *
+   * The ignored set is recorded here as well: ignored files are invisible to `git add -A`,
+   * so a worker that writes only ignored files would otherwise produce an empty patch and
+   * read as "no change". `runSetup` calls this again after a setup step ran (or after a kept
+   * path was restored), so whatever the setup wrote is the copy's starting state and never
+   * the worker's change.
+   *
+   * @param {Slot} slot - a prepared slot whose `repoDir` and `tmpDir` exist.
+   * @returns {string} the base commit id.
+   */
+  #recordBase(slot) {
+    const repoDir = slot.repoDir
+    const indexFile = join(slot.tmpDir, `base-index-${randomUUID()}`)
+    const realIndex = resolve(repoDir, git(['rev-parse', '--git-path', 'index'], repoDir).trim())
+    let tree
+    try {
+      if (existsSync(realIndex)) copyFileSync(realIndex, indexFile)
+      const env = { ...process.env, GIT_INDEX_FILE: indexFile }
+      git(['add', '-A'], repoDir, env)
+      tree = git(['write-tree'], repoDir, env).trim()
+    } finally {
+      // The temp index is a copy of the caller's and holds nothing worth keeping; a
+      // failure to remove it must not turn a prepared slot into a failed call.
+      rmSync(indexFile, { force: true })
+    }
+    let parent = []
+    try {
+      parent = ['-p', git(['rev-parse', '--verify', '-q', 'HEAD'], repoDir).trim()]
+    } catch {
+      // A repository without a first commit has no parent to name.
+    }
+    slot.base = git([...COMMIT_CONFIG, 'commit-tree', tree, ...parent, '-m', 'flash base'], repoDir).trim()
+    git(['update-ref', BASE_REF, slot.base], repoDir)
+    slot.ignoredBase = ignoredPaths(repoDir)
+    return slot.base
   }
 
   /**
@@ -2620,7 +3085,23 @@ export class WorkspaceIsolation {
     // where the path really lives, not in the top repository that merely contains it.
     const repo = enclosingRepository(original, relPath)
     const rel = relative(repo, join(original, relPath)).split(sep).join('/')
-    if (!gitCheckIgnore(repo, rel)) return { omit: false, reason: 'it is not ignored' }
+    // A directory rule such as `node_modules/` does not match a path that does not exist yet
+    // when it is spelled without the slash, and a `slotSetup` keep path is usually exactly
+    // that: configured before the first build created it. The slash variant is only tried as
+    // a fallback where it can mean a directory: a missing path (which a later build may
+    // create as one) or an existing directory. A file of the same name is not a directory
+    // and a `dir/` rule does not ignore it, so the slash variant must not be tried for it —
+    // `git check-ignore cache/` answers "ignored" for a plain FILE named `cache`. A symlink
+    // is not a directory here either: `lstat` does not follow it.
+    let directoryOnly = true
+    try {
+      directoryOnly = lstatSync(join(original, relPath)).isDirectory()
+    } catch {
+      // Missing: the path may well become a directory, so the slash variant applies.
+    }
+    if (!gitCheckIgnore(repo, rel) && !(directoryOnly && gitCheckIgnore(repo, `${rel}/`))) {
+      return { omit: false, reason: 'it is not ignored' }
+    }
     if (gitTracksUnder(repo, rel)) return { omit: false, reason: 'git tracks files there' }
     return { omit: true }
   }
@@ -2639,6 +3120,8 @@ export class WorkspaceIsolation {
   #createSlotEnv(slot) {
     if (Object.keys(this.slotEnv).length === 0) return
     for (const spec of Object.values(this.slotEnv)) {
+      // A port entry reserves a number, not a directory: there is nothing to create.
+      if (spec.kind === 'port') continue
       mkdirSync(join(slot.dir, spec.kind === 'home' ? SLOT_HOME : SLOT_CACHE, spec.segment), { recursive: true })
     }
   }
@@ -2646,19 +3129,466 @@ export class WorkspaceIsolation {
   /**
    * The environment one slot's worker boots with, resolved fresh from `slot.dir`.
    *
-   * The runtime is rooted at `slot.dir`, so these paths are stable for the life of the
-   * slot; `retire` gives the slot a new directory and the next boot resolves new paths.
-   * A fresh object is returned every call, so a runtime cannot mutate the pool's settings.
+   * The runtime is rooted at `slot.dir`, so directory paths are stable for the life of the
+   * slot; `retire` gives the slot a new directory and the next boot resolves new paths. A
+   * `port:` entry resolves from `slot.id` alone, so it is stable across `retire` too. A
+   * fresh object is returned every call, so a runtime cannot mutate the pool's settings.
    *
    * @param {Slot} slot - the slot the worker will run in.
-   * @returns {Record<string, string>} ENV_NAME to absolute path; empty when none is configured.
+   * @returns {Record<string, string>} ENV_NAME to absolute path or decimal port; empty when
+   *   none is configured.
    */
   slotEnvFor(slot) {
     const env = {}
     for (const [name, spec] of Object.entries(this.slotEnv)) {
+      if (spec.kind === 'port') {
+        env[name] = String(spec.base + slot.id * spec.stride)
+        continue
+      }
       env[name] = join(slot.dir, spec.kind === 'home' ? SLOT_HOME : SLOT_CACHE, spec.segment)
     }
     return env
+  }
+
+  /**
+   * The short digest that keys one scope's setup cache.
+   *
+   * A call scoped to a nested repository is a different tree with its own build output, so
+   * its kept paths and stamps must not be confused with the root's: the outer repository's
+   * `node_modules` in the slot would otherwise be handed to the nested copy, and the root's
+   * stamp would skip the nested setup as already run. The whole-root scope keeps the
+   * historical layout with no digest segment.
+   *
+   * @param {string | undefined} scope - a repository path relative to the service root.
+   * @returns {string} a 12-hex-character digest, or `''` for the root.
+   */
+  #scopeDigest(scope) {
+    if (scope === undefined || scope === '') return ''
+    return createHash('sha256').update(scope).digest('hex').slice(0, 12)
+  }
+
+  /**
+   * The directory a step's kept paths wait in while the slot is idle.
+   *
+   * @param {Slot} slot - the slot.
+   * @param {number} index - the step's index.
+   * @param {string} [scope] - the scope the kept copy belongs to; defaults to the slot's
+   *   current one. `#stashKeepPaths` runs before `prepare` changes it, so the default is
+   *   the scope the copy being emptied was made with.
+   * @returns {string} the keep directory for that step and scope.
+   */
+  #keepRoot(slot, index, scope = slot.scope) {
+    const digest = this.#scopeDigest(scope)
+    const base = digest === '' ? [SLOT_CACHE, SETUP_KEEP_DIR] : [SLOT_CACHE, SETUP_KEEP_DIR, digest]
+    return join(slot.dir, ...base, String(index))
+  }
+
+  /**
+   * The stamp file that records the inputs a step last ran with, for one scope.
+   *
+   * @param {Slot} slot - the slot.
+   * @param {number} index - the step's index.
+   * @param {string} [scope] - the scope the stamp belongs to; defaults to the slot's current one.
+   * @returns {string} the stamp path for that step and scope.
+   */
+  #stampPath(slot, index, scope = slot.scope) {
+    const digest = this.#scopeDigest(scope)
+    const base = digest === '' ? [SLOT_CACHE, SETUP_STAMP_DIR] : [SLOT_CACHE, SETUP_STAMP_DIR, digest]
+    return join(slot.dir, ...base, `${String(index)}.stamp`)
+  }
+
+  /**
+   * Whether one kept path may be moved for this particular copy.
+   *
+   * The startup check asks the service root, which is all a pool knows before a call names
+   * its scope. A call in a nested repository has its own ignore rules, so the question is
+   * asked again where the path really lives: moving a tracked directory out of the copy
+   * would make the worker see its deletion, and moving the cache over it would replace the
+   * caller's source in the copy with a stale build.
+   *
+   * @param {Slot} slot - the prepared slot.
+   * @param {string} relPath - the path relative to the copy's repository.
+   * @returns {boolean} true when git ignores the path there and tracks nothing under it.
+   */
+  #keepAllowed(slot, relPath) {
+    const decision = this.#excludeDecision(slot.repoDir, relPath)
+    if (decision.omit) return true
+    this.log(`not moving the kept path ${relPath} for this copy: ${decision.reason ?? 'it is not ignored'}`)
+    return false
+  }
+
+  /**
+   * Whether a kept path is physically inside the copy, so the host may move it.
+   *
+   * `#keepAllowed` asks git (or, outside a work tree, answers without git at all) whether
+   * the path may be left out. That says nothing about where the path really is: with
+   * `node_modules` a symlink to a directory outside the copy, `node_modules/sub` is
+   * "ignored" and a host `rename` would move files out of the caller's tree — or, on a
+   * restore, `rm` them there. A symlink anywhere above the path redirects the move, so the
+   * parent's real path must lie inside the copy's real path, and the kept path itself must
+   * not be a symlink (`lstat`, which does not follow the final component).
+   *
+   * @param {string} repoDir - the copy's repository.
+   * @param {string} relPath - the kept path, relative to `repoDir`.
+   * @returns {boolean} true when moving it can only touch the copy.
+   */
+  #keepPathInCopy(repoDir, relPath) {
+    const full = join(repoDir, relPath)
+    let info
+    try {
+      info = lstatSync(full)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        this.log(`not moving the kept path ${relPath}: it could not be inspected (${messageOf(error)})`)
+        return false
+      }
+      // A missing path is fine for a restore target: it is created inside the copy.
+    }
+    if (info?.isSymbolicLink()) {
+      this.log(`not moving the kept path ${relPath}: it is a symlink, so moving it would move whatever it names`)
+      return false
+    }
+    let real
+    try {
+      real = realpathSync(repoDir)
+    } catch (error) {
+      this.log(`not moving the kept path ${relPath}: the copy could not be resolved (${messageOf(error)})`)
+      return false
+    }
+    // A restore target's parent may not exist yet; the deepest existing ancestor is what a
+    // recursive `mkdir` would follow, and that has to be inside the copy.
+    let parent = dirname(full)
+    for (;;) {
+      try {
+        const realParent = realpathSync(parent)
+        if (isWithin(real, realParent)) return true
+        this.log(`not moving the kept path ${relPath}: its parent resolves to ${realParent}, outside the copy`)
+        return false
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          this.log(`not moving the kept path ${relPath}: its parent could not be resolved (${messageOf(error)})`)
+          return false
+        }
+        const up = dirname(parent)
+        if (up === parent) {
+          this.log(`not moving the kept path ${relPath}: its parent is not inside the copy`)
+          return false
+        }
+        parent = up
+      }
+    }
+  }
+
+  /**
+   * Move a step's kept paths out of the copy and back into the slot cache.
+   *
+   * Called before anything empties the slot (`prepare`'s own `emptyDirectory` and
+   * `discard`), because `.flash-cache` is deliberately preserved across calls and the copy
+   * is not. A path the worker deleted is simply absent; the next setup notices that and
+   * rebuilds it.
+   *
+   * @param {Slot} slot - the slot whose copy is about to be emptied.
+   * @returns {void}
+   */
+  #stashKeepPaths(slot) {
+    if (this.slotSetup.length === 0 || slot.repoDir === undefined) return
+    for (const [index, step] of this.slotSetup.entries()) {
+      for (const relPath of step.keep) {
+        const source = join(slot.repoDir, relPath)
+        if (!existsSync(source) || !this.#keepPathInCopy(slot.repoDir, relPath) || !this.#keepAllowed(slot, relPath)) continue
+        const target = join(this.#keepRoot(slot, index), relPath)
+        try {
+          mkdirSync(dirname(target), { recursive: true })
+          // A stale copy in the cache would make `rename` fail with ENOTEMPTY; the copy in
+          // the slot is the newer one, so it wins.
+          rmSync(target, { recursive: true, force: true })
+          renameSync(source, target)
+        } catch (error) {
+          this.log(`could not move the kept path ${relPath} back into the slot cache: ${messageOf(error)}`)
+        }
+      }
+    }
+  }
+
+  /**
+   * Move a step's kept paths from the slot cache into the copy.
+   *
+   * @param {Slot} slot - the prepared slot.
+   * @param {number} index - the step's index.
+   * @param {object} step - the step.
+   * @returns {number} how many paths were moved.
+   */
+  #restoreKeepPaths(slot, index, step) {
+    let moved = 0
+    for (const relPath of step.keep) {
+      const source = join(this.#keepRoot(slot, index), relPath)
+      if (!existsSync(source) || !this.#keepAllowed(slot, relPath)) continue
+      // The target is in the copy, where a symlinked parent would turn the restore's `rm`
+      // and `rename` into writes outside it; the same physical check as the stash applies.
+      if (!this.#keepPathInCopy(slot.repoDir, relPath)) continue
+      const target = join(slot.repoDir, relPath)
+      try {
+        mkdirSync(dirname(target), { recursive: true })
+        // The copy excluded this path, so anything here is a leftover of a copy that did
+        // not honour the exclusion; the slot's own kept copy is the one that counts.
+        rmSync(target, { recursive: true, force: true })
+        renameSync(source, target)
+        moved += 1
+      } catch (error) {
+        this.log(`could not restore the kept path ${relPath} into the copy: ${messageOf(error)}`)
+      }
+    }
+    return moved
+  }
+
+  /**
+   * The fingerprint a setup step runs against.
+   *
+   * The argv, the platform, the call's scope and the content of every declared input (a
+   * fixed marker when the file is missing) are hashed together. Nothing else is: a step
+   * whose output changed on disk but whose inputs did not has nothing to redo, which is
+   * the point.
+   *
+   * @param {Slot} slot - the prepared slot.
+   * @param {object} step - the step.
+   * @returns {string} the hex digest.
+   */
+  #setupStamp(slot, step) {
+    const hash = createHash('sha256')
+    hash.update(`flash-slot-setup\0${process.platform}\0${slot.scope ?? ''}\0${JSON.stringify(step.run)}\0`)
+    for (const input of step.inputs) {
+      hash.update(`input\0${input}\0`)
+      let content
+      try {
+        content = readFileSync(join(slot.repoDir, input))
+      } catch (error) {
+        // "Missing" is a state worth re-running for when the file appears, so it gets a
+        // marker of its own rather than being skipped.
+        content = Buffer.from(error?.code === 'ENOENT' ? '\0missing\0' : `\0unreadable:${String(error?.code ?? '')}\0`)
+      }
+      hash.update(content)
+    }
+    return hash.digest('hex')
+  }
+
+  /**
+   * Run one setup step, asynchronously, with its output's tail kept for a failure.
+   *
+   * `spawn`, never `spawnSync`: the MCP server must keep answering status calls and sending
+   * progress heartbeats while `uv sync` runs. No shell is involved, so the argv is the argv;
+   * on Windows a `.cmd` program therefore needs `["cmd", "/c", ...]` explicitly.
+   *
+   * @param {object} step - the step to run.
+   * @param {string} repoDir - the copy's repository, the working directory.
+   * @param {Record<string, string>} slotEnv - the slot's environment, on top of `process.env`.
+   * @param {AbortSignal} [signal] - the call's cancellation.
+   * @returns {Promise<void>} resolves when the step exits zero.
+   * @throws {IsolationError} with code `SETUP_FAILED` on a non-zero exit, a spawn failure, a
+   *   timeout or a cancellation.
+   */
+  #runSetupStep(step, repoDir, slotEnv, signal) {
+    const label = `slot setup ${JSON.stringify(step.run)}`
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted === true) {
+        reject(new IsolationError(`${label} was cancelled before it started`, 'SETUP_FAILED'))
+        return
+      }
+      let child
+      try {
+        child = spawn(step.run[0], step.run.slice(1), {
+          cwd: repoDir,
+          env: { ...process.env, ...slotEnv },
+          shell: false,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true,
+          // Its own process group, so a timeout or a cancel can stop everything the step
+          // started: `uv sync` and `bun install` run children of their own, and killing only
+          // the direct process left them writing into the copy and holding its pipes open.
+          detached: process.platform !== 'win32',
+        })
+      } catch (error) {
+        reject(new IsolationError(`${label} could not start: ${messageOf(error)}`, 'SETUP_FAILED'))
+        return
+      }
+      let output = ''
+      const append = (chunk) => {
+        output = (output + chunk.toString()).slice(-SETUP_OUTPUT_TAIL_BYTES)
+      }
+      child.stdout?.on('data', append)
+      child.stderr?.on('data', append)
+      let settled = false
+      let timedOut = false
+      let aborted = false
+      let closeTimer
+      const finish = (error) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        clearTimeout(closeTimer)
+        signal?.removeEventListener?.('abort', onAbort)
+        if (error === undefined) resolve()
+        else reject(error)
+      }
+      const tail = () => {
+        const text = output.trim()
+        return text.length === 0 ? '' : `\n--- last output ---\n${text}`
+      }
+      const killTree = () => {
+        if (process.platform === 'win32') {
+          try {
+            spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
+          } catch {
+            // Fall through to the direct kill below.
+          }
+          child.kill('SIGKILL')
+          return
+        }
+        try {
+          process.kill(-child.pid, 'SIGKILL')
+        } catch {
+          child.kill('SIGKILL')
+        }
+      }
+      const timer = setTimeout(() => {
+        timedOut = true
+        killTree()
+      }, step.timeoutSeconds * 1000)
+      const onAbort = () => {
+        aborted = true
+        killTree()
+      }
+      signal?.addEventListener?.('abort', onAbort, { once: true })
+      // `addEventListener` cannot cover an abort that landed between the check above and
+      // this line, and a signal already aborted must still kill the child.
+      if (signal?.aborted === true) onAbort()
+      // A kill issued before the OS process exists does nothing; repeat it once it does.
+      child.on('spawn', () => {
+        if (timedOut || aborted) killTree()
+      })
+      child.on('error', (error) => {
+        finish(new IsolationError(`${label} could not start: ${messageOf(error)}${tail()}`, 'SETUP_FAILED'))
+      })
+      const settle = (code, killedBy) => {
+        if (timedOut) {
+          finish(new IsolationError(`${label} timed out after ${String(step.timeoutSeconds)} s${tail()}`, 'SETUP_FAILED'))
+          return
+        }
+        if (aborted) {
+          finish(new IsolationError(`${label} was cancelled${tail()}`, 'SETUP_FAILED'))
+          return
+        }
+        if (code !== 0) {
+          const how = code === null ? `was killed by ${String(killedBy)}` : `failed with exit code ${String(code)}`
+          finish(new IsolationError(`${label} ${how}${tail()}`, 'SETUP_FAILED'))
+          return
+        }
+        finish()
+      }
+      child.on('close', (code, killedBy) => {
+        clearTimeout(closeTimer)
+        settle(code, killedBy)
+      })
+      // The step's own exit code is the outcome that matters. A step that deliberately
+      // leaves a background child running hands that child its stdout/stderr pipes, so
+      // `close` can be minutes away; waiting for it used to report a successful step as a
+      // timeout. `exit` settles the step, and the pipes get a short grace period only to
+      // collect the output tail. Nothing is killed here: the step meant to leave that child.
+      child.on('exit', (code, killedBy) => {
+        closeTimer = setTimeout(() => settle(code, killedBy), SETUP_CLOSE_WAIT_MS)
+      })
+    })
+  }
+
+  /**
+   * Run the repository's setup steps in a prepared slot, and make what they wrote the base.
+   *
+   * The steps belong after `prepare`'s copy and `source: "head"` reset and before the base
+   * is recorded, so an editable install's `.pth` files name the copy and a generated file is
+   * part of what the copy started with rather than the worker's change. `prepare` stays
+   * synchronous and records a base first — many callers and tests rely on that — and this
+   * method re-records it after a step ran; the extra `commit-tree` is cheap next to a copy.
+   *
+   * A step is skipped when its stamp matches and its kept paths are present. Kept paths are
+   * restored from the slot cache before the check, and stay in the copy for the worker;
+   * `discard` and the next `prepare` move them back. A step whose `keep` list is empty runs
+   * on every call (`'nothing is kept between calls'`): nothing it wrote survives the copy
+   * being emptied, so its stamp cannot stand for output that is no longer there. A step
+   * whose output instead lives in a `cache:` `slotEnv` folder can keep nothing and accept
+   * the re-run, which is then fast.
+   *
+   * @param {Slot} slot - a slot `prepare` just filled.
+   * @param {object} [options] - run settings.
+   * @param {AbortSignal} [options.signal] - the call's cancellation.
+   * @param {(run: string[]) => void} [options.onStep] - called before each step that runs, so
+   *   the caller can say what the slot is doing.
+   * @returns {Promise<{run: string[], ran: boolean, ms: number, reason: string}[] | undefined>}
+   *   one entry per configured step, or undefined when there are none or they are not allowed.
+   * @throws {IsolationError} with code `SETUP_FAILED` when a step fails, times out or is cancelled.
+   */
+  async runSetup(slot, { signal, onStep } = {}) {
+    if (this.slotSetup.length === 0 || !this.slotSetupAllowed) return undefined
+    if (slot.repoDir === undefined) return undefined
+    const results = []
+    let ranAny = false
+    let restoredAny = false
+    for (const [index, step] of this.slotSetup.entries()) {
+      const moved = this.#restoreKeepPaths(slot, index, step)
+      if (moved > 0) restoredAny = true
+      const stampPath = this.#stampPath(slot, index)
+      let previous
+      try {
+        previous = readFileSync(stampPath, 'utf8').trim()
+      } catch {
+        // No stamp means this step has never run in this slot.
+      }
+      const stamp = this.#setupStamp(slot, step)
+      const keptMissing = step.keep.some((relPath) => !existsSync(join(slot.repoDir, relPath)))
+      let reason
+      // A step that keeps nothing leaves nothing to restore: the next copy is made without
+      // whatever it wrote, so a matching stamp would skip work whose output is not there.
+      // Such a step runs every call. A step whose output lives in a `cache:` slotEnv folder
+      // can list nothing in keep and accept the re-run, which is then fast.
+      if (step.keep.length === 0) reason = 'nothing is kept between calls'
+      else if (previous === undefined) reason = 'first run in this slot'
+      else if (previous !== stamp) reason = 'inputs changed'
+      else if (keptMissing) reason = 'kept path missing'
+      if (reason === undefined) {
+        results.push({ run: [...step.run], ran: false, ms: 0, reason: 'stamp matched' })
+        continue
+      }
+      if (signal?.aborted === true) {
+        throw new IsolationError(`slot setup ${JSON.stringify(step.run)} was cancelled before it started`, 'SETUP_FAILED')
+      }
+      onStep?.(step.run)
+      const started = Date.now()
+      try {
+        await this.#runSetupStep(step, slot.repoDir, this.slotEnvFor(slot), signal)
+      } catch (error) {
+        // A stamp is a promise that the step's output is current; a failure must not leave
+        // one behind, or the next call would skip a step that never finished.
+        rmSync(stampPath, { force: true })
+        throw error
+      }
+      const ms = Date.now() - started
+      mkdirSync(dirname(stampPath), { recursive: true })
+      writeFileSync(stampPath, `${stamp}\n`)
+      ranAny = true
+      results.push({ run: [...step.run], ran: true, ms, reason })
+    }
+    if (ranAny || restoredAny) {
+      // Whatever the setup wrote — tracked or ignored — is where this call starts. Recording
+      // it again keeps it out of the worker's patch and out of the ignored-paths report.
+      if (isGitWorkTree(slot.repoDir)) {
+        try {
+          this.#recordBase(slot)
+        } catch (error) {
+          slot.base = null
+          slot.baseReason = `the base state could not be recorded after the slot setup: ${messageOf(error)}`
+          this.log(slot.baseReason)
+        }
+      }
+    }
+    return results
   }
 
   /**
@@ -2862,15 +3792,98 @@ export class WorkspaceIsolation {
     }
     // A patch computed inside one nested repository applies inside that repository.
     const target = record.scope ? join(this.root, record.scope) : this.root
-    const workTree = isGitWorkTree(target)
+    const filesChanged = plainPaths(record.filesChanged)
+    const diffstat = (record.diffstat ?? '').trim()
+    const outcome = this.#applyTo(record, { target, dryRun, threeWay, mark: !dryRun })
+    return { patchId, dryRun, root: target, filesChanged, diffstat, ...outcome }
+  }
+
+  /**
+   * Leave a stored patch in a call's disposable copy, so this call continues from it.
+   *
+   * A worker that stopped partway leaves a patch; starting the next call from that patch is
+   * cheaper than describing the state again. The record's base was recorded by `prepare`
+   * *before* this runs, so the change this call later collects contains the base patch's
+   * change plus the new work — it replaces the old patch instead of adding to it.
+   *
+   * The patch lands in the copy, never in the caller's tree: the plain apply is tried in the
+   * copy first, then the same index-free three-way merge `apply` uses, with the copy as its
+   * target. Conflicts are therefore not an error here — the copy holds conflict markers in
+   * `conflicts` and the worker is told to resolve them — and the record is deliberately NOT
+   * marked applied: it reached a throwaway tree, not the caller's.
+   *
+   * @param {Slot} slot - a slot `prepare` has already filled.
+   * @param {string} patchId - the stored patch to continue from.
+   * @returns {{patchId: string, applied: true, threeWay: boolean, conflicts: string[],
+   *   filesChanged: string[]}} what landed in the copy.
+   * @throws {Error} when the patch is unknown, belongs to another root or scope, its file is
+   *   gone, or its base is unavailable for the merge the copy needs.
+   */
+  applyBasePatch(slot, patchId) {
+    const record = this.#lookupPatch(patchId)
+    if (!existsSync(record.patchPath)) throw new Error(`the patch file for ${patchId} is gone (${record.patchPath})`)
+    // The copy was made from the scope the call's cwd resolves to, and a patch only means
+    // the same edit inside the repository it was computed in.
+    const scope = slot.scope ?? ''
+    const patchScope = record.scope ?? ''
+    if (patchScope !== scope) {
+      const where = (value) => (value === '' ? 'the service root' : `the repository ${value}`)
+      throw new Error(
+        `patch ${patchId} was computed for ${where(patchScope)}, but this call's cwd resolves to ${where(scope)}; ` +
+          'a base patch must come from the same repository as the call',
+      )
+    }
+    const target = slot.repoDir ?? slot.dir
+    let outcome
+    try {
+      // Always through the merge fallback: the caller's tree may have moved on since the base
+      // patch was collected, and a plain apply is only refused when its context no longer fits.
+      outcome = this.#applyTo(record, { target, threeWay: true, mark: false })
+    } catch (error) {
+      throw new Error(
+        `${messageOf(error)} Continuing from this patch is not possible in the copy. ` +
+          `Pass source: "head" to start from the last commit instead, or apply patch ${patchId} to your tree with flash_apply first.`,
+      )
+    }
+    // The copy's state now includes the base patch's change, so what it started with changed
+    // too: an ignored path the patch created is part of that state, not the worker's work.
+    slot.ignoredBase = ignoredPaths(target)
+    // The copy holds the change whether the patch applied outright, the merge wrote something,
+    // or the merge found the copy already equal to its result. Conflict markers are reported
+    // as conflicts, and the worker is told to resolve them.
+    return {
+      patchId: record.patchId,
+      applied: true,
+      threeWay: outcome.threeWay === true,
+      conflicts: outcome.conflicts ?? [],
+      filesChanged: plainPaths(record.filesChanged),
+    }
+  }
+
+  /**
+   * Apply one patch to one directory: the plain apply first, the three-way merge on request.
+   *
+   * The target is a parameter because two different trees take this path: the caller's tree
+   * (`apply`) and a call's disposable copy (`applyBasePatch`). Only `mark` tells them apart —
+   * it records the apply on the patch record, which belongs to the caller's tree alone.
+   *
+   * @param {object} record - the patch record to apply.
+   * @param {object} options - where, how, and whether to record it.
+   * @param {string} options.target - the directory the patch applies into.
+   * @param {boolean} [options.dryRun] - check that it applies without changing anything.
+   * @param {boolean} [options.threeWay] - merge it when the plain apply fails.
+   * @param {boolean} [options.mark] - record the apply on the patch record.
+   * @returns {{applied: boolean, threeWay: boolean, conflicts: string[], indexTouched: false, note?: string}} the outcome.
+   * @throws {Error} when the patch does not apply, or its base is unavailable for a merge.
+   */
+  #applyTo(record, { target, dryRun = false, threeWay = false, mark = false }) {
     // Without `--index` the caller's index is left alone; only the working tree moves.
     // Outside a repository the target must not discover one enclosing it: paths in the
     // patch would then be read relative to that repository's top instead of to the target.
+    const workTree = isGitWorkTree(target)
     const env = workTree ? undefined : { ...process.env, GIT_CEILING_DIRECTORIES: dirname(target) }
     const applyArgs = ['apply', '--whitespace=nowarn']
     const check = dryRun ? ['--check'] : []
-    const filesChanged = plainPaths(record.filesChanged)
-    const diffstat = (record.diffstat ?? '').trim()
     try {
       git([...applyArgs, ...check, record.patchPath], target, env)
     } catch (plainError) {
@@ -2879,21 +3892,10 @@ export class WorkspaceIsolation {
           `${messageOf(plainError)}. The patch is at ${record.patchPath}; retry with threeWay: true to merge it.`,
         )
       }
-      const merged = this.#threeWayMerge(record, target, { dryRun, plainError })
-      return { patchId, dryRun, root: target, filesChanged, diffstat, ...merged }
+      return this.#threeWayMerge(record, target, { dryRun, plainError, mark })
     }
-    if (!dryRun) this.#markApplied(record)
-    return {
-      patchId,
-      applied: !dryRun,
-      dryRun,
-      root: target,
-      filesChanged,
-      diffstat,
-      threeWay: false,
-      conflicts: [],
-      indexTouched: false,
-    }
+    if (!dryRun && mark) this.#markApplied(record)
+    return { applied: !dryRun, threeWay: false, conflicts: [], indexTouched: false }
   }
 
   /**
@@ -2918,14 +3920,17 @@ export class WorkspaceIsolation {
    * repository's alternates) and only ever written by the final write-back.
    *
    * @param {object} record - the patch record being applied.
-   * @param {string} target - the caller's tree the patch is scoped to.
-   * @param {object} options - the run and the failure to report alongside.
+   * @param {string} target - the tree the patch is applied to: the caller's tree, or a call's
+   *   disposable copy when a base patch is being planted there.
+   * @param {object} options - the run, the failure to report alongside, and whether to record it.
    * @param {boolean} options.dryRun - run the merge but skip the write-back.
    * @param {Error} options.plainError - the plain apply's failure, folded into ours.
+   * @param {boolean} [options.mark] - record the apply on the patch record, which only an
+   *   apply into the caller's tree may do.
    * @returns {{threeWay: true, applied: boolean, conflicts: string[], indexTouched: false, note?: string}} the outcome.
    * @throws {Error} when the base is unavailable, git is too old, or the merge errors.
    */
-  #threeWayMerge(record, target, { dryRun, plainError }) {
+  #threeWayMerge(record, target, { dryRun, plainError, mark = false }) {
     const patchId = record.patchId
     const unavailable =
       `The base of patch ${patchId} is not available for a three-way merge ` +
@@ -3007,10 +4012,14 @@ export class WorkspaceIsolation {
       // apply. The same goes for a difference that is only submodule pointers, which git's
       // three-way merge does not apply at all. A dry run records nothing by definition.
       if (!dryRun && outcome.written) {
-        this.#markApplied(record)
-        if (conflicts.length > 0) {
-          note =
-            'the three-way merge left conflict markers in the working tree; the change is recorded as applied so a second apply is refused'
+        // Only the caller's tree is recorded: a base patch planted in a copy reached a
+        // throwaway tree, and marking it applied would refuse the apply it still deserves.
+        if (mark) {
+          this.#markApplied(record)
+          if (conflicts.length > 0) {
+            note =
+              'the three-way merge left conflict markers in the working tree; the change is recorded as applied so a second apply is refused'
+          }
         }
       } else if (!dryRun) {
         note =
@@ -3393,6 +4402,9 @@ export class WorkspaceIsolation {
    * @returns {void}
    */
   discard(slot) {
+    // A kept path belongs to the slot cache, not to the copy that is about to be thrown
+    // away; moving it back before emptying is what makes the next call in this slot see it.
+    this.#stashKeepPaths(slot)
     emptyDirectory(slot.dir)
     slot.base = null
     slot.scope = undefined

@@ -210,7 +210,8 @@ try {
     const names = tools.tools.map((tool) => tool.name)
     check('boot', 'the task, fleet, patch, and job tools are exposed', JSON.stringify(names) === '["flash_task","flash_batch","flash_apply","flash_patch","flash_status","flash_result","flash_cancel"]', names.join(', '))
     const schema = tools.tools[0].inputSchema
-    check('boot', 'task and cwd are required, acceptance is optional', JSON.stringify(schema.required) === '["task","cwd"]', JSON.stringify(schema.required))
+    // `task` or `taskFile`, exactly one: the service enforces it, so the schema only requires cwd.
+    check('boot', 'cwd is required, and the task comes inline or from a file', JSON.stringify(schema.required) === '["cwd"]' && schema.properties?.task !== undefined && schema.properties?.taskFile !== undefined, JSON.stringify(schema.required))
     const batchSchema = tools.tools[1].inputSchema
     check('boot', 'a fleet is addressed by tasks only', JSON.stringify(batchSchema.required) === '["tasks"]', JSON.stringify(batchSchema.required))
     const properties = [...Object.keys(schema.properties ?? {}), ...Object.keys(batchSchema.properties ?? {})]
@@ -239,8 +240,9 @@ try {
     check('task', 'worker stop reason is reported', typeof payload.stopReason === 'string', String(payload.stopReason))
     check('task', 'result carries the worker final message', typeof payload.result === 'string' && payload.result.length > 0, JSON.stringify(payload.result ?? '').slice(0, 160))
     check('task', 'result carries the child session id', typeof payload.childSessionId === 'string' && payload.childSessionId.length > 0, String(payload.childSessionId))
-    check('task', 'no transcript is returned', payload.children === undefined && Object.keys(payload).every((key) => ['status','stopReason','provider','route','result','resultTruncated','childSessionId','sessionId','durationMs','usage','runtime','warnings','children','mode','isolation','change'].includes(key)), Object.keys(payload).join(', '))
+    check('task', 'no transcript is returned', payload.children === undefined && Object.keys(payload).every((key) => ['status','stopReason','provider','route','result','resultTruncated','emptyResult','childSessionId','sessionId','durationMs','queuedMs','usage','instructions','runtime','warnings','children','mode','isolation','change','basePatch','setup'].includes(key)), Object.keys(payload).join(', '))
     check('task', 'runtime facts are reported', typeof payload.runtime?.pid === 'number' && payload.runtime.sessions === 1, JSON.stringify(payload.runtime))
+    check('task', 'the wait for a tree and the instruction files are reported', typeof payload.queuedMs === 'number' && typeof payload.instructions?.bytes === 'number' && Array.isArray(payload.instructions?.files), JSON.stringify({ queuedMs: payload.queuedMs, instructions: payload.instructions }))
 
     // The worker wrote the file into its own disposable tree — this is the property
     // the whole design rests on, so it is asserted before anything is applied.
@@ -415,6 +417,27 @@ try {
     check('jobs', 'a discarded call reports its change', discarded.payload.change?.filesChanged?.includes(scratch) === true, JSON.stringify(discarded.payload.change?.filesChanged))
     check('jobs', 'a discarded call stores no patch', discarded.payload.change?.stored === false && discarded.payload.change?.patchId === undefined, JSON.stringify({ stored: discarded.payload.change?.stored, patchId: discarded.payload.change?.patchId }))
     check('jobs', 'a discarded call leaves the caller\'s tree alone', !existsSync(join(ROOT, scratch)), scratch)
+    check('jobs', 'a wait says what ended it', result.payload.wait?.endedBy === 'job-ended' || result.payload.wait?.endedBy === 'not-waited', JSON.stringify(result.payload.wait))
+    const listing = await callTool('flash_status', {})
+    check('jobs', 'a job listing carries counts', typeof listing.payload.running === 'number' && typeof listing.payload.ended === 'number' && Array.isArray(listing.payload.jobs), JSON.stringify(listing.payload).slice(0, 160))
+
+    // taskFile, then basePatch: a brief read from a file inside the root, and a second call that
+    // continues from the first one's stored patch and returns one cumulative change.
+    const briefPath = join(ROOT, '.flash-verify-brief.md')
+    const first = 'flash-mcp-base-a.txt'
+    const second = 'flash-mcp-base-b.txt'
+    writeFileSync(briefPath, `Create a file named ${first} containing the line: from the base. Reply done.\n`)
+    let base
+    try {
+      base = await flashTask({ taskFile: briefPath, cwd: ROOT })
+    } finally {
+      rmSync(briefPath, { force: true })
+    }
+    check('jobs', 'a task brief is read from taskFile', base.response.isError !== true && base.payload.change?.filesChanged?.includes(first) === true, JSON.stringify(base.payload.change?.filesChanged ?? base.payload))
+    const continued = await flashTask({ task: `Create a file named ${second} containing the line: on top. Do not touch ${first}. Reply done.`, cwd: ROOT, basePatch: base.payload.change?.patchId })
+    const both = continued.payload.change?.filesChanged ?? []
+    check('jobs', 'a call continued from basePatch returns both changes', continued.response.isError !== true && both.includes(first) && both.includes(second) && continued.payload.basePatch?.patchId === base.payload.change?.patchId, JSON.stringify({ files: both, basePatch: continued.payload.basePatch }))
+    check('jobs', 'continuing from a patch leaves the caller\'s tree alone', !existsSync(join(ROOT, first)) && !existsSync(join(ROOT, second)), `${first}, ${second}`)
   }
 
   if (stage('guard')) {

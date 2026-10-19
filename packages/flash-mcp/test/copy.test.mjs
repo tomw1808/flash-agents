@@ -9,13 +9,15 @@
 
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, symlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import test from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 
-import { WorkspaceIsolation, copyTree } from '../lib/isolation.js'
-import { FlashTaskService, FlashTaskError } from '../lib/service.js'
+import { DEFAULT_COPY_EXCLUDE, SETUP_NOT_ALLOWED_WARNING, WorkspaceIsolation, copyTree } from '../lib/isolation.js'
+import { FlashTaskService, FlashTaskError, buildChildPrompt } from '../lib/service.js'
 import { parseOptions } from '../lib/index.js'
 import { mergeConfig } from '../lib/config.js'
 
@@ -67,6 +69,15 @@ function enoent(path) {
   const error = new Error(`ENOENT: no such file or directory, '${path}'`)
   error.code = 'ENOENT'
   return error
+}
+
+/** A symlink's text, or undefined when nothing was created there (a recorded junction). */
+function readlinkSafe(path) {
+  try {
+    return readlinkSync(path)
+  } catch {
+    return undefined
+  }
 }
 
 // ── entries that vanish mid-copy ────────────────────────────────────────────
@@ -132,6 +143,242 @@ test('copyTree leaves out a nested repository whose .git is a symlink outside th
   assert.deepEqual(result.skipped, ['nested'])
   assert.equal(existsSync(join(to, 'nested')), false)
   assert.equal(existsSync(join(to, 'kept.txt')), true)
+})
+
+// ── symlinks in the copy ────────────────────────────────────────────────────
+
+test('an absolute link to a path inside the tree is re-pointed into the copy', () => {
+  const from = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-from-')))
+  const to = mkdtempSync(join(tmpdir(), 'flash-copy-to-'))
+  mkdirSync(join(from, 'pkg'), { recursive: true })
+  writeFileSync(join(from, 'pkg', 'index.js'), 'dep\n')
+  // A hand-made workspace link, named by absolute path, as a repository that keeps its
+  // dependency elsewhere in the tree does.
+  symlinkSync(join(from, 'pkg'), join(from, 'link'), 'dir')
+
+  const result = copyTree(from, to)
+  // Verbatim, the link would still name the caller's tree, so a worker reading through it
+  // would read the caller's live files and writing through it would reach them.
+  assert.equal(readlinkSync(join(to, 'link')), join(to, 'pkg'))
+  writeFileSync(join(to, 'link', 'written.js'), 'worker\n')
+  assert.equal(readFileSync(join(to, 'pkg', 'written.js'), 'utf8'), 'worker\n', 'a write through the copy’s link lands in the copy')
+  assert.equal(existsSync(join(from, 'pkg', 'written.js')), false, 'the caller’s tree is not reachable through the copy')
+  assert.equal(result.linksRepointed, 1)
+})
+
+test('a relative link keeps its text exactly', () => {
+  const from = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-from-')))
+  const to = mkdtempSync(join(tmpdir(), 'flash-copy-to-'))
+  mkdirSync(join(from, 'pkg'))
+  writeFileSync(join(from, 'pkg', 'index.js'), 'dep\n')
+  mkdirSync(join(from, 'app'))
+  // Relative text resolves inside the copy on its own, because the whole tree moved.
+  symlinkSync('../pkg', join(from, 'app', 'dep'), 'dir')
+
+  const result = copyTree(from, to)
+  assert.equal(readlinkSync(join(to, 'app', 'dep')), '../pkg')
+  assert.equal(readFileSync(join(to, 'app', 'dep', 'index.js'), 'utf8'), 'dep\n')
+  assert.equal(result.linksRepointed, 0)
+})
+
+test('an absolute link to a path outside the tree keeps its text exactly', () => {
+  const from = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-from-')))
+  const to = mkdtempSync(join(tmpdir(), 'flash-copy-to-'))
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-outside-')))
+  mkdirSync(join(outside, 'shared'))
+  writeFileSync(join(outside, 'shared', 'x.txt'), 'shared\n')
+  symlinkSync(join(outside, 'shared'), join(from, 'shared'), 'dir')
+
+  const result = copyTree(from, to)
+  assert.equal(readlinkSync(join(to, 'shared')), join(outside, 'shared'), 'there is nothing in the copy to point at instead')
+  assert.equal(result.linksRepointed, 0)
+})
+
+test('an absolute link spelled through a symlinked ancestor is re-pointed into the copy', () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-alias-')))
+  const from = join(base, 'repo')
+  const to = join(base, 'copy')
+  mkdirSync(join(from, 'pkg'), { recursive: true })
+  mkdirSync(to)
+  writeFileSync(join(from, 'pkg', 'index.js'), 'dep\n')
+  // The same directory spelled through a symlinked ancestor: a plain string comparison
+  // against `from` does not see it as inside the tree, so the link used to be copied
+  // verbatim — and a write through the copy reached the source.
+  symlinkSync(base, join(base, 'alias'), 'dir')
+  symlinkSync(join(base, 'alias', 'repo', 'pkg'), join(from, 'link'), 'dir')
+
+  const result = copyTree(from, to)
+  assert.equal(result.linksRepointed, 1)
+  assert.equal(readlinkSync(join(to, 'link')), join(to, 'pkg'))
+  writeFileSync(join(to, 'link', 'written.js'), 'worker\n')
+  assert.equal(readFileSync(join(to, 'pkg', 'written.js'), 'utf8'), 'worker\n')
+  assert.equal(existsSync(join(from, 'pkg', 'written.js')), false, 'the alias spelling must not reach the caller’s tree')
+})
+
+test('on darwin a link spelled in a different case is re-pointed into the copy', (t) => {
+  if (process.platform !== 'darwin') {
+    t.skip('a case-insensitive volume is a macOS behaviour')
+    return
+  }
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-case-')))
+  const from = join(base, 'repo')
+  const to = join(base, 'copy')
+  mkdirSync(from)
+  mkdirSync(to)
+  writeFileSync(join(from, 'file.txt'), 'source\n')
+  const shout = from.toUpperCase()
+  if (shout === from) {
+    t.skip('the temporary path has no letters to change case')
+    return
+  }
+  // The very same directory as `from`, spelled in upper case. On a case-insensitive volume
+  // the link resolves there, but the string was not `from`, so it used to be copied as-is.
+  symlinkSync(shout, join(from, 'link'), 'dir')
+
+  const result = copyTree(from, to)
+  assert.equal(result.linksRepointed, 1)
+  assert.equal(readlinkSync(join(to, 'link')), to, 'the copy’s link names the copy root')
+  writeFileSync(join(to, 'link', 'written.txt'), 'worker\n')
+  assert.equal(readFileSync(join(to, 'written.txt'), 'utf8'), 'worker\n', 'the write lands in the copy')
+  assert.equal(existsSync(join(from, 'written.txt')), false, 'the caller’s tree is not reachable through the copy')
+})
+
+test('on win32 a refused in-tree directory link becomes a junction, and the rest are left out', () => {
+  const from = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-from-')))
+  const to = mkdtempSync(join(tmpdir(), 'flash-copy-to-'))
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-outside-')))
+  mkdirSync(join(from, 'pkg'))
+  writeFileSync(join(from, 'pkg', 'index.js'), 'dep\n')
+  writeFileSync(join(from, 'target.txt'), 'file\n')
+  symlinkSync(join(from, 'pkg'), join(from, 'in-tree'), 'dir')
+  symlinkSync(outside, join(from, 'out-of-tree'), 'dir')
+  symlinkSync(join(from, 'target.txt'), join(from, 'file-link'), 'file')
+
+  const calls = []
+  // Windows without Developer Mode or the symlink privilege: every plain symlink is
+  // refused, a junction is allowed. The junction is recorded rather than created.
+  const fs = {
+    symlinkSync: (target, path, type) => {
+      calls.push({ target, path, type })
+      if (type !== 'junction') {
+        const error = new Error(`EPERM: operation not permitted, symlink '${target}' -> '${path}'`)
+        error.code = 'EPERM'
+        throw error
+      }
+    },
+  }
+  const result = copyTree(from, to, { fs, platform: 'win32' })
+
+  assert.equal(result.linksRepointed, 1, 'the junction fallback is a re-pointed link')
+  const junctions = calls.filter((call) => call.type === 'junction')
+  assert.equal(junctions.length, 1, `expected one junction, got ${JSON.stringify(calls)}`)
+  assert.equal(junctions[0].target, join(to, 'pkg'), 'a junction gets an absolute path inside the copy')
+  assert.ok(isAbsolute(junctions[0].target))
+  assert.equal(readlinkSafe(join(to, 'in-tree')), undefined, 'the junction was recorded, not created')
+
+  const skipped = Object.fromEntries(result.linksSkipped.map((entry) => [entry.path, entry]))
+  assert.deepEqual(Object.keys(skipped).sort(), ['file-link', 'out-of-tree'])
+  assert.match(skipped['out-of-tree'].reason, /outside the copy/, 'an out-of-tree junction would be a write path out')
+  assert.match(skipped['file-link'].reason, /(Developer Mode|symlink privilege)/)
+  assert.equal(existsSync(join(to, 'out-of-tree')), false)
+  assert.equal(existsSync(join(to, 'file-link')), false)
+})
+
+test('on win32 a junction whose relative target lands outside the copy is left out', () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-junction-')))
+  const from = join(base, 'repo')
+  const to = join(base, 'state', 'copy')
+  mkdirSync(join(from, 'pkg'), { recursive: true })
+  mkdirSync(to, { recursive: true })
+  writeFileSync(join(from, 'pkg', 'index.js'), 'dep\n')
+  // Relative text that leaves the copy's directory and re-enters the caller's tree by name.
+  // The source-side guard sees a directory inside the tree; the junction's own absolute
+  // target, resolved against the link's directory, is outside the copy.
+  symlinkSync('../repo/pkg', join(from, 'link'), 'dir')
+
+  const calls = []
+  const fs = {
+    symlinkSync: (target, path, type) => {
+      calls.push({ target, path, type })
+      if (type !== 'junction') {
+        const error = new Error(`EPERM: operation not permitted, symlink '${target}' -> '${path}'`)
+        error.code = 'EPERM'
+        throw error
+      }
+    },
+  }
+  const result = copyTree(from, to, { fs, platform: 'win32' })
+
+  assert.deepEqual(calls.filter((call) => call.type === 'junction'), [], 'no junction may point outside the copy')
+  assert.equal(result.linksSkipped.length, 1)
+  assert.equal(result.linksSkipped[0].path, 'link')
+  assert.match(result.linksSkipped[0].reason, /its target is outside the copy/)
+  assert.equal(result.linksRepointed, 0)
+  assert.equal(existsSync(join(to, 'link')), false)
+})
+
+test('a non-EPERM symlink error still fails the copy', () => {
+  const from = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-from-')))
+  const to = mkdtempSync(join(tmpdir(), 'flash-copy-to-'))
+  mkdirSync(join(from, 'pkg'))
+  symlinkSync(join(from, 'pkg'), join(from, 'link'), 'dir')
+  const fs = {
+    symlinkSync: () => {
+      const error = new Error('EIO: i/o error, symlink')
+      error.code = 'EIO'
+      throw error
+    },
+  }
+  assert.throws(
+    () => copyTree(from, to, { fs, platform: 'win32' }),
+    (error) => error.code === 'EIO',
+  )
+})
+
+test('a committed absolute in-tree link is re-pointed without appearing in the patch', async () => {
+  const repo = makeRepo()
+  mkdirSync(join(repo, 'pkg'))
+  writeFileSync(join(repo, 'pkg', 'index.js'), 'dep\n')
+  symlinkSync(join(repo, 'pkg'), join(repo, 'link'), 'dir')
+  execFileSync('git', ['add', '-A'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'link'], { cwd: repo })
+
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  assert.equal(readlinkSync(join(slot.dir, 'link')), join(slot.dir, 'pkg'), 'the copy’s link names the copy')
+  // Nor does it read as the caller's uncommitted work: only the copy moved it.
+  assert.deepEqual(slot.uncommitted, { count: 0, files: [] })
+
+  // The base is recorded after the copy was made, so the re-pointed link is part of the
+  // copy's starting state and must not read as the worker's work.
+  const change = isolation.collect(slot)
+  assert.equal(change.available, true)
+  assert.deepEqual(change.filesChanged, [])
+  assert.equal(readlinkSync(join(repo, 'link')), join(repo, 'pkg'), 'the caller’s link is untouched')
+  isolation.close()
+})
+
+test('a caller’s own retarget of a committed absolute link is reported as uncommitted', async () => {
+  const repo = makeRepo()
+  mkdirSync(join(repo, 'pkg'))
+  writeFileSync(join(repo, 'pkg', 'index.js'), 'dep\n')
+  mkdirSync(join(repo, 'other'))
+  writeFileSync(join(repo, 'other', 'index.js'), 'other\n')
+  symlinkSync(join(repo, 'pkg'), join(repo, 'link'), 'dir')
+  execFileSync('git', ['add', '-A'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'link'], { cwd: repo })
+  // The caller retargets the committed link itself before the call. That is real
+  // uncommitted work, not the copy-only re-pointing, and must not be hidden from the report.
+  rmSync(join(repo, 'link'))
+  symlinkSync(join(repo, 'other'), join(repo, 'link'), 'dir')
+
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  const prepared = isolation.prepare(slot)
+  assert.equal(prepared.uncommitted.count, 1)
+  assert.deepEqual(prepared.uncommitted.files, ['link'])
+  isolation.close()
 })
 
 test('prepare names the copy that failed and says a retry helps', async () => {
@@ -233,6 +480,38 @@ test('a matching entry that git tracks is copied anyway, and named', async () =>
   isolation.close()
 })
 
+test('a directory-only ignore rule does not drop an untracked file of that name', async () => {
+  const repo = makeRepo()
+  writeFileSync(join(repo, '.gitignore'), 'cache/\ndir/\n')
+  execFileSync('git', ['add', '.gitignore'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'ignore'], { cwd: repo })
+  // `cache/` is a directory-only rule; a plain file named `cache` is not ignored by it,
+  // although `git check-ignore cache/` answers "ignored" for the file too.
+  writeFileSync(join(repo, 'cache'), 'not ignored\n')
+
+  const logs = []
+  const { isolation } = makePool(repo, { copyExclude: ['cache'], log: (line) => logs.push(line) })
+  const slot = await isolation.lease()
+  const prepared = isolation.prepare(slot)
+  assert.equal(readFileSync(join(slot.dir, 'cache'), 'utf8'), 'not ignored\n', 'the untracked file is copied')
+  assert.equal(prepared.excluded.includes('cache'), false)
+  assert.ok(
+    logs.some((line) => /not leaving out cache: it is not ignored/.test(line)),
+    `expected the file to be named as kept, got ${JSON.stringify(logs)}`,
+  )
+  isolation.close()
+
+  // A path that does not exist yet may still become the directory a `dir/` rule names, so
+  // the slash variant has to keep accepting a not-yet-created keep path.
+  writeFileSync(
+    join(repo, '.flash-agents.json'),
+    JSON.stringify({ slotSetup: [{ run: [process.execPath, '-e', '0'], keep: ['dir'] }] }),
+  )
+  const kept = makePool(repo, { allowSlotSetup: true })
+  assert.deepEqual(kept.isolation.slotSetup[0].keep, ['dir'])
+  kept.isolation.close()
+})
+
 test('a bare name matches at any depth, a path entry matches only that path', async () => {
   const repo = makeExcludeRepo()
   const named = makePool(repo, { copyExclude: ['node_modules'] })
@@ -294,15 +573,53 @@ test('the settings file and the pool option both contribute exclusions', async (
   isolation.close()
 })
 
+test('ignored secrets are left out by default, and a tracked example is still copied', async () => {
+  const repo = makeRepo()
+  writeFileSync(join(repo, '.gitignore'), '.env\n.env.local\n.mcp.json\n')
+  writeFileSync(join(repo, '.env.example'), 'TOKEN=\n')
+  execFileSync('git', ['add', '-A'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'ignore'], { cwd: repo })
+  writeFileSync(join(repo, '.env'), 'TOKEN=secret\n')
+  writeFileSync(join(repo, '.env.local'), 'TOKEN=secret\n')
+  writeFileSync(join(repo, '.mcp.json'), '{"token":"secret"}\n')
+  const logs = []
+  const { isolation } = makePool(repo, { log: (line) => logs.push(line) })
+  const slot = await isolation.lease()
+  const prepared = isolation.prepare(slot)
+  for (const name of ['.env', '.env.local', '.mcp.json']) assert.equal(existsSync(join(slot.dir, name)), false, `${name} is left out`)
+  assert.equal(readFileSync(join(slot.dir, '.env.example'), 'utf8'), 'TOKEN=\n', 'a tracked example is copied')
+  assert.deepEqual([...prepared.excluded].sort(), ['.env', '.env.local', '.mcp.json'])
+  // The tracked example is kept by the default rule, which is expected and not logged.
+  assert.equal(logs.some((line) => line.includes('not leaving out')), false, logs.join('\n'))
+  isolation.close()
+})
+
+test('copyExcludeDefaults: false copies the secrets again, and a trailing * matches a prefix', async () => {
+  const repo = makeRepo()
+  writeFileSync(join(repo, '.gitignore'), '.env\nbuild-*\n')
+  execFileSync('git', ['add', '-A'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'ignore'], { cwd: repo })
+  writeFileSync(join(repo, '.env'), 'TOKEN=dev\n')
+  mkdirSync(join(repo, 'build-debug'))
+  writeFileSync(join(repo, 'build-debug', 'out.o'), 'x')
+  writeFileSync(join(repo, '.flash-agents.json'), JSON.stringify({ copyExcludeDefaults: false, copyExclude: ['build-*'] }))
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  assert.equal(readFileSync(join(slot.dir, '.env'), 'utf8'), 'TOKEN=dev\n')
+  assert.equal(existsSync(join(slot.dir, 'build-debug')), false)
+  isolation.close()
+})
+
 test('a malformed or unknown settings file logs and is ignored', async () => {
   const repo = makeExcludeRepo()
   writeFileSync(join(repo, '.flash-agents.json'), '{ not json')
   const logs = []
   const broken = makePool(repo, { log: (line) => logs.push(line) })
   assert.ok(logs.some((line) => /not valid JSON/.test(line)), `expected a JSON note, got ${JSON.stringify(logs)}`)
-  // The service still starts and prepares with no exclusions.
+  // The service still starts and prepares with only the default exclusions.
   const slot = await broken.isolation.lease()
-  assert.equal(broken.isolation.copyExclude.length, 0)
+  assert.deepEqual(broken.isolation.copyExclude, [...DEFAULT_COPY_EXCLUDE])
   assert.notEqual(broken.isolation.prepare(slot).base, null)
   broken.isolation.close()
 
@@ -415,7 +732,523 @@ test('a slotEnv option wins per variable over the settings file', () => {
   isolation.close()
 })
 
-// ── the copy's git index mirrors the caller's ─────────────────────────────────
+// ── port: slotEnv entries ────────────────────────────────────────────────────
+
+test('port: values resolve from the slot id, with the default and a custom stride', async () => {
+  const repo = makeRepo()
+  const { isolation } = makePool(repo, {
+    slots: 2,
+    slotEnv: { E2E_PORT: 'port:41000', E2E_WIDE: 'port:42000/100' },
+  })
+  const first = await isolation.lease()
+  const second = await isolation.lease()
+  assert.deepEqual(isolation.slotEnvFor(first), { E2E_PORT: '41000', E2E_WIDE: '42000' })
+  assert.deepEqual(isolation.slotEnvFor(second), { E2E_PORT: '41010', E2E_WIDE: '42100' })
+
+  // A port is a number, not a folder: preparing the slot creates no directory for it.
+  isolation.prepare(first)
+  assert.equal(existsSync(join(first.dir, '.flash-home')), false)
+  assert.equal(existsSync(join(first.dir, '.flash-cache')), false)
+
+  // The value depends on the slot id alone, so retiring the directory does not move it.
+  isolation.retire(first)
+  assert.equal(isolation.slotEnvFor(first).E2E_PORT, '41000')
+  isolation.close()
+})
+
+test('an out-of-range port base, stride or highest slot is refused with a log line', () => {
+  const repo = makeRepo()
+  const logs = []
+  const { isolation } = makePool(repo, {
+    slots: 2,
+    slotEnv: {
+      LOW: 'port:80',
+      HIGH: 'port:70000',
+      ZERO_STRIDE: 'port:41000/0',
+      WIDE_STRIDE: 'port:41000/10001',
+      OVER_TOP: 'port:65535/10',
+      NOT_A_PORT: 'port:41000/x',
+    },
+    log: (line) => logs.push(line),
+  })
+  assert.deepEqual(isolation.slotEnv, {})
+  const text = logs.join('\n')
+  assert.match(text, /LOW: the port base must be a whole number in 1024\.\.65535/)
+  assert.match(text, /HIGH: the port base must be a whole number in 1024\.\.65535/)
+  assert.match(text, /ZERO_STRIDE: the port stride must be a whole number in 1\.\.10000/)
+  assert.match(text, /WIDE_STRIDE: the port stride must be a whole number in 1\.\.10000/)
+  assert.match(text, /OVER_TOP: port:65535\/10 reaches 65545 at slot 1, past 65535/)
+  assert.match(text, /NOT_A_PORT: expected "home:<name>", "cache:<name>" or "port:<base>\[\/<stride>\]"/)
+  isolation.close()
+})
+
+test('the prompt names port variables apart from the writable directories', () => {
+  const prompt = buildChildPrompt({
+    cwd: '/w',
+    task: 'run the end-to-end suite',
+    copy: true,
+    uncommitted: { count: 0, files: [] },
+    slotEnv: { E2E_PORT: '41000', CARGO_HOME: '/slot/.flash-home/cargo' },
+    slotPorts: ['E2E_PORT'],
+  })
+  assert.match(prompt, /The environment sets CARGO_HOME to writable per-slot directories; use them for caches and tool state\./)
+  assert.match(prompt, /E2E_PORT hold a port base reserved for this slot; use ports from there instead of fixed ones\./)
+  assert.doesNotMatch(prompt, /The environment sets .*E2E_PORT/)
+  assert.doesNotMatch(prompt, /E2E_PORT.*writable per-slot directories/)
+})
+
+
+// ── slotSetup: commands run in the copy before the worker ────────────────────
+
+/**
+ * The setup program used by the tests: it records one run in a counter outside the
+ * repository (through an environment variable) and builds the kept `node_modules`
+ * directory inside the copy. `process.execPath -e <script>` needs no uv or bun.
+ */
+const SETUP_SCRIPT = `
+const fs = require('node:fs')
+if (process.env.FLASH_SETUP_COUNTER) fs.appendFileSync(process.env.FLASH_SETUP_COUNTER, 'run\\n')
+fs.mkdirSync('node_modules', { recursive: true })
+fs.writeFileSync('node_modules/marker.txt', 'built\\n')
+// Setup output that git does not ignore must also be part of the starting state.
+fs.writeFileSync('generated.txt', 'from setup\\n')
+`
+
+/** A repository with an ignored kept directory, a lock input, and one setup step. */
+function makeSetupRepo({ script = SETUP_SCRIPT, run, keep = ['node_modules'], inputs = ['bun.lock'], timeoutSeconds = 10 } = {}) {
+  const repo = makeRepo()
+  writeFileSync(join(repo, '.gitignore'), 'node_modules/\n.venv/\nvendor/\n')
+  writeFileSync(join(repo, 'bun.lock'), 'lock-v1\n')
+  writeFileSync(
+    join(repo, '.flash-agents.json'),
+    JSON.stringify({ slotSetup: [{ run: run ?? [process.execPath, '-e', script], inputs, keep, timeoutSeconds }] }),
+  )
+  execFileSync('git', ['add', '-A'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'setup'], { cwd: repo })
+  return repo
+}
+
+/** How many times the setup program appended to its counter. */
+function setupRuns(counter) {
+  try {
+    return readFileSync(counter, 'utf8').trim().split('\n').filter(Boolean).length
+  } catch {
+    return 0
+  }
+}
+
+/** Run one test with a fresh counter path in the environment the setup step inherits. */
+async function withSetupCounter(fn) {
+  const counter = join(realpathSync(mkdtempSync(join(tmpdir(), 'flash-setup-counter-'))), 'runs.log')
+  const previous = process.env.FLASH_SETUP_COUNTER
+  process.env.FLASH_SETUP_COUNTER = counter
+  try {
+    return await fn(counter)
+  } finally {
+    if (previous === undefined) delete process.env.FLASH_SETUP_COUNTER
+    else process.env.FLASH_SETUP_COUNTER = previous
+  }
+}
+
+/** Lease, prepare and run the setup of one slot through one call's lifecycle. */
+async function prepareAndSetup(isolation) {
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  const setup = await isolation.runSetup(slot)
+  return { slot, setup }
+}
+
+test('the first call runs the setup step, and the next call in the slot skips it while inputs are unchanged', async () => {
+  await withSetupCounter(async (counter) => {
+    const repo = makeSetupRepo()
+    const { isolation } = makePool(repo, { allowSlotSetup: true })
+    const { slot, setup } = await prepareAndSetup(isolation)
+    assert.equal(setup.length, 1)
+    assert.equal(setup[0].ran, true)
+    assert.equal(setup[0].reason, 'first run in this slot')
+    assert.equal(setup[0].run[0], process.execPath)
+    assert.equal(typeof setup[0].ms, 'number')
+    assert.equal(setupRuns(counter), 1)
+    assert.equal(readFileSync(join(slot.dir, 'node_modules', 'marker.txt'), 'utf8'), 'built\n')
+
+    // Nothing the setup wrote is the worker's change or an ignored path of its own.
+    const change = isolation.collect(slot)
+    assert.deepEqual(change.filesChanged, [])
+    assert.deepEqual(change.ignored, [])
+
+    // The worker's run leaves the copy; the kept directory goes back to the slot cache.
+    isolation.discard(slot)
+    assert.equal(existsSync(join(slot.dir, 'node_modules')), false)
+    assert.equal(existsSync(join(slot.dir, '.flash-cache', 'keep', '0', 'node_modules', 'marker.txt')), true)
+    isolation.release(slot)
+
+    const again = await isolation.lease()
+    isolation.prepare(again)
+    const second = await isolation.runSetup(again)
+    assert.equal(second[0].ran, false)
+    assert.equal(second[0].reason, 'stamp matched')
+    assert.equal(setupRuns(counter), 1, 'an unchanged input does not rebuild')
+    assert.equal(readFileSync(join(again.dir, 'node_modules', 'marker.txt'), 'utf8'), 'built\n', 'the kept directory was restored')
+    isolation.release(again)
+    isolation.close()
+  })
+})
+
+test('changing a declared input in the caller’s tree re-runs the step', async () => {
+  await withSetupCounter(async (counter) => {
+    const repo = makeSetupRepo()
+    const { isolation } = makePool(repo, { allowSlotSetup: true })
+    const first = await prepareAndSetup(isolation)
+    assert.equal(first.setup[0].ran, true)
+    isolation.discard(first.slot)
+    isolation.release(first.slot)
+
+    // The copy is made from the caller's tree, so an edit there is what the stamp sees.
+    writeFileSync(join(repo, 'bun.lock'), 'lock-v2\n')
+    const second = await prepareAndSetup(isolation)
+    assert.equal(second.setup[0].ran, true)
+    assert.equal(second.setup[0].reason, 'inputs changed')
+    assert.equal(setupRuns(counter), 2)
+    isolation.release(second.slot)
+    isolation.close()
+  })
+})
+
+test('removing the kept directory from the slot cache re-runs the step', async () => {
+  await withSetupCounter(async (counter) => {
+    const repo = makeSetupRepo()
+    const { isolation } = makePool(repo, { allowSlotSetup: true })
+    const first = await prepareAndSetup(isolation)
+    isolation.discard(first.slot)
+    assert.equal(setupRuns(counter), 1)
+    rmSync(join(first.slot.dir, '.flash-cache', 'keep', '0', 'node_modules'), { recursive: true, force: true })
+    isolation.release(first.slot)
+
+    const second = await prepareAndSetup(isolation)
+    assert.equal(second.setup[0].ran, true)
+    assert.equal(second.setup[0].reason, 'kept path missing')
+    assert.equal(setupRuns(counter), 2)
+    isolation.release(second.slot)
+    isolation.close()
+  })
+})
+
+test('a kept path behind a symlink in the copy is not moved out of the copy', async () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-keep-link-')))
+  const repo = join(base, 'repo')
+  const outside = join(base, 'outside')
+  mkdirSync(join(outside, 'sub'), { recursive: true })
+  mkdirSync(repo)
+  writeFileSync(join(outside, 'sub', 'marker.txt'), 'outside\n')
+  writeFileSync(
+    join(repo, '.flash-agents.json'),
+    JSON.stringify({ slotSetup: [{ run: [process.execPath, '-e', '0'], keep: ['node_modules/sub'] }] }),
+  )
+  // Not a git work tree: `#excludeDecision` answers "omit" without git, so the keep path is
+  // accepted as written. `node_modules` is a symlink to a directory outside the copy, and
+  // the host's `rename` would move files out of the caller's tree (a restore is an `rm`).
+  symlinkSync(outside, join(repo, 'node_modules'), 'dir')
+
+  const { isolation } = makePool(repo, { allowSlotSetup: true })
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  isolation.discard(slot)
+  isolation.prepare(slot)
+  assert.equal(readFileSync(join(outside, 'sub', 'marker.txt'), 'utf8'), 'outside\n', 'the outside file survives prepare and discard')
+  assert.equal(
+    existsSync(join(slot.dir, '.flash-cache', 'keep', '0', 'node_modules', 'sub', 'marker.txt')),
+    false,
+    'the slot cache does not hold a file from outside the copy',
+  )
+  isolation.close()
+})
+
+test('a step that keeps nothing runs on every call with the reason stated', async () => {
+  await withSetupCounter(async (counter) => {
+    const repo = makeSetupRepo({ keep: [] })
+    const { isolation } = makePool(repo, { allowSlotSetup: true })
+    const first = await prepareAndSetup(isolation)
+    assert.equal(first.setup[0].ran, true)
+    isolation.discard(first.slot)
+    isolation.release(first.slot)
+
+    // The copy was emptied and nothing was kept, so the stamp cannot stand for output that
+    // is no longer there: a "stamp matched" here would skip work whose result is missing.
+    const second = await prepareAndSetup(isolation)
+    assert.equal(second.setup[0].ran, true)
+    assert.equal(second.setup[0].reason, 'nothing is kept between calls')
+    assert.equal(setupRuns(counter), 2)
+    assert.equal(readFileSync(join(second.slot.dir, 'node_modules', 'marker.txt'), 'utf8'), 'built\n')
+    isolation.release(second.slot)
+    isolation.close()
+  })
+})
+
+/** A setup program that records the directory it ran in, so a scope mix-up is visible. */
+const CWD_SETUP_SCRIPT = `
+const fs = require('node:fs')
+fs.mkdirSync('node_modules', { recursive: true })
+fs.writeFileSync('node_modules/marker.txt', process.cwd() + '\\n')
+`
+
+test('kept paths and stamps are per scope, so a nested repository gets its own setup', async () => {
+  const repo = makeSetupRepo({ script: CWD_SETUP_SCRIPT, inputs: [] })
+  // A nested repository of its own below the root, which is where a scoped call copies.
+  const app = join(repo, 'app')
+  mkdirSync(app)
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: app })
+  writeFileSync(join(app, '.gitignore'), 'node_modules/\n')
+  writeFileSync(join(app, 'main.js'), 'app\n')
+  execFileSync('git', ['add', '-A'], { cwd: app })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'app'], { cwd: app })
+
+  const { isolation } = makePool(repo, { allowSlotSetup: true })
+  const slot = await isolation.lease()
+
+  isolation.prepare(slot)
+  const outer = await isolation.runSetup(slot)
+  assert.equal(outer[0].ran, true)
+  assert.equal(outer[0].reason, 'first run in this slot')
+  const outerMarker = readFileSync(join(slot.dir, 'node_modules', 'marker.txt'), 'utf8')
+  assert.equal(outerMarker, `${slot.dir}\n`)
+
+  // A call scoped to the nested repository must not inherit the root's kept node_modules or
+  // its stamp: that directory was built for a different tree.
+  assert.equal(isolation.prepare(slot, { cwd: app }).scope, 'app')
+  const inner = await isolation.runSetup(slot)
+  assert.equal(inner[0].ran, true)
+  assert.equal(inner[0].reason, 'first run in this slot')
+  const innerMarker = readFileSync(join(slot.dir, 'app', 'node_modules', 'marker.txt'), 'utf8')
+  assert.equal(innerMarker, `${join(slot.dir, 'app')}\n`, 'the nested setup ran in the nested copy')
+  assert.notEqual(innerMarker, outerMarker)
+
+  // Back at the root, the root's own kept directory and stamp are waiting again.
+  assert.equal(isolation.prepare(slot).scope, '')
+  const back = await isolation.runSetup(slot)
+  assert.equal(back[0].ran, false)
+  assert.equal(back[0].reason, 'stamp matched')
+  assert.equal(readFileSync(join(slot.dir, 'node_modules', 'marker.txt'), 'utf8'), outerMarker, 'the root kept directory came back')
+  isolation.close()
+})
+
+test('a keep path that is tracked or not ignored is refused at startup, and the step runs without it', async () => {
+  const repo = makeRepo()
+  writeFileSync(join(repo, '.gitignore'), 'node_modules/\nvendor/\n')
+  mkdirSync(join(repo, 'src'))
+  writeFileSync(join(repo, 'src', 'app.js'), 'app\n')
+  // A force-added file inside an ignored directory: git ignores the path but tracks content.
+  mkdirSync(join(repo, 'vendor'))
+  writeFileSync(join(repo, 'vendor', 'tracked.txt'), 'tracked\n')
+  execFileSync('git', ['add', '-A', '-f', 'vendor/tracked.txt'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'keep'], { cwd: repo })
+  writeFileSync(
+    join(repo, '.flash-agents.json'),
+    JSON.stringify({ slotSetup: [{ run: [process.execPath, '-e', '0'], keep: ['src', 'vendor', 'absent'] }] }),
+  )
+
+  const logs = []
+  const { isolation } = makePool(repo, { allowSlotSetup: true, log: (line) => logs.push(line) })
+  assert.deepEqual(isolation.slotSetup[0].keep, [], 'no unignored or tracked path is ever moved')
+  const text = logs.join('\n')
+  assert.match(text, /not keeping src for slotSetup .*: it is not ignored; the step still runs, without it/)
+  assert.match(text, /not keeping vendor for slotSetup .*: (git tracks files there|it is not ignored); the step still runs, without it/)
+  assert.match(text, /not keeping absent for slotSetup .*: it is not ignored; the step still runs, without it/)
+
+  // The step itself is still configured, and still runs.
+  const { slot, setup } = await prepareAndSetup(isolation)
+  assert.equal(setup[0].ran, true)
+  // With every keep path refused it keeps nothing, so it runs on every call.
+  assert.equal(setup[0].reason, 'nothing is kept between calls')
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('an unusable slotSetup entry is named and dropped, and an over-long timeout is capped', () => {
+  const repo = makeRepo()
+  writeFileSync(
+    join(repo, '.flash-agents.json'),
+    JSON.stringify({
+      slotSetup: [
+        { run: 'npm test' },
+        { run: [] },
+        { run: ['x'], inputs: ['/etc/passwd'] },
+        { run: ['x'], keep: ['../outside'] },
+        { run: ['x'], timeoutSeconds: 0 },
+        { run: [process.execPath, '-e', '0'], timeoutSeconds: 7200 },
+        { run: [process.execPath, '-e', '0'] },
+      ],
+    }),
+  )
+  const logs = []
+  const { isolation } = makePool(repo, { allowSlotSetup: true, log: (line) => logs.push(line) })
+  assert.equal(isolation.slotSetup.length, 2)
+  assert.equal(isolation.slotSetup[0].timeoutSeconds, 3600)
+  assert.equal(isolation.slotSetup[1].timeoutSeconds, 900)
+  const text = logs.join('\n')
+  assert.match(text, /slotSetup\[0\]\.run must be a non-empty array of strings/)
+  assert.match(text, /slotSetup\[1\]\.run must be a non-empty array of strings/)
+  assert.match(text, /slotSetup\[2\]\.inputs names "\/etc\/passwd", which is not a relative path/)
+  assert.match(text, /slotSetup\[3\]\.keep names "\.\.\/outside", which is not a relative path/)
+  assert.match(text, /slotSetup\[4\]\.timeoutSeconds must be a positive number/)
+  assert.match(text, /slotSetup\[5\]\.timeoutSeconds 7200 is above the 3600 s maximum; using 3600/)
+  isolation.close()
+})
+
+test('slotSetup configured without the opt-in does not run, logs how to allow it, and carries the warning', async () => {
+  await withSetupCounter(async (counter) => {
+    const repo = makeSetupRepo()
+    const logs = []
+    const { isolation } = makePool(repo, { log: (line) => logs.push(line) })
+    assert.match(logs.join('\n'), /--allow-slot-setup/)
+    assert.equal(isolation.slotSetupWarning, SETUP_NOT_ALLOWED_WARNING)
+
+    const slot = await isolation.lease()
+    isolation.prepare(slot)
+    assert.equal(await isolation.runSetup(slot), undefined)
+    assert.equal(setupRuns(counter), 0)
+    assert.equal(existsSync(join(slot.dir, 'node_modules')), false)
+    isolation.release(slot)
+    isolation.close()
+  })
+})
+
+test('a failing setup step fails with SETUP_FAILED, names the argv and exit code, and keeps the output tail', async () => {
+  const repo = makeSetupRepo({ script: "console.error('setup-broke-here'); process.exit(7)" })
+  const { isolation } = makePool(repo, { allowSlotSetup: true })
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  await assert.rejects(
+    isolation.runSetup(slot),
+    (error) =>
+      error.code === 'SETUP_FAILED' &&
+      /exit code 7/.test(error.message) &&
+      /setup-broke-here/.test(error.message) &&
+      error.message.includes(process.execPath),
+  )
+  // A failed step must not leave a stamp that would skip it next time.
+  assert.equal(existsSync(join(slot.dir, '.flash-cache', 'setup', '0.stamp')), false)
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('a setup step that runs past its timeout is killed, and the stamp is removed', async () => {
+  const late = join(realpathSync(mkdtempSync(join(tmpdir(), 'flash-setup-late-'))), 'late.txt')
+  const script = `
+const fs = require('node:fs')
+setTimeout(() => fs.writeFileSync(${JSON.stringify(late)}, 'late\\n'), 300)
+setTimeout(() => {}, 5000)
+`
+  const repo = makeSetupRepo({ script, timeoutSeconds: 0.1 })
+  const { isolation } = makePool(repo, { allowSlotSetup: true })
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  const started = Date.now()
+  await assert.rejects(isolation.runSetup(slot), (error) => error.code === 'SETUP_FAILED' && /timed out after 0\.1 s/.test(error.message))
+  assert.ok(Date.now() - started < 3000, 'the timeout is enforced, not waited out')
+  assert.equal(existsSync(join(slot.dir, '.flash-cache', 'setup', '0.stamp')), false)
+  await delay(500)
+  assert.equal(existsSync(late), false, 'the killed step wrote nothing afterwards')
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('a timed-out setup step takes the processes it started with it', { skip: process.platform === 'win32' }, async () => {
+  const late = join(realpathSync(mkdtempSync(join(tmpdir(), 'flash-setup-grandchild-'))), 'late.txt')
+  // The step starts a child of its own, as `uv sync` and `bun install` do, and that child is
+  // the one that would write after the timeout.
+  const grandchild = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(late)}, 'late\\n'), 400)`
+  const script = `
+require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore' })
+setTimeout(() => {}, 5000)
+`
+  const repo = makeSetupRepo({ script, timeoutSeconds: 0.15 })
+  const { isolation } = makePool(repo, { allowSlotSetup: true })
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  await assert.rejects(isolation.runSetup(slot), (error) => error.code === 'SETUP_FAILED' && /timed out/.test(error.message))
+  await delay(700)
+  assert.equal(existsSync(late), false, 'the step’s own child was killed too')
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('an aborted call kills the setup step', async () => {
+  const late = join(realpathSync(mkdtempSync(join(tmpdir(), 'flash-setup-abort-'))), 'late.txt')
+  const script = `
+const fs = require('node:fs')
+setTimeout(() => fs.writeFileSync(${JSON.stringify(late)}, 'late\\n'), 300)
+setTimeout(() => {}, 5000)
+`
+  const repo = makeSetupRepo({ script })
+  const { isolation } = makePool(repo, { allowSlotSetup: true })
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  const controller = new AbortController()
+  const promise = isolation.runSetup(slot, { signal: controller.signal })
+  setTimeout(() => controller.abort(), 80)
+  await assert.rejects(promise, (error) => error.code === 'SETUP_FAILED' && /was cancelled/.test(error.message))
+  assert.equal(existsSync(join(slot.dir, '.flash-cache', 'setup', '0.stamp')), false)
+  await delay(500)
+  assert.equal(existsSync(late), false, 'the killed step wrote nothing afterwards')
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('the setup step runs asynchronously, so the event loop keeps turning', async () => {
+  const repo = makeSetupRepo({ script: 'setTimeout(() => {}, 300)' })
+  const { isolation } = makePool(repo, { allowSlotSetup: true })
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  const ticks = []
+  const timer = setInterval(() => ticks.push(Date.now()), 20)
+  try {
+    const [entry] = await isolation.runSetup(slot)
+    assert.equal(entry.ran, true)
+  } finally {
+    clearInterval(timer)
+  }
+  assert.ok(ticks.length >= 3, `a timer must fire during a 300 ms step, got ${String(ticks.length)} tick(s)`)
+  isolation.release(slot)
+  isolation.close()
+})
+
+
+
+test('a step that exits zero but leaves a background child holding its stdout is not a timeout', { skip: process.platform === 'win32' }, async () => {
+  const pidFile = join(realpathSync(mkdtempSync(join(tmpdir(), 'flash-setup-bg-'))), 'pid')
+  const script = `
+const { spawn } = require('node:child_process')
+const fs = require('node:fs')
+// The child inherits the step's stdout pipe and outlives the step, as a daemon started with
+// \`cmd &\` does: detached and unref'd, so the step itself exits at once while the child keeps
+// the pipe open, and the stdio close event waits for the child, not the step.
+const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'inherit', detached: true })
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))
+child.unref()
+console.log('setup finished')
+`
+  const repo = makeSetupRepo({ script, timeoutSeconds: 5 })
+  const { isolation } = makePool(repo, { allowSlotSetup: true })
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  const started = Date.now()
+  try {
+    const [entry] = await isolation.runSetup(slot)
+    const elapsed = Date.now() - started
+    assert.equal(entry.ran, true)
+    assert.ok(elapsed < 5000, `a step that exited must not wait out its 5 s timeout, took ${String(elapsed)} ms`)
+  } finally {
+    // Stop the deliberately left-running child so the test does not leak it. It was spawned
+    // detached, so its pid is also its own process group's id.
+    try {
+      process.kill(-Number(readFileSync(pidFile, 'utf8')), 'SIGKILL')
+    } catch {
+      // The child may already be gone; nothing to clean up then.
+    }
+    isolation.release(slot)
+    isolation.close()
+  }
+})
 
 test('git status in the copy equals the caller’s for staged, unstaged and untracked work', async () => {
   const repo = makeRepo()
@@ -732,6 +1565,78 @@ test('the resolved slotEnv is handed to the runtime factory, and only when confi
   })
   // The prompt names the variables that were set, so the worker knows where to cache.
   assert.match(client.prompts[0].text, /CARGO_HOME, CARGO_TARGET_DIR/)
+  await service.close()
+})
+
+test('a writing call without the opt-in carries the setup warning and does not run the step', async () => {
+  await withSetupCounter(async (counter) => {
+    const repo = makeSetupRepo()
+    const { service } = makeService({ root: repo })
+    const result = await service.flashTask({ task: 'do a thing', cwd: repo })
+    assert.equal(setupRuns(counter), 0)
+    assert.equal(result.setup, undefined)
+    assert.ok(result.warnings.includes(SETUP_NOT_ALLOWED_WARNING), `expected the setup warning, got ${JSON.stringify(result.warnings)}`)
+    await service.close()
+  })
+})
+
+test('a fleet without the opt-in carries the setup warning too', async () => {
+  await withSetupCounter(async (counter) => {
+    const repo = makeSetupRepo()
+    const { service } = makeService({ root: repo })
+    const result = await service.flashBatch({ tasks: ['do a thing'], cwd: repo })
+    assert.equal(setupRuns(counter), 0)
+    assert.equal(result.setup, undefined)
+    assert.ok(result.warnings.includes(SETUP_NOT_ALLOWED_WARNING), `expected the setup warning, got ${JSON.stringify(result.warnings)}`)
+    await service.close()
+  })
+})
+
+test('an allowed setup runs before the worker, is reported in the result, and is named in the prompt', async () => {
+  await withSetupCounter(async (counter) => {
+    const repo = makeSetupRepo()
+    const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-setup-svc-')))
+    const { client, service } = makeService({
+      root: repo,
+      writes: 'worker.txt',
+      isolate: { slots: 1, stateDir, allowSlotSetup: true },
+    })
+    const result = await service.flashTask({ task: 'do a thing', cwd: repo })
+    assert.equal(setupRuns(counter), 1)
+    assert.equal(result.setup.length, 1)
+    assert.equal(result.setup[0].ran, true)
+    assert.equal(result.setup[0].reason, 'first run in this slot')
+    assert.deepEqual(result.setup[0].run.slice(0, 2), [process.execPath, '-e'])
+    assert.equal(result.warnings, undefined)
+    // The setup's own output is never the worker's change.
+    assert.deepEqual(result.change.filesChanged, ['worker.txt'])
+    assert.equal(result.change.ignored, undefined)
+    assert.ok(
+      client.prompts[0].text.includes(
+        `The slot setup (${process.execPath} -e `,
+      ) &&
+        client.prompts[0].text.includes(
+          '; inputs: bun.lock) has already run in this copy; do not run it again unless you change bun.lock.',
+        ),
+      client.prompts[0].text,
+    )
+    await service.close()
+  })
+})
+
+test('a failing setup step fails the call with SETUP_FAILED and releases the slot', async () => {
+  const repo = makeSetupRepo({ script: "console.error('boom-tail'); process.exit(9)" })
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-setup-fail-')))
+  const { service } = makeService({ root: repo, isolate: { slots: 1, stateDir, allowSlotSetup: true } })
+  await assert.rejects(
+    service.flashTask({ task: 'do a thing', cwd: repo }),
+    (error) =>
+      error instanceof FlashTaskError &&
+      error.code === 'SETUP_FAILED' &&
+      /exit code 9/.test(error.message) &&
+      /boom-tail/.test(error.message),
+  )
+  assert.equal(service.isolation.inUse, 0, 'the slot is handed back like any other early refusal')
   await service.close()
 })
 

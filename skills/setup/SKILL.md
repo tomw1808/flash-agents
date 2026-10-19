@@ -65,29 +65,44 @@ confirm with the doctor again; the `profile` check must pass.
 
 ## 5. Prove it end to end
 
-Ask for one small, real task in a repository you do not mind a patch against, using the
-`flash_task` tool with `apply: "none"`:
+Let the doctor run one real worker task in a throwaway repository it creates and deletes, so
+nothing touches the user's project or another session's uncommitted work:
 
-> Create a file `flash-hello.txt` containing the line `it works`, then read it back.
+```sh
+node "${CLAUDE_PLUGIN_ROOT}/packages/flash-mcp/lib/index.js" doctor --e2e
+```
 
-Then report to the user:
-- the worker's `status` and observed `route` (it must be the configured model);
-- `change.filesChanged` and `change.diffstat` — the machine-generated summary, not the
-  worker's prose;
-- that the file does **not** exist in their repository, because the work happened in a
-  disposable copy;
-- the `change.patchId`, and that `flash_apply { patchId }` is what would land it.
+It asks a worker to create `flash-hello.txt` containing `it works`, and passes when the worker
+ended `ok` on the configured model, the patch holds exactly that file, and the temporary
+repository itself was not touched — the work happened in a disposable copy. Report those lines,
+the duration and the token count to the user.
 
-If `flash_task` reports `NOT_DELEGATED`, say so plainly: the cheap dispatcher occasionally
-does the work itself instead of delegating, the call is discarded rather than trusted, and
-re-running usually succeeds.
+If it reports `NOT_DELEGATED`, say so plainly: the cheap dispatcher occasionally does the work
+itself instead of delegating, the call is discarded rather than trusted, and re-running usually
+succeeds.
+
+Then show what a copy of the user's own project costs:
+
+```sh
+node "${CLAUDE_PLUGIN_ROOT}/packages/flash-mcp/lib/index.js" doctor --copy --root "$CLAUDE_PROJECT_DIR"
+```
+
+It makes one copy the way a writing call would, prints its size, time and what was left out,
+and deletes it. If the copy fails, every writing call would fail the same way — report the error.
+If it is large or slow, point at the largest entries it lists and at a `.flash-agents.json` in
+the project root (`copyExclude`, `slotEnv`; see the README's "Per-repository settings"). `.env`,
+`.env.*` and `.mcp.json` are already left out by default.
 
 ## 6. Tell them what they have
 
-Close with the three doors and one caveat:
-- `flash_task` — one narrow task, one worker, a patch back.
+Close with the tools and two caveats:
+- `flash_task` — one coherent task, one worker, a patch back (`taskFile` sends a long brief).
 - `flash_batch` — several independent tasks at once, sharing one copy.
-- `flash_apply` — land a patch you decided to keep.
-- Workers cannot be steered mid-task: the harness protocol has no attach or cancel. Point
-  at `--log-file` and `scripts/flash-sessions.mjs` for watching, and at the `gauntlet`
-  skill for running rounds of competing attempts.
+- `flash_apply` — land a patch you decided to keep (`threeWay` when the tree moved on).
+- `flash_patch` — read a stored patch whole or page by page.
+- `background: true` with `flash_status`, `flash_result`, `flash_cancel` — run calls while
+  doing other work, and stop one whose framing turned out wrong.
+- A running worker cannot be steered mid-task, only cancelled. Point at `--log-file` and
+  `scripts/flash-sessions.mjs` for watching, and at the `delegate` skill for the everyday loop
+  and `gauntlet` for rounds of competing attempts.
+- Workers share the machine: two copies in parallel share ports and per-user services.

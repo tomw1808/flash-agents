@@ -16,8 +16,20 @@
  * @module flash-mcp
  */
 
-import { appendFileSync, openSync, realpathSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { serveStdio, describeError } from './mcp.js'
@@ -25,10 +37,17 @@ import { FlashTaskService } from './service.js'
 import { JobRegistry, JOB_TOOLS } from './jobs.js'
 import { loadConfig } from './config.js'
 import { formatChecks, runChecks } from './doctor.js'
-import { cleanLayout } from './isolation.js'
+import { WorkspaceIsolation, cleanLayout } from './isolation.js'
 
 /** Server identity reported to the MCP client. */
-export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.3' })
+export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.4' })
+
+/**
+ * How often a `flash_result` call that is waiting tells the MCP client it is alive. The
+ * client aborts a tool call that shows no sign of life for its own idle timeout, and the
+ * wait can be minutes; the notification resets that clock and says what is being waited on.
+ */
+export const WAIT_PROGRESS_INTERVAL_MS = 30_000
 
 /** Usage guidance offered to the client model at handshake. */
 const INSTRUCTIONS = [
@@ -58,6 +77,8 @@ const INSTRUCTIONS = [
   'Project facts every worker needs (layout, check commands, style rules) belong in an',
   '`AGENTS.md` or `CLAUDE.md` in the repository: the Harness loads those into every worker',
   'from the repository root down to its working directory, so a task need not repeat them.',
+  'Every result reports what they cost under `instructions` (files, bytes, approximate tokens);',
+  'past the harness\'s 64 KB budget a warning says the worker was only given part of them.',
   '',
   'A read-only call cannot build or run tests (both write). For a review that must, run a',
   'writing call with `apply: "discard"`: it works in a throwaway copy and stores nothing.',
@@ -91,7 +112,13 @@ export function listTools() {
         properties: {
           task: {
             type: 'string',
-            description: 'The complete, self-contained task for the worker, including any context it needs.',
+            description:
+              'The complete, self-contained task for the worker, including any context it needs. Pass exactly one of task and taskFile.',
+          },
+          taskFile: {
+            type: 'string',
+            description:
+              'Path to a UTF-8 file holding the task text, sent exactly as written — for a long brief that would otherwise have to be pasted. A relative path resolves against the service root, and the file must resolve inside it; it must be a regular file of at most 256 KB. Pass exactly one of task and taskFile.',
           },
           cwd: {
             type: 'string',
@@ -116,12 +143,16 @@ export function listTools() {
             enum: ['working-tree', 'head'],
             description: 'What the disposable copy starts from. "working-tree" (the default) copies your tree as it is, uncommitted edits included, and the result lists them under isolation.uncommittedAtStart. "head" starts from the last commit (ignored files such as dependencies and build output are kept), for a call that must not pick up uncommitted work — for instance another session\'s, in the same tree.',
           },
+          basePatch: {
+            type: 'string',
+            description: "A patchId from an earlier writing call. Its change is applied to this call's copy before the worker starts (three-way merged if the tree moved on), and the result's patch then contains both that change and the new work; the stored base patch itself is not applied to your tree.",
+          },
           background: {
             type: 'boolean',
             description: 'Return at once with a jobId instead of holding your turn while the worker runs (minutes, often). Collect the result with flash_result, watch it with flash_status, stop it with flash_cancel. Meanwhile you can run tests or review an earlier patch.',
           },
         },
-        required: ['task', 'cwd'],
+        required: ['cwd'],
         additionalProperties: false,
       },
     },
@@ -149,17 +180,24 @@ export function listTools() {
             type: 'array',
             minItems: 1,
             description:
-              'The tasks to delegate, each either a self-contained task string or an object with its own acceptance criteria.',
+              'The tasks to delegate, each either a self-contained task string or an object with its own task text (inline or in a taskFile) and acceptance criteria.',
             items: {
               oneOf: [
                 { type: 'string' },
                 {
                   type: 'object',
                   properties: {
-                    task: { type: 'string', description: 'The complete, self-contained task.' },
+                    task: {
+                      type: 'string',
+                      description: 'The complete, self-contained task. Use either task or taskFile.',
+                    },
+                    taskFile: {
+                      type: 'string',
+                      description:
+                        "Path to a UTF-8 file holding this task's text, sent exactly as written. A relative path resolves against the service root and must stay inside it. Use either task or taskFile.",
+                    },
                     acceptance: { type: 'string', description: 'Optional acceptance criteria for this task.' },
                   },
-                  required: ['task'],
                   additionalProperties: false,
                 },
               ],
@@ -187,6 +225,10 @@ export function listTools() {
             type: 'string',
             enum: ['working-tree', 'head'],
             description: 'What the shared copy starts from: "working-tree" (the default, uncommitted edits included) or "head" (the last commit, ignored files kept).',
+          },
+          basePatch: {
+            type: 'string',
+            description: "A patchId from an earlier writing call. Its change is applied to this call's copy before the workers start (three-way merged if the tree moved on), and the result's patch then contains both that change and the new work; the stored base patch itself is not applied to your tree.",
           },
           background: {
             type: 'boolean',
@@ -326,6 +368,10 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
     slots: numberFrom(env.FLASH_SLOTS, config.limits.slots),
     stateDir: textFrom(env.FLASH_STATE_DIR),
     copyExclude: listFrom(env.FLASH_COPY_EXCLUDE),
+    // Running a repository's `slotSetup` steps is host code outside the worker's sandbox,
+    // so it is off unless the operator explicitly says yes.
+    // `on` is the plugin setting's spelling, `1` the shell's.
+    allowSlotSetup: env.FLASH_ALLOW_SLOT_SETUP === '1' || env.FLASH_ALLOW_SLOT_SETUP === 'on',
     diffChars: numberFrom(env.FLASH_DIFF_CHARS, config.limits.diffChars),
     patchRetentionDays: numberFrom(env.FLASH_PATCH_RETENTION_DAYS, config.limits.patchRetentionDays),
     maxStateBytes: numberFrom(env.FLASH_MAX_STATE_BYTES, config.limits.maxStateBytes),
@@ -369,6 +415,9 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
         break
       case '--copy-exclude':
         options.copyExclude = listFrom(next())
+        break
+      case '--allow-slot-setup':
+        options.allowSlotSetup = true
         break
       case '--diff-chars':
         options.diffChars = numberFrom(next(), undefined)
@@ -425,10 +474,19 @@ function usage() {
   return `flash-agents — cheap DeepSeek Harness workers over MCP stdio
 
 Usage: flash-agents [serve] [options]           serve the MCP stdio protocol (the default)
-       flash-agents doctor [--profile <id>]     check the prerequisites and print the fixes
+       flash-agents doctor [--profile <id>] [--e2e] [--copy [--root <path>]]
+                                                check the prerequisites and print the fixes
        flash-agents clean [--all] [--root <path>]
                                                 report the state directory per root and
                                                 remove dead trees and expired patches
+
+Doctor modes, on top of the checks:
+  --e2e                     after the checks pass, run one writing call in a throwaway
+                            repository — the proof that the whole stack works — and leave
+                            no trace of it behind
+  --copy                    dry-run the disposable copy of --root and report what it costs
+                            (time, bytes, files, what was excluded and why) without running
+                            a worker; the failure a writing call would hit surfaces here
 
 Options:
   --root <path>             sandbox root and runtime working directory (default: cwd)
@@ -450,6 +508,9 @@ Options:
                             depth, one with a slash is a path relative to the root; a match
                             is left out only where git ignores it and tracks nothing under it
                             (default: none; .flash-agents.json may set copyExclude)
+  --allow-slot-setup        run the .flash-agents.json slotSetup steps in the copy before the
+                            worker starts; they run on the host, with your privileges and
+                            outside the worker's sandbox (default: off)
   --diff-chars <n>          how much of a patch a result carries (default: ${value('diffChars')})
   --patch-retention-days <n>
                             days an unapplied patch is kept before the startup prune
@@ -464,7 +525,7 @@ Options:
 Environment: FLASH_SERVICE_ROOT, FLASH_SERVICE_PROFILE, FLASH_SERVICE_PROVIDER,
 FLASH_SERVICE_MODEL, FLASH_TASK_TIMEOUT_MS, FLASH_IDLE_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS,
 FLASH_MAX_TASKS, FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
-FLASH_STATE_DIR, FLASH_COPY_EXCLUDE, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_MAX_STATE_BYTES, FLASH_LOG_FILE,
+FLASH_STATE_DIR, FLASH_COPY_EXCLUDE, FLASH_ALLOW_SLOT_SETUP, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_MAX_STATE_BYTES, FLASH_LOG_FILE,
 FLASH_DSH_BIN.
 
 The route and the numeric limits default to flash.config.json, the one file that owns
@@ -488,13 +549,15 @@ leave a setting blank rather than having to omit it.
  * @param {object} options.service - the FlashTaskService, or a stand-in in tests.
  * @param {JobRegistry} options.jobs - the background job registry.
  * @param {(message: string) => void} [options.log] - diagnostic sink.
+ * @param {number} [options.waitProgressIntervalMs] - how often a waiting flash_result reports
+ *   progress to the client (default 30 s; injectable so a test need not wait half a minute).
  * @returns {(name: string, args: object, ctx: {
  *   signal: AbortSignal,
  *   progressToken: string | number | undefined,
  *   sendProgress: (report: object) => void,
  * }) => Promise<object>} the tool caller.
  */
-export function createToolCaller({ service, jobs, log = () => {} }) {
+export function createToolCaller({ service, jobs, log = () => {}, waitProgressIntervalMs = WAIT_PROGRESS_INTERVAL_MS }) {
   // A thunk, not a call: `flashApply` and `flashPatch` throw synchronously on a bad id, and
   // that throw must land inside the caller's try rather than escape the dispatcher.
   const runFor = (name, args, { signal, progress, progressToken }) =>
@@ -549,15 +612,58 @@ export function createToolCaller({ service, jobs, log = () => {} }) {
 
   const statusTool = (args) => {
     const jobId = args?.jobId
-    if (jobId === undefined) return okResult({ jobs: jobs.list() })
-    if (typeof jobId !== 'string' || jobId.length === 0) {
-      return errorResult(`flash_status failed: jobId must be a non-empty string; got ${JSON.stringify(jobId)}`)
+    if (jobId !== undefined) {
+      if (typeof jobId !== 'string' || jobId.length === 0) {
+        return errorResult(`flash_status failed: jobId must be a non-empty string; got ${JSON.stringify(jobId)}`)
+      }
+      const status = jobs.status(jobId)
+      return status === undefined ? unknownJob('flash_status', jobId) : okResult(status)
     }
-    const status = jobs.status(jobId)
-    return status === undefined ? unknownJob('flash_status', jobId) : okResult(status)
+    // A listing is a page, not the whole history: a server up for a day accumulated dozens of
+    // jobs, and the caller had to read all of them to find the two still running.
+    const state = args?.state ?? 'all'
+    if (state !== 'running' && state !== 'ended' && state !== 'all') {
+      return errorResult(
+        `flash_status failed: state must be "running", "ended", or "all"; got ${JSON.stringify(args?.state)}`,
+      )
+    }
+    const limit = args?.limit ?? 10
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+      return errorResult(`flash_status failed: limit must be an integer between 1 and 50; got ${JSON.stringify(args?.limit)}`)
+    }
+    const { running, ended } = jobs.counts()
+    const shown = jobs.list({ state, limit })
+    const shownEnded = state === 'running' ? 0 : Math.min(ended, limit)
+    return okResult({ jobs: shown, running, ended, omittedEnded: ended - shownEnded })
   }
 
-  const resultTool = async (args, signal) => {
+  /**
+   * The heartbeat a waiting `flash_result` sends: elapsed seconds, the wait the caller asked
+   * for, and the job's latest progress line. A client without a progress token gets nothing,
+   * because such a notification would be invalid; a sender that throws is ignored, because a
+   * client that has gone away must not turn a wait into a failure.
+   */
+  const startWaitProgress = ({ jobId, waitSeconds, progressToken, sendProgress }) => {
+    if (progressToken === undefined || progressToken === null || typeof sendProgress !== 'function') return () => {}
+    const startedAt = Date.now()
+    const timer = setInterval(() => {
+      try {
+        const latest = jobs.get(jobId)?.lastProgress?.message
+        sendProgress({
+          progress: Math.round((Date.now() - startedAt) / 1000),
+          total: waitSeconds,
+          message: `waiting for ${jobId}: ${latest ?? 'no progress yet'}`,
+        })
+      } catch (error) {
+        log(`could not send a progress notification: ${describeError(error)}`)
+      }
+    }, waitProgressIntervalMs)
+    // The heartbeat must never be the only thing keeping the process alive.
+    timer.unref?.()
+    return () => clearInterval(timer)
+  }
+
+  const resultTool = async (args, signal, { progressToken, sendProgress } = {}) => {
     const jobId = args?.jobId
     if (typeof jobId !== 'string' || jobId.length === 0) {
       return errorResult(`flash_result failed: jobId must be a non-empty string; got ${JSON.stringify(jobId)}`)
@@ -570,8 +676,24 @@ export function createToolCaller({ service, jobs, log = () => {} }) {
     }
     if (jobs.get(jobId) === undefined) return unknownJob('flash_result', jobId)
     // Waiting is on the *request's* signal: cancelling this call stops the wait, and the job
-    // is left untouched, still running.
-    const job = waitSeconds > 0 ? await jobs.waitFor(jobId, waitSeconds * 1000, signal) : jobs.get(jobId)
+    // is left untouched, still running. The answer says which of the three ended the wait,
+    // because "the job is still running" alone cannot tell a timeout from a cancelled request.
+    let job
+    let wait
+    if (waitSeconds > 0) {
+      const requestedMs = waitSeconds * 1000
+      const startedWaiting = Date.now()
+      const stopProgress = startWaitProgress({ jobId, waitSeconds, progressToken, sendProgress })
+      try {
+        const outcome = await jobs.waitFor(jobId, requestedMs, signal)
+        job = outcome.job
+        wait = { requestedMs, waitedMs: Date.now() - startedWaiting, endedBy: outcome.endedBy }
+      } finally {
+        stopProgress()
+      }
+    } else {
+      job = jobs.get(jobId)
+    }
     if (job === undefined) return unknownJob('flash_result', jobId)
     // Project the job already held rather than looking it up again by id: the sweep may have
     // evicted it while this request waited, and a second lookup that comes back undefined
@@ -583,6 +705,7 @@ export function createToolCaller({ service, jobs, log = () => {} }) {
         state: 'running',
         elapsedMs: status.elapsedMs,
         ...(status.lastProgress === undefined ? {} : { lastProgress: status.lastProgress }),
+        ...(wait === undefined ? {} : { wait }),
       })
     }
     if (job.state === 'ok') {
@@ -591,7 +714,11 @@ export function createToolCaller({ service, jobs, log = () => {} }) {
       job.collected = true
       // The call's full result, exactly as the synchronous call would have returned it, plus
       // the job's identity so the caller can tie it back to the id it holds.
-      return okResult({ ...job.result, job: { jobId: job.jobId, state: 'ok', elapsedMs: status.elapsedMs } })
+      return okResult({
+        ...job.result,
+        job: { jobId: job.jobId, state: 'ok', elapsedMs: status.elapsedMs },
+        ...(wait === undefined ? {} : { wait }),
+      })
     }
     // Failed or cancelled: the same message the synchronous dispatch would have produced.
     return errorResult(`${job.kind} failed: ${describeError(job.error)} (job ${job.jobId})`)
@@ -616,8 +743,8 @@ export function createToolCaller({ service, jobs, log = () => {} }) {
     // wait is bounded and the status is returned either way. `waitFor` hands back the job it
     // held, and projecting that (rather than a fresh lookup) is what keeps an evicted job
     // from turning into a TypeError here.
-    const settled = (await jobs.waitFor(jobId, 30_000)) ?? job
-    const status = jobs.statusOf(settled)
+    const { job: settledJob } = await jobs.waitFor(jobId, 30_000)
+    const status = jobs.statusOf(settledJob ?? job)
     return okResult({
       ...status,
       note:
@@ -641,7 +768,7 @@ export function createToolCaller({ service, jobs, log = () => {} }) {
       }
     }
     if (name === 'flash_status') return statusTool(args)
-    if (name === 'flash_result') return await resultTool(args, signal)
+    if (name === 'flash_result') return await resultTool(args, signal, { progressToken, sendProgress })
     if (name === 'flash_cancel') return await cancelTool(args)
 
     const run = runFor(name, args, { signal, progress: sendProgress, progressToken })
@@ -695,6 +822,34 @@ function clip(text, maxChars) {
 }
 
 /**
+ * Build the service, from parsed options, exactly as the server builds it.
+ *
+ * `serve` and `doctor --e2e` share this one construction: the doctor's whole purpose
+ * is to prove the stack the server really starts, so the wiring between the parsed
+ * options and the service's own `isolate` block must not exist twice and drift.
+ *
+ * @param {object} options - parsed options (see `parseOptions`).
+ * @param {(message: string) => void} [log] - diagnostic sink.
+ * @returns {FlashTaskService} the service.
+ */
+export function createService(options, log = () => {}) {
+  return new FlashTaskService({
+    ...options,
+    isolate: {
+      mode: options.isolate,
+      ...(options.slots === undefined ? {} : { slots: options.slots }),
+      ...(options.stateDir === undefined ? {} : { stateDir: options.stateDir }),
+      ...(options.copyExclude === undefined ? {} : { copyExclude: options.copyExclude }),
+      ...(options.allowSlotSetup === true ? { allowSlotSetup: true } : {}),
+      ...(options.diffChars === undefined ? {} : { diffChars: options.diffChars }),
+      ...(options.patchRetentionDays === undefined ? {} : { patchRetentionDays: options.patchRetentionDays }),
+      ...(options.maxStateBytes === undefined ? {} : { maxStateBytes: options.maxStateBytes }),
+    },
+    log,
+  })
+}
+
+/**
  * Start the server on stdio.
  * @param {object} [options] - parsed options.
  * @param {NodeJS.ReadableStream} [input] - protocol input.
@@ -731,19 +886,7 @@ export function startServer(options, input = process.stdin, output = process.std
       reportLogFileFailure(error)
     }
   }
-  const service = new FlashTaskService({
-    ...options,
-    isolate: {
-      mode: options.isolate,
-      ...(options.slots === undefined ? {} : { slots: options.slots }),
-      ...(options.stateDir === undefined ? {} : { stateDir: options.stateDir }),
-      ...(options.copyExclude === undefined ? {} : { copyExclude: options.copyExclude }),
-      ...(options.diffChars === undefined ? {} : { diffChars: options.diffChars }),
-      ...(options.patchRetentionDays === undefined ? {} : { patchRetentionDays: options.patchRetentionDays }),
-      ...(options.maxStateBytes === undefined ? {} : { maxStateBytes: options.maxStateBytes }),
-    },
-    log,
-  })
+  const service = createService(options, log)
   log(`root ${service.root}; profile ${service.profile}; route ${service.provider}/${service.model}`)
   if (service.isolation === undefined) {
     log(
@@ -821,10 +964,42 @@ function listFrom(value) {
 }
 
 /**
+ * The task `doctor --e2e` hands to a worker in a throwaway repository. It asks for
+ * exactly one file with exactly one known line, so every part of the round trip can
+ * be checked against a fact rather than against the worker's own account of itself.
+ */
+const E2E_TASK = 'Create a file flash-hello.txt containing the line `it works`, then read it back.'
+
+/** The one file `doctor --e2e` expects the worker to have created in its copy. */
+const E2E_FILE = 'flash-hello.txt'
+
+/** The line the worker's patch must carry. */
+const E2E_LINE = 'it works'
+
+/** How long `doctor --e2e` lets the worker work. A real call takes minutes, not seconds. */
+const E2E_TIMEOUT_MS = 600_000
+
+/** The git identity the throwaway repository commits under, so no user identity is needed. */
+const E2E_GIT_CONFIG = [
+  '-c',
+  'user.email=doctor@flash-agents',
+  '-c',
+  'user.name=flash-agents',
+]
+
+/**
  * Run the prerequisite checks and print them, fixes included.
  *
  * The model and the minimum harness version come from the same configuration the
  * server runs on, so the doctor cannot approve a setup the service would reject.
+ *
+ * Two modes go beyond the checks, and both exist because a setup that passes them can
+ * still fail the first real call:
+ *
+ * - `--e2e` proves the whole stack with one writing call in a throwaway repository,
+ *   rather than asking the user to run a patch against their own tree;
+ * - `--copy` dry-runs the disposable copy of the root, which is where a Windows
+ *   junction, a huge `node_modules` or a mis-tuned `copyExclude` actually hurts.
  *
  * @param {string[]} [argv] - arguments after the command name.
  * @param {object} [options] - injected effects, for tests.
@@ -832,29 +1007,471 @@ function listFrom(value) {
  * @param {(text: string) => void} [options.write] - output sink.
  * @param {Function} [options.run] - command runner handed to the checks.
  * @param {Function} [options.probe] - HTTP probe handed to the checks.
+ * @param {Function} [options.generate] - one-token model request handed to the checks.
  * @param {{command: string, prefix: string[]}} [options.launcher] - dsh launcher handed to the checks.
- * @returns {Promise<number>} the exit code: 0 when nothing failed.
+ * @param {Function} [options.createService] - service factory for `--e2e` (default:
+ *   `createService`, the one the server uses), injectable so a test need not start a worker.
+ * @returns {Promise<number>} the exit code: 0 only when everything that ran passed.
  */
-export async function runDoctor(argv = [], { env = process.env, write, run, probe, launcher } = {}) {
+export async function runDoctor(
+  argv = [],
+  { env = process.env, write, run, probe, generate, launcher, createService: makeServiceOption } = {},
+) {
   const emit = write ?? ((text) => process.stdout.write(text))
   const config = loadConfig({ env })
-  const at = argv.indexOf('--profile')
-  const result = await runChecks({
-    env,
-    model: config.route.model,
-    dshVersion: config.dsh.version,
-    profile: at < 0 ? (textFrom(env.FLASH_SERVICE_PROFILE) ?? 'flash-service') : argv[at + 1],
-    ...(run === undefined ? {} : { run }),
-    ...(probe === undefined ? {} : { probe }),
-    ...(launcher === undefined ? {} : { launcher }),
-  })
-  emit(`${formatChecks(result)}\n`)
-  emit(
-    result.ok
-      ? `\nall required checks passed${result.warnings === 0 ? '' : ` (${String(result.warnings)} warning(s))`}\n`
-      : `\n${String(result.failures)} check(s) failed; run the fixes above and try again\n`,
-  )
-  return result.ok ? 0 : 1
+  const flags = doctorFlags(argv)
+  let options
+  try {
+    options = parseOptions(flags.optionsArgv, flags.copy ? envWithProjectRoot(env) : env, config)
+  } catch (error) {
+    emit(`flash-agents: ${describeError(error)}\n\n${usage()}`)
+    return 2
+  }
+  if (options.help) {
+    emit(usage())
+    return 0
+  }
+  const makeService = makeServiceOption ?? createService
+  let checksOk = true
+  // A plain doctor run, and `--e2e`, check the prerequisites first; a bare `--copy` is
+  // its own question ("what would copying this tree cost?") and must not wait on the
+  // model round trip the checks make.
+  if (!flags.copy || flags.e2e) {
+    const result = await runChecks({
+      env,
+      model: config.route.model,
+      dshVersion: config.dsh.version,
+      profile: options.profile,
+      ...(run === undefined ? {} : { run }),
+      ...(probe === undefined ? {} : { probe }),
+      ...(generate === undefined ? {} : { generate }),
+      ...(launcher === undefined ? {} : { launcher }),
+    })
+    emit(`${formatChecks(result)}\n`)
+    emit(
+      result.ok
+        ? `\nall required checks passed${result.warnings === 0 ? '' : ` (${String(result.warnings)} warning(s))`}\n`
+        : `\n${String(result.failures)} check(s) failed; run the fixes above and try again\n`,
+    )
+    checksOk = result.ok
+  }
+  const copyOk = flags.copy ? await runCopyProbe({ options, emit }) : true
+  let e2eOk = true
+  if (flags.e2e) {
+    if (!checksOk) {
+      emit(`${'skip'.padEnd(4)}  e2e  the checks failed, so the end-to-end run was skipped\n`)
+    } else {
+      e2eOk = await runE2e({ options, emit, makeService })
+    }
+  }
+  return checksOk && copyOk && e2eOk ? 0 : 1
+}
+
+/**
+ * Split the doctor's own flags from the options it shares with the server.
+ *
+ * `--e2e` and `--copy` are doctor modes; everything else (`--root`, `--profile`,
+ * `--copy-exclude`, …) is a service option and is parsed by `parseOptions`, so the
+ * doctor resolves its root, route and copy exclusions exactly as the server does.
+ *
+ * @param {string[]} argv - arguments after `doctor`.
+ * @returns {{e2e: boolean, copy: boolean, optionsArgv: string[]}} the doctor modes and
+ *   the arguments left for `parseOptions`.
+ */
+function doctorFlags(argv) {
+  const optionsArgv = []
+  let e2e = false
+  let copy = false
+  for (const flag of argv) {
+    if (flag === '--e2e') e2e = true
+    else if (flag === '--copy') copy = true
+    else optionsArgv.push(flag)
+  }
+  return { e2e, copy, optionsArgv }
+}
+
+/**
+ * The environment the server resolves its root from, given what a project session has.
+ *
+ * The plugin starts the server with `--root "$CLAUDE_PROJECT_DIR"`, so a `doctor --copy`
+ * run from inside a session should probe that same tree even when the shell's cwd is
+ * somewhere else. An explicit `FLASH_SERVICE_ROOT`, and then `--root`, still win.
+ *
+ * @param {Record<string, string | undefined>} env - the doctor's environment.
+ * @returns {Record<string, string | undefined>} the environment to parse options from.
+ */
+function envWithProjectRoot(env) {
+  if (textFrom(env.FLASH_SERVICE_ROOT) !== undefined) return env
+  const project = textFrom(env.CLAUDE_PROJECT_DIR)
+  return project === undefined ? env : { ...env, FLASH_SERVICE_ROOT: project }
+}
+
+/**
+ * Prove the whole stack end to end in a throwaway repository.
+ *
+ * The setup skill used to ask the user's session for a writing call "in a repository
+ * you do not mind a patch against". From a project session that can only be the open
+ * project — the server is confined to its root — and that project may hold another
+ * session's uncommitted work, which is exactly what a user stopped a first run over.
+ * So the doctor does the proof itself: a fresh git repository in a temp directory, a
+ * private state directory in another, one slot, and one writing call.
+ *
+ * Passing means the worker said `ok`, made exactly the file it was asked for with the
+ * line it was asked for, and did so in its copy: the temp repository is untouched.
+ *
+ * @param {object} options - the parsed service options.
+ * @param {object} options.options - parsed CLI options (profile, route, copy excludes).
+ * @param {(text: string) => void} options.emit - output sink.
+ * @param {Function} options.makeService - service factory, injected by tests.
+ * @returns {Promise<boolean>} whether the run passed.
+ */
+async function runE2e({ options, emit, makeService }) {
+  // A service that would not close may have left a runtime and a tree behind: the run
+  // printed `fail` for it, and the exit code has to agree. The flag is set in `finally`,
+  // which has run by the time the steps' promise settles.
+  const cleanup = { failed: false }
+  const ok = await runE2eSteps({ options, emit, makeService, cleanup })
+  return ok && !cleanup.failed
+}
+
+/** The steps of `runE2e`; `cleanup.failed` records a close that did not succeed. */
+async function runE2eSteps({ options, emit, makeService, cleanup }) {
+  const line = (status, text) => emit(`${status.padEnd(4)}  e2e  ${text}\n`)
+  let repo
+  let stateRoot
+  let service
+  try {
+    // realpath'd because the service realpaths its root: on macOS a temp path is
+    // /var/... on the way in and /private/var/... inside, and two spellings of one
+    // directory would make the checks below look at the wrong tree.
+    repo = realpathSync(mkdtempSync(join(tmpdir(), 'flash-doctor-')))
+    stateRoot = realpathSync(mkdtempSync(join(tmpdir(), 'flash-doctor-state-')))
+  } catch (error) {
+    line('fail', `could not create the throwaway directories: ${describeError(error)}`)
+    return false
+  }
+  const serviceLog = []
+  try {
+    const prepared = prepareE2eRepository(repo)
+    if (prepared !== undefined) {
+      line('fail', prepared)
+      return false
+    }
+    service = makeService(
+      {
+        ...options,
+        root: repo,
+        // Forced on: the proof is that a writing call lands in a copy, and with
+        // isolation off the worker would write into this repository directly.
+        isolate: 'copy',
+        slots: 1,
+        // A private state directory: the user's own trees, patches and log are never
+        // touched, swept or trimmed by this run.
+        stateDir: join(stateRoot, 'state'),
+        taskTimeoutMs: E2E_TIMEOUT_MS,
+      },
+      (message) => serviceLog.push(message),
+    )
+    const started = Date.now()
+    let result
+    try {
+      result = await service.flashTask({ task: E2E_TASK, cwd: repo, apply: 'none' })
+    } catch (error) {
+      line('fail', describeError(error))
+      if (error?.code === 'NOT_DELEGATED') {
+        line('note', 'the cheap dispatcher sometimes does the work itself; a rerun usually passes')
+      }
+      for (const message of serviceLog) emit(`log   e2e  ${message}\n`)
+      return false
+    }
+    const elapsedMs = Date.now() - started
+    let ok = true
+    // 1. the worker's own verdict, and the route it actually ran on
+    const route = result?.route
+    const routeName =
+      route?.provider === undefined || route?.model === undefined
+        ? String(result?.provider ?? 'unknown')
+        : `${String(route.provider)}/${String(route.model)}`
+    if (result?.status === 'ok') {
+      line('ok', `worker status ok on ${routeName}`)
+    } else {
+      ok = false
+      line('fail', `worker status ${JSON.stringify(result?.status)} (stop reason ${JSON.stringify(result?.stopReason)})`)
+    }
+    // 2. exactly the file the task asked for, with exactly the line it asked for
+    const files = result?.change?.filesChanged ?? []
+    const diff = typeof result?.change?.diff === 'string' ? result.change.diff : ''
+    const additions = diff.split('\n').filter((text) => text.startsWith('+') && !text.startsWith('+++')).length
+    if (files.length === 1 && files[0] === E2E_FILE) {
+      line('ok', `change: ${E2E_FILE} (+${String(additions)})`)
+    } else {
+      ok = false
+      line('fail', `change: expected exactly ${JSON.stringify([E2E_FILE])}, got ${JSON.stringify(files)}`)
+    }
+    if (diff.includes(`+${E2E_LINE}`)) {
+      line('ok', `the diff carries "${E2E_LINE}"`)
+    } else {
+      ok = false
+      line('fail', `the diff does not carry the line "${E2E_LINE}"`)
+    }
+    // 3. the throwaway repository itself is untouched: the work happened in the copy
+    const touched = touchedPaths(repo)
+    if (touched.length === 0) {
+      line('ok', 'the temp repository was not touched')
+    } else {
+      ok = false
+      line('fail', `the temp repository was touched: ${touched.slice(0, 5).join(', ')}`)
+    }
+    // 4. what the call cost
+    const tokens = result?.usage?.totalTokens
+    line(ok ? 'ok' : 'fail', `${formatSeconds(elapsedMs)}, ${tokens === undefined ? 'no usage reported' : `${String(tokens)} tokens`}`)
+    if (!ok) for (const message of serviceLog) emit(`log   e2e  ${message}\n`)
+    return ok
+  } finally {
+    // Always, on every path: the service first (it owns the trees and the runtimes),
+    // then both temp directories, which hold no work worth keeping.
+    try {
+      await service?.close()
+    } catch (error) {
+      cleanup.failed = true
+      line('fail', `could not close the service: ${describeError(error)}`)
+    }
+    for (const dir of [repo, stateRoot]) {
+      if (dir === undefined) continue
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        // A temp directory that will not go away is not a failed proof.
+      }
+    }
+  }
+}
+
+/**
+ * Create the throwaway repository `--e2e` proves the stack in: one commit, so a
+ * writing call has a base to diff against.
+ *
+ * @param {string} repo - the empty temp directory to turn into a repository.
+ * @returns {string | undefined} a failure message, or undefined when it was prepared.
+ */
+function prepareE2eRepository(repo) {
+  const git = (args) => spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
+  try {
+    writeFileSync(join(repo, 'README.md'), '# flash-agents doctor\n\nA throwaway repository, deleted when the run ends.\n')
+  } catch (error) {
+    return `could not write the throwaway repository: ${describeError(error)}`
+  }
+  const steps = [['init', '-q', '-b', 'main'], ['add', '-A'], [...E2E_GIT_CONFIG, 'commit', '-q', '-m', 'init']]
+  for (const args of steps) {
+    const result = git(args)
+    if (result.error !== undefined) return `git ${args.join(' ')} failed: ${describeError(result.error)}`
+    if (result.status !== 0) {
+      return `git ${args.join(' ')} failed: ${String(result.stderr ?? '').trim().split('\n')[0]}`
+    }
+  }
+  return undefined
+}
+
+/**
+ * The paths in `dir` that git reports as modified, which is every way a writing call
+ * could have reached the throwaway repository it was pointed at.
+ *
+ * @param {string} dir - the throwaway repository.
+ * @returns {string[]} the changed paths; empty when the repository is untouched.
+ */
+function touchedPaths(dir) {
+  // The call's own file is named even if git cannot answer, so the failure that matters
+  // is reported even in a repository git refuses to read.
+  const found = []
+  if (existsSync(join(dir, E2E_FILE))) found.push(E2E_FILE)
+  const status = spawnSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf8' })
+  if (status.status === 0 && typeof status.stdout === 'string') {
+    for (const text of status.stdout.split('\n')) {
+      const path = text.slice(3).trim()
+      if (path !== '' && !found.includes(path)) found.push(path)
+    }
+  }
+  return found
+}
+
+/**
+ * Dry-run the disposable copy of a root: what it costs, whether it can be made, and
+ * what the pool decided to leave out along the way.
+ *
+ * This is the failure a Windows user hit 25 minutes into a call: a directory junction in
+ * the tree made every copy abort, and the only sign was in `flash_status`. Measuring the
+ * copy is also how `copyExclude` is tuned — the five largest top-level entries are the
+ * first candidates.
+ *
+ * @param {object} options - what to probe.
+ * @param {object} options.options - parsed CLI options (root, copy excludes).
+ * @param {(text: string) => void} options.emit - output sink.
+ * @returns {Promise<boolean>} whether the copy could be made.
+ */
+async function runCopyProbe({ options, emit }) {
+  // As in `runE2e`: a tree that could not be removed is a failure the exit code reports.
+  const cleanup = { failed: false }
+  const ok = await runCopyProbeSteps({ options, emit, cleanup })
+  return ok && !cleanup.failed
+}
+
+/** The steps of `runCopyProbe`; `cleanup.failed` records a pool that would not close. */
+async function runCopyProbeSteps({ options, emit, cleanup }) {
+  const line = (status, text) => emit(`${status.padEnd(4)}  copy  ${text}\n`)
+  const root = canonicalRoot(options.root)
+  const logs = []
+  const started = Date.now()
+  let tempDir
+  let pool
+  let slot
+  try {
+    tempDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-doctor-copy-')))
+    pool = new WorkspaceIsolation({
+      root,
+      slots: 1,
+      // A private state directory: the user's own trees, patches and sweep are untouched.
+      stateDir: join(tempDir, 'state'),
+      ...(options.copyExclude === undefined ? {} : { copyExclude: options.copyExclude }),
+      // One copy, then gone: a housekeeping timer has nothing to sweep and must not
+      // keep the process alive.
+      sweepIntervalMs: 0,
+      log: (message) => logs.push(message),
+    })
+    slot = await pool.lease()
+    let prepared
+    try {
+      prepared = pool.prepare(slot, { cwd: root })
+    } catch (error) {
+      // Exactly the failure a writing call would have hit, which is the point: print it
+      // as it is, root and cause included.
+      line('fail', describeError(error))
+      for (const message of logs) line('log', message)
+      return false
+    }
+    const elapsedMs = Date.now() - started
+    const copy = directoryStats(slot.dir)
+    line('ok', `copied ${root} in ${formatSeconds(elapsedMs)}`)
+    line('ok', `${formatBytes(copy.bytes)} in ${String(copy.files)} file(s), mechanism: ${String(prepared?.mechanism ?? 'unknown')}`)
+    if (prepared?.reason !== undefined) line('note', String(prepared.reason))
+    for (const message of logs) line('log', message)
+    const largest = largestTopLevel(slot.dir)
+    if (largest.length > 0) {
+      line('top', 'the largest top-level entries of the copy (candidates for copyExclude in .flash-agents.json):')
+      for (const entry of largest) {
+        line('top', `${formatBytes(entry.bytes).padStart(10)}  ${entry.path}`)
+      }
+    }
+    return true
+  } catch (error) {
+    line('fail', `the copy probe failed: ${describeError(error)}`)
+    for (const message of logs) line('log', message)
+    return false
+  } finally {
+    if (slot !== undefined && pool !== undefined) {
+      try {
+        pool.release(slot)
+      } catch {
+        // Releasing a slot that is about to be removed cannot fail the probe.
+      }
+    }
+    try {
+      pool?.close()
+    } catch (error) {
+      cleanup.failed = true
+      line('fail', `could not remove the disposable tree: ${describeError(error)}`)
+    }
+    if (tempDir !== undefined) {
+      try {
+        rmSync(tempDir, { recursive: true, force: true })
+      } catch {
+        // A temp directory that will not go away is not a failed probe.
+      }
+    }
+  }
+}
+
+/**
+ * The total size and file count below a directory.
+ *
+ * `directorySize` in the isolation module is the same walk, but it is deliberately not
+ * exported: this is the doctor's own measurement, and it counts files as well.
+ *
+ * @param {string} dir - the directory to size.
+ * @returns {{bytes: number, files: number}} the sum of the file sizes and how many there are.
+ */
+function directoryStats(dir) {
+  let bytes = 0
+  let files = 0
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return { bytes, files }
+  }
+  for (const entry of entries) {
+    const child = join(dir, entry.name)
+    try {
+      if (entry.isDirectory()) {
+        const nested = directoryStats(child)
+        bytes += nested.bytes
+        files += nested.files
+      } else {
+        bytes += statSync(child).size
+        files += 1
+      }
+    } catch {
+      // A file that vanished mid-walk contributes nothing, exactly as it would to a copy.
+    }
+  }
+  return { bytes, files }
+}
+
+/**
+ * The five largest entries directly under a directory, by size.
+ *
+ * @param {string} dir - the copy's root.
+ * @returns {Array<{path: string, bytes: number}>} the largest entries, biggest first.
+ */
+function largestTopLevel(dir) {
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  return entries
+    // The pool's own scratch directories (`.flash-tmp`, and `.flash-home`/`.flash-cache`
+    // when the repository configures them) are not the caller's content and are never a
+    // copyExclude candidate.
+    .filter((entry) => !(entry.isDirectory() && entry.name.startsWith('.flash-')))
+    .map((entry) => ({
+      path: `${entry.isDirectory() ? `${entry.name}/` : entry.name}`,
+      bytes: entry.isDirectory() ? directoryStats(join(dir, entry.name)).bytes : safeSize(join(dir, entry.name)),
+    }))
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 5)
+}
+
+/** One path's size, or 0 when it cannot be read. @param {string} path @returns {number} */
+function safeSize(path) {
+  try {
+    return statSync(path).size
+  } catch {
+    return 0
+  }
+}
+
+/** A byte count in the unit a person reads it in. @param {number} bytes @returns {string} */
+function formatBytes(bytes) {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${String(bytes)} B`
+}
+
+/** A duration in seconds, at the precision a person reads. @param {number} ms @returns {string} */
+function formatSeconds(ms) {
+  return `${(ms / 1000).toFixed(1)}s`
 }
 
 /** Format a byte count as megabytes, the unit the state report is read in. */

@@ -15,11 +15,12 @@
  * @module flash-mcp/service
  */
 
-import { existsSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 import { IsolationError, WorkspaceIsolation, canonicalTmpdir } from './isolation.js'
+import { estimateInstructions } from './instructions.js'
 import { HarnessSdkClient } from './sdk.js'
 
 /** Route the service pins; callers can never change it. */
@@ -31,6 +32,13 @@ const DEFAULT_TASK_TIMEOUT_MS = 300_000
 
 /** Default returned size of the child's final message. */
 const DEFAULT_MAX_RESULT_CHARS = 8_000
+
+/**
+ * The largest `taskFile` this service reads. A brief is 4-8 KB in practice; a quarter of a
+ * megabyte leaves room for a generous one while keeping a mistaken path (a log, a binary, a
+ * whole checkout) from being pasted into a prompt.
+ */
+const MAX_TASK_FILE_BYTES = 256 * 1024
 
 /**
  * How long a call may go without a single event from its session or its workers
@@ -164,6 +172,8 @@ export class FlashTaskService {
    * @param {(message: string) => void} [options.log] - diagnostic sink (stderr).
    * @param {(profile: string, cwd: string, extraEnv?: object) => HarnessSdkClient} [options.clientFactory]
    *   runtime factory (tests).
+   * @param {object} [options.isolate] - isolation settings. `allowSlotSetup` opts in to the
+   *   repository's `slotSetup` steps, which run on the host outside the worker's sandbox.
    */
   constructor({
     root,
@@ -237,6 +247,9 @@ export class FlashTaskService {
             // options; the options win per entry.
             ...(isolate.copyExclude === undefined ? {} : { copyExclude: isolate.copyExclude }),
             ...(isolate.slotEnv === undefined ? {} : { slotEnv: isolate.slotEnv }),
+            // A setup step is repository code run on the host, outside the sandbox the worker
+            // is confined to, so the pool only runs it after an explicit opt-in.
+            ...(isolate.allowSlotSetup === undefined ? {} : { allowSlotSetup: isolate.allowSlotSetup }),
             log,
           })
     this.stateDir = this.isolation?.stateDir ?? resolve(isolate.stateDir ?? join(canonicalTmpdir(), 'flash-mcp'))
@@ -314,6 +327,45 @@ export class FlashTaskService {
   }
 
   /**
+   * Mark the activity queued when every tree is in use, so the wait does not read as silence.
+   *
+   * The activity object exists before the lease, so a call waiting for a tree used to
+   * report `starting` and a "last event" that only grew: to the caller — and to the idle
+   * check — a queued call looked hung. The counts are stored too, so a render can fall
+   * back to them if the pool is no longer at hand.
+   *
+   * @param {WorkspaceIsolation} pool - the pool the call is about to lease from.
+   * @param {object} activity - the call's activity record.
+   * @returns {number | undefined} when the wait began, or undefined when a tree was free.
+   */
+  #noteQueue(pool, activity) {
+    if (pool.inUse < pool.size) return undefined
+    const since = Date.now()
+    activity.what = `queued: waiting for a free tree (${String(pool.inUse)} of ${String(pool.size)} in use)`
+    activity.queuedSince = since
+    activity.queuedInUse = pool.inUse
+    activity.queuedSize = pool.size
+    // Read through at render time: another waiting call may take the freeing tree first.
+    activity.pool = pool
+    return since
+  }
+
+  /**
+   * Record the end of a wait for a tree: how long it took, and that copying comes next.
+   *
+   * @param {object} activity - the call's activity record.
+   * @param {number | undefined} queuedSince - when the wait began, if it waited at all.
+   * @returns {number} how long the call waited for a tree; 0 when one was free at once.
+   */
+  #noteLeased(activity, queuedSince) {
+    const queuedMs = queuedSince === undefined ? 0 : Math.max(0, Date.now() - queuedSince)
+    delete activity.queuedSince
+    activity.what = 'copying the repository'
+    activity.at = Date.now()
+    return queuedMs
+  }
+
+  /**
    * The runtime a call runs on, and the environment it needs.
    *
    * The runtime is rooted at the *tree*, never at a subdirectory of it: the sandbox root
@@ -323,11 +375,12 @@ export class FlashTaskService {
    *
    * @param {object | undefined} slot - the leased tree, when the call is isolated.
    * @param {string} rootCwd - the resolved directory inside the caller's root.
-   * @returns {{promptCwd: string, runtimeCwd: string, extraEnv: object | undefined}} where to run.
+   * @returns {{promptCwd: string, runtimeCwd: string, extraEnv: object | undefined,
+   *   slotPorts: string[]}} where to run, and which of `extraEnv`'s names are port ranges.
    */
   #runLocation(slot, rootCwd, pool) {
     if (slot === undefined || pool === undefined) {
-      return { promptCwd: rootCwd, runtimeCwd: rootCwd, extraEnv: undefined }
+      return { promptCwd: rootCwd, runtimeCwd: rootCwd, extraEnv: undefined, slotPorts: [] }
     }
     // The runtime's environment is deliberately left alone apart from the per-slot paths
     // the repository's settings ask for. Pointing TMPDIR into the tree looked tidy, but the
@@ -337,6 +390,11 @@ export class FlashTaskService {
     // the same directory succeeded. The tree's own scratch directory still exists and the
     // worker is told about it in its prompt.
     const slotEnv = pool.slotEnvFor(slot)
+    // A `port:` entry resolves to a bare number, which the worker must not read as a path:
+    // the prompt names those variables in their own sentence.
+    const slotPorts = Object.entries(pool.slotEnv)
+      .filter(([, spec]) => spec.kind === 'port')
+      .map(([name]) => name)
     return {
       promptCwd: pool.slotCwd(slot, rootCwd),
       runtimeCwd: slot.dir,
@@ -344,6 +402,7 @@ export class FlashTaskService {
       // same set of paths the slot was prepared with. Undefined when nothing is configured,
       // exactly as before: the runtime's environment is then untouched.
       extraEnv: Object.keys(slotEnv).length === 0 ? undefined : slotEnv,
+      slotPorts,
     }
   }
 
@@ -368,7 +427,8 @@ export class FlashTaskService {
   /**
    * Run one delegated task.
    * @param {object} args - the MCP tool arguments.
-   * @param {string} args.task - the work to delegate.
+   * @param {string} [args.task] - the work to delegate.
+   * @param {string} [args.taskFile] - a file holding the work; exactly one of the two.
    * @param {string} args.cwd - working directory for the worker; must be inside the root.
    * @param {string} [args.acceptance] - optional acceptance criteria for the worker.
    * @param {AbortSignal} [options.signal] - client cancellation.
@@ -377,7 +437,7 @@ export class FlashTaskService {
    * @returns {Promise<object>} the compact structured result.
    */
   async flashTask(args, { signal, progress, progressToken } = {}) {
-    const task = requireText(args?.task, 'task')
+    const task = this.#resolveTask(args)
     const rootCwd = this.#resolveCwd(args?.cwd)
     const acceptance = optionalText(args?.acceptance)
     const apply = this.#resolveApply(args?.apply)
@@ -400,6 +460,18 @@ export class FlashTaskService {
     if (source === 'head' && pool === undefined) {
       throw new FlashTaskError('source "head" applies only to writing calls; a read-only call is not isolated', 'SOURCE_UNAVAILABLE')
     }
+    // `basePatch` continues a call from a patch an earlier one stored: the patch is planted
+    // in this call's copy before the worker starts, never in the caller's tree. Like
+    // `source: "head"`, it needs a copy to act on, so a read-only call is refused here. The
+    // rest of the id — whether it exists, belongs to this root, and names the repository this
+    // call's cwd resolves to — is checked once the copy exists, before the worker starts.
+    const basePatchId = optionalPatchId(args?.basePatch)
+    if (basePatchId !== undefined && pool === undefined) {
+      throw new FlashTaskError(
+        'basePatch applies only to writing calls; a read-only call is not isolated, so it has no copy to apply the patch to',
+        'BASE_PATCH_UNAVAILABLE',
+      )
+    }
     // Progress spans the whole call, including a wait for a free tree: that wait is
     // itself work the client must not mistake for a dead server. The interval is
     // stopped on every path out of this method.
@@ -416,9 +488,16 @@ export class FlashTaskService {
     })
     let slot
     let change
+    let baseApplied
+    let setup
+    let queuedMs = 0
     try {
-      slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal)
-      const { promptCwd, runtimeCwd, extraEnv } = this.#runLocation(slot, rootCwd, pool)
+      if (pool !== undefined) {
+        const queuedSince = this.#noteQueue(pool, activity)
+        slot = await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal)
+        queuedMs = this.#noteLeased(activity, queuedSince)
+      }
+      const { promptCwd, runtimeCwd, extraEnv, slotPorts } = this.#runLocation(slot, rootCwd, pool)
       if (slot !== undefined) {
         try {
           pool.prepare(slot, { cwd: rootCwd, source })
@@ -429,13 +508,42 @@ export class FlashTaskService {
           if (error instanceof IsolationError) throw new FlashTaskError(error.message, error.code)
           throw error
         }
+        // Setup runs on the fresh copy, before the base patch is planted and before the base
+        // is re-recorded: what it writes belongs to the copy's starting state, not to the
+        // worker's change nor to the patch this call continues from.
+        setup = await this.#runSlotSetup(pool, slot, activity, signal)
+        // After `prepare` and the setup, so the base this call's own patch is measured from is
+        // the state the copy was made at, and before the worker, so it starts on top of the
+        // patch. A base patch that cannot be planted is an early refusal: the slot is released
+        // like any other.
+        if (basePatchId !== undefined) {
+          try {
+            baseApplied = pool.applyBasePatch(slot, basePatchId)
+          } catch (error) {
+            throw new FlashTaskError(messageOf(error), 'BASE_PATCH_UNAVAILABLE')
+          }
+        }
+        activity.what = 'starting'
       }
       const childPrompt = buildChildPrompt({
         cwd: promptCwd,
         task,
         acceptance,
-        ...(slot === undefined ? {} : { copy: true, uncommitted: slot.uncommitted, slotEnv: extraEnv }),
+        ...(slot === undefined
+          ? {}
+          : {
+              copy: true,
+              uncommitted: slot.uncommitted,
+              slotEnv: extraEnv,
+              slotPorts,
+              slotSetup: promptSlotSetup(pool, setup),
+              discard: apply === 'discard',
+              ...(baseApplied === undefined ? {} : { basePatch: promptBasePatch(baseApplied) }),
+            }),
       })
+      // Measured before the worker runs, in the tree it is about to see: a worker that writes
+      // or deletes an instruction file must not change what this call reports it was given.
+      const instructions = this.#instructionsFor(promptCwd)
       const { state, started } = await this.#runSession({
         sessionId,
         activity,
@@ -464,9 +572,14 @@ export class FlashTaskService {
         started,
         profile: profileName,
         cwd: runtimeCwd,
+        // Measured where the worker sees them: inside the disposable copy for a writing call.
+        instructions,
         slot,
         change,
         applied,
+        basePatch: baseApplied,
+        setup,
+        queuedMs,
       })
     } catch (error) {
       if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'IDLE' || error?.code === 'CANCELLED')) {
@@ -588,7 +701,9 @@ export class FlashTaskService {
    * @returns {Promise<object>} the compact per-task fleet result.
    */
   async flashBatch(args, { signal, progress, progressToken } = {}) {
-    const tasks = normalizeTasks(args?.tasks, this.maxTasks)
+    const tasks = normalizeTasks(args?.tasks, this.maxTasks, {
+      readTaskFile: (value, field) => this.#readTaskFile(value, field),
+    })
     const rootCwd = this.#resolveCwd(args?.cwd)
     const acceptance = optionalText(args?.acceptance)
     const apply = this.#resolveApply(args?.apply)
@@ -610,6 +725,14 @@ export class FlashTaskService {
     if (source === 'head' && pool === undefined) {
       throw new FlashTaskError('source "head" applies only to writing calls; a read-only call is not isolated', 'SOURCE_UNAVAILABLE')
     }
+    // A fleet continues from a base patch exactly as one task does; see flashTask.
+    const basePatchId = optionalPatchId(args?.basePatch)
+    if (basePatchId !== undefined && pool === undefined) {
+      throw new FlashTaskError(
+        'basePatch applies only to writing calls; a read-only call is not isolated, so it has no copy to apply the patch to',
+        'BASE_PATCH_UNAVAILABLE',
+      )
+    }
     // As with flash_task, progress spans the whole call, a wait for a free tree included.
     const activity = createActivity()
     const stopProgress = startProgress({
@@ -624,9 +747,16 @@ export class FlashTaskService {
     })
     let slot
     let change
+    let baseApplied
+    let setup
+    let queuedMs = 0
     try {
-      slot = pool === undefined ? undefined : await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal)
-      const { promptCwd, runtimeCwd, extraEnv } = this.#runLocation(slot, rootCwd, pool)
+      if (pool !== undefined) {
+        const queuedSince = this.#noteQueue(pool, activity)
+        slot = await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal)
+        queuedMs = this.#noteLeased(activity, queuedSince)
+      }
+      const { promptCwd, runtimeCwd, extraEnv, slotPorts } = this.#runLocation(slot, rootCwd, pool)
       if (slot !== undefined) {
         try {
           pool.prepare(slot, { cwd: rootCwd, source })
@@ -634,8 +764,30 @@ export class FlashTaskService {
           if (error instanceof IsolationError) throw new FlashTaskError(error.message, error.code)
           throw error
         }
+        // The fleet's one copy gets the same setup as a single task's; see flashTask.
+        setup = await this.#runSlotSetup(pool, slot, activity, signal)
+        // The fleet's one copy starts on top of the base patch, exactly as a single task's does.
+        if (basePatchId !== undefined) {
+          try {
+            baseApplied = pool.applyBasePatch(slot, basePatchId)
+          } catch (error) {
+            throw new FlashTaskError(messageOf(error), 'BASE_PATCH_UNAVAILABLE')
+          }
+        }
+        activity.what = 'starting'
       }
-      const copy = slot === undefined ? {} : { copy: true, uncommitted: slot.uncommitted, slotEnv: extraEnv }
+      const copy =
+        slot === undefined
+          ? {}
+          : {
+              copy: true,
+              uncommitted: slot.uncommitted,
+              slotEnv: extraEnv,
+              slotPorts,
+              slotSetup: promptSlotSetup(pool, setup),
+              discard: apply === 'discard',
+              ...(baseApplied === undefined ? {} : { basePatch: promptBasePatch(baseApplied) }),
+            }
       const items = tasks.map((entry, index) => ({
         label: `task-${String(index + 1)}`,
         prompt: [
@@ -644,6 +796,8 @@ export class FlashTaskService {
           WORKER_RULES,
         ].join('\n'),
       }))
+      // As in flashTask: measured before the fleet runs, in the copy its members see.
+      const instructions = this.#instructionsFor(promptCwd)
       const { state, started } = await this.#runSession({
         sessionId,
         activity,
@@ -677,9 +831,13 @@ export class FlashTaskService {
         started,
         profile: profileName,
         cwd: runtimeCwd,
+        instructions,
         slot,
         change,
         applied,
+        basePatch: baseApplied,
+        setup,
+        queuedMs,
       })
     } catch (error) {
       if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'IDLE' || error?.code === 'CANCELLED')) {
@@ -689,6 +847,35 @@ export class FlashTaskService {
     } finally {
       stopProgress()
       if (slot !== undefined) this.#settleSlot(pool, slot, change)
+    }
+  }
+
+  /**
+   * Run the repository's setup steps in one prepared slot, as the service sees them.
+   *
+   * The pool owns the steps; the service owns the error shape and the activity line, so a
+   * status call or a heartbeat never reads as silence while `uv sync` runs. A failed or
+   * cancelled step is a FlashTaskError like every other refusal, and the slot is released by
+   * the caller's `finally` exactly as it would be after a worker that ran.
+   *
+   * @param {WorkspaceIsolation} pool - the call's pool.
+   * @param {object} slot - the prepared slot.
+   * @param {object} activity - the call's activity record.
+   * @param {AbortSignal} [signal] - the call's cancellation.
+   * @returns {Promise<object[] | undefined>} what `runSetup` reported, if anything.
+   */
+  async #runSlotSetup(pool, slot, activity, signal) {
+    try {
+      return await pool.runSetup(slot, {
+        signal,
+        onStep: (run) => {
+          activity.what = `running slot setup: ${run.join(' ')}`
+          activity.at = Date.now()
+        },
+      })
+    } catch (error) {
+      if (error instanceof IsolationError) throw new FlashTaskError(error.message, error.code)
+      throw error
     }
   }
 
@@ -908,6 +1095,85 @@ export class FlashTaskService {
     }
   }
 
+  /**
+   * The task text of a `flash_task` call: either `task` or `taskFile`, exactly one.
+   *
+   * @param {object} args - the MCP tool arguments.
+   * @returns {string} the task text, exactly as written.
+   * @throws {FlashTaskError} when both or neither field is present.
+   */
+  #resolveTask(args) {
+    const hasTask = args?.task !== undefined && args?.task !== null
+    const hasFile = args?.taskFile !== undefined && args?.taskFile !== null
+    if (hasTask && hasFile) {
+      throw new FlashTaskError(
+        'task and taskFile cannot both be given: pass exactly one of "task" (the task text) or ' +
+          '"taskFile" (a path to a file holding it)',
+        'INVALID_ARGUMENT',
+      )
+    }
+    if (!hasTask && !hasFile) {
+      throw new FlashTaskError(
+        'a task is required: pass exactly one of "task" (the task text) or "taskFile" (a path to a ' +
+          'file holding it)',
+        'INVALID_ARGUMENT',
+      )
+    }
+    if (hasFile) return this.#readTaskFile(args.taskFile)
+    return requireText(args.task, 'task')
+  }
+
+  /**
+   * Read a task brief from a file, fenced to the service root exactly like `cwd`.
+   *
+   * Callers write 4-8 KB briefs to a file and used to paste `$(cat brief)` into the task
+   * text, which the worker then started on literally. A path — relative to the root — is
+   * sent as written, once. Reading is confined for the same reason every other path is:
+   * the file is about to be put into a prompt, so a path outside the root (or a symlink
+   * pointing out of it) is refused rather than read.
+   *
+   * @param {unknown} requested - the `taskFile` argument.
+   * @param {string} [field] - the argument's name, for errors (`tasks[1].taskFile` in a fleet).
+   * @returns {string} the file's text, exactly as written.
+   * @throws {FlashTaskError} when the path is unreadable, outside the root, or not a usable file.
+   */
+  #readTaskFile(requested, field = 'taskFile') {
+    const text = requireText(requested, field)
+    const absolute = isAbsolute(text) ? resolve(text) : resolve(this.root, text)
+    let real
+    try {
+      // realpathSync both proves the file exists and resolves a symlink, so a link that
+      // points out of the root is fenced by the same comparison a literal path gets.
+      real = realpathSync(absolute)
+    } catch (error) {
+      throw new FlashTaskError(`${field} "${text}" could not be read: ${messageOf(error)}`, 'INVALID_ARGUMENT')
+    }
+    const relation = relative(this.root, real)
+    if (relation === '..' || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
+      throw new FlashTaskError(
+        `${field} "${text}" is outside the service root ${this.root}; this service is confined to that root`,
+        'TASK_FILE_OUTSIDE_ROOT',
+      )
+    }
+    const stats = statSync(real)
+    if (!stats.isFile()) {
+      throw new FlashTaskError(`${field} "${text}" is not a regular file`, 'INVALID_ARGUMENT')
+    }
+    if (stats.size > MAX_TASK_FILE_BYTES) {
+      throw new FlashTaskError(
+        `${field} "${text}" is ${String(stats.size)} bytes; the most this service reads is ` +
+          `${String(MAX_TASK_FILE_BYTES)} (256 KB)`,
+        'INVALID_ARGUMENT',
+      )
+    }
+    const content = readFileSync(real, 'utf8')
+    if (content.trim().length === 0) {
+      throw new FlashTaskError(`${field} "${text}" is empty`, 'INVALID_ARGUMENT')
+    }
+    this.log(`task read from ${real} (${String(content.length)} chars)`)
+    return content
+  }
+
   /** Resolve and fence the worker working directory. */
   #resolveCwd(requested) {
     if (requested === undefined || requested === null || requested === '') return this.root
@@ -958,11 +1224,19 @@ export class FlashTaskService {
    * @param {object} [input.slot] - the disposable tree, when the call had one.
    * @param {object} [input.change] - the change the call produced.
    * @param {boolean} [input.applied] - whether the change was applied to the root.
+   * @param {object} [input.basePatch] - the base patch the copy was started from.
    * @returns {object} fields to spread into the result.
    */
-  #changeFields({ profileName, slot, change, applied }) {
+  #changeFields({ profileName, slot, change, applied, basePatch }) {
     const isolated = this.isolation !== undefined && profileName === this.profile
-    const fields = { isolation: { mode: isolated ? 'copy' : 'none', slot: slot?.id ?? null, ...(slot?.uncommitted?.count > 0 ? { uncommittedAtStart: slot.uncommitted } : {}) } }
+    const fields = {
+      isolation: {
+        mode: isolated ? 'copy' : 'none',
+        slot: slot?.id ?? null,
+        ...(slot?.uncommitted?.count > 0 ? { uncommittedAtStart: slot.uncommitted } : {}),
+      },
+      ...basePatchFields(basePatch),
+    }
     if (change === undefined) return fields
     const omitted = change.diffOmitted ?? []
     return {
@@ -990,10 +1264,12 @@ export class FlashTaskService {
   }
 
   /** Assemble the compact per-task fleet result. */
-  #buildBatchResult({ state, tasks, sessionId, started, profile, cwd, slot, change, applied }) {
+  #buildBatchResult({ state, tasks, sessionId, started, profile, cwd, instructions, slot, change, applied, basePatch, setup, queuedMs = 0 }) {
     const envelope = extractWorkflowValue(state.workflowText)
     const payload = envelope.value
     const warnings = []
+    // What every member of the fleet was given in its prompt before it read the task.
+    if (instructions.overBudget) warnings.push(overBudgetWarning(instructions))
     // Operational breadcrumb: enough to tell an unreadable value from a
     // mis-shaped one without ever returning the workflow's raw text.
     const header = parseWorkflowHeader(state.workflowText)
@@ -1091,6 +1367,17 @@ export class FlashTaskService {
     }
 
     const maxParallel = state.maxParallel
+    // A member that ended "ok" with an empty message did not report its work: the entry's
+    // text *is* the account, so an empty one cannot count as done. The fleet status below
+    // is computed from the corrected entries, so a silent member makes the fleet partial
+    // or failed rather than quietly ok.
+    if (results !== null) {
+      results = results.map((entry) =>
+        entry.status === 'ok' && entry.result.trim().length === 0
+          ? { ...entry, status: 'error', emptyResult: true }
+          : entry,
+      )
+    }
     const ok = results === null ? 0 : results.filter((entry) => entry.status === 'ok').length
     const failed = results === null ? 0 : results.length - ok
     const status = results === null ? 'unknown' : failed === 0 ? 'ok' : ok === 0 ? 'error' : 'partial'
@@ -1099,6 +1386,9 @@ export class FlashTaskService {
     }
     if (state.children.some((child) => child.status !== 'ok')) {
       warnings.push('at least one worker ended with a non-ok status')
+    }
+    if (slot !== undefined && this.isolation?.slotSetupWarning !== undefined) {
+      warnings.push(this.isolation.slotSetupWarning)
     }
     const routes = []
     for (const route of state.childRoutes.values()) {
@@ -1129,16 +1419,20 @@ export class FlashTaskService {
       ...(state.workflowStopReason === undefined ? {} : { runStopReason: state.workflowStopReason }),
       sessionId,
       mode: profile.endsWith('-readonly') ? 'read-only' : 'workspace-write',
+      // The session's own run time: a wait for a free tree is reported separately, as queuedMs.
       durationMs: Date.now() - started,
+      queuedMs,
       ...(usage === undefined ? {} : { usage }),
+      instructions,
+      ...(setup === undefined || setup.length === 0 ? {} : { setup }),
       runtime: this.#runtimeInfo(profile, cwd),
-      ...this.#changeFields({ profileName: profile, slot, change, applied }),
+      ...this.#changeFields({ profileName: profile, slot, change, applied, basePatch }),
       ...(warnings.length === 0 ? {} : { warnings }),
     }
   }
 
   /** Assemble the compact result the MCP client receives. */
-  #buildResult({ state, sessionId, started, profile, cwd, slot, change, applied }) {
+  #buildResult({ state, sessionId, started, profile, cwd, instructions, slot, change, applied, basePatch, setup, queuedMs = 0 }) {
     const children = state.children.map((child) => {
       const clipped = truncate(child.result, this.maxResultChars)
       return {
@@ -1153,13 +1447,33 @@ export class FlashTaskService {
     })
     const primary = children[children.length - 1]
     const usage = usageTotal(state)
+    // `instructions` is what the worker was given in its prompt before it read the task: the
+    // harness injects the project's instruction files into every worker, so this is a
+    // per-call token cost the caller would otherwise only discover from its bill.
+    // "ok" with no words and no work is not a finished task: nothing says the worker did
+    // what it was asked, and a caller that reads the status alone would accept it. Only an
+    // empty message is reclassified — a short one is the worker's business, not ours.
+    const changed = change?.available === true && (change.filesChanged ?? []).length > 0
+    const emptyResult = primary.result.trim().length === 0
     const warnings = []
     if (children.length > 1) warnings.push(`the orchestrator delegated ${String(children.length)} times; the last child is reported as the result`)
     if (primary.status !== 'ok') warnings.push(`the worker ended with status "${String(primary.status)}"`)
+    if (emptyResult && !changed) {
+      primary.status = 'error'
+      warnings.push('the worker ended with an empty final message and changed nothing; treat the call as failed and send the task again')
+    } else if (emptyResult) {
+      warnings.push('the worker ended with an empty final message, so its account of the change is missing; review the diff before applying it')
+    }
     if ((change?.ignored ?? []).length > 0) {
       warnings.push(
         `the worker created ${String(change.ignored.length)} path(s) that git ignores, so the patch cannot carry them: ${change.ignored.slice(0, 5).join(', ')}`,
       )
+    }
+    // Over budget, the harness keeps the most specific files and drops the broader
+    // ones, so the worker's prompt is quietly missing project-wide rules. Say so.
+    if (instructions.overBudget) warnings.push(overBudgetWarning(instructions))
+    if (slot !== undefined && this.isolation?.slotSetupWarning !== undefined) {
+      warnings.push(this.isolation.slotSetupWarning)
     }
 
     return {
@@ -1169,17 +1483,51 @@ export class FlashTaskService {
       route: primary.route,
       result: primary.result,
       resultTruncated: primary.resultTruncated,
+      ...(emptyResult ? { emptyResult: true } : {}),
       childSessionId: primary.childSessionId,
       sessionId,
       mode: profile.endsWith('-readonly') ? 'read-only' : 'workspace-write',
+      // The session's own run time: a wait for a free tree is reported separately, as queuedMs.
       durationMs: Date.now() - started,
+      queuedMs,
       ...(usage === undefined ? {} : { usage }),
+      instructions,
+      ...(setup === undefined || setup.length === 0 ? {} : { setup }),
       runtime: this.#runtimeInfo(profile, cwd),
-      ...this.#changeFields({ profileName: profile, slot, change, applied }),
+      ...this.#changeFields({ profileName: profile, slot, change, applied, basePatch }),
       ...(warnings.length === 0 ? {} : { warnings }),
       ...(children.length === 1 ? {} : { children }),
     }
   }
+
+  /**
+   * The instruction files the harness injects into every worker of a call, measured
+   * for the directory the worker actually sees.
+   *
+   * Runs once per call and never throws; see `estimateInstructions`.
+   *
+   * @param {string} workerCwd - the working directory named in the worker's prompt.
+   * @returns {{files: object[], bytes: number, budgetBytes: number, overBudget: boolean, approxTokens: number}}
+   */
+  #instructionsFor(workerCwd) {
+    return estimateInstructions({ cwd: workerCwd, dshHome: this.env?.DSH_HOME })
+  }
+}
+
+/**
+ * The warning a result carries when the project's instruction files outgrew the
+ * harness's budget: over it, the worker's prompt silently misses the broader files.
+ *
+ * @param {{bytes: number, budgetBytes: number}} instructions - the measured estimate.
+ * @returns {string} one sentence naming the size and the consequence.
+ */
+function overBudgetWarning(instructions) {
+  const kb = Math.ceil(instructions.bytes / 1024)
+  const budgetKb = Math.round(instructions.budgetBytes / 1024)
+  return (
+    `the project instruction files are ${String(kb)} KB, over the harness's ${String(budgetKb)} KB budget; ` +
+    'workers see only part of them (the most specific files first)'
+  )
 }
 
 /** The observation state for one session. */
@@ -1208,6 +1556,14 @@ function touchActivity(activity, event) {
 /** One line describing the last activity, for heartbeats and stop reasons. */
 export function describeActivity(activity, now = Date.now()) {
   if (activity === undefined) return 'no activity recorded'
+  // A call waiting for a tree has no session event to report, and saying so is the point:
+  // "last event 10m0s ago" for a call that never started reads as a hang. The counts come
+  // from the pool at render time when it is still at hand.
+  if (activity.queuedSince !== undefined) {
+    const inUse = activity.pool?.inUse ?? activity.queuedInUse ?? 0
+    const size = activity.pool?.size ?? activity.queuedSize ?? 0
+    return `queued ${formatElapsed(now - activity.queuedSince)}: waiting for a free tree (${String(inUse)} of ${String(size)} in use)`
+  }
   const ago = formatElapsed(now - activity.at)
   const step = activity.step === undefined ? '' : `step ${String(activity.step)} · `
   return `${step}${activity.what} · last event ${ago} ago`
@@ -1778,8 +2134,21 @@ export function buildBatchPrompt({ count, script, args }) {
   ].join('\n')
 }
 
-/** Validate and normalize the fleet's task list. */
-export function normalizeTasks(tasks, maxTasks) {
+/**
+ * Validate and normalize the fleet's task list.
+ *
+ * An entry is a task string, or an object carrying its text either inline (`task`) or in a
+ * file (`taskFile`), plus optional acceptance criteria. Reading a task file is the
+ * caller's job — the service owns the fence around its root — so the reader is passed in;
+ * the errors for the string and inline `task` forms are unchanged.
+ *
+ * @param {unknown} tasks - the raw `tasks` argument.
+ * @param {number} maxTasks - ceiling on tasks in one call.
+ * @param {object} [options] - task-file wiring.
+ * @param {(value: unknown, field: string) => string} [options.readTaskFile] - reads one brief.
+ * @returns {Array<{task: string, acceptance: string | undefined}>} the normalized tasks.
+ */
+export function normalizeTasks(tasks, maxTasks, { readTaskFile } = {}) {
   if (!Array.isArray(tasks)) {
     throw new FlashTaskError('tasks must be an array', 'INVALID_ARGUMENT')
   }
@@ -1792,6 +2161,9 @@ export function normalizeTasks(tasks, maxTasks) {
       'INVALID_ARGUMENT',
     )
   }
+  const read = readTaskFile ?? (() => {
+    throw new FlashTaskError('taskFile is not readable in this context', 'INVALID_ARGUMENT')
+  })
   return tasks.map((entry, index) => {
     if (typeof entry === 'string') return { task: requireText(entry, `tasks[${String(index)}]`), acceptance: undefined }
     if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
@@ -1799,6 +2171,20 @@ export function normalizeTasks(tasks, maxTasks) {
         `tasks[${String(index)}] must be a string or an object with a "task" field`,
         'INVALID_ARGUMENT',
       )
+    }
+    const hasTask = entry.task !== undefined && entry.task !== null
+    const hasFile = entry.taskFile !== undefined && entry.taskFile !== null
+    if (hasTask && hasFile) {
+      throw new FlashTaskError(
+        `tasks[${String(index)}] carries both "task" and "taskFile"; pass exactly one of them`,
+        'INVALID_ARGUMENT',
+      )
+    }
+    if (hasFile) {
+      return {
+        task: read(entry.taskFile, `tasks[${String(index)}].taskFile`),
+        acceptance: optionalText(entry.acceptance),
+      }
     }
     return {
       task: requireText(entry.task, `tasks[${String(index)}].task`),
@@ -1862,27 +2248,68 @@ function warnAboutIgnoredArguments(args, toolName, log) {
 }
 
 /**
- * Two instructions every worker carries, isolated or not.
+ * The instructions every worker carries, isolated or not.
  *
  * A commit hides the work from the service: the patch is read from the working tree, so a
- * committed change reads as unrelated or as nothing at all. And an escape hatch — unsafe
- * code, a lint silenced instead of fixed, a test weakened so it passes — is exactly the kind
- * of thing a later reader cannot see from the diff, so naming it in the final report is the
- * only place it survives.
+ * committed change reads as unrelated or as nothing at all. An escape hatch — unsafe code, a
+ * lint silenced instead of fixed, a test weakened so it passes — is exactly the kind of thing
+ * a later reader cannot see from the diff, so naming it in the final report is the only place
+ * it survives. Three more exist because the caller reads the report, not the transcript: a
+ * deviation from the named interface is invisible unless it is said first, a contract that
+ * looks wrong is the caller's decision rather than something to route around, and a task
+ * abandoned halfway must say so before its partial result is mistaken for a whole one.
  */
 export const WORKER_INSTRUCTIONS = [
   'Do not commit unless the task explicitly asks: the service reads the change from the working tree, and a commit only confuses the report.',
   'If the work reaches for an escape hatch (unsafe code, a disabled or suppressed check or lint, a skipped or weakened test), name each one in the final report with the reason.',
+  'If you build a different interface or structure than the task names (another signature, the logic split across several places instead of one, a different data shape), say so first in your final report, with the reason.',
+  "If the task's contract or design looks wrong, report it rather than quietly working around it.",
+  'If you stop before the task is done, start your final report with why you stopped (for example: the context is full, a blocker, a test you could not make pass) and what is left.',
 ]
 
 /** How many of the copy's uncommitted paths are worth naming in the prompt. */
 const PROMPT_UNCOMMITTED_LIMIT = 20
 
+/** How many files the base-patch paragraph names on its one line. */
+const PROMPT_BASE_PATCH_LIMIT = 20
+
+/**
+ * What a `discard` call tells its worker about scratch space. The usual ending says the
+ * scratch directory is left out of the reported change; under `discard` there is no report
+ * and no patch, so a worker that "saves" a finding there loses it when the copy is deleted
+ * — which is what happened to a review that named a `.flash-tmp` patch file that never
+ * survived the call.
+ */
+const DISCARD_SCRATCH =
+  'This call keeps nothing: the copy, ./.flash-tmp/ included, is deleted when you finish, and no patch is stored. ' +
+  'Anything that matters — a test that proves a finding, a proposed fix — must be written out in full in your final message (a fix as a unified diff).'
+
+/**
+ * The base-patch facts the worker prompt names: which patch, what it changed, and whether it
+ * landed cleanly. Deliberately smaller than the result's field — a worker has no use for the
+ * merge mode, and the sentence it reads is built from these three.
+ *
+ * @param {object} basePatch - what `applyBasePatch` planted in the copy.
+ * @returns {{patchId: string, filesChanged: string[], conflicts: string[]}} the prompt facts.
+ */
+function promptBasePatch(basePatch) {
+  return { patchId: basePatch.patchId, filesChanged: basePatch.filesChanged ?? [], conflicts: basePatch.conflicts ?? [] }
+}
+
 /** The worker-facing task text. */
-export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slotEnv }) {
+export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slotEnv, slotPorts, slotSetup, discard, basePatch }) {
   const started = Number(uncommitted?.count) > 0
   const startedFiles = started ? (uncommitted.files ?? []).slice(0, PROMPT_UNCOMMITTED_LIMIT) : []
-  const envNames = slotEnv === undefined || slotEnv === null ? [] : Object.keys(slotEnv)
+  const allEnvNames = slotEnv === undefined || slotEnv === null ? [] : Object.keys(slotEnv)
+  // A `port:` entry holds a number, not a directory, and the worker would look for a path
+  // if it were named in the same sentence. Only the names this call actually set count.
+  const portNames = (Array.isArray(slotPorts) ? slotPorts : []).filter((name) => allEnvNames.includes(name))
+  const envNames = allEnvNames.filter((name) => !portNames.includes(name))
+  const setupSteps = Array.isArray(slotSetup) ? slotSetup : []
+  // A call that continues from an earlier patch starts on top of that change: the worker must
+  // not redo it, and must resolve it first when the copy holds conflict markers instead.
+  const baseFiles = basePatch === undefined || basePatch === null ? [] : (basePatch.filesChanged ?? []).slice(0, PROMPT_BASE_PATCH_LIMIT)
+  const baseConflicts = basePatch === undefined || basePatch === null ? [] : (basePatch.conflicts ?? [])
   return [
     `Working directory: ${cwd}`,
     '',
@@ -1894,7 +2321,9 @@ export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slo
           'Use relative paths: a path naming the original repository refers to a different directory that you cannot write, and',
           'anything outside this copy is discarded — only the change you leave here is reported back.',
           'Scratch files of your own (downloads, throwaway output, notes to yourself) go under ./.flash-tmp/ in this copy;',
-          'it already exists and is left out of the reported change.',
+          ...(discard === true
+            ? ['it already exists.', DISCARD_SCRATCH]
+            : ['it already exists and is left out of the reported change.']),
         ]
       : []),
     ...(started
@@ -1906,14 +2335,83 @@ export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slo
           "They are the caller's work in progress, not yours: git status shows them exactly as the caller left them (staged only where the caller staged them). Leave them alone unless the task is about them.",
         ]
       : []),
-    ...(envNames.length === 0
+    ...(basePatch === undefined || basePatch === null
       ? []
-      : ['', `The environment sets ${envNames.join(', ')} to writable per-slot directories; use them for caches and tool state.`]),
+      : [
+          '',
+          `The copy already contains the change from an earlier call (patch ${basePatch.patchId}), applied before you started: ${baseFiles.join(', ')}. Continue from it; do not redo it.`,
+          ...(baseConflicts.length === 0 ? [] : [`It did not apply cleanly: ${baseConflicts.join(', ')} hold conflict markers. Resolve them first.`]),
+        ]),
+    ...(envNames.length === 0 && portNames.length === 0
+      ? []
+      : [
+          '',
+          ...(envNames.length === 0
+            ? []
+            : [`The environment sets ${envNames.join(', ')} to writable per-slot directories; use them for caches and tool state.`]),
+          ...(portNames.length === 0
+            ? []
+            : [`${portNames.join(', ')} hold a port base reserved for this slot; use ports from there instead of fixed ones.`]),
+        ]),
+    ...(setupSteps.length === 0
+      ? []
+      : ['', ...setupSteps.map((step) => slotSetupPromptLine(step))]),
     '',
     'Task:',
     task,
     ...(acceptance === undefined ? [] : ['', 'Acceptance criteria:', acceptance]),
   ].join('\n')
+}
+
+/**
+ * The sentence a worker reads about one setup step that already ran.
+ *
+ * @param {{run: string[], inputs?: string[]}} step - the step's argv and declared inputs.
+ * @returns {string} the prompt line.
+ */
+function slotSetupPromptLine(step) {
+  const run = Array.isArray(step.run) ? step.run.join(' ') : String(step.run)
+  const inputs = Array.isArray(step.inputs) ? step.inputs : []
+  if (inputs.length === 0) {
+    return `The slot setup (${run}) has already run in this copy; do not run it again unless you change the files it reads.`
+  }
+  return `The slot setup (${run}; inputs: ${inputs.join(', ')}) has already run in this copy; do not run it again unless you change ${inputs.join(', ')}.`
+}
+
+/**
+ * The setup facts the worker prompt may name, or nothing when no step ran.
+ *
+ * @param {WorkspaceIsolation | undefined} pool - the call's pool.
+ * @param {object[] | undefined} setup - what `runSetup` reported.
+ * @returns {{run: string[], inputs: string[]}[] | undefined} the prompt facts.
+ */
+function promptSlotSetup(pool, setup) {
+  if (pool === undefined || setup === undefined || setup.length === 0) return undefined
+  return pool.slotSetup.map((step) => ({ run: step.run, inputs: step.inputs }))
+}
+
+/**
+ * The base patch a call continued from, as its result reports it.
+ *
+ * The note is part of the answer, not decoration: `prepare` records the copy's base before
+ * the base patch is applied, so the patch this call stores holds the base patch's change plus
+ * the new work. A caller that applies both would fail or duplicate the change, so the result
+ * says which one replaces which.
+ *
+ * @param {object} [basePatch] - what `applyBasePatch` planted in the copy.
+ * @returns {object} the field to spread into the result, or nothing when no base was used.
+ */
+function basePatchFields(basePatch) {
+  if (basePatch === undefined) return {}
+  return {
+    basePatch: {
+      patchId: basePatch.patchId,
+      applied: true,
+      threeWay: basePatch.threeWay === true,
+      conflicts: basePatch.conflicts ?? [],
+      note: "this call's change.patchId is cumulative: it holds the base patch's change and the new work together, so apply it instead of the base patch",
+    },
+  }
 }
 
 /**
@@ -1981,6 +2479,25 @@ function optionalText(value) {
   if (typeof value !== 'string') throw new FlashTaskError('acceptance must be a string when present', 'INVALID_ARGUMENT')
   const trimmed = value.trim()
   return trimmed.length === 0 ? undefined : trimmed
+}
+
+/**
+ * The `basePatch` argument, when a call carried one.
+ *
+ * Only the shape is checked here. The id itself is looked up where the copy exists, so an
+ * unknown id is refused with the message that names the patch directory it searched rather
+ * than a second, weaker one here.
+ *
+ * @param {unknown} value - the raw argument.
+ * @returns {string | undefined} the patch id, or undefined when none was given.
+ * @throws {FlashTaskError} with code `INVALID_ARGUMENT` when it is present but not a string.
+ */
+function optionalPatchId(value) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new FlashTaskError('basePatch must be a non-empty patchId string when present', 'INVALID_ARGUMENT')
+  }
+  return value.trim()
 }
 
 function messageOf(error) {

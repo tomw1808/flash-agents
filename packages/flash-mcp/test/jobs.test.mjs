@@ -59,7 +59,7 @@ class FakeService {
 }
 
 /** A dispatcher over a fake service, a registry with an injected clock, and captured logs. */
-function harness({ maxEnded } = {}) {
+function harness({ maxEnded, waitProgressIntervalMs } = {}) {
   const service = new FakeService()
   const logs = []
   let now = 1_000_000
@@ -76,7 +76,12 @@ function harness({ maxEnded } = {}) {
     now: () => now,
     ...(maxEnded === undefined ? {} : { maxEnded }),
   })
-  const call = createToolCaller({ service, jobs: registry, log: (message) => logs.push(message) })
+  const call = createToolCaller({
+    service,
+    jobs: registry,
+    log: (message) => logs.push(message),
+    ...(waitProgressIntervalMs === undefined ? {} : { waitProgressIntervalMs }),
+  })
   return { service, registry, logs, clock, call }
 }
 
@@ -156,6 +161,120 @@ test('cancelling the request carrying flash_result stops the wait and leaves the
   assert.equal(stopped.isError, undefined)
   assert.equal(payloadOf(stopped).state, 'running')
   assert.equal(registry.status(jobId).state, 'running')
+})
+
+test('flash_result says why its wait ended: job-ended, timeout, request-cancelled, or not-waited', async () => {
+  const { service, registry, call } = harness()
+
+  // 1. The job ended while the request waited.
+  const ending = await start(call, 'flash_task', { task: 'ends while waited on' })
+  const waiting = call('flash_result', { jobId: ending, waitSeconds: 600 }, {})
+  await tick()
+  service.calls.at(-1).gate.resolve({ status: 'ok', message: 'done' })
+  const settled = payloadOf(await waiting)
+  assert.equal(settled.message, 'done')
+  assert.equal(settled.wait.endedBy, 'job-ended')
+  assert.equal(settled.wait.requestedMs, 600_000)
+  assert.ok(settled.wait.waitedMs >= 0 && settled.wait.waitedMs < 600_000)
+
+  // 2. The timer ran out with the job still running. waitSeconds is an integer, so the
+  // shortest real wait is one second; the job's own clock is not what bounds it.
+  const stuck = await start(call, 'flash_task', { task: 'never ends' })
+  const timedOut = payloadOf(await call('flash_result', { jobId: stuck, waitSeconds: 1 }, {}))
+  assert.equal(timedOut.state, 'running')
+  assert.equal(timedOut.wait.endedBy, 'timeout')
+  assert.equal(timedOut.wait.requestedMs, 1_000)
+  assert.ok(timedOut.wait.waitedMs >= 900, `expected about a second, got ${String(timedOut.wait.waitedMs)}`)
+  assert.equal(registry.status(stuck).state, 'running')
+
+  // 3. The request carrying the call was cancelled by its client.
+  const controller = new AbortController()
+  const cancelled = call('flash_result', { jobId: stuck, waitSeconds: 600 }, { signal: controller.signal })
+  await tick()
+  controller.abort()
+  const stopped = payloadOf(await cancelled)
+  assert.equal(stopped.state, 'running')
+  assert.equal(stopped.wait.endedBy, 'request-cancelled')
+  assert.ok(stopped.wait.waitedMs < 600_000)
+
+  // 4. Nothing was waited for: the job had already ended when the call arrived.
+  const after = payloadOf(await call('flash_result', { jobId: ending, waitSeconds: 5 }, {}))
+  assert.equal(after.wait.endedBy, 'not-waited')
+  assert.equal(after.wait.requestedMs, 5_000)
+  assert.ok(after.wait.waitedMs < 50, `a job that had already ended is not waited for, got ${String(after.wait.waitedMs)}`)
+})
+
+test('a waiting flash_result sends progress heartbeats with the job’s latest line, and stops', async () => {
+  const { service, registry, call } = harness({ waitProgressIntervalMs: 10 })
+  const jobId = await start(call, 'flash_task', { task: 'waits a while' })
+
+  // Before the job has reported anything, the heartbeat says so.
+  const early = []
+  const earlyWait = call(
+    'flash_result',
+    { jobId, waitSeconds: 600 },
+    { progressToken: 'tok-wait', sendProgress: (report) => early.push(report) },
+  )
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.ok(early.length >= 1, `expected a heartbeat, saw ${String(early.length)}`)
+  assert.equal(early[0].total, 600)
+  assert.equal(typeof early[0].progress, 'number')
+  assert.match(early[0].message, /^waiting for job-[0-9a-f]{8}: no progress yet$/)
+
+  service.calls[0].progress({ message: 'halfway' })
+  const reports = []
+  const waiting = call(
+    'flash_result',
+    { jobId, waitSeconds: 600 },
+    { progressToken: 'tok-wait', sendProgress: (report) => reports.push(report) },
+  )
+  await new Promise((resolve) => setTimeout(resolve, 35))
+  assert.ok(reports.length >= 2, `expected progress while waiting, saw ${String(reports.length)}`)
+  assert.equal(reports[0].total, 600)
+  assert.match(reports.at(-1).message, /^waiting for job-[0-9a-f]{8}: halfway$/)
+
+  // Ending the wait clears the interval: no heartbeat may arrive after the answer.
+  service.calls[0].gate.resolve({ status: 'ok', message: 'done' })
+  const result = payloadOf(await waiting)
+  assert.equal(result.wait.endedBy, 'job-ended')
+  const after = reports.length
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  assert.equal(reports.length, after, 'no progress after the wait ended')
+
+  service.calls[0].gate.resolve({ status: 'ok' })
+  await earlyWait
+  await registry.get(jobId).settled
+})
+
+test('a heartbeat is sent only when the request carried a progress token, and a throwing sender is ignored', async () => {
+  const { service, registry, call } = harness({ waitProgressIntervalMs: 5 })
+  const jobId = await start(call, 'flash_task', { task: 'waits' })
+
+  // No token: sendProgress is never called, because such a notification would be invalid.
+  const withoutToken = []
+  const silent = call('flash_result', { jobId, waitSeconds: 600 }, { sendProgress: (report) => withoutToken.push(report) })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.deepEqual(withoutToken, [])
+
+  // A sender that throws must not turn the wait into a failure.
+  let attempts = 0
+  const throwing = call(
+    'flash_result',
+    { jobId, waitSeconds: 600 },
+    {
+      progressToken: 'tok-throws',
+      sendProgress: () => {
+        attempts += 1
+        throw new Error('the client went away')
+      },
+    },
+  )
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.ok(attempts >= 1, 'the heartbeat must have fired')
+  service.calls[0].gate.resolve({ status: 'ok', message: 'done' })
+  assert.equal(payloadOf(await throwing).message, 'done')
+  assert.equal(payloadOf(await silent).message, 'done')
+  await registry.get(jobId).settled
 })
 
 test('a failed job comes back as an error with the synchronous call message', async () => {
@@ -251,6 +370,70 @@ test('flash_status lists jobs newest first and reports the fields, never a resul
   assert.equal(ended.state, 'ok')
   assert.equal(ended.resultReady, true)
   assert.equal(typeof ended.endedAt, 'string')
+})
+
+test('flash_status lists running jobs first, then the newest ended ones, with counts and a cap', async () => {
+  const { service, registry, clock, call } = harness()
+  const ended = []
+  for (const name of ['one', 'two', 'three']) {
+    const jobId = await start(call, 'flash_task', { task: name })
+    clock.advance(1_000)
+    service.calls.at(-1).gate.resolve({ status: 'ok', message: name })
+    await registry.get(jobId).settled
+    // Collecting keeps the cap from evicting them while the assertion runs.
+    await call('flash_result', { jobId }, {})
+    ended.push(jobId)
+  }
+  const running = await start(call, 'flash_task', { task: 'still running' })
+
+  // Running first (what a caller can act on), then history newest first — not start order.
+  const listed = payloadOf(await call('flash_status', {}, {}))
+  assert.deepEqual(listed.jobs.map((job) => job.jobId), [running, ended[2], ended[1], ended[0]])
+  assert.equal(listed.running, 1)
+  assert.equal(listed.ended, 3)
+  assert.equal(listed.omittedEnded, 0)
+
+  // Only ended jobs may be capped; `omittedEnded` says how many were left out.
+  const capped = payloadOf(await call('flash_status', { limit: 2 }, {}))
+  assert.deepEqual(capped.jobs.map((job) => job.jobId), [running, ended[2], ended[1]])
+  assert.equal(capped.running, 1)
+  assert.equal(capped.ended, 3)
+  assert.equal(capped.omittedEnded, 1)
+
+  const endedOnly = payloadOf(await call('flash_status', { state: 'ended', limit: 1 }, {}))
+  assert.deepEqual(endedOnly.jobs.map((job) => job.jobId), [ended[2]])
+  assert.equal(endedOnly.running, 1)
+  assert.equal(endedOnly.ended, 3)
+  assert.equal(endedOnly.omittedEnded, 2)
+
+  const runningOnly = payloadOf(await call('flash_status', { state: 'running' }, {}))
+  assert.deepEqual(runningOnly.jobs.map((job) => job.jobId), [running])
+  assert.equal(runningOnly.running, 1)
+  assert.equal(runningOnly.ended, 3)
+  assert.equal(runningOnly.omittedEnded, 3)
+
+  // A listing never carries a result, and reading one by id still does.
+  assert.equal('result' in listed.jobs[0], false)
+  assert.equal(payloadOf(await call('flash_result', { jobId: ended[0] }, {})).message, 'one')
+})
+
+test('flash_status validates state and limit like any other argument', async () => {
+  const { call } = harness()
+  for (const [args, pattern] of [
+    [{ state: 'done' }, /state must be "running", "ended", or "all"; got "done"/],
+    [{ state: 1 }, /state must be "running", "ended", or "all"; got 1/],
+    [{ limit: 0 }, /limit must be an integer between 1 and 50; got 0/],
+    [{ limit: 51 }, /limit must be an integer between 1 and 50; got 51/],
+    [{ limit: 2.5 }, /limit must be an integer between 1 and 50; got 2.5/],
+    [{ limit: '10' }, /limit must be an integer between 1 and 50; got "10"/],
+  ]) {
+    const result = await call('flash_status', args, {})
+    assert.equal(result.isError, true)
+    assert.match(textOf(result), pattern)
+  }
+  // A jobId still wins, and bad arguments do not start or disturb anything.
+  const status = await call('flash_status', { jobId: 'job-deadbeef', state: 'nonsense' }, {})
+  assert.match(textOf(status), /unknown job/)
 })
 
 test('a long task label is clipped to 80 characters', async () => {
@@ -434,6 +617,17 @@ test('the three job tools are descriptors in the service style', () => {
   assert.deepEqual(JOB_TOOLS[1].inputSchema.required, ['jobId'])
   assert.deepEqual(JOB_TOOLS[2].inputSchema.required, ['jobId'])
   assert.match(JOB_TOOLS[1].description, /waiting in chunks.*waitSeconds: 300/)
+  // A listing is a page with filters, not the server's whole history.
+  assert.deepEqual(JOB_TOOLS[0].inputSchema.properties.state.enum, ['running', 'ended', 'all'])
+  assert.equal(JOB_TOOLS[0].inputSchema.properties.limit.minimum, 1)
+  assert.equal(JOB_TOOLS[0].inputSchema.properties.limit.maximum, 50)
+  assert.match(JOB_TOOLS[0].description, /running jobs|still running/)
+  assert.match(JOB_TOOLS[0].description, /up to `limit` of them \(default 10\)/)
+  assert.match(JOB_TOOLS[0].description, /how many ended ones were left out/)
+  // A wait can end early because the client gave up, and the answer says so.
+  assert.match(JOB_TOOLS[1].description, /some\nclients cancel a long tool call on their own timeout/)
+  assert.match(JOB_TOOLS[1].description, /`wait\.endedBy` says what ended it/)
+  assert.match(JOB_TOOLS[1].description, /request-cancelled/)
   // The retention is stated honestly: results are in memory, dropped after six hours, and
   // the cap may reclaim collected and failed ones sooner.
   assert.match(JOB_TOOLS[1].description, /dropped six hours after it ended/)

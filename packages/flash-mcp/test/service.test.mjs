@@ -8,7 +8,7 @@ import test from 'node:test'
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 
 import {
   BATCH_SCRIPT,
@@ -19,6 +19,7 @@ import {
   buildBatchPrompt,
   buildChildPrompt,
   buildOrchestrationPrompt,
+  describeActivity,
   extractWorkflowValue,
   looksLikeWorkflowResult,
   normalizeTasks,
@@ -218,7 +219,11 @@ class FakeSdkClient {
       const entries = items.map((item, index) => ({
         index,
         ok: !(script === 'batch-partial' && index === 1),
-        result: `fleet result ${String(index)} from ${String(item.label)}`,
+        // `batch-empty` is a member the engine reports as ok with nothing to say.
+        result:
+          script === 'batch-empty' && index === 1
+            ? ''
+            : `fleet result ${String(index)} from ${String(item.label)}`,
       }))
       const text2 = script.startsWith('batch-unreadable')
         ? 'workflow "flash-batch" completed (3 agents).\nthe renderer was truncated before the value'
@@ -273,7 +278,9 @@ class FakeSdkClient {
         childSessionId: childId(index),
         status: script === 'child-error' ? 'error' : 'ok',
         stopReason: 'completed',
-        lastAssistantMessage: [{ type: 'text', text: `worker result ${String(index)}\n${text.slice(0, 10)}` }],
+        // `empty-result` is the shape the caller reported: "ok"/"completed", no message.
+        lastAssistantMessage:
+          script === 'empty-result' ? [] : [{ type: 'text', text: `worker result ${String(index)}\n${text.slice(0, 10)}` }],
       })
     }
     this.emit('session.status', { sessionId, status: 'idle' })
@@ -351,9 +358,11 @@ test('runs one task through one child and returns a compact result', async () =>
   assert.deepEqual(Object.keys(result).sort(), [
     'childSessionId',
     'durationMs',
+    'instructions',
     'isolation',
     'mode',
     'provider',
+    'queuedMs',
     'result',
     'resultTruncated',
     'route',
@@ -362,7 +371,85 @@ test('runs one task through one child and returns a compact result', async () =>
     'status',
     'stopReason',
   ])
+  // A call that never waited for a tree says so, and its run time is the session's own.
+  assert.equal(result.queuedMs, 0)
 })
+
+/** An empty harness home, so the machine's real `~/.dsh/AGENTS.md` cannot reach a result. */
+function emptyDshHome() {
+  return mkdtempSync(join(tmpdir(), 'flash-mcp-dsh-'))
+}
+
+test('a result carries the instruction files its worker was given', async () => {
+  const { service } = makeService({ env: { DSH_HOME: emptyDshHome() } })
+  // The project root is the nearest `.git`, so the root's file reaches a nested worker.
+  mkdirSync(join(service.root, '.git'))
+  writeFileSync(join(service.root, 'AGENTS.md'), 'project rules\n')
+  mkdirSync(join(service.root, 'packages'))
+  writeFileSync(join(service.root, 'packages', 'CLAUDE.md'), 'package rules\n')
+
+  const result = await service.flashTask({ task: 'work', cwd: join(service.root, 'packages') })
+  assert.deepEqual(
+    result.instructions.files.map((file) => file.path),
+    ['AGENTS.md', 'packages/CLAUDE.md'],
+  )
+  assert.equal(result.instructions.bytes, Buffer.byteLength('project rules\n') + Buffer.byteLength('package rules\n'))
+  assert.equal(result.instructions.overBudget, false)
+  assert.equal(result.instructions.approxTokens, Math.ceil(result.instructions.bytes / 4))
+})
+
+test('a batch result carries the instruction files too', async () => {
+  const { service } = makeService({ script: 'batch', env: { DSH_HOME: emptyDshHome() } })
+  mkdirSync(join(service.root, '.git'))
+  writeFileSync(join(service.root, 'AGENTS.md'), 'project rules\n')
+
+  const result = await service.flashBatch({ tasks: ['one'], cwd: service.root })
+  assert.deepEqual(
+    result.instructions.files.map((file) => file.path),
+    ['AGENTS.md'],
+  )
+  assert.equal(result.instructions.overBudget, false)
+})
+
+test('an instruction set over the harness budget is warned about', async () => {
+  const { service } = makeService({ env: { DSH_HOME: emptyDshHome() } })
+  mkdirSync(join(service.root, '.git'))
+  writeFileSync(join(service.root, 'AGENTS.md'), 'x'.repeat(70_000))
+
+  const result = await service.flashTask({ task: 'work', cwd: service.root })
+  assert.equal(result.instructions.overBudget, true)
+  assert.equal(result.instructions.bytes, 70_000)
+  // 70,000 bytes is 68.4 KB, rounded up so the number always reads as over 64.
+  assert.deepEqual(result.warnings, [
+    "the project instruction files are 69 KB, over the harness's 64 KB budget; workers see only part of them (the most specific files first)",
+  ])
+})
+
+test('a writing call measures the copy, because that is the tree the worker sees', async () => {
+  const { service } = makeIsolatedService({ env: { DSH_HOME: emptyDshHome() } })
+  // Uncommitted, so it is in the caller's tree and absent from a `head` copy.
+  writeFileSync(join(service.root, 'AGENTS.md'), 'uncommitted rules\n')
+
+  const fromHead = await service.flashTask({ task: 'work', cwd: service.root, source: 'head' })
+  assert.deepEqual(fromHead.instructions.files, [])
+
+  const fromWorkingTree = await service.flashTask({ task: 'work', cwd: service.root })
+  assert.deepEqual(
+    fromWorkingTree.instructions.files.map((file) => file.path),
+    ['AGENTS.md'],
+  )
+})
+
+
+test('the instruction files are measured before the worker runs, not after', async () => {
+  // The "worker" writes an AGENTS.md into its copy. It was never given one, and the result
+  // must say so rather than report the file it wrote as the project's instructions.
+  const { service } = makeIsolatedService({ file: 'AGENTS.md', env: { DSH_HOME: emptyDshHome() } })
+  const result = await service.flashTask({ task: 'write AGENTS.md', cwd: service.root })
+  assert.deepEqual(result.change.filesChanged, ['AGENTS.md'])
+  assert.deepEqual(result.instructions.files, [])
+})
+
 
 test('boots the runtime lazily and reuses it across calls', async () => {
   const { root, client, service } = makeService()
@@ -414,6 +501,78 @@ test('requires a task and rejects a non-string acceptance', async () => {
   await assert.rejects(service.flashTask({ cwd: root }), (error) => error.code === 'INVALID_ARGUMENT')
   await assert.rejects(service.flashTask({ task: '   ', cwd: root }), (error) => error.code === 'INVALID_ARGUMENT')
   await assert.rejects(service.flashTask({ task: 'x', cwd: root, acceptance: 7 }), (error) => error.code === 'INVALID_ARGUMENT')
+})
+
+// ── taskFile: a long brief goes in once, exactly as written ────────────────
+
+test('reads the task from a file, relative to the service root and exactly as written', async () => {
+  const logs = []
+  const { root, client, service } = makeService({ log: (line) => logs.push(line) })
+  const brief = 'Fix the parser.\n\nA long brief, with $(cat brief) left as literal text.\n'
+  writeFileSync(join(root, 'brief.txt'), brief)
+
+  const result = await service.flashTask({ taskFile: 'brief.txt', cwd: root })
+  assert.equal(result.status, 'ok')
+  assert.ok(client.prompts[0].text.includes(brief), 'the brief must arrive verbatim')
+  assert.match(client.prompts[0].text, /Task:\nFix the parser\./)
+  assert.ok(
+    logs.some((line) => line === `task read from ${join(service.root, 'brief.txt')} (${String(brief.length)} chars)`),
+    `expected a "task read from" log line, saw ${JSON.stringify(logs)}`,
+  )
+})
+
+test('taskFile and task are mutually exclusive, and one of them is required', async () => {
+  const { root, service } = makeService()
+  writeFileSync(join(root, 'brief.txt'), 'do it\n')
+  const rejects = (args, pattern) =>
+    assert.rejects(
+      service.flashTask({ cwd: root, ...args }),
+      (error) => error.code === 'INVALID_ARGUMENT' && pattern.test(error.message),
+    )
+  await rejects({}, /exactly one of "task".*"taskFile"/)
+  await rejects({ task: 'inline', taskFile: 'brief.txt' }, /task and taskFile cannot both be given/)
+})
+
+test('refuses a taskFile outside the root, a directory, an oversized file, and an empty one', async () => {
+  const { root, service } = makeService()
+  const outside = mkdtempSync(join(tmpdir(), 'flash-mcp-outside-'))
+  writeFileSync(join(outside, 'brief.txt'), 'not yours\n')
+  writeFileSync(join(root, 'empty.txt'), '  \n\t\n')
+  writeFileSync(join(root, 'huge.txt'), 'x'.repeat(256 * 1024 + 1))
+  const rejects = (args, code, pattern) =>
+    assert.rejects(service.flashTask({ cwd: root, ...args }), (error) => error.code === code && pattern.test(error.message))
+
+  await rejects({ taskFile: join(outside, 'brief.txt') }, 'TASK_FILE_OUTSIDE_ROOT', /is outside the service root/)
+  await rejects({ taskFile: relative(root, join(outside, 'brief.txt')) }, 'TASK_FILE_OUTSIDE_ROOT', /is outside the service root/)
+  await rejects({ taskFile: root }, 'INVALID_ARGUMENT', /is not a regular file/)
+  await rejects({ taskFile: 'huge.txt' }, 'INVALID_ARGUMENT', /the most this service reads is 262144/)
+  await rejects({ taskFile: 'empty.txt' }, 'INVALID_ARGUMENT', /is empty/)
+  await rejects({ taskFile: 'missing.txt' }, 'INVALID_ARGUMENT', /could not be read/)
+})
+
+test('a fleet task may carry a taskFile instead of its text', async () => {
+  const logs = []
+  const { root, client, service } = makeService({ script: 'batch', log: (line) => logs.push(line) })
+  writeFileSync(join(root, 'second.txt'), 'second task from a file\n')
+  const outside = mkdtempSync(join(tmpdir(), 'flash-mcp-outside-'))
+  writeFileSync(join(outside, 'brief.txt'), 'not yours\n')
+
+  const result = await service.flashBatch({ tasks: ['first task', { taskFile: 'second.txt', acceptance: 'be brief' }], cwd: root })
+  assert.equal(result.status, 'ok')
+  const { items } = promptArgs(client.prompts[0].text)
+  assert.match(items[1].prompt, /Task:\nsecond task from a file/)
+  assert.match(items[1].prompt, /Acceptance criteria:\nbe brief/)
+  assert.ok(logs.some((line) => /^task read from .*second\.txt \(\d+ chars\)$/.test(line)))
+
+  // The same exactly-one rule applies per task, and the entry errors name the entry.
+  await assert.rejects(
+    service.flashBatch({ tasks: [{ task: 'inline', taskFile: 'second.txt' }], cwd: root }),
+    (error) => error.code === 'INVALID_ARGUMENT' && /tasks\[0\] carries both "task" and "taskFile"/.test(error.message),
+  )
+  await assert.rejects(
+    service.flashBatch({ tasks: [{ taskFile: join(outside, 'brief.txt') }], cwd: root }),
+    (error) => error.message.includes('tasks[0].taskFile') && /is outside the service root/.test(error.message),
+  )
 })
 
 test('reports a non-delegating orchestrator instead of hanging', async () => {
@@ -495,13 +654,49 @@ test('reports progress while a queued call waits for a free tree', async () => {
   assert.equal(cancelled.code, 'CANCELLED')
   assert.match(cancelled.message, /cancelled while waiting/)
   assert.ok(reports.length >= 2, `expected progress while waiting, saw ${String(reports.length)}`)
-  assert.match(reports[0].message, /starting · last event .* ago \(session flash-task-.*\)/)
+  // A call queued for a tree has no session event to report, so the heartbeat says what it
+  // is waiting for instead of "last event … ago", which read as a hang.
+  assert.match(reports[0].message, /^flash_task running \d+m?\d*s; queued \d+m?\d*s: waiting for a free tree \(1 of 1 in use\) \(session flash-task-.*\)$/)
   // A call that never got a tree is still a call the client must see living; but its
   // interval stops when it is cancelled, and nothing is salvaged because nothing ran.
   const settled = reports.length
   await new Promise((resolve) => setTimeout(resolve, 30))
   assert.equal(reports.length, settled)
   await holding
+  await service.close()
+})
+
+test('describeActivity renders a queued call as a wait, never as silence', () => {
+  const pool = { inUse: 2, size: 2 }
+  const activity = { at: 1_000, events: 0, what: 'queued: waiting for a free tree (2 of 2 in use)', queuedSince: 1_000, pool }
+  assert.equal(
+    describeActivity(activity, 1_000 + 6 * 60_000 + 12_000),
+    'queued 6m12s: waiting for a free tree (2 of 2 in use)',
+  )
+  // The counts are read when the line is rendered, so a tree freeing up is visible.
+  pool.inUse = 1
+  assert.equal(describeActivity(activity, 2_000), 'queued 1s: waiting for a free tree (1 of 2 in use)')
+  // Without a pool the counts recorded when the wait began are used.
+  const detached = { ...activity, pool: undefined, queuedInUse: 2, queuedSize: 2 }
+  assert.equal(describeActivity(detached, 2_000), 'queued 1s: waiting for a free tree (2 of 2 in use)')
+  // The ordinary line is unchanged.
+  assert.equal(describeActivity({ at: 1_000, events: 0, what: 'starting' }, 4_000), 'starting · last event 3s ago')
+})
+
+test('a call that waited for a tree reports queuedMs, separately from its run time', async () => {
+  const { root, client, service } = makeIsolatedService({ slots: 1 })
+  client.delayMs = 250
+  const first = service.flashTask({ task: 'first', cwd: root })
+  // Let the first call lease the only tree before the second asks for one, so the wait is real.
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const second = service.flashTask({ task: 'second', cwd: root })
+  const [a, b] = await Promise.all([first, second])
+
+  assert.equal(a.queuedMs, 0)
+  assert.ok(b.queuedMs > 0, `expected the second call to report a wait, got ${String(b.queuedMs)}`)
+  // durationMs keeps its meaning: the session's own run, not the time spent queueing.
+  assert.equal(typeof a.durationMs, 'number')
+  assert.equal(typeof b.durationMs, 'number')
   await service.close()
 })
 
@@ -515,6 +710,34 @@ test('truncates an oversized child message and warns about a failed child', asyn
   const failed = await failing.service.flashTask({ task: 'x', cwd: failing.root })
   assert.equal(failed.status, 'error')
   assert.deepEqual(failed.warnings, ['the worker ended with status "error"'])
+})
+
+test('an ok call with an empty message and no change is reported as failed', async () => {
+  const { root, service } = makeService({ script: 'empty-result' })
+  const result = await service.flashTask({ task: 'x', cwd: root })
+
+  // "ok"/"completed" alone is not evidence of work: nothing was said and nothing changed.
+  assert.equal(result.status, 'error')
+  assert.equal(result.stopReason, 'completed')
+  assert.equal(result.result, '')
+  assert.equal(result.emptyResult, true)
+  assert.deepEqual(result.warnings, [
+    'the worker ended with an empty final message and changed nothing; treat the call as failed and send the task again',
+  ])
+})
+
+test('an empty message with a change keeps the status but warns that the account is missing', async () => {
+  const { root, service } = makeIsolatedService({ script: 'empty-result', file: 'quiet.txt' })
+  const result = await service.flashTask({ task: 'write one file', cwd: root })
+
+  assert.equal(result.change.available, true)
+  assert.deepEqual(result.change.filesChanged, ['quiet.txt'])
+  assert.equal(result.status, 'ok')
+  assert.equal(result.emptyResult, true)
+  assert.deepEqual(result.warnings, [
+    'the worker ended with an empty final message, so its account of the change is missing; review the diff before applying it',
+  ])
+  await service.close()
 })
 
 test('reports extra children rather than hiding them', async () => {
@@ -533,6 +756,133 @@ test('prompt builders keep the dispatcher on a single delegation', () => {
   const prompt = buildOrchestrationPrompt(child)
   assert.match(prompt, /<<<TASK\nWorking directory: \/w/)
   assert.match(prompt, /TASK$/)
+})
+
+test('every child prompt carries the standing worker instructions, in order', () => {
+  // The first two are the originals; the other three exist so a caller reading the report
+  // (never the transcript) learns about a deviation, a wrong contract, or an unfinished task.
+  assert.equal(WORKER_INSTRUCTIONS.length, 5)
+  assert.match(WORKER_INSTRUCTIONS[0], /^Do not commit unless the task explicitly asks/)
+  assert.match(WORKER_INSTRUCTIONS[1], /^If the work reaches for an escape hatch/)
+  assert.equal(
+    WORKER_INSTRUCTIONS[2],
+    'If you build a different interface or structure than the task names (another signature, the logic split across several places instead of one, a different data shape), say so first in your final report, with the reason.',
+  )
+  assert.equal(
+    WORKER_INSTRUCTIONS[3],
+    "If the task's contract or design looks wrong, report it rather than quietly working around it.",
+  )
+  assert.equal(
+    WORKER_INSTRUCTIONS[4],
+    'If you stop before the task is done, start your final report with why you stopped (for example: the context is full, a blocker, a test you could not make pass) and what is left.',
+  )
+  for (const prompt of [
+    buildChildPrompt({ cwd: '/w', task: 'x' }),
+    buildChildPrompt({ cwd: '/w', task: 'x', copy: true, uncommitted: { count: 0, files: [] }, discard: true }),
+  ]) {
+    assert.ok(prompt.startsWith(`Working directory: /w\n\n${WORKER_INSTRUCTIONS.join('\n')}`))
+    for (const line of WORKER_INSTRUCTIONS) assert.ok(prompt.includes(line))
+  }
+})
+
+test('the three new instructions reach the dispatched task and every fleet member', async () => {
+  const { root, client, service } = makeService()
+  await service.flashTask({ task: 'one', cwd: root })
+  for (const line of WORKER_INSTRUCTIONS.slice(2)) assert.ok(client.prompts[0].text.includes(line))
+
+  const fleet = makeService({ script: 'batch' })
+  await fleet.service.flashBatch({ tasks: ['a', 'b'], cwd: fleet.root })
+  const { items } = promptArgs(fleet.client.prompts[0].text)
+  for (const item of items) {
+    for (const line of WORKER_INSTRUCTIONS.slice(2)) assert.ok(item.prompt.includes(line))
+  }
+})
+
+test('a discard call tells its worker that nothing it leaves behind survives', async () => {
+  const copy = { copy: true, uncommitted: { count: 0, files: [] } }
+  const kept = buildChildPrompt({ cwd: '/w', task: 'review', ...copy })
+  const discarded = buildChildPrompt({ cwd: '/w', task: 'review', ...copy, discard: true })
+
+  assert.match(kept, /it already exists and is left out of the reported change\./)
+  assert.equal(discarded.includes('it already exists and is left out of the reported change'), false)
+  assert.ok(
+    discarded.includes(
+      'This call keeps nothing: the copy, ./.flash-tmp/ included, is deleted when you finish, and no patch is stored. ' +
+        'Anything that matters — a test that proves a finding, a proposed fix — must be written out in full in your final message (a fix as a unified diff).',
+    ),
+    discarded,
+  )
+  // It still tells the worker that ./.flash-tmp exists for scratch.
+  assert.match(discarded, /Scratch files of your own .* go under \.\/\.flash-tmp\/ in this copy;/)
+  // Without discard, the copy paragraph is byte-for-byte what 0.1.3 sent, spelled out here
+  // rather than rebuilt with the function under test.
+  assert.equal(
+    kept,
+    [
+      'Working directory: /w',
+      '',
+      ...WORKER_INSTRUCTIONS,
+      '',
+      "This working directory is a disposable copy of the caller's repository, so its files are here at the same relative paths.",
+      'Use relative paths: a path naming the original repository refers to a different directory that you cannot write, and',
+      'anything outside this copy is discarded — only the change you leave here is reported back.',
+      'Scratch files of your own (downloads, throwaway output, notes to yourself) go under ./.flash-tmp/ in this copy;',
+      'it already exists and is left out of the reported change.',
+      '',
+      'Task:',
+      'review',
+    ].join('\n'),
+  )
+  // discard says nothing when there is no copy.
+  assert.equal(buildChildPrompt({ cwd: '/w', task: 'x', discard: true }), buildChildPrompt({ cwd: '/w', task: 'x' }))
+})
+
+test('the base-patch paragraph appears only when a call continues from an earlier patch', () => {
+  const copy = { copy: true, uncommitted: { count: 0, files: [] } }
+  const base = { patchId: 'flash-1', filesChanged: ['a.txt', 'b.txt'], conflicts: [] }
+  const without = buildChildPrompt({ cwd: '/w', task: 'x', ...copy })
+
+  // Without the option the prompt is byte-for-byte what it was.
+  assert.equal(without, buildChildPrompt({ cwd: '/w', task: 'x', ...copy, basePatch: undefined }))
+  assert.doesNotMatch(without, /earlier call/)
+
+  const withBase = buildChildPrompt({ cwd: '/w', task: 'x', ...copy, basePatch: base })
+  assert.ok(
+    withBase.includes(
+      'The copy already contains the change from an earlier call (patch flash-1), applied before you started: a.txt, b.txt. Continue from it; do not redo it.',
+    ),
+    withBase,
+  )
+  assert.equal(withBase.includes('It did not apply cleanly'), false)
+
+  const conflicted = buildChildPrompt({ cwd: '/w', task: 'x', ...copy, basePatch: { ...base, conflicts: ['a.txt'] } })
+  assert.ok(conflicted.includes('It did not apply cleanly: a.txt hold conflict markers. Resolve them first.'), conflicted)
+
+  // It follows the uncommitted-files paragraph, which still describes the caller's tree.
+  const dirty = buildChildPrompt({ cwd: '/w', task: 'x', ...copy, uncommitted: { count: 1, files: ['mine.txt'] }, basePatch: base })
+  assert.ok(dirty.indexOf("They are the caller's work in progress") < dirty.indexOf('The copy already contains'))
+
+  // Only the first 20 files are named: the list is context, not an inventory.
+  const many = Array.from({ length: 22 }, (_, index) => `f${String(index)}.txt`)
+  const capped = buildChildPrompt({ cwd: '/w', task: 'x', ...copy, basePatch: { ...base, filesChanged: many } })
+  assert.ok(capped.includes('f19.txt. Continue from it'))
+  assert.equal(capped.includes('f20.txt'), false)
+})
+
+test('apply "discard" passes discard into the prompt and stores no patch', async () => {
+  const { root, client, service } = makeIsolatedService({ file: 'scratch.txt' })
+  const result = await service.flashTask({ task: 'review the parser', cwd: root, apply: 'discard' })
+
+  assert.match(client.prompts[0].text, /This call keeps nothing:/)
+  assert.equal(result.change.available, true)
+  assert.equal(result.change.stored, false)
+  await service.close()
+
+  const fleet = makeIsolatedService({ file: 'scratch.txt', script: 'batch' })
+  await fleet.service.flashBatch({ tasks: ['review'], cwd: fleet.root, apply: 'discard' })
+  const { items } = promptArgs(fleet.client.prompts[0].text)
+  assert.match(items[0].prompt, /This call keeps nothing:/)
+  await fleet.service.close()
 })
 
 test('runs a fleet and returns one compact result per task, in task order', async () => {
@@ -580,6 +930,18 @@ test('reports a partial fleet per task instead of collapsing it to one status', 
   assert.equal(result.status, 'partial')
   assert.deepEqual(result.results.map((entry) => entry.status), ['ok', 'error', 'ok'])
   assert.match(result.warnings.join('\n'), /at least one worker ended with a non-ok status/)
+})
+
+test('a fleet member reported ok with an empty message becomes an error for that task', async () => {
+  const { root, service } = makeService({ script: 'batch-empty' })
+  const result = await service.flashBatch({ tasks: ['a', 'b', 'c'], cwd: root })
+
+  // The entry's text is the member's account of its work; an empty one cannot be "ok".
+  assert.deepEqual(result.results.map((entry) => entry.status), ['ok', 'error', 'ok'])
+  assert.equal(result.results[1].emptyResult, true)
+  assert.equal(result.results[0].emptyResult, undefined)
+  // The fleet status is computed from the corrected entries, so it is partial, not ok.
+  assert.equal(result.status, 'partial')
 })
 
 test('an unreadable workflow value still pairs tasks through the engine member records', async () => {
