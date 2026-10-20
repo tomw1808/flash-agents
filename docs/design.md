@@ -279,6 +279,11 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
   at most 64 KB of them, most specific first; over that, a warning says the worker saw only part.
 - `basePatch` (`{ patchId, applied, threeWay, conflicts, note }`) appears when the call continued
   from a stored patch.
+- `change.ignored` names git-ignored paths the worker created; `change.ignoredChanged`
+  (`[{ path, change: "modified" | "deleted" }]`) names ignored *files* that existed when the copy was
+  made and that the worker rewrote or deleted, compared by size and mtime. Neither can be in the
+  patch, and both come with a warning. Ignored directories are not walked, so a change inside
+  `node_modules/` is not reported.
 
 `flash_batch { tasks, cwd?, acceptance?, mode? }` returns one entry per task, **in task order**, so
 `results[i]` always answers `tasks[i]`:
@@ -434,7 +439,7 @@ to apply.
 | `--isolate copy` | ✓ | writing calls run in a disposable copy |
 | `--isolate none` | | workers write to the root directly; the wall is the only defence |
 | `--slots <n>` | 2 | how many copies may be in flight; each one is a runtime process |
-| `--state-dir <path>` | private to this root and process | where copies and returned patches live |
+| `--state-dir <path>` | copies: private to this root and process, under the temp dir; patches: the data directory | where copies and returned patches live |
 | `--diff-chars <n>` | 20000 | how much of a patch a result carries |
 | `--patch-retention-days <n>` | 14 | how long an unapplied patch is kept before the startup prune removes it |
 | `--max-state-bytes <n>` | 20 GiB | cap on this root's stored patches and retired trees (see below) |
@@ -445,6 +450,15 @@ The state directory is keyed by root, by process, and by pool:
 ```
 $TMPDIR/flash-mcp/<sha256(root)[0:12]>/<pid>/<pool>
 ```
+
+Stored patches are not disposable, so they do not live there. By default they are kept in a data
+directory that neither a reboot nor the temp cleaner touches — `FLASH_DATA_DIR` if set, else
+`~/Library/Application Support/flash-agents` on macOS, `%LOCALAPPDATA%\flash-agents` on Windows,
+and `$XDG_STATE_HOME/flash-agents` (or `~/.local/state/flash-agents`) elsewhere — under
+`<sha256(root)[0:12]>/patches`. Older versions kept them in the temp tree; a server moves those over
+when it starts. macOS deletes files in its per-user temp folder that went unused for about three
+days, and many Linux systems clear `/tmp` on reboot, so an unapplied patch used to be able to
+vanish long before its retention ran out.
 
 A *shared* default was a data-loss bug: a second service deleted the first one's in-flight tree
 and then handed the same path to a different worker, so one call's patch could carry another
@@ -656,6 +670,7 @@ a script or in CI.
 | `FLASH_SERVICE_PROFILE` | `flash-service` | profile the runtime boots |
 | `FLASH_SERVICE_PROVIDER` / `FLASH_SERVICE_MODEL` | `ollama` / `deepseek-v4.1-flash:cloud` | pinned orchestrator route (the worker route is pinned by the profile) |
 | `FLASH_TASK_TIMEOUT_MS` | `10800000` | per-task wall-clock budget; a coherent feature slice that builds and tests between steps takes real minutes per cycle, and the call returns as soon as the worker finishes |
+| `FLASH_INIT_TIMEOUT_MS` | `120000` | how long a starting runtime may take to answer `initialize`; a timeout is retried once with a fresh process, and the error carries dsh's stderr tail |
 | `FLASH_IDLE_TIMEOUT_MS` | `600000` | how long a call may go without any event from its session or workers before it is stopped as stuck (`IDLE`); the change so far is salvaged as a patch |
 | `FLASH_RESULT_MAX_CHARS` | `24000` | returned worker-message budget |
 | `FLASH_MAX_TOKENS` | unset | optional output cap for SDK agents |
@@ -664,6 +679,8 @@ a script or in CI.
 | `FLASH_PER_ITEM_CHARS` | `12000` | returned per-worker budget inside a fleet |
 | `FLASH_LOG_FILE` | unset | file the diagnostics are appended to, timestamped, as well as stderr |
 | `FLASH_DSH_BIN` | `dsh` on `PATH` | the launcher to spawn (a `.js` path runs under the current Node) |
+| `FLASH_ALLOW_SLOT_SETUP` | unset | `1` or `on` lets `.flash-agents.json`'s `slotSetup` steps run (outside the sandbox) |
+| `FLASH_DATA_DIR` | platform data dir | where stored patches live (see [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck)) |
 
 ### Observing a run
 
@@ -930,7 +947,7 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
   is kept and named in the error when that happens.
 - **Patches outlive the service.** They live per root rather than per process, so a restarted
   server — or the next one on the same root — can still apply an id it did not issue. They sit
-  under `$TMPDIR/flash-mcp/<sha256(root)[0:12]>/patches` until the startup prune removes them after
+  in the data directory (see the state layout above) until the startup prune removes them after
   `limits.patchRetentionDays` (default 14), or `flash-agents clean` does. With a configured
   `--state-dir` they stay in `<dir>/calls`, one service per directory.
 - **The service needs a local Ollama serving the pinned model.** The route is registered by the

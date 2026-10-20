@@ -55,6 +55,10 @@ class FakeSdkClient {
     this.notificationHandlers = new Set()
     this.exitHandlers = new Set()
     this.diagnostics = ''
+    /** Errors `initialize` rejects with, consumed one per call (tests). */
+    this.initializeFailures = []
+    /** When set, `initialize` waits this long before answering or failing (tests). */
+    this.initializeDelayMs = 0
   }
 
   start() {
@@ -66,6 +70,10 @@ class FakeSdkClient {
   async initialize(params) {
     this.initializes.push(params)
     this.cwd = params.cwd
+    if (this.initializeDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.initializeDelayMs))
+    }
+    if (this.initializeFailures.length > 0) throw this.initializeFailures.shift()
     return { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' }
   }
 
@@ -291,6 +299,13 @@ function defaultScript() {
   return 'ok'
 }
 
+/** The error `HarnessSdkClient` rejects with when the handshake misses its deadline. */
+function initializeTimeout(timeoutMs) {
+  const error = new Error(`dsh protocol request "initialize" timed out after ${String(timeoutMs)}ms`)
+  error.code = 'TIMEOUT'
+  return error
+}
+
 /** A service rooted at a fresh temporary directory. */
 function makeService({ script, ...overrides } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'flash-mcp-test-'))
@@ -451,6 +466,27 @@ test('the instruction files are measured before the worker runs, not after', asy
 })
 
 
+test('a result names an ignored file the worker rewrote, and warns that the patch cannot carry it', async () => {
+  const { root, service } = makeIsolatedService({ file: 'generated.d.ts' })
+  writeFileSync(join(root, '.gitignore'), 'generated.d.ts\n')
+  execFileSync('git', ['add', '.gitignore'], { cwd: root })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'ignore'], { cwd: root })
+  // Shorter than what the fake worker writes, so the rewrite differs in size as well as mtime.
+  writeFileSync(join(root, 'generated.d.ts'), 'old\n')
+
+  const result = await service.flashTask({ task: 'regenerate the worker types', cwd: root })
+
+  assert.deepEqual(result.change.ignoredChanged, [{ path: 'generated.d.ts', change: 'modified' }])
+  // The path existed before the copy, so it is not a created path, and it is not in the patch.
+  assert.equal(result.change.ignored, undefined)
+  assert.deepEqual(result.change.filesChanged, [])
+  assert.match(
+    result.warnings.join('\n'),
+    /the worker changed 1 git-ignored file\(s\) that the patch cannot carry: generated\.d\.ts; regenerate or copy them after applying/,
+  )
+  await service.close()
+})
+
 test('boots the runtime lazily and reuses it across calls', async () => {
   const { root, client, service } = makeService()
   assert.equal(client.starts, 0)
@@ -466,6 +502,131 @@ test('boots the runtime lazily and reuses it across calls', async () => {
   })
   assert.equal(client.prompts.length, 2)
   assert.notEqual(client.prompts[0].sessionId, client.prompts[1].sessionId)
+})
+
+test('retries one initialize timeout and then succeeds', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flash-mcp-test-'))
+  const clients = []
+  const logs = []
+  const service = new FlashTaskService({
+    root,
+    initTimeoutMs: 1_500,
+    clientFactory: () => {
+      const client = new FakeSdkClient()
+      if (clients.length === 0) {
+        client.diagnostics = 'cold start stderr'
+        client.initializeFailures.push(initializeTimeout(1_500))
+      }
+      clients.push(client)
+      return client
+    },
+    log: (line) => logs.push(line),
+    isolate: { mode: 'none' },
+  })
+
+  const result = await service.flashTask({ task: 'x', cwd: root })
+  assert.equal(result.status, 'ok')
+  // Exactly one retry: a second client, each asked to initialize once.
+  assert.equal(clients.length, 2)
+  assert.equal(clients[0].initializes.length, 1)
+  assert.equal(clients[1].initializes.length, 1)
+  assert.equal(clients[0].shutdowns, 1, 'the timed-out runtime is shut down before the retry')
+  assert.ok(
+    logs.some((line) => /the runtime did not answer initialize within 1\.5 s; starting it once more/.test(line)),
+    `expected the retry log line, saw:\n${logs.join('\n')}`,
+  )
+})
+
+test('two initialize timeouts fail as tried twice with the second stderr tail', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flash-mcp-test-'))
+  const clients = []
+  const service = new FlashTaskService({
+    root,
+    initTimeoutMs: 2_000,
+    clientFactory: () => {
+      const client = new FakeSdkClient()
+      client.diagnostics = clients.length === 0 ? 'first attempt stderr' : 'second attempt stderr'
+      client.initializeFailures.push(initializeTimeout(2_000))
+      clients.push(client)
+      return client
+    },
+    log: () => {},
+    isolate: { mode: 'none' },
+  })
+
+  await assert.rejects(
+    service.flashTask({ task: 'x', cwd: root }),
+    (error) =>
+      error instanceof FlashTaskError &&
+      error.code === 'RUNTIME_INIT_FAILED' &&
+      /tried twice/.test(error.message) &&
+      error.message.includes('--- dsh stderr ---\nsecond attempt stderr') &&
+      !error.message.includes('first attempt stderr'),
+  )
+  assert.equal(clients.length, 2, 'only one retry happens')
+  assert.deepEqual(clients.map((client) => client.shutdowns), [1, 1])
+  assert.deepEqual(clients.map((client) => client.initializes.length), [1, 1])
+})
+
+test('does not retry a non-timeout initialize failure, and carries its stderr tail', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flash-mcp-test-'))
+  const clients = []
+  const service = new FlashTaskService({
+    root,
+    clientFactory: () => {
+      const client = new FakeSdkClient()
+      client.diagnostics = 'identity mismatch stderr'
+      client.initializeFailures.push(new Error('unexpected SDK runtime identity: {"name":"someone-else"}'))
+      clients.push(client)
+      return client
+    },
+    log: () => {},
+    isolate: { mode: 'none' },
+  })
+
+  await assert.rejects(
+    service.flashTask({ task: 'x', cwd: root }),
+    (error) =>
+      error instanceof FlashTaskError &&
+      error.code === 'RUNTIME_INIT_FAILED' &&
+      /unexpected SDK runtime identity/.test(error.message) &&
+      error.message.includes('--- dsh stderr ---\nidentity mismatch stderr') &&
+      !/tried twice/.test(error.message),
+  )
+  assert.equal(clients.length, 1, 'a verdict is not retried')
+  assert.equal(clients[0].shutdowns, 1)
+})
+
+test('concurrent callers all receive the outcome of the initialize retry', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flash-mcp-test-'))
+  const clients = []
+  const logs = []
+  const service = new FlashTaskService({
+    root,
+    initTimeoutMs: 1_000,
+    clientFactory: () => {
+      const client = new FakeSdkClient()
+      if (clients.length === 0) {
+        // Hold the first caller on `starting` long enough for the second to join it.
+        client.initializeDelayMs = 20
+        client.initializeFailures.push(initializeTimeout(1_000))
+      }
+      clients.push(client)
+      return client
+    },
+    log: (line) => logs.push(line),
+    isolate: { mode: 'none' },
+  })
+
+  const [first, second] = await Promise.all([
+    service.flashTask({ task: 'first', cwd: root }),
+    service.flashTask({ task: 'second', cwd: root }),
+  ])
+  assert.equal(first.status, 'ok')
+  assert.equal(second.status, 'ok')
+  assert.equal(clients.length, 2, 'both callers share one retry rather than starting their own')
+  assert.equal(clients[1].initializes.length, 1)
+  assert.equal(logs.filter((line) => /starting it once more/.test(line)).length, 1)
 })
 
 test('pins the route regardless of caller-supplied selection', async () => {

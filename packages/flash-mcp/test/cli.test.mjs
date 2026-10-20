@@ -16,7 +16,7 @@ import { existsSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { parseOptions, runDoctor } from '../lib/index.js'
+import { createService, parseOptions, runDoctor } from '../lib/index.js'
 import { DEFAULT_CONFIG, mergeConfig } from '../lib/config.js'
 
 /** A configuration with recognisable limits, so a default can be traced to it. */
@@ -33,6 +33,8 @@ test('defaults are taken from the configuration, not from literals', () => {
   assert.equal(options.maxTasks, 3)
   assert.equal(options.taskTimeoutMs, 1_234)
   assert.equal(options.diffChars, 99)
+  // The handshake budget has no configuration entry; it has its own shipped default.
+  assert.equal(options.initTimeoutMs, 120_000)
   // Untouched limits still come from the shipped defaults.
   assert.equal(options.perItemChars, DEFAULT_CONFIG.limits.perItemChars)
   assert.equal(options.patchRetentionDays, DEFAULT_CONFIG.limits.patchRetentionDays)
@@ -47,6 +49,7 @@ test('an empty environment value counts as unset', () => {
     FLASH_SERVICE_PROFILE: '',
     FLASH_SLOTS: '',
     FLASH_DIFF_CHARS: '',
+    FLASH_INIT_TIMEOUT_MS: '',
   }
   const options = parseOptions([], env, config)
   assert.equal(options.isolate, 'copy')
@@ -55,17 +58,28 @@ test('an empty environment value counts as unset', () => {
   assert.equal(options.profile, 'flash-service')
   assert.equal(options.slots, 7)
   assert.equal(options.diffChars, 99)
+  assert.equal(options.initTimeoutMs, 120_000)
 })
 
 test('a set environment value and a flag both override the configuration', () => {
-  const fromEnv = parseOptions([], { FLASH_SLOTS: '4', FLASH_LOG_FILE: '/tmp/flash.log' }, config)
+  const fromEnv = parseOptions(
+    [],
+    { FLASH_SLOTS: '4', FLASH_LOG_FILE: '/tmp/flash.log', FLASH_INIT_TIMEOUT_MS: '45000' },
+    config,
+  )
   assert.equal(fromEnv.slots, 4)
   assert.equal(fromEnv.logFile, '/tmp/flash.log')
+  assert.equal(fromEnv.initTimeoutMs, 45_000)
 
-  const fromFlags = parseOptions(['--slots', '5', '--isolate', 'none', '--model', 'other:latest'], {}, config)
+  const fromFlags = parseOptions(
+    ['--slots', '5', '--isolate', 'none', '--model', 'other:latest', '--init-timeout-ms', '90000'],
+    {},
+    config,
+  )
   assert.equal(fromFlags.slots, 5)
   assert.equal(fromFlags.isolate, 'none')
   assert.equal(fromFlags.model, 'other:latest')
+  assert.equal(fromFlags.initTimeoutMs, 90_000)
 
   const retention = parseOptions(['--patch-retention-days', '3'], {}, config)
   assert.equal(retention.patchRetentionDays, 3)
@@ -86,6 +100,23 @@ test('an unusable option is refused', () => {
   assert.throws(() => parseOptions(['--isolate', 'yolo'], {}, config), /is not available/)
   assert.throws(() => parseOptions(['--nope'], {}, config), /unknown argument/)
   assert.throws(() => parseOptions(['--slots'], {}, config), /needs a value/)
+  // The handshake timeout is a positive integer, from either door.
+  assert.throws(() => parseOptions(['--init-timeout-ms'], {}, config), /needs a value/)
+  assert.throws(() => parseOptions(['--init-timeout-ms', 'soon'], {}, config), /must be a positive integer/)
+  assert.throws(() => parseOptions(['--init-timeout-ms', '0'], {}, config), /must be a positive integer/)
+  assert.throws(() => parseOptions([], { FLASH_INIT_TIMEOUT_MS: '-1' }, config), /must be a positive integer/)
+})
+
+test('the parsed handshake timeout reaches the service', async () => {
+  const options = parseOptions(['--init-timeout-ms', '4321'], {}, config)
+  options.root = mkdtempSync(join(tmpdir(), 'flash-mcp-cli-'))
+  options.isolate = 'none'
+  const service = createService(options)
+  try {
+    assert.equal(service.initTimeoutMs, 4_321)
+  } finally {
+    await service.close()
+  }
 })
 
 /** Injected effects for the doctor: no binary is run and no socket is opened. */

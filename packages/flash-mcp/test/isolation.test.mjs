@@ -16,12 +16,18 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, sep } from 'node:path'
 import { test } from 'node:test'
 
-import { WorkspaceIsolation, canonicalTmpdir } from '../lib/isolation.js'
+import { WorkspaceIsolation, canonicalTmpdir, durableBaseDir, migrateLegacyPatches, rootDigest } from '../lib/isolation.js'
+
+/**
+ * Patches default to the durable data directory. Keep every default-layout pool in this
+ * file out of the real user data directory, whichever platform the suite runs on.
+ */
+process.env.FLASH_DATA_DIR = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-data-')))
 
 /** A throwaway repository, realpath'd so macOS `/var` vs `/private/var` cannot bite. */
 function makeRepo() {
@@ -75,6 +81,29 @@ function makeFlashBaseTree(dir) {
 function salvagedPatch(isolation) {
   return isolation.listPatches().find((record) => record.salvagedFrom !== undefined)
 }
+
+test('the durable patch base honours FLASH_DATA_DIR and each platform’s data location', () => {
+  // An explicit override is used exactly as given, and an empty value counts as unset.
+  assert.equal(durableBaseDir({ FLASH_DATA_DIR: '/var/lib/flash' }, { platform: 'linux', home: '/home/u' }), '/var/lib/flash')
+  assert.equal(durableBaseDir({ FLASH_DATA_DIR: '' }, { platform: 'linux', home: '/home/u' }), join('/home/u', '.local', 'state', 'flash-agents'))
+  // Linux/other: XDG_STATE_HOME, then the conventional fallback under the home directory.
+  assert.equal(durableBaseDir({ XDG_STATE_HOME: '/state' }, { platform: 'linux', home: '/home/u' }), join('/state', 'flash-agents'))
+  assert.equal(durableBaseDir({}, { platform: 'freebsd', home: '/home/u' }), join('/home/u', '.local', 'state', 'flash-agents'))
+  // macOS: Application Support.
+  assert.equal(
+    durableBaseDir({}, { platform: 'darwin', home: '/Users/u' }),
+    join('/Users/u', 'Library', 'Application Support', 'flash-agents'),
+  )
+  // Windows: LOCALAPPDATA, then the AppData\Local fallback under the home directory.
+  assert.equal(
+    durableBaseDir({ LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' }, { platform: 'win32', home: 'C:\\Users\\u' }),
+    join('C:\\Users\\u\\AppData\\Local', 'flash-agents'),
+  )
+  assert.equal(
+    durableBaseDir({}, { platform: 'win32', home: 'C:\\Users\\u' }),
+    join('C:\\Users\\u', 'AppData', 'Local', 'flash-agents'),
+  )
+})
 
 test('a worker writes into a copy, and the caller’s tree is untouched', async () => {
   const repo = makeRepo()
@@ -485,6 +514,46 @@ test('a patch written by an earlier process can still be applied', async () => {
   second.close()
 })
 
+test('a default pool stores patches in the durable data directory, while a configured state directory keeps calls', async () => {
+  const repo = makeRepo()
+  const digest = rootDigest(repo)
+  const pool = new WorkspaceIsolation({ root: repo, slots: 1 })
+  try {
+    assert.equal(pool.patchDir, join(process.env.FLASH_DATA_DIR, digest, 'patches'))
+    const slot = await pool.lease()
+    pool.prepare(slot)
+    writeFileSync(join(slot.dir, 'durable.txt'), 'survives a reboot\n')
+    const change = pool.collect(slot)
+
+    // The patch is in the durable store, and not in the temp layout.
+    assert.equal(existsSync(join(pool.patchDir, `${change.patchId}.patch`)), true)
+    assert.equal(existsSync(join(pool.patchDir, `${change.patchId}.json`)), true)
+    const legacyDir = join(canonicalTmpdir(), 'flash-mcp', digest, 'patches')
+    assert.equal(existsSync(join(legacyDir, `${change.patchId}.patch`)), false, 'a new patch is not written to the temp tree')
+
+    // Applying it still works, and then the caller's tree has the worker's change.
+    pool.apply({ patchId: change.patchId })
+    assert.equal(readFileSync(join(repo, 'durable.txt'), 'utf8'), 'survives a reboot\n')
+  } finally {
+    pool.close()
+  }
+
+  // An explicitly configured state directory is used as given, `calls` store included.
+  const configuredDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-configured-')))
+  const configured = new WorkspaceIsolation({ root: repo, slots: 1, stateDir: configuredDir })
+  try {
+    assert.equal(configured.patchDir, join(configuredDir, 'calls'))
+    const slot = await configured.lease()
+    configured.prepare(slot)
+    writeFileSync(join(slot.dir, 'configured.txt'), 'kept beside its state\n')
+    const change = configured.collect(slot)
+    assert.equal(existsSync(join(configuredDir, 'calls', `${change.patchId}.patch`)), true)
+    assert.equal(existsSync(join(process.env.FLASH_DATA_DIR, digest, 'patches', `${change.patchId}.patch`)), false)
+  } finally {
+    configured.close()
+  }
+})
+
 test('the slot count is honoured and at least one slot always exists', () => {
   const repo = makeRepo()
   const { isolation } = makePool(repo, 0)
@@ -517,6 +586,96 @@ test('work that git ignores is named instead of silently vanishing', async () =>
   assert.doesNotMatch(change.diff, /build\.log/)
   assert.match(change.diff, /worker\.txt/)
   await isolation.close()
+})
+
+/**
+ * A repository whose committed `.gitignore` names a generated file, a log file and a build
+ * directory, with the generated file and the build directory present and ignored before any
+ * copy is made — the shape the caller reported from Linux: a worker regenerates a
+ * `worker-configuration.d.ts` that already existed, and the change cannot be in the patch.
+ */
+function makeIgnoredRepo() {
+  const repo = makeRepo()
+  writeFileSync(join(repo, '.gitignore'), 'generated.d.ts\n*.log\ndist/\n')
+  execFileSync('git', ['add', '-A'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'ignore'], { cwd: repo })
+  // Untracked and ignored, so they travel in the copy and the patch can never carry them.
+  writeFileSync(join(repo, 'generated.d.ts'), 'declare const version: "old"\n')
+  mkdirSync(join(repo, 'dist'), { recursive: true })
+  writeFileSync(join(repo, 'dist', 'stale.js'), 'was here before\n')
+  return repo
+}
+
+test('an ignored file the worker rewrote is reported, though the patch cannot carry it', async () => {
+  const repo = makeIgnoredRepo()
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+
+  // Both the size and the mtime differ, and the mtime is set explicitly so a rewrite within
+  // one filesystem timestamp tick cannot hide the change.
+  writeFileSync(join(slot.dir, 'generated.d.ts'), 'declare const version: "new"; export {}\n')
+  const older = new Date(Date.now() - 60_000)
+  utimesSync(join(slot.dir, 'generated.d.ts'), older, older)
+
+  const change = isolation.collect(slot)
+  assert.deepEqual(change.ignoredChanged, [{ path: 'generated.d.ts', change: 'modified' }])
+  // The rewrite is the worker's only work: it is neither a tracked change nor a new path.
+  assert.deepEqual(change.filesChanged, [])
+  assert.deepEqual(change.ignored, [])
+  assert.doesNotMatch(change.diff, /generated\.d\.ts/)
+  isolation.close()
+})
+
+test('an ignored file the worker deleted is reported as deleted', async () => {
+  const repo = makeIgnoredRepo()
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+
+  rmSync(join(slot.dir, 'generated.d.ts'))
+
+  const change = isolation.collect(slot)
+  assert.deepEqual(change.ignoredChanged, [{ path: 'generated.d.ts', change: 'deleted' }])
+  assert.deepEqual(change.filesChanged, [])
+  // A deletion leaves no new ignored path behind, so only the comparison can see it.
+  assert.deepEqual(change.ignored, [])
+  isolation.close()
+})
+
+test('an ignored file left alone, and a change inside an ignored directory, are not reported', async () => {
+  const repo = makeIgnoredRepo()
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+
+  // `dist/` is ignored as a directory: git lists the directory entry, not the files under it,
+  // so a change deep inside it is the documented limit of this comparison and must not be
+  // guessed at. `generated.d.ts` is left exactly as the copy started with it.
+  writeFileSync(join(slot.dir, 'dist', 'stale.js'), 'rewritten by the worker\n')
+  writeFileSync(join(slot.dir, 'dist', 'added.js'), 'added by the worker\n')
+
+  const change = isolation.collect(slot)
+  assert.equal(readFileSync(join(slot.dir, 'generated.d.ts'), 'utf8'), 'declare const version: "old"\n')
+  assert.deepEqual(change.ignoredChanged, [])
+  assert.deepEqual(change.ignored, [])
+  assert.deepEqual(change.filesChanged, [])
+  isolation.close()
+})
+
+test('an ignored file the worker created is reported as new, not as changed', async () => {
+  const repo = makeIgnoredRepo()
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+
+  writeFileSync(join(slot.dir, 'build.log'), 'written by the worker\n')
+
+  const change = isolation.collect(slot)
+  assert.deepEqual(change.ignored, ['build.log'])
+  assert.deepEqual(change.ignoredChanged, [])
+  assert.deepEqual(change.filesChanged, [])
+  isolation.close()
 })
 
 test('a call whose patch is empty is not confused with a call that ignored its work', async () => {
@@ -582,6 +741,10 @@ test('a sweep salvages a dead owner’s unfinished work as an applicable patch',
   const logLines = []
   const next = new WorkspaceIsolation({ root: repo, slots: 1, log: (message) => logLines.push(message) })
   try {
+    assert.ok(
+      next.patchDir.startsWith(join(process.env.FLASH_DATA_DIR, rootDigest(repo)) + sep),
+      `the salvage store ${next.patchDir} must be the durable data store`,
+    )
     // The directory is still reclaimed, but only after the work was taken out of it.
     assert.equal(existsSync(owner), false, 'the dead owner directory is removed')
     assert.equal(existsSync(slotDir), false, 'the slot tree is removed with it')
@@ -653,6 +816,301 @@ function writePatchRecord(patchDir, root, { createdAt, ...extra }) {
   )
   return patchId
 }
+
+/**
+ * A private legacy patch store.
+ *
+ * Migration tests used to fabricate `$TMPDIR/flash-mcp/<random-digest>/patches` and leave
+ * it behind, which made the suite itself deposit state in the shared temp base. A legacy
+ * directory is just a directory: `migrateLegacyPatches` takes it as an argument, so a
+ * throwaway one tests the same behaviour without touching the shared layout.
+ *
+ * @returns {string} an empty `<temp>/patches` directory.
+ */
+function makeLegacyStore() {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-legacy-')))
+  const patches = join(dir, 'patches')
+  mkdirSync(patches, { recursive: true })
+  return patches
+}
+
+/** Wait until `predicate` holds, so a test can observe the pool's periodic sweep. */
+async function waitFor(predicate, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  assert.fail(`condition was not met within ${timeoutMs}ms`)
+}
+
+test('an old temp patch store is migrated into the durable one, blobs included, before it is loaded', async () => {
+  const repo = makeRepo()
+  const digest = rootDigest(repo)
+  const seedDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-migrate-seed-')))
+  const seed = new WorkspaceIsolation({ root: repo, slots: 1, stateDir: seedDir })
+  const slot = await seed.lease()
+  seed.prepare(slot)
+  writeFileSync(join(slot.dir, 'keep.txt'), 'the migrated fix\n')
+  const change = seed.collect(slot)
+  seed.close()
+
+  // Lay this real patch out exactly where an older version left it: under the temp base.
+  const legacyDir = join(canonicalTmpdir(), 'flash-mcp', digest, 'patches')
+  mkdirSync(legacyDir, { recursive: true })
+  for (const suffix of ['.patch', '.json', '.blobs']) {
+    const from = join(seed.patchDir, `${change.patchId}${suffix}`)
+    if (existsSync(from)) renameSync(from, join(legacyDir, `${change.patchId}${suffix}`))
+  }
+  assert.equal(existsSync(join(legacyDir, `${change.patchId}.blobs`)), true, 'the collected patch has its preimage blobs')
+
+  const logLines = []
+  const next = new WorkspaceIsolation({ root: repo, slots: 1, log: (message) => logLines.push(message) })
+  try {
+    assert.equal(next.patchDir, join(process.env.FLASH_DATA_DIR, digest, 'patches'))
+    for (const suffix of ['.patch', '.json', '.blobs']) {
+      assert.equal(existsSync(join(next.patchDir, `${change.patchId}${suffix}`)), true, `${suffix} moved`)
+      assert.equal(existsSync(join(legacyDir, `${change.patchId}${suffix}`)), false, `${suffix} left the temp tree`)
+    }
+    assert.equal(existsSync(legacyDir), false, 'the empty legacy patches directory is removed')
+    assert.ok(next.listPatches().some((record) => record.patchId === change.patchId), 'the moved patch is loaded')
+    assert.equal(next.apply({ patchId: change.patchId }).applied, true)
+    assert.equal(readFileSync(join(repo, 'keep.txt'), 'utf8'), 'the migrated fix\n')
+
+    const line = logLines.find((message) => message.startsWith('moved 1 stored patch(es) from '))
+    assert.ok(line, `expected the migration log line in ${JSON.stringify(logLines)}`)
+    assert.ok(line.includes(legacyDir), line)
+    assert.ok(line.includes(next.patchDir), line)
+    assert.match(line, /where a reboot or the temp cleaner cannot remove them$/)
+  } finally {
+    next.close()
+    // The pool's default state directory sits under this throwaway repo's digest in the
+    // shared temp base. Remove it whole: the digest belongs to a repository no later test
+    // can use, and leaving it would be the very temp-tree residue the suite checks for.
+    rmSync(join(canonicalTmpdir(), 'flash-mcp', digest), { recursive: true, force: true })
+  }
+})
+
+test('a legacy patch already present in the durable store is not overwritten', () => {
+  const legacyDir = makeLegacyStore()
+  const patchDir = join(process.env.FLASH_DATA_DIR, `migrate-${randomUUID()}`, 'patches')
+  mkdirSync(patchDir, { recursive: true })
+  const patchId = `flash-${randomUUID()}`
+  const legacyMeta = `${JSON.stringify({ patchId, createdAt: 123 })}\n`
+  const durableMeta = `${JSON.stringify({ patchId, createdAt: 456 })}\n`
+  writeFileSync(join(legacyDir, `${patchId}.patch`), 'legacy copy\n')
+  writeFileSync(join(legacyDir, `${patchId}.json`), legacyMeta)
+  writeFileSync(join(patchDir, `${patchId}.patch`), 'durable copy\n')
+  writeFileSync(join(patchDir, `${patchId}.json`), durableMeta)
+
+  const moved = migrateLegacyPatches(legacyDir, patchDir, { log: () => {} })
+  assert.equal(moved, 0)
+  assert.equal(readFileSync(join(patchDir, `${patchId}.patch`), 'utf8'), 'durable copy\n', 'the durable patch wins')
+  assert.equal(readFileSync(join(patchDir, `${patchId}.json`), 'utf8'), durableMeta, 'the durable record wins')
+  assert.equal(existsSync(join(legacyDir, `${patchId}.patch`)), true, 'the untouched legacy copy stays for clean')
+  assert.equal(existsSync(join(legacyDir, `${patchId}.json`)), true)
+})
+
+test('an incomplete legacy patch is left alone until its record lands', () => {
+  const legacyDir = makeLegacyStore()
+  const patchDir = join(process.env.FLASH_DATA_DIR, `migrate-${randomUUID()}`, 'patches')
+  const patchId = `flash-${randomUUID()}`
+  writeFileSync(join(legacyDir, `${patchId}.patch`), 'half-written patch\n')
+
+  // The old server has written the `.patch` but not yet the `.json` that commits it.
+  assert.equal(migrateLegacyPatches(legacyDir, patchDir, { log: () => {} }), 0)
+  assert.equal(existsSync(join(legacyDir, `${patchId}.patch`)), true, 'the incomplete id stays where it is written')
+  assert.equal(existsSync(join(patchDir, `${patchId}.patch`)), false, 'no patch is split across the stores')
+  assert.equal(existsSync(legacyDir), true, 'the legacy store is not removed while an id is in flight')
+
+  // A record that names another id is not this patch's commit point either.
+  writeFileSync(join(legacyDir, `${patchId}.json`), `${JSON.stringify({ patchId: `flash-${randomUUID()}` })}\n`)
+  assert.equal(migrateLegacyPatches(legacyDir, patchDir, { log: () => {} }), 0)
+  assert.equal(existsSync(join(patchDir, `${patchId}.patch`)), false)
+
+  // The matching record is the commit point: now the whole id moves.
+  writeFileSync(join(legacyDir, `${patchId}.json`), `${JSON.stringify({ patchId, createdAt: 123 })}\n`)
+  assert.equal(migrateLegacyPatches(legacyDir, patchDir, { log: () => {} }), 1)
+  assert.equal(existsSync(join(patchDir, `${patchId}.patch`)), true)
+  assert.equal(existsSync(join(patchDir, `${patchId}.json`)), true)
+  assert.equal(existsSync(legacyDir), false, 'the now-empty legacy store is removed')
+})
+
+test('a cross-device legacy move falls back to copy-then-remove', () => {
+  const legacyDir = makeLegacyStore()
+  const patchDir = join(process.env.FLASH_DATA_DIR, `migrate-${randomUUID()}`, 'patches')
+  const patchId = `flash-${randomUUID()}`
+  const meta = `${JSON.stringify({ patchId, createdAt: 123 })}\n`
+  mkdirSync(join(legacyDir, `${patchId}.blobs`, 'pack'), { recursive: true })
+  writeFileSync(join(legacyDir, `${patchId}.patch`), 'cross-device patch\n')
+  writeFileSync(join(legacyDir, `${patchId}.json`), meta)
+  writeFileSync(join(legacyDir, `${patchId}.blobs`, 'pack', 'pack-test.pack'), 'blob payload\n')
+
+  const exdev = (from, to) => {
+    const error = new Error(`EXDEV: cross-device link, rename '${from}' -> '${to}'`)
+    error.code = 'EXDEV'
+    throw error
+  }
+  const moved = migrateLegacyPatches(legacyDir, patchDir, { fs: { renameSync: exdev } })
+  assert.equal(moved, 1)
+  assert.equal(readFileSync(join(patchDir, `${patchId}.patch`), 'utf8'), 'cross-device patch\n')
+  assert.equal(readFileSync(join(patchDir, `${patchId}.json`), 'utf8'), meta)
+  assert.equal(readFileSync(join(patchDir, `${patchId}.blobs`, 'pack', 'pack-test.pack'), 'utf8'), 'blob payload\n')
+  assert.equal(existsSync(legacyDir), false, 'the copied artefacts were removed from the temp tree')
+})
+
+test('a patch that cannot be migrated is logged and left whole in the legacy store', () => {
+  const legacyDir = makeLegacyStore()
+  const patchDir = join(process.env.FLASH_DATA_DIR, `migrate-${randomUUID()}`, 'patches')
+  const patchId = `flash-${randomUUID()}`
+  mkdirSync(join(legacyDir, `${patchId}.blobs`, 'pack'), { recursive: true })
+  writeFileSync(join(legacyDir, `${patchId}.patch`), 'stuck patch\n')
+  writeFileSync(join(legacyDir, `${patchId}.json`), `${JSON.stringify({ patchId, createdAt: 123 })}\n`)
+  writeFileSync(join(legacyDir, `${patchId}.blobs`, 'pack', 'pack-test.pack'), 'blob payload\n')
+
+  const refuseJson = (from, to) => {
+    if (from.endsWith('.json')) {
+      const error = new Error(`EACCES: permission denied, rename '${from}' -> '${to}'`)
+      error.code = 'EACCES'
+      throw error
+    }
+    renameSync(from, to)
+  }
+  const logs = []
+  const moved = migrateLegacyPatches(legacyDir, patchDir, { fs: { renameSync: refuseJson }, log: (line) => logs.push(line) })
+  assert.equal(moved, 0)
+  assert.equal(existsSync(join(legacyDir, `${patchId}.patch`)), true, 'the patch moved before the failure is put back')
+  assert.equal(existsSync(join(legacyDir, `${patchId}.json`)), true)
+  assert.equal(existsSync(join(legacyDir, `${patchId}.blobs`, 'pack', 'pack-test.pack')), true)
+  assert.equal(existsSync(join(patchDir, `${patchId}.patch`)), false)
+  assert.equal(existsSync(join(patchDir, `${patchId}.json`)), false, 'the fragment left by the failed move is removed')
+  assert.ok(logs.some((line) => line.startsWith(`could not move stored patch ${patchId} from `)), JSON.stringify(logs))
+})
+
+test('a partial cross-device copy leaves no destination fragment and can be retried', () => {
+  // The measured failure: the temp and data directories are on different filesystems, the
+  // `.patch` copy succeeds, the `.json` copy runs out of space after writing part of the
+  // file, and the old rollback restored only fully moved suffixes. The durable store kept
+  // a `.patch` plus a half-written `.json`, and every later migration skipped the id.
+  const legacyDir = makeLegacyStore()
+  const patchDir = join(process.env.FLASH_DATA_DIR, `migrate-${randomUUID()}`, 'patches')
+  const patchId = `flash-${randomUUID()}`
+  const meta = `${JSON.stringify({ patchId, createdAt: 123 })}\n`
+  mkdirSync(join(legacyDir, `${patchId}.blobs`, 'pack'), { recursive: true })
+  writeFileSync(join(legacyDir, `${patchId}.patch`), 'complete legacy patch\n')
+  writeFileSync(join(legacyDir, `${patchId}.json`), meta)
+  writeFileSync(join(legacyDir, `${patchId}.blobs`, 'pack', 'pack-test.pack'), 'blob payload\n')
+
+  const exdev = () => {
+    const error = new Error('EXDEV: cross-device link')
+    error.code = 'EXDEV'
+    throw error
+  }
+  const failing = {
+    renameSync: exdev,
+    copyFileSync(from, to) {
+      if (from.endsWith('.json')) {
+        // A copy that hit ENOSPC part-way: the destination now holds a fragment.
+        writeFileSync(to, '{"patchId":')
+        const error = new Error('ENOSPC: no space left on device')
+        error.code = 'ENOSPC'
+        throw error
+      }
+      writeFileSync(to, readFileSync(from))
+    },
+  }
+  const logs = []
+  assert.equal(migrateLegacyPatches(legacyDir, patchDir, { fs: failing, log: (line) => logs.push(line) }), 0)
+  assert.equal(existsSync(join(legacyDir, `${patchId}.patch`)), true, 'the complete legacy patch is put back')
+  assert.equal(existsSync(join(legacyDir, `${patchId}.json`)), true)
+  assert.equal(existsSync(join(legacyDir, `${patchId}.blobs`, 'pack', 'pack-test.pack')), true)
+  for (const suffix of ['.patch', '.json', '.blobs']) {
+    assert.equal(existsSync(join(patchDir, `${patchId}${suffix}`)), false, `no ${suffix} fragment is left behind`)
+  }
+  assert.ok(logs.some((line) => line.startsWith(`could not move stored patch ${patchId} from `)), JSON.stringify(logs))
+
+  // With the space problem gone, the id is still migratable: nothing about the failed
+  // attempt makes the durable store look like it already holds this patch.
+  assert.equal(migrateLegacyPatches(legacyDir, patchDir, { log: () => {} }), 1)
+  assert.equal(readFileSync(join(patchDir, `${patchId}.patch`), 'utf8'), 'complete legacy patch\n')
+  assert.equal(readFileSync(join(patchDir, `${patchId}.json`), 'utf8'), meta)
+  assert.equal(existsSync(legacyDir), false)
+})
+
+test('an incomplete durable fragment does not block a complete legacy patch', () => {
+  const legacyDir = makeLegacyStore()
+  const patchDir = join(process.env.FLASH_DATA_DIR, `migrate-${randomUUID()}`, 'patches')
+  mkdirSync(patchDir, { recursive: true })
+  const patchId = `flash-${randomUUID()}`
+  const meta = `${JSON.stringify({ patchId, createdAt: 123 })}\n`
+  writeFileSync(join(legacyDir, `${patchId}.patch`), 'complete legacy patch\n')
+  writeFileSync(join(legacyDir, `${patchId}.json`), meta)
+  // An interrupted earlier migration left only the patch half in the durable store.
+  writeFileSync(join(patchDir, `${patchId}.patch`), 'partial destination copy\n')
+
+  assert.equal(migrateLegacyPatches(legacyDir, patchDir, { log: () => {} }), 1)
+  assert.equal(readFileSync(join(patchDir, `${patchId}.patch`), 'utf8'), 'complete legacy patch\n')
+  assert.equal(readFileSync(join(patchDir, `${patchId}.json`), 'utf8'), meta)
+  assert.equal(existsSync(legacyDir), false)
+})
+
+test('a migration deferred for a live old server lists and applies legacy patches in place, then retries on the sweep', async () => {
+  const repo = makeRepo()
+  const digest = rootDigest(repo)
+  // A real patch, collected by a pool that wrote it to the durable store as this release does.
+  const seedDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-defer-seed-')))
+  const seed = new WorkspaceIsolation({ root: repo, slots: 1, stateDir: seedDir })
+  const slot = await seed.lease()
+  seed.prepare(slot)
+  writeFileSync(join(slot.dir, 'keep.txt'), 'the deferred fix\n')
+  const change = seed.collect(slot)
+  const seedPatchDir = seed.patchDir
+  seed.close()
+
+  // Lay it out where an OLD server keeps it: under this root's digest in the temp base.
+  const legacyDir = join(canonicalTmpdir(), 'flash-mcp', digest, 'patches')
+  mkdirSync(legacyDir, { recursive: true })
+  for (const suffix of ['.patch', '.json', '.blobs']) {
+    const from = join(seedPatchDir, `${change.patchId}${suffix}`)
+    if (existsSync(from)) renameSync(from, join(legacyDir, `${change.patchId}${suffix}`))
+  }
+  // Another live process still owns state for this root: the old server, whose in-memory
+  // `patchPath` points into `legacyDir`. `process.ppid` is alive for the whole test.
+  const oldOwner = join(canonicalTmpdir(), 'flash-mcp', digest, String(process.ppid))
+  mkdirSync(oldOwner, { recursive: true })
+
+  const logLines = []
+  const next = new WorkspaceIsolation({ root: repo, slots: 1, sweepIntervalMs: 20, log: (message) => logLines.push(message) })
+  try {
+    const deferred = logLines.find((message) => message.includes('deferred moving stored patches'))
+    assert.ok(deferred, `expected a deferral log line in ${JSON.stringify(logLines)}`)
+    assert.match(deferred, new RegExp(`process\\(es\\) ${String(process.ppid)}`))
+    assert.ok(deferred.includes(legacyDir), deferred)
+    assert.equal(existsSync(join(next.patchDir, `${change.patchId}.json`)), false, 'nothing moved under a live old server')
+
+    // The new pool lists the legacy patch and applies it without moving a byte.
+    assert.ok(next.listPatches().some((record) => record.patchId === change.patchId), 'the legacy patch is listed in place')
+    assert.equal(next.apply({ patchId: change.patchId }).applied, true)
+    assert.equal(readFileSync(join(repo, 'keep.txt'), 'utf8'), 'the deferred fix\n')
+    // Marking it applied wrote next to the record it came from, never into the durable store.
+    const legacyMeta = JSON.parse(readFileSync(join(legacyDir, `${change.patchId}.json`), 'utf8'))
+    assert.notEqual(legacyMeta.appliedAt, null, 'the applied marker lives in the legacy record')
+    assert.equal(existsSync(join(next.patchDir, `${change.patchId}.json`)), false, 'the record was not split across stores')
+
+    // The old server exits; the pool's periodic sweep now moves the patch and reloads it.
+    rmSync(oldOwner, { recursive: true, force: true })
+    await waitFor(() => existsSync(join(next.patchDir, `${change.patchId}.json`)))
+    assert.equal(existsSync(join(legacyDir, `${change.patchId}.json`)), false, 'the record left the legacy store')
+    const migrated = next.listPatches().find((record) => record.patchId === change.patchId)
+    assert.ok(migrated, 'the migrated patch is still listed after the reload')
+    assert.equal(migrated.patchPath, join(next.patchDir, `${change.patchId}.patch`), 'the reloaded record names the durable store')
+    assert.notEqual(migrated.appliedAt, null, 'the applied marker travelled with the record')
+  } finally {
+    next.close()
+    rmSync(oldOwner, { recursive: true, force: true })
+    rmSync(join(canonicalTmpdir(), 'flash-mcp', digest), { recursive: true, force: true })
+  }
+})
 
 test('construction prunes patches past the retention window, keeping fresh and recently salvaged work', async () => {
   const repo = makeRepo()

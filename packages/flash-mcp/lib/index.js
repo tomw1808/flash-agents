@@ -34,13 +34,14 @@ import { pathToFileURL } from 'node:url'
 
 import { serveStdio, describeError } from './mcp.js'
 import { FlashTaskService } from './service.js'
+import { DEFAULT_INITIALIZE_TIMEOUT_MS } from './sdk.js'
 import { JobRegistry, JOB_TOOLS } from './jobs.js'
 import { loadConfig } from './config.js'
 import { formatChecks, runChecks } from './doctor.js'
 import { WorkspaceIsolation, cleanLayout } from './isolation.js'
 
 /** Server identity reported to the MCP client. */
-export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.4' })
+export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.5' })
 
 /**
  * How often a `flash_result` call that is waiting tells the MCP client it is alive. The
@@ -358,6 +359,13 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
     provider: config.route.provider,
     model: config.route.model,
     taskTimeoutMs: numberFrom(env.FLASH_TASK_TIMEOUT_MS, config.limits.taskTimeoutMs),
+    // The handshake is the one request that runs while a cold runtime is still reading
+    // its profile and warming up, so it gets a longer, separately configurable budget.
+    initTimeoutMs: positiveIntegerFrom(
+      env.FLASH_INIT_TIMEOUT_MS,
+      DEFAULT_INITIALIZE_TIMEOUT_MS,
+      'FLASH_INIT_TIMEOUT_MS',
+    ),
     batchTimeoutMs: numberFrom(env.FLASH_BATCH_TIMEOUT_MS, config.limits.batchTimeoutMs),
     idleTimeoutMs: numberFrom(env.FLASH_IDLE_TIMEOUT_MS, config.limits.idleTimeoutMs),
     maxTasks: numberFrom(env.FLASH_MAX_TASKS, config.limits.maxTasks),
@@ -400,6 +408,9 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
         break
       case '--timeout-ms':
         options.taskTimeoutMs = numberFrom(next(), undefined)
+        break
+      case '--init-timeout-ms':
+        options.initTimeoutMs = positiveIntegerFrom(next(), undefined, '--init-timeout-ms')
         break
       case '--max-result-chars':
         options.maxResultChars = numberFrom(next(), undefined)
@@ -494,6 +505,7 @@ Options:
   --provider <id>           pinned LLM provider route (default: ${route.provider})
   --model <id>              pinned model on that route (default: ${route.model})
   --timeout-ms <n>          per-task wall-clock budget (default: ${value('taskTimeoutMs')})
+  --init-timeout-ms <n>     how long dsh may take to answer initialize (default: ${String(DEFAULT_INITIALIZE_TIMEOUT_MS)})
   --batch-timeout-ms <n>    per-fleet wall-clock budget (default: ${value('batchTimeoutMs')})
   --max-tasks <n>           tasks accepted in one flash_batch call (default: ${value('maxTasks')})
   --per-item-chars <n>      returned budget for one worker inside a fleet (default: ${value('perItemChars')})
@@ -501,8 +513,9 @@ Options:
   --isolate <mode>          "copy" (default) runs writing calls in a disposable copy of the
                             root; "none" lets workers write to the root directly
   --slots <n>               disposable trees kept in flight, one runtime each (default: ${value('slots')})
-  --state-dir <path>        where slot trees and returned patches live (default: a directory
-                            private to this root and this process under TMPDIR); a
+  --state-dir <path>        where slot trees and returned patches live (default: trees in a
+                            directory private to this root and this process under TMPDIR,
+                            patches in FLASH_DATA_DIR or the platform data directory); a
                             configured directory is shared, so one service per directory
   --copy-exclude <a,b,c>    names left out of a disposable copy: a bare name matches at any
                             depth, one with a slash is a path relative to the root; a match
@@ -523,7 +536,7 @@ Options:
   -h, --help                show this help
 
 Environment: FLASH_SERVICE_ROOT, FLASH_SERVICE_PROFILE, FLASH_SERVICE_PROVIDER,
-FLASH_SERVICE_MODEL, FLASH_TASK_TIMEOUT_MS, FLASH_IDLE_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS,
+FLASH_SERVICE_MODEL, FLASH_TASK_TIMEOUT_MS, FLASH_INIT_TIMEOUT_MS, FLASH_IDLE_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS,
 FLASH_MAX_TASKS, FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
 FLASH_STATE_DIR, FLASH_COPY_EXCLUDE, FLASH_ALLOW_SLOT_SETUP, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_MAX_STATE_BYTES, FLASH_LOG_FILE,
 FLASH_DSH_BIN.
@@ -929,6 +942,24 @@ function numberFrom(value, fallback) {
   if (value === undefined || value === null || value === '') return fallback
   const parsed = Number(value)
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback
+}
+
+/**
+ * Read a setting that must be a positive integer, refusing an explicit value that is
+ * not one. Empty still means unset, as it does for every other setting.
+ *
+ * @param {unknown} value - the raw environment value or flag argument.
+ * @param {number | undefined} fallback - the value when none was given.
+ * @param {string} name - the setting's name, for the error.
+ * @returns {number | undefined} the parsed value or the fallback.
+ */
+function positiveIntegerFrom(value, fallback, name) {
+  if (value === undefined || value === null || value === '') return fallback
+  const parsed = numberFrom(value, undefined)
+  if (parsed === undefined) {
+    throw new Error(`${name} must be a positive integer, got ${JSON.stringify(String(value))}`)
+  }
+  return parsed
 }
 
 /**
@@ -1513,9 +1544,11 @@ directories. Patches are never removed by --all.
  * Report and reclaim the state directory, one line per root digest.
  *
  * The layout it reads is the default one the service writes: `$TMPDIR/flash-mcp` with
- * one digest directory per root, one directory per server pid under it, and a
- * `patches/` directory that outlives the process that issued the patches. Sizes are
- * printed in MB because the report answers a disk question, not a file-count one.
+ * one digest directory per root, one directory per server pid under it, and a durable
+ * per-root patch store under the platform data directory (or `FLASH_DATA_DIR`). A legacy
+ * `patches/` directory under the temp tree is pruned too, so an upgrade leaves nothing
+ * behind to age out twice. Sizes are printed in MB because the report answers a disk
+ * question, not a file-count one.
  *
  * @param {string[]} [argv] - arguments after `clean`.
  * @param {object} [options] - injected effects, for tests.
@@ -1547,8 +1580,10 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, n
     } else throw new Error(`unknown argument "${flag}"`)
   }
   const config = loadConfig({ env })
+  const dataDir = textFrom(env.FLASH_DATA_DIR)
   const report = cleanLayout({
     ...(baseDir === undefined ? {} : { baseDir }),
+    ...(dataDir === undefined ? {} : { dataDir }),
     root: canonicalRoot(root),
     all,
     retentionDays: retentionDays ?? config.limits.patchRetentionDays,
@@ -1556,6 +1591,8 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, n
     log: (message) => emit(`[flash-mcp clean] ${message}\n`),
   })
   emit(`flash-mcp state: ${report.baseDir}\n`)
+  emit(`flash-mcp patches: ${report.patchDir}\n`)
+  if (report.legacyPatchDir !== undefined) emit(`flash-mcp legacy patches: ${report.legacyPatchDir}\n`)
   for (const entry of report.stats) {
     const pids = entry.livePids.length === 0 ? 'none' : entry.livePids.join(', ')
     emit(

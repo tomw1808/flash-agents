@@ -35,6 +35,9 @@
  * @property {string[]} filesChanged - `STATUS<TAB>path` entries, in git's order.
  * @property {string[]} ignored - paths the worker created that git ignores, so the patch
  *   cannot carry them; reported rather than silently dropped.
+ * @property {{path: string, change: 'modified' | 'deleted'}[]} ignoredChanged - git-ignored
+ *   FILES that existed when the copy was made and the worker has since rewritten or deleted.
+ *   The patch cannot carry those either. Files inside an ignored directory are not tracked.
  * @property {string} diffstat - `git diff --stat` output.
  * @property {string} diff - the patch itself, clipped to whole file sections by the service.
  * @property {number} diffChars - the patch length before clipping.
@@ -65,7 +68,7 @@ import {
 } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 
 /**
  * The only shape a patch id may have. It is checked before the id is used to build a
@@ -311,6 +314,36 @@ function stateBaseDir() {
 }
 
 /**
+ * The durable directory a root's patches live in.
+ *
+ * The temp directory is the right home for disposable worker trees, but the wrong one
+ * for a patch: Linux clears `/tmp` on reboot, and macOS removes files in its per-user
+ * temp folder that were untouched for about three days — both long before the default
+ * retention window. The platform's own state/application-data location survives that,
+ * and `FLASH_DATA_DIR` overrides it for callers who already manage one.
+ *
+ * @param {Record<string, string | undefined>} [env] - environment to read.
+ * @param {object} [options] - platform details, injected by tests.
+ * @param {string} [options.platform] - `process.platform`.
+ * @param {string} [options.home] - the user's home directory.
+ * @returns {string} the durable base directory, without the root digest.
+ */
+export function durableBaseDir(env = process.env, { platform = process.platform, home = homedir() } = {}) {
+  const configured = env.FLASH_DATA_DIR
+  if (typeof configured === 'string' && configured.length > 0) return configured
+  if (platform === 'win32') {
+    const localAppData = env.LOCALAPPDATA
+    return join(typeof localAppData === 'string' && localAppData.length > 0 ? localAppData : join(home, 'AppData', 'Local'), 'flash-agents')
+  }
+  if (platform === 'darwin') return join(home, 'Library', 'Application Support', 'flash-agents')
+  const stateHome = env.XDG_STATE_HOME
+  return join(
+    typeof stateHome === 'string' && stateHome.length > 0 ? stateHome : join(home, '.local', 'state'),
+    'flash-agents',
+  )
+}
+
+/**
  * The platform temp directory with its symlinks resolved.
  *
  * On macOS `os.tmpdir()` is `/var/folders/...`, a symlink to `/private/var/...`. A slot
@@ -370,11 +403,16 @@ export function rootDigest(root) {
  * started on the same root. Patches therefore sit beside the pid directories — which
  * the sweep only visits for numeric names — and outlive the process that issued them.
  *
+ * Also deliberately not under `stateBaseDir`: an unapplied patch is durable work, so it
+ * lives in the platform's durable data location instead of the temp directory that a
+ * reboot or a temp cleaner can empty. `mkdirSync` at the point of use creates it on
+ * demand; merely reporting the layout must not leave an empty directory behind.
+ *
  * @param {string} root - the canonical service root.
  * @returns {string} the patch directory for this root.
  */
 function defaultPatchDir(root) {
-  return join(stateBaseDir(), rootDigest(root), 'patches')
+  return join(durableBaseDir(), rootDigest(root), 'patches')
 }
 
 /**
@@ -490,10 +528,20 @@ function digestDirs(baseDir) {
 
 /**
  * Count and size the slot trees and patches of one root digest.
+ *
+ * The legacy temp store is read from `<digestDir>/patches`. A default pool keeps its
+ * patches in the durable data directory instead, so the caller may name that directory
+ * too: without it, `clean` reported `patches: 0` for a root whose patches had already
+ * moved, which is exactly the case an operator runs it to inspect. Duplicate directories
+ * are counted once, so a configured `dataDir` that happens to be the temp base cannot
+ * double a patch.
+ *
  * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
+ * @param {string[]} [extraPatchDirs] - further patch directories that belong to this
+ *   digest, such as the durable store.
  * @returns {{slotTrees: number, slotBytes: number, patches: number, patchBytes: number}} the facts.
  */
-function digestStats(digestDir) {
+function digestStats(digestDir, extraPatchDirs = []) {
   let slotTrees = 0
   let slotBytes = 0
   for (const pid of ownerDirs(digestDir)) {
@@ -512,23 +560,28 @@ function digestStats(digestDir) {
   }
   let patches = 0
   let patchBytes = 0
-  const patchesDir = join(digestDir, 'patches')
-  try {
-    for (const entry of readdirSync(patchesDir, { withFileTypes: true })) {
-      if (entry.isFile() && entry.name.endsWith('.patch')) {
-        patches += 1
-        try {
-          patchBytes += statSync(join(patchesDir, entry.name)).size
-        } catch {
-          // A patch that vanished mid-walk contributes nothing.
+  const seen = new Set()
+  for (const patchesDir of [join(digestDir, 'patches'), ...extraPatchDirs]) {
+    const key = resolve(patchesDir)
+    if (seen.has(key)) continue
+    seen.add(key)
+    try {
+      for (const entry of readdirSync(patchesDir, { withFileTypes: true })) {
+        if (entry.isFile() && entry.name.endsWith('.patch')) {
+          patches += 1
+          try {
+            patchBytes += statSync(join(patchesDir, entry.name)).size
+          } catch {
+            // A patch that vanished mid-walk contributes nothing.
+          }
+        } else if (entry.isDirectory() && entry.name.endsWith('.blobs')) {
+          // The preimage blobs stored beside a patch are part of what that patch costs.
+          patchBytes += directorySize(join(patchesDir, entry.name))
         }
-      } else if (entry.isDirectory() && entry.name.endsWith('.blobs')) {
-        // The preimage blobs stored beside a patch are part of what that patch costs.
-        patchBytes += directorySize(join(patchesDir, entry.name))
       }
+    } catch {
+      // No `patches/` directory: nothing stored for this root.
     }
-  } catch {
-    // No `patches/` directory: nothing stored for this root.
   }
   return { slotTrees, slotBytes, patches, patchBytes }
 }
@@ -805,6 +858,7 @@ function salvageSlot(slotDir, { root, patchDir, pid, sweptAt, log = () => {} }) 
     patchId,
     patchPath,
     metaPath,
+    storeDir: patchDir,
     root,
     scope,
     base,
@@ -982,12 +1036,222 @@ function blobsDirectory(patchDir, patchId) {
  *
  * @param {string} patchDir - the directory the patch is stored in.
  * @param {string} patchId - the patch id.
+ * @param {object} [options] - injected effects, so the migration can observe failures.
+ * @param {object} [options.fs] - an `fs`-like override supplying `rmSync`.
  * @returns {void}
  */
-function removeStoredPatch(patchDir, patchId) {
-  rmSync(join(patchDir, `${patchId}.patch`), { force: true })
-  rmSync(join(patchDir, `${patchId}.json`), { force: true })
-  rmSync(blobsDirectory(patchDir, patchId), { recursive: true, force: true })
+function removeStoredPatch(patchDir, patchId, { fs = {} } = {}) {
+  const remove = fs.rmSync ?? rmSync
+  remove(join(patchDir, `${patchId}.patch`), { force: true })
+  remove(join(patchDir, `${patchId}.json`), { force: true })
+  remove(blobsDirectory(patchDir, patchId), { recursive: true, force: true })
+}
+
+/**
+ * Remove one artefact of a stored patch, so a failed move can clear exactly the fragment
+ * it left without touching the artefacts it already moved and must roll back.
+ *
+ * @param {string} patchDir - the directory the patch is stored in.
+ * @param {string} patchId - the patch id.
+ * @param {string} suffix - `.patch`, `.json`, or `.blobs`.
+ * @param {object} [fs] - an `fs`-like override supplying `rmSync`.
+ * @returns {void}
+ */
+function removeStoredPatchArtifact(patchDir, patchId, suffix, fs = {}) {
+  const remove = fs.rmSync ?? rmSync
+  remove(join(patchDir, `${patchId}${suffix}`), { recursive: suffix === '.blobs', force: true })
+}
+
+/**
+ * Whether a directory holds a complete stored patch for one id.
+ *
+ * A patch is three artefacts written in a fixed order: `.patch`, then the optional
+ * `.blobs`, then the `.json` record that is the commit point. A `.patch` with no record,
+ * or with a record that cannot be parsed or names another id, is a fragment left by an
+ * interrupted write or an interrupted migration — not a patch anybody can list or apply.
+ * Both stores use this test: a legacy snapshot is only old enough to move when it has the
+ * record, and the durable store only shadows a legacy patch when it has one too.
+ *
+ * @param {string} patchDir - the directory to inspect.
+ * @param {string} patchId - the patch id.
+ * @returns {boolean} true when the patch and a matching parseable record are both there.
+ */
+function storedPatchComplete(patchDir, patchId) {
+  if (!existsSync(join(patchDir, `${patchId}.patch`))) return false
+  try {
+    return JSON.parse(readFileSync(join(patchDir, `${patchId}.json`), 'utf8'))?.patchId === patchId
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Copy one file, symlink or directory tree to a path that does not exist yet.
+ *
+ * Only the migration fallback uses this, for the case where the temp and durable
+ * directories are on different filesystems and `renameSync` cannot cross. The tree is a
+ * stored patch's three artefacts, so there is nothing exotic to preserve beyond a
+ * symlink, which is recreated rather than followed.
+ *
+ * @param {string} from - source path.
+ * @param {string} to - destination path.
+ * @param {object} [fs] - an `fs`-like override, so tests can observe the copy.
+ * @returns {void}
+ */
+function copyPath(from, to, fs = {}) {
+  const readdir = fs.readdirSync ?? readdirSync
+  const write = fs.copyFileSync ?? copyFileSync
+  const readlink = fs.readlinkSync ?? readlinkSync
+  const link = fs.symlinkSync ?? symlinkSync
+  const mkdir = fs.mkdirSync ?? mkdirSync
+  const lstat = fs.lstatSync ?? lstatSync
+  const info = lstat(from)
+  if (info.isSymbolicLink()) {
+    link(readlink(from), to)
+    return
+  }
+  if (info.isDirectory()) {
+    mkdir(to, { recursive: true })
+    for (const entry of readdir(from)) copyPath(join(from, entry), join(to, entry), fs)
+    return
+  }
+  mkdir(dirname(to), { recursive: true })
+  write(from, to)
+}
+
+/**
+ * Move one stored artefact, falling back to a copy when the rename crosses filesystems.
+ *
+ * `renameSync` is atomic and free on one filesystem, but a temp directory and the
+ * durable data directory often are not the same filesystem; `EXDEV` is the kernel's
+ * answer to that, and copy-then-remove is the only correct alternative.
+ *
+ * @param {string} from - source path.
+ * @param {string} to - destination path.
+ * @param {object} [fs] - an `fs`-like override, so tests can force `EXDEV`.
+ * @returns {void}
+ */
+function moveStoredPath(from, to, fs = {}) {
+  const rename = fs.renameSync ?? renameSync
+  const remove = fs.rmSync ?? rmSync
+  try {
+    rename(from, to)
+  } catch (error) {
+    if (error?.code !== 'EXDEV') throw error
+    copyPath(from, to, fs)
+    remove(from, { recursive: true, force: true })
+  }
+}
+
+/**
+ * Move a legacy temp-directory patch store into the durable one.
+ *
+ * Before patches moved to `durableBaseDir`, an unapplied patch lived under
+ * `$TMPDIR/flash-mcp/<digest>/patches`. A pool that owns its default state calls this at
+ * construction, so an upgrade does not strand the work a caller was told it could still
+ * apply.
+ *
+ * Only an id whose WHOLE snapshot is there is moved: the `.patch` and a `.json` record
+ * that parses and names the same id. An old server writes `.patch`, then `.blobs`, then
+ * `.json`, so an id without its record may still be in flight; moving it would split the
+ * patch across the two stores and leave a durable `.patch` that no record ever lists.
+ * All three artefacts of a complete id travel together. An id already complete in the new
+ * store is left alone rather than overwritten; an incomplete durable fragment beside a
+ * complete legacy patch is removed first, and a move that fails part-way removes its own
+ * destination fragment before rolling back, so a retry is always possible. A patch that
+ * cannot be moved is logged and stays where it was, for `clean` to prune later.
+ *
+ * @param {string} legacyDir - the old `<tempBase>/<digest>/patches` directory.
+ * @param {string} patchDir - the durable patch directory.
+ * @param {object} [options] - logging and injected effects.
+ * @param {(message: string) => void} [options.log] - progress log.
+ * @param {object} [options.fs] - an `fs`-like override, so tests can force `EXDEV`.
+ * @returns {number} how many patches were moved.
+ */
+export function migrateLegacyPatches(legacyDir, patchDir, { log = () => {}, fs = {} } = {}) {
+  if (resolve(legacyDir) === resolve(patchDir)) return 0
+  let names
+  try {
+    names = readdirSync(legacyDir)
+  } catch {
+    return 0
+  }
+  const ids = new Set()
+  for (const name of names) {
+    const dot = name.lastIndexOf('.')
+    const suffix = dot < 0 ? '' : name.slice(dot)
+    if (suffix !== '.patch' && suffix !== '.json' && suffix !== '.blobs') continue
+    const patchId = name.slice(0, dot)
+    if (PATCH_ID.test(patchId)) ids.add(patchId)
+  }
+  let moved = 0
+  for (const patchId of ids) {
+    // An old server writes `.patch`, then `.blobs`, then `.json`. Moving an id whose
+    // record has not landed yet would split it across the two stores: the old server
+    // would still write its `.json` into a recreated legacy directory, and the durable
+    // store would keep a patch with no record that no later migration lists or applies.
+    // An incomplete id is left entirely alone, because it may still be being written.
+    if (!storedPatchComplete(legacyDir, patchId)) continue
+    // A DURABLE fragment beside a COMPLETE legacy patch is the other half of that race,
+    // left by an earlier migration attempt. It must not make the id look present: remove
+    // it, then move the complete legacy copy over it.
+    if (storedPatchComplete(patchDir, patchId)) continue
+    mkdirSync(patchDir, { recursive: true })
+    try {
+      removeStoredPatch(patchDir, patchId, { fs })
+    } catch (error) {
+      // A fragment that cannot be removed leaves this id for a later run rather than
+      // failing the migration of every other patch.
+      log(`could not clear the incomplete stored patch ${patchId} in ${patchDir}: ${messageOf(error)}`)
+      continue
+    }
+    const suffixes = ['.patch', '.json', '.blobs']
+    const movedSuffixes = []
+    try {
+      for (const suffix of suffixes) {
+        const from = join(legacyDir, `${patchId}${suffix}`)
+        if (!existsSync(from)) continue
+        moveStoredPath(from, join(patchDir, `${patchId}${suffix}`), fs)
+        movedSuffixes.push(suffix)
+      }
+      moved += 1
+    } catch (error) {
+      // A copy across filesystems that fails part-way (ENOSPC, EACCES) leaves a partial
+      // destination file the old rollback never removed. Drop every destination artefact
+      // this attempt did not complete — including that partial one — before putting the
+      // moved ones back, so no fragment can make a later run skip the id forever.
+      for (const suffix of suffixes) {
+        if (movedSuffixes.includes(suffix)) continue
+        try {
+          removeStoredPatchArtifact(patchDir, patchId, suffix, fs)
+        } catch {
+          // Best effort: a fragment that will not go away is retried by the next run.
+        }
+      }
+      // Put a half-moved patch back as one unit: the legacy store is where `clean` still
+      // knows to look, and half an id in each store is worse than one left behind.
+      for (const suffix of [...movedSuffixes].reverse()) {
+        try {
+          moveStoredPath(join(patchDir, `${patchId}${suffix}`), join(legacyDir, `${patchId}${suffix}`), fs)
+        } catch {
+          // Best effort: the log line below names the patch that needs a human.
+        }
+      }
+      log(`could not move stored patch ${patchId} from ${legacyDir}: ${messageOf(error)}`)
+    }
+  }
+  try {
+    if (readdirSync(legacyDir).length === 0) rmSync(legacyDir, { recursive: true, force: true })
+  } catch {
+    // A directory that vanished or cannot be read is not a failed migration.
+  }
+  if (moved > 0) {
+    log(
+      `moved ${moved} stored patch(es) from ${legacyDir} to ${patchDir}, ` +
+        'where a reboot or the temp cleaner cannot remove them',
+    )
+  }
+  return moved
 }
 
 /**
@@ -1008,6 +1272,75 @@ function ignoredPaths(dir) {
   } catch {
     return []
   }
+}
+
+/**
+ * The stat facts this service keeps about the git-ignored FILES a copy started with.
+ *
+ * A change to a path that already existed is invisible to a plain list comparison, and
+ * git cannot carry it in a patch either: a worker that regenerated an ignored
+ * `worker-configuration.d.ts` produced a patch the caller's type check then failed on.
+ * The size and modification time are enough to notice a rewrite or a deletion without
+ * reading the file, and they cost no walk of the ignored directories.
+ *
+ * Entries that are not regular files — directories such as `node_modules/` and
+ * `target/`, and symlinks, which `lstat` does not follow — are skipped: walking them
+ * would stat a whole dependency tree on every call.
+ *
+ * The limit that follows from this: a change DEEP INSIDE an ignored directory is not
+ * tracked. `git status --ignored=matching` names `node_modules/` as one entry, so a file
+ * rewritten under it is neither in `ignored` (the path is not new) nor in
+ * `ignoredChanged`, and the patch will not carry it. Such paths are usually rebuilt by
+ * the caller's own install or generate step; a file a worker changes there on purpose
+ * must be copied outside the ignored directory or the caller must be told separately.
+ *
+ * @param {string} dir - the repository the ignored paths were listed in.
+ * @param {string[]} paths - repository-relative ignored paths, as `ignoredPaths` returns them.
+ * @returns {Record<string, {size: number, mtimeMs: number}>} facts keyed by path.
+ */
+function ignoredFileStats(dir, paths) {
+  const files = {}
+  for (const path of paths) {
+    try {
+      const info = lstatSync(join(dir, path))
+      // A directory is reported by git as one ignored entry and is not walked; a symlink
+      // is not a file whose content a patch could carry.
+      if (!info.isFile()) continue
+      files[path] = { size: info.size, mtimeMs: info.mtimeMs }
+    } catch {
+      // A path that vanished between the listing and the stat is not a file this copy
+      // started with.
+    }
+  }
+  return files
+}
+
+/**
+ * Which of the recorded git-ignored files the worker changed, sorted by path.
+ *
+ * A recorded file that is now missing was deleted; one whose size or modification time
+ * differs was rewritten. Paths the worker created are not considered here — they are
+ * new to the copy and are reported by `collect` as `ignored`. The documented limit of
+ * `ignoredFileStats` applies: files inside an ignored directory were never recorded.
+ *
+ * @param {string} dir - the repository to look in now.
+ * @param {Record<string, {size: number, mtimeMs: number}> | undefined} recorded - the facts
+ *   taken when the copy was made (or when its base patch was applied).
+ * @returns {{path: string, change: 'modified' | 'deleted'}[]} the changes, sorted by path.
+ */
+function ignoredChangedFiles(dir, recorded) {
+  const changed = []
+  for (const [path, before] of Object.entries(recorded ?? {})) {
+    let now
+    try {
+      now = lstatSync(join(dir, path))
+    } catch {
+      changed.push({ path, change: 'deleted' })
+      continue
+    }
+    if (now.size !== before.size || now.mtimeMs !== before.mtimeMs) changed.push({ path, change: 'modified' })
+  }
+  return changed.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 }
 
 /**
@@ -1893,27 +2226,38 @@ function slotDirectory(stateDir, id, index) {
  *
  * @param {object} options - what to report and reclaim.
  * @param {string} [options.baseDir] - the state base directory, usually `$TMPDIR/flash-mcp`.
+ * @param {string} [options.dataDir] - the durable data directory; defaults to `durableBaseDir()`.
  * @param {string} options.root - the canonical service root of this invocation.
  * @param {boolean} [options.all] - also remove the trees of roots with no live server.
  * @param {number} [options.retentionDays] - the patch retention window.
  * @param {number} [options.now] - the current time, for tests.
  * @param {(message: string) => void} [options.log] - progress log.
- * @returns {{baseDir: string, own: string, stats: object[], actions: object}} the report.
+ * @returns {{baseDir: string, own: string, patchDir: string, legacyPatchDir?: string, stats: object[], actions: object}} the report.
  */
-export function cleanLayout({ baseDir = stateBaseDir(), root, all = false, retentionDays = PATCH_RETENTION_DAYS, now = Date.now(), log = () => {} } = {}) {
+export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = false, retentionDays = PATCH_RETENTION_DAYS, now = Date.now(), log = () => {} } = {}) {
   const own = rootDigest(root)
+  const ownDir = join(baseDir, own)
+  const patchDir = dataDir === undefined ? defaultPatchDir(root) : join(dataDir, own, 'patches')
+  const legacyPatchDir = join(ownDir, 'patches')
   // Facts are read before anything is removed, so the report describes what was found.
+  // This root's durable store is part of its footprint even though it does not live under
+  // the temp base, so it is counted on this root's line alongside any legacy copy.
   const stats = digestDirs(baseDir).map((digest) => ({
     digest,
     own: digest === own,
     livePids: livePidsIn(join(baseDir, digest)),
-    ...digestStats(join(baseDir, digest)),
+    ...digestStats(join(baseDir, digest), digest === own ? [patchDir] : []),
   }))
   const actions = { deadOwnersRemoved: 0, patchesPruned: 0, emptyDigestsRemoved: 0, foreignTreesRemoved: 0 }
-  const ownDir = join(baseDir, own)
   if (existsSync(ownDir)) {
-    actions.deadOwnersRemoved = sweepDeadOwners(root, { patchDir: join(ownDir, 'patches'), baseDir, log })
-    actions.patchesPruned = prunePatches(join(ownDir, 'patches'), { retentionDays, now })
+    // Salvage goes to the durable store too, exactly as a startup sweep would.
+    actions.deadOwnersRemoved = sweepDeadOwners(root, { patchDir, baseDir, log })
+  }
+  actions.patchesPruned = prunePatches(patchDir, { retentionDays, now })
+  if (resolve(legacyPatchDir) !== resolve(patchDir)) {
+    // An upgrade can leave patches behind in the temp tree. Do not move them from `clean`
+    // (a pool migrates on construction); just age out the ones that are already due.
+    actions.patchesPruned += prunePatches(legacyPatchDir, { retentionDays, now })
   }
   actions.emptyDigestsRemoved = removeEmptyForeignDigests(root, { baseDir, log })
   if (all) {
@@ -1925,7 +2269,9 @@ export function cleanLayout({ baseDir = stateBaseDir(), root, all = false, reten
     }
     actions.emptyDigestsRemoved += removeEmptyForeignDigests(root, { baseDir, log })
   }
-  return { baseDir, own, stats, actions }
+  const report = { baseDir, own, patchDir, stats, actions }
+  if (existsSync(legacyPatchDir)) report.legacyPatchDir = legacyPatchDir
+  return report
 }
 
 /**
@@ -2540,9 +2886,11 @@ export class WorkspaceIsolation {
     this.ownsStateDir = stateDir === undefined || stateDir === null || stateDir === ''
     this.stateDir = this.ownsStateDir ? defaultStateDir(this.root) : resolve(stateDir)
     /**
-     * Where patches are stored. With a private state directory they sit one level
-     * above this process's own, so the sweep that reclaims a dead service's copies
-     * cannot take a patch the caller was told it could still apply.
+     * Where patches are stored. With a private state directory they live in the durable
+     * per-root store (`FLASH_DATA_DIR` or the platform data directory), not beside this
+     * process's own trees, so the sweep that reclaims a dead service's copies cannot take
+     * a patch the caller was told it could still apply. A configured state directory
+     * keeps its own `calls` store.
      */
     this.patchDir = this.ownsStateDir ? defaultPatchDir(this.root) : join(this.stateDir, 'calls')
     this.patchRetentionDays = patchRetentionDays
@@ -2605,6 +2953,14 @@ export class WorkspaceIsolation {
     this.clones = 0
     /** Patches kept for a later `flash_apply`. @type {Map<string, object>} */
     this.patches = new Map()
+    /**
+     * The legacy temp patch store this pool still reads, when its migration had to be
+     * deferred because another live server of this old version still uses it. While it is
+     * set, records are loaded from both stores (durable wins on a shared id) and updates go
+     * to the record's own directory. `#sweepDeadOwners` retries the migration once no other
+     * live pid remains.
+     */
+    this.legacyPatchDir = undefined
     /** Callers waiting for a slot, oldest first. @type {Function[]} */
     this.waiting = []
     this.slots = Array.from({ length: slotCount }, (_, id) => ({
@@ -2628,8 +2984,30 @@ export class WorkspaceIsolation {
     // patches that still exist on disk. The prune runs for a configured state directory
     // too, because an unapplied patch ages out wherever it is stored.
     mkdirSync(this.stateDir, { recursive: true })
-    mkdirSync(this.patchDir, { recursive: true })
+    // A configured `calls` directory is part of the configured state and is made eagerly
+    // as before. The durable default store is made on demand: constructing a pool that
+    // never stores a patch must not leave an empty directory in the user's data
+    // directory, which is also what keeps a read-only test run out of the real home.
+    if (!this.ownsStateDir) mkdirSync(this.patchDir, { recursive: true })
     if (this.ownsStateDir) {
+      // A patch written by an older version lives in the temp tree. Normally it is moved
+      // before the sweep and the load, so the upgrade keeps exactly the work the caller was
+      // told it could still apply. But an old server may be running on this root right now,
+      // with its in-memory paths already pointing into that directory: moving the files out
+      // from under it would make its `flash_apply` fail. Deferring is safe because this pool
+      // lists and applies those records in place until the migration can run (see
+      // `#sweepDeadOwners`), and an incomplete id is never moved (see `migrateLegacyPatches`).
+      const legacyDir = join(stateBaseDir(), rootDigest(this.root), 'patches')
+      const otherPids = livePidsIn(join(stateBaseDir(), rootDigest(this.root))).filter((pid) => pid !== process.pid)
+      if (otherPids.length > 0) {
+        this.legacyPatchDir = legacyDir
+        this.log(
+          `deferred moving stored patches from ${legacyDir} to ${this.patchDir}: ` +
+            `process(es) ${otherPids.join(', ')} still use the old store`,
+        )
+      } else {
+        migrateLegacyPatches(legacyDir, this.patchDir, { log: this.log })
+      }
       sweepDeadOwners(this.root, { patchDir: this.patchDir, log: this.log })
       removeEmptyForeignDigests(this.root, { log: this.log })
     }
@@ -2664,11 +3042,46 @@ export class WorkspaceIsolation {
    * owner — so it can run before every `prepare`. Whatever it salvages is loaded at
    * once, so the patch is applicable from this server without a restart.
    *
+   * The pass also retries a deferred legacy-store migration. That is what closes the
+   * upgrade window: this pool read the old store in place while another live server used
+   * it, and once that process is gone the same periodic pass moves the patches to the
+   * durable store and reloads them from there.
+   *
    * @returns {void}
    */
   #sweepDeadOwners() {
     if (!this.ownsStateDir) return
-    if (sweepDeadOwners(this.root, { patchDir: this.patchDir, log: this.log }) > 0) this.#loadPatches()
+    const migrated = this.#retryLegacyMigration()
+    const swept = sweepDeadOwners(this.root, { patchDir: this.patchDir, log: this.log }) > 0
+    // While a live old server keeps writing into the legacy store, the in-memory view is
+    // refreshed from it too: the old server may have committed a patch since construction,
+    // and the caller of this server must be able to list it. The reload is two small
+    // directory listings, and only while the old store is being watched.
+    const watchingLegacy = this.legacyPatchDir !== undefined
+    if (migrated || swept || watchingLegacy) this.#loadPatches()
+  }
+
+  /**
+   * Move the legacy store into the durable one once no other live process uses it.
+   *
+   * A deferred migration is retried on every sweep, but only while another live owner of
+   * this root's state exists is it held back; the check excludes this process, whose own
+   * pid directory is not a reason to keep the old store. An incomplete legacy id stays
+   * where it is, because its writer may still be finishing it.
+   *
+   * @returns {boolean} whether anything moved and the in-memory records need reloading.
+   */
+  #retryLegacyMigration() {
+    const legacyDir = this.legacyPatchDir
+    if (legacyDir === undefined) return false
+    const others = livePidsIn(join(stateBaseDir(), rootDigest(this.root))).filter((pid) => pid !== process.pid)
+    if (others.length > 0) return false
+    const moved = migrateLegacyPatches(legacyDir, this.patchDir, { log: this.log })
+    // A fully migrated store is gone. Forgetting the flag then keeps later sweeps from
+    // probing a directory that no longer exists; anything still in it was incomplete and
+    // is retried only while the old store is still being watched.
+    if (!existsSync(legacyDir)) this.legacyPatchDir = undefined
+    return moved > 0
   }
 
   /**
@@ -2703,7 +3116,7 @@ export class WorkspaceIsolation {
         fileSize(record.metaPath) +
         // The saved preimage blobs are kept for the merge that may still come, so they are
         // part of what the patch costs until the patch itself goes.
-        directorySize(blobsDirectory(this.patchDir, record.patchId)),
+        directorySize(blobsDirectory(record.storeDir ?? this.patchDir, record.patchId)),
     }))
     let total = [...trees, ...patches].reduce((sum, entry) => sum + entry.bytes, 0)
     for (const tree of trees) {
@@ -2721,7 +3134,7 @@ export class WorkspaceIsolation {
       if (total <= this.maxStateBytes) break
       rmSync(record.patchPath, { force: true })
       rmSync(record.metaPath, { force: true })
-      rmSync(blobsDirectory(this.patchDir, record.patchId), { recursive: true, force: true })
+      rmSync(blobsDirectory(record.storeDir ?? this.patchDir, record.patchId), { recursive: true, force: true })
       this.patches.delete(record.patchId)
       total -= bytes
       result.removedPatches += 1
@@ -2762,9 +3175,29 @@ export class WorkspaceIsolation {
    * @returns {void}
    */
   #loadPatches() {
+    // Rebuilt rather than merged: a deferred migration can move a record from the legacy
+    // store to the durable one, and a held record whose paths still name the old directory
+    // would then apply a file that is gone. Each load reflects the stores as they are now.
+    this.patches.clear()
+    this.#loadPatchesFrom(this.patchDir)
+    if (this.legacyPatchDir !== undefined) this.#loadPatchesFrom(this.legacyPatchDir)
+  }
+
+  /**
+   * Read the patch records of one store into memory.
+   *
+   * A durable record wins over a legacy one with the same id because the durable store is
+   * read first and an id already held is skipped. The record keeps the directory it came
+   * from (`storeDir`) and its paths point there, so an update — marking it applied, say —
+   * is written next to that record and never split across the two stores.
+   *
+   * @param {string} patchDir - the store to read.
+   * @returns {void}
+   */
+  #loadPatchesFrom(patchDir) {
     let names
     try {
-      names = readdirSync(this.patchDir)
+      names = readdirSync(patchDir)
     } catch {
       return
     }
@@ -2772,7 +3205,7 @@ export class WorkspaceIsolation {
       if (!name.endsWith('.json')) continue
       const patchId = name.slice(0, -'.json'.length)
       if (!PATCH_ID.test(patchId) || this.patches.has(patchId)) continue
-      const metaPath = join(this.patchDir, name)
+      const metaPath = join(patchDir, name)
       let record
       try {
         record = JSON.parse(readFileSync(metaPath, 'utf8'))
@@ -2783,7 +3216,8 @@ export class WorkspaceIsolation {
       }
       if (record?.patchId !== patchId || record?.root !== this.root) continue
       record.metaPath = metaPath
-      record.patchPath = join(this.patchDir, `${patchId}.patch`)
+      record.patchPath = join(patchDir, `${patchId}.patch`)
+      record.storeDir = patchDir
       this.patches.set(patchId, record)
     }
   }
@@ -3035,6 +3469,10 @@ export class WorkspaceIsolation {
    * path was restored), so whatever the setup wrote is the copy's starting state and never
    * the worker's change.
    *
+   * The ignored FILES — their size and mtime — are recorded beside the path list, because a
+   * file that existed at the start and was rewritten leaves the list unchanged (see
+   * `ignoredFileStats`).
+   *
    * @param {Slot} slot - a prepared slot whose `repoDir` and `tmpDir` exist.
    * @returns {string} the base commit id.
    */
@@ -3061,8 +3499,27 @@ export class WorkspaceIsolation {
     }
     slot.base = git([...COMMIT_CONFIG, 'commit-tree', tree, ...parent, '-m', 'flash base'], repoDir).trim()
     git(['update-ref', BASE_REF, slot.base], repoDir)
-    slot.ignoredBase = ignoredPaths(repoDir)
+    this.#recordIgnored(slot, repoDir)
     return slot.base
+  }
+
+  /**
+   * Record the copy's git-ignored state: the path list, and the facts of the ignored FILES.
+   *
+   * Called wherever the copy's starting state is (re)recorded — `#recordBase` after the
+   * copy is made or the slot setup ran, and `applyBasePatch` once a base patch is in the
+   * copy — so that a later `collect` can tell a path the worker created from one it
+   * rewrote. Files inside an ignored directory are deliberately not tracked; see
+   * `ignoredFileStats`.
+   *
+   * @param {Slot} slot - the slot whose state is being recorded.
+   * @param {string} repoDir - the git work tree that holds the copy's state.
+   * @returns {void}
+   */
+  #recordIgnored(slot, repoDir) {
+    const paths = ignoredPaths(repoDir)
+    slot.ignoredBase = paths
+    slot.ignoredFiles = ignoredFileStats(repoDir, paths)
   }
 
   /**
@@ -3622,6 +4079,7 @@ export class WorkspaceIsolation {
     slot.baseReason = undefined
     slot.tmpDir = undefined
     slot.ignoredBase = undefined
+    slot.ignoredFiles = undefined
     slot.scope = undefined
     slot.repoDir = undefined
     this.log(`retired ${orphan} in place: its session may still be writing there; the slot moved to ${nextDir}`)
@@ -3662,6 +4120,7 @@ export class WorkspaceIsolation {
         reason: slot.baseReason ?? 'no base state was recorded for this call, so no diff could be computed',
         filesChanged: [],
         ignored: [],
+        ignoredChanged: [],
         diffstat: '',
         diff: '',
         diffChars: 0,
@@ -3675,8 +4134,11 @@ export class WorkspaceIsolation {
       const filesChanged = nameStatusRecords(repoDir, slot.base)
       // Work that git ignores is work the patch cannot carry. It is reported rather
       // than silently dropped: a caller told "no change" while the worker wrote a
-      // whole build directory has been misled, not informed.
+      // whole build directory has been misled, not informed. A path that already
+      // existed at the base is not new, so it is compared against the recorded facts
+      // instead: a rewritten or deleted ignored file is just as invisible to the patch.
       const ignored = ignoredPaths(repoDir).filter((entry) => !(slot.ignoredBase ?? []).includes(entry))
+      const ignoredChanged = ignoredChangedFiles(repoDir, slot.ignoredFiles)
       // The diff is clipped at a file boundary: a caller can read every line it holds,
       // and `diffOmitted` names what is not there. The whole patch is what `apply` uses.
       const clipped = clipPatch(full, diffChars)
@@ -3684,6 +4146,7 @@ export class WorkspaceIsolation {
         available: true,
         filesChanged,
         ignored,
+        ignoredChanged,
         diffstat: diffstat.trim(),
         diff: clipped.diff,
         diffChars: full.length,
@@ -3715,6 +4178,7 @@ export class WorkspaceIsolation {
         patchId,
         patchPath,
         metaPath,
+        storeDir: this.patchDir,
         root: this.root,
         scope,
         base: slot.base,
@@ -3735,6 +4199,7 @@ export class WorkspaceIsolation {
         reason: `the change could not be read: ${error.message}`,
         filesChanged: [],
         ignored: [],
+        ignoredChanged: [],
         diffstat: '',
         diff: '',
         diffChars: 0,
@@ -3847,7 +4312,7 @@ export class WorkspaceIsolation {
     }
     // The copy's state now includes the base patch's change, so what it started with changed
     // too: an ignored path the patch created is part of that state, not the worker's work.
-    slot.ignoredBase = ignoredPaths(target)
+    this.#recordIgnored(slot, target)
     // The copy holds the change whether the patch applied outright, the merge wrote something,
     // or the merge found the copy already equal to its result. Conflict markers are reported
     // as conflicts, and the worker is told to resolve them.
@@ -3953,7 +4418,7 @@ export class WorkspaceIsolation {
       // repository objects when the base was committed there. The scratch repository
       // borrows both read-only, so a merge never writes into either.
       const alternates = []
-      const blobs = blobsDirectory(this.patchDir, patchId)
+      const blobs = blobsDirectory(record.storeDir ?? this.patchDir, patchId)
       if (existsSync(blobs)) alternates.push(blobs)
       if (isGitWorkTree(target)) {
         const commonDir = resolve(target, git(['rev-parse', '--git-common-dir'], target).trim())
@@ -4308,18 +4773,29 @@ export class WorkspaceIsolation {
       this.#refreshAppliedAt(held)
       return held
     }
-    const metaPath = join(this.patchDir, `${patchId}.json`)
-    if (!existsSync(metaPath)) {
+    // A patch written by an old server after this pool loaded its records is not in
+    // memory yet. Look in both stores, durable first, so the deferred window does not hide
+    // work the caller was told it could still apply.
+    const stores = [this.patchDir, ...(this.legacyPatchDir === undefined ? [] : [this.legacyPatchDir])]
+    let record
+    let metaPath
+    for (const store of stores) {
+      const candidate = join(store, `${patchId}.json`)
+      if (!existsSync(candidate)) continue
+      try {
+        record = JSON.parse(readFileSync(candidate, 'utf8'))
+        metaPath = candidate
+        break
+      } catch (error) {
+        throw new Error(`the record for patch ${patchId} is unreadable: ${messageOf(error)}`)
+      }
+    }
+    if (record === undefined || metaPath === undefined) {
       throw new Error(`no patch ${patchId} is held by this service; patches are kept in ${this.patchDir}`)
     }
-    let record
-    try {
-      record = JSON.parse(readFileSync(metaPath, 'utf8'))
-    } catch (error) {
-      throw new Error(`the record for patch ${patchId} is unreadable: ${messageOf(error)}`)
-    }
     record.metaPath = metaPath
-    record.patchPath = join(this.patchDir, `${patchId}.patch`)
+    record.patchPath = join(dirname(metaPath), `${patchId}.patch`)
+    record.storeDir = dirname(metaPath)
     if (record.root !== this.root) {
       throw new Error(
         `patch ${patchId} was computed for ${String(record.root)}, not for ${this.root}; patches do not cross repositories`,
@@ -4377,11 +4853,18 @@ export class WorkspaceIsolation {
 
   /**
    * Write a patch's record next to it.
+   *
+   * The directory comes from the record itself, not from `this.patchDir`: while a legacy
+   * migration is deferred, the record lives in the old temp store and its update must stay
+   * in that same store. Splitting the record from its patch is how a patch becomes
+   * unlistable.
+   *
    * @param {object} record - the record to store.
    * @returns {void}
    */
   #writeMeta(record) {
-    mkdirSync(this.patchDir, { recursive: true })
+    const dir = record.storeDir ?? (typeof record.metaPath === 'string' ? dirname(record.metaPath) : this.patchDir)
+    mkdirSync(dir, { recursive: true })
     writePatchMeta(record)
   }
 

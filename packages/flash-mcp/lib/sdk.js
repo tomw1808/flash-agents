@@ -23,6 +23,13 @@ export const SDK_SERVER_NAME = 'deepseek-harness-sdk-runtime'
 /** Default per-request protocol timeout. */
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 
+/**
+ * Default budget for the cold-start handshake. A runtime started right after a large
+ * copy can spend far longer than a steady-state request before it answers `initialize`
+ * (the disk and any antivirus are still busy), so the handshake gets its own budget.
+ */
+export const DEFAULT_INITIALIZE_TIMEOUT_MS = 120_000
+
 /** Default retained stderr bytes. */
 const DEFAULT_STDERR_TAIL_BYTES = 4_096
 
@@ -128,6 +135,7 @@ export class HarnessSdkClient {
    * @param {Record<string, string | undefined>} [options.env] - child environment.
    * @param {(message: string) => void} [options.log] - diagnostic sink (stderr).
    * @param {number} [options.requestTimeoutMs] - per-request protocol timeout.
+   * @param {number} [options.initializeTimeoutMs] - cold-start handshake timeout.
    * @param {number} [options.stderrTailBytes] - retained stderr bytes.
    * @param {{command: string, prefix: string[]}} [options.command] - launcher override (tests).
    */
@@ -137,6 +145,7 @@ export class HarnessSdkClient {
     env = process.env,
     log = () => {},
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+    initializeTimeoutMs = DEFAULT_INITIALIZE_TIMEOUT_MS,
     stderrTailBytes = DEFAULT_STDERR_TAIL_BYTES,
     command,
   }) {
@@ -145,6 +154,7 @@ export class HarnessSdkClient {
     this.env = env
     this.log = log
     this.requestTimeoutMs = requestTimeoutMs
+    this.initializeTimeoutMs = initializeTimeoutMs
     this.stderrTailBytes = stderrTailBytes
     this.launcher = command ?? resolveDshCommand(env)
 
@@ -218,12 +228,16 @@ export class HarnessSdkClient {
    * @returns {Promise<{name: string, version: string}>} server identity.
    */
   async initialize({ cwd, provider, model, maxTokens }) {
-    const result = await this.request('initialize', {
-      cwd,
-      provider,
-      model,
-      ...(maxTokens === undefined ? {} : { maxTokens }),
-    })
+    const result = await this.request(
+      'initialize',
+      {
+        cwd,
+        provider,
+        model,
+        ...(maxTokens === undefined ? {} : { maxTokens }),
+      },
+      { timeoutMs: this.initializeTimeoutMs },
+    )
     this.serverInfo = result?.serverInfo
     if (this.serverInfo?.name !== SDK_SERVER_NAME) {
       throw new Error(`unexpected SDK runtime identity: ${JSON.stringify(this.serverInfo)}`)
@@ -249,16 +263,20 @@ export class HarnessSdkClient {
    * Send one JSON-RPC request and await its result.
    * @param {string} method - protocol method.
    * @param {object} [params] - request parameters.
+   * @param {object} [options] - request options.
+   * @param {number} [options.timeoutMs] - this call's timeout (default: `requestTimeoutMs`).
    * @returns {Promise<any>} the result payload.
    */
-  request(method, params) {
+  request(method, params, { timeoutMs = this.requestTimeoutMs } = {}) {
     if (!this.running) return Promise.reject(new Error('dsh runtime is not running'))
     const id = this.nextId++
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id)
-        reject(new Error(`dsh protocol request "${method}" timed out after ${String(this.requestTimeoutMs)}ms`))
-      }, this.requestTimeoutMs)
+        const error = new Error(`dsh protocol request "${method}" timed out after ${String(timeoutMs)}ms`)
+        error.code = 'TIMEOUT'
+        reject(error)
+      }, timeoutMs)
       this.pending.set(id, {
         method,
         resolve: (value) => {

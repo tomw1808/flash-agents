@@ -21,7 +21,7 @@ import { randomUUID } from 'node:crypto'
 
 import { IsolationError, WorkspaceIsolation, canonicalTmpdir } from './isolation.js'
 import { estimateInstructions } from './instructions.js'
-import { HarnessSdkClient } from './sdk.js'
+import { HarnessSdkClient, DEFAULT_INITIALIZE_TIMEOUT_MS } from './sdk.js'
 
 /** Route the service pins; callers can never change it. */
 export const DEFAULT_PROVIDER = 'ollama'
@@ -168,6 +168,7 @@ export class FlashTaskService {
    * @param {number} [options.maxTasks] - ceiling on tasks in one fleet call.
    * @param {number} [options.perItemChars] - returned per-worker budget inside a fleet.
    * @param {number} [options.progressIntervalMs] - how often a running call reports progress.
+   * @param {number} [options.initTimeoutMs] - cold-start handshake budget for one runtime.
    * @param {Record<string, string | undefined>} [options.env] - runtime environment.
    * @param {(message: string) => void} [options.log] - diagnostic sink (stderr).
    * @param {(profile: string, cwd: string, extraEnv?: object) => HarnessSdkClient} [options.clientFactory]
@@ -188,6 +189,7 @@ export class FlashTaskService {
     maxTasks = DEFAULT_MAX_TASKS,
     perItemChars = DEFAULT_PER_ITEM_CHARS,
     progressIntervalMs = DEFAULT_PROGRESS_INTERVAL_MS,
+    initTimeoutMs = DEFAULT_INITIALIZE_TIMEOUT_MS,
     env = process.env,
     log = () => {},
     clientFactory,
@@ -205,6 +207,7 @@ export class FlashTaskService {
     this.maxTasks = maxTasks
     this.perItemChars = perItemChars
     this.progressIntervalMs = progressIntervalMs
+    this.initTimeoutMs = initTimeoutMs
     this.env = env
     this.log = log
     // The environment a runtime boots with may be extended per call. It is no longer
@@ -221,6 +224,7 @@ export class FlashTaskService {
           cwd,
           env: extraEnv === undefined ? env : { ...env, ...extraEnv },
           log,
+          initializeTimeoutMs: initTimeoutMs,
         }))
     this.diffChars = isolate.diffChars ?? DEFAULT_DIFF_CHARS
     /**
@@ -1065,28 +1069,49 @@ export class FlashTaskService {
     this.runtimes.set(key, run)
     run.starting = (async () => {
       let client
-      try {
-        client = this.clientFactory(profileName, cwd, extraEnv)
-        client.start()
-        const info = await client.initialize({
-          cwd,
-          provider: this.provider,
-          model: this.model,
-          ...(this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens }),
-        })
-        run.client = client
-        run.initialized = true
-        run.startedAt = Date.now()
-        this.log(`runtime ready: ${info.name} ${info.version} (pid ${String(client.pid)}) on ${profileName}`)
-        return client
-      } catch (error) {
-        await client?.shutdown().catch(() => {})
-        this.runtimes.delete(key)
-        throw new FlashTaskError(
-          `could not initialize the ${profileName} runtime: ${messageOf(error)}`,
-          'RUNTIME_INIT_FAILED',
-        )
+      // A cold runtime on a busy disk can miss the handshake deadline without anything
+      // being wrong with it. That failure is the one worth retrying: a fresh process gets
+      // a fresh budget. Every other failure is a verdict, and repeating it only delays it.
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        let diagnostics = ''
+        try {
+          client = this.clientFactory(profileName, cwd, extraEnv)
+          client.start()
+          const info = await client.initialize({
+            cwd,
+            provider: this.provider,
+            model: this.model,
+            ...(this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens }),
+          })
+          run.client = client
+          run.initialized = true
+          run.startedAt = Date.now()
+          this.log(`runtime ready: ${info.name} ${info.version} (pid ${String(client.pid)}) on ${profileName}`)
+          return client
+        } catch (error) {
+          // Capture the tail before shutdown: closing the process is exactly when the
+          // part that explains the failure would otherwise be discarded.
+          diagnostics = client?.diagnostics
+          await client?.shutdown().catch(() => {})
+          client = undefined
+          if (isTimeoutError(error) && attempt === 1) {
+            this.log(
+              `the runtime did not answer initialize within ${String(this.initTimeoutMs / 1000)} s; starting it once more`,
+            )
+            continue
+          }
+          this.runtimes.delete(key)
+          const hint = stderrHint(diagnostics)
+          const alreadyHinted = hint.length > 0 && messageOf(error).endsWith(hint)
+          const attempts = attempt === 1 ? '' : 'tried twice, the first attempt timed out: '
+          throw new FlashTaskError(
+            `could not initialize the ${profileName} runtime: ${attempts}${messageOf(error)}${alreadyHinted ? '' : hint}`,
+            'RUNTIME_INIT_FAILED',
+          )
+        }
       }
+      // The loop always returns or throws; this keeps the method's contract explicit.
+      throw new FlashTaskError(`could not initialize the ${profileName} runtime`, 'RUNTIME_INIT_FAILED')
     })()
     try {
       return await run.starting
@@ -1248,6 +1273,9 @@ export class FlashTaskService {
         // Files the worker created that git ignores, so the patch cannot carry them.
         // Named so that "no change" is never the whole answer when there was work.
         ...((change.ignored ?? []).length === 0 ? {} : { ignored: change.ignored }),
+        // Ignored files that already existed and the worker rewrote or deleted: also
+        // outside the patch, and invisible to the list comparison above.
+        ...((change.ignoredChanged ?? []).length === 0 ? {} : { ignoredChanged: change.ignoredChanged }),
         diffstat: change.diffstat,
         diff: change.diff,
         // Truncation is measured by what the clipping left out, not by the returned text's
@@ -1387,6 +1415,9 @@ export class FlashTaskService {
     if (state.children.some((child) => child.status !== 'ok')) {
       warnings.push('at least one worker ended with a non-ok status')
     }
+    if ((change?.ignoredChanged ?? []).length > 0) {
+      warnings.push(ignoredChangedWarning(change))
+    }
     if (slot !== undefined && this.isolation?.slotSetupWarning !== undefined) {
       warnings.push(this.isolation.slotSetupWarning)
     }
@@ -1469,6 +1500,9 @@ export class FlashTaskService {
         `the worker created ${String(change.ignored.length)} path(s) that git ignores, so the patch cannot carry them: ${change.ignored.slice(0, 5).join(', ')}`,
       )
     }
+    if ((change?.ignoredChanged ?? []).length > 0) {
+      warnings.push(ignoredChangedWarning(change))
+    }
     // Over budget, the harness keeps the most specific files and drops the broader
     // ones, so the worker's prompt is quietly missing project-wide rules. Say so.
     if (instructions.overBudget) warnings.push(overBudgetWarning(instructions))
@@ -1530,6 +1564,26 @@ function overBudgetWarning(instructions) {
   )
 }
 
+/**
+ * The warning a result carries when the worker changed a git-ignored file that existed
+ * when the copy was made.
+ *
+ * Such a file leaves the ignored path list unchanged, so it is not `ignored`; the patch
+ * cannot carry it either, so the caller has to regenerate or copy it after applying —
+ * exactly what a stale ignored `worker-configuration.d.ts` cost a Linux caller whose
+ * type check failed after the patch was applied.
+ *
+ * @param {{ignoredChanged?: {path: string, change: 'modified' | 'deleted'}[]}} change - the change.
+ * @returns {string} one sentence naming the count and the first few paths.
+ */
+function ignoredChangedWarning(change) {
+  const changed = change.ignoredChanged ?? []
+  const paths = changed.slice(0, 5).map((entry) => entry.path).join(', ')
+  return (
+    `the worker changed ${String(changed.length)} git-ignored file(s) that the patch cannot carry: ${paths}; ` +
+    'regenerate or copy them after applying'
+  )
+}
 /** The observation state for one session. */
 /**
  * The last sign of life a call has seen: when, which step, and what it was doing.
@@ -2463,8 +2517,14 @@ function describeParent(state) {
 }
 
 function stderrHint(diagnostics) {
-  const tail = typeof diagnostics === 'function' ? String(diagnostics() ?? '').trim() : ''
+  const tail = typeof diagnostics === 'function' ? String(diagnostics() ?? '').trim() : String(diagnostics ?? '').trim()
   return tail.length === 0 ? '' : `\n--- dsh stderr ---\n${tail}`
+}
+
+/** Whether a handshake failure was the client's own request deadline. */
+function isTimeoutError(error) {
+  if (error?.code === 'TIMEOUT') return true
+  return error instanceof Error && /timed out after \d+ms/.test(error.message)
 }
 
 function requireText(value, field) {

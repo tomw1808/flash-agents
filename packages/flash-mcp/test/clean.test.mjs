@@ -20,6 +20,12 @@ import test from 'node:test'
 import { runClean } from '../lib/index.js'
 import { rootDigest } from '../lib/isolation.js'
 
+/**
+ * `clean` reads the durable patch store from `FLASH_DATA_DIR`, so every test here points
+ * it at a throwaway directory rather than the real user data directory.
+ */
+process.env.FLASH_DATA_DIR = realpathSync(mkdtempSync(join(tmpdir(), 'flash-clean-data-')))
+
 /** A throwaway state base directory. */
 function makeBase() {
   return realpathSync(mkdtempSync(join(tmpdir(), 'flash-clean-')))
@@ -91,6 +97,74 @@ test('clean reports each root digest and reclaims this root’s dead trees and e
   assert.equal(existsSync(join(patches, `${fresh}.patch`)), true, 'the fresh patch is kept')
   assert.equal(existsSync(join(base, emptyDigest)), false, 'the empty foreign digest is removed')
   assert.equal(existsSync(foreignLiveSlot), true, 'a foreign root with a live server is untouched')
+})
+
+test('clean prunes the durable store and a legacy temp store, and reports both locations', async () => {
+  const base = makeBase()
+  const root = makeRoot()
+  const own = rootDigest(root)
+  const dataDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-clean-data-case-')))
+  const patchDir = join(dataDir, own, 'patches')
+  const legacyPatchDir = join(base, own, 'patches')
+  mkdirSync(patchDir, { recursive: true })
+  mkdirSync(legacyPatchDir, { recursive: true })
+  const now = Date.now()
+  const expiredNew = writePatch(patchDir, root, { createdAt: now - 30 * DAY_MS })
+  const freshNew = writePatch(patchDir, root, { createdAt: now - DAY_MS })
+  const expiredLegacy = writePatch(legacyPatchDir, root, { createdAt: now - 30 * DAY_MS })
+  const freshLegacy = writePatch(legacyPatchDir, root, { createdAt: now - DAY_MS })
+
+  const lines = []
+  const code = await runClean([], {
+    env: { FLASH_SERVICE_ROOT: root, FLASH_DATA_DIR: dataDir },
+    write: (text) => lines.push(text),
+    baseDir: base,
+  })
+  assert.equal(code, 0)
+  const text = lines.join('')
+  assert.match(text, new RegExp(`flash-mcp patches: ${patchDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+  assert.match(text, new RegExp(`flash-mcp legacy patches: ${legacyPatchDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+  assert.match(text, /patches: 4 \(0\.0 MB\)/, 'this root’s line counts the durable store and the legacy one')
+  assert.match(text, /removed: 0 dead owner\(s\), 2 expired patch\(es\), 0 empty digest\(s\)/)
+
+  assert.equal(existsSync(join(patchDir, `${expiredNew}.patch`)), false, 'an expired durable patch is pruned')
+  assert.equal(existsSync(join(patchDir, `${freshNew}.patch`)), true, 'a fresh durable patch is kept')
+  assert.equal(existsSync(join(legacyPatchDir, `${expiredLegacy}.patch`)), false, 'an expired legacy patch is pruned')
+  assert.equal(existsSync(join(legacyPatchDir, `${freshLegacy}.patch`)), true, 'fresh work in the temp tree is not deleted')
+})
+
+test('clean reports the durable patch count on this root’s line', async () => {
+  // The defect this guards: `clean` read only `<tempBase>/<digest>/patches`, so after the
+  // upgrade it printed `patches: 0` for a root whose patches were all in the durable store.
+  const base = makeBase()
+  const root = makeRoot()
+  const own = rootDigest(root)
+  const dataDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-clean-data-count-')))
+  const patchDir = join(dataDir, own, 'patches')
+  const legacyDir = join(base, own, 'patches')
+  mkdirSync(patchDir, { recursive: true })
+  mkdirSync(legacyDir, { recursive: true })
+  const now = Date.now()
+  const durableIds = [
+    writePatch(patchDir, root, { createdAt: now }),
+    writePatch(patchDir, root, { createdAt: now }),
+  ]
+  const legacyId = writePatch(legacyDir, root, { createdAt: now })
+
+  const lines = []
+  const code = await runClean([], {
+    env: { FLASH_SERVICE_ROOT: root, FLASH_DATA_DIR: dataDir },
+    write: (text) => lines.push(text),
+    baseDir: base,
+  })
+  assert.equal(code, 0)
+  const line = lines.join('').split('\n').find((entry) => entry.includes(`${own} (this root)`))
+  assert.ok(line, `expected this root’s report line in ${JSON.stringify(lines)}`)
+  assert.match(line, /patches: 3 \(0\.0 MB\)/)
+  // The count is a report, not a cleanup: every fresh patch is still there.
+  for (const patchId of [...durableIds, legacyId]) {
+    assert.equal(existsSync(join(patchId === legacyId ? legacyDir : patchDir, `${patchId}.patch`)), true)
+  }
 })
 
 test('clean --all removes the trees of roots with no live server, never their patches', async () => {

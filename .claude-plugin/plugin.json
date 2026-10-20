@@ -1,7 +1,7 @@
 {
   "name": "flash-agents",
   "displayName": "Flash Agents",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "author": {
     "name": "Thomas Wiesner",
     "url": "https://github.com/tomw1808"
@@ -63,7 +63,7 @@
     "state_dir": {
       "type": "directory",
       "title": "State directory",
-      "description": "Where worker copies and returned patches live. Leave empty for a private directory under the system temp area; set it to a fixed path to make worker session history browsable.",
+      "description": "Where worker copies and returned patches live. Leave empty for the defaults: copies in a private directory under the system temp area, patches in your user data directory, where a reboot cannot remove them. Set a fixed path to make worker session history browsable.",
       "required": false
     }
   }

@@ -234,8 +234,11 @@ To watch workers live, set a log file and `tail -f` it — see
   the idle timeout is what stops a stuck one.
 - **Members of one `flash_batch` share one copy**, so they see each other's edits. Give them
   disjoint files.
-- **Gitignored output isn't carried in the patch.** It's named in the result instead, and the copy
-  it was written in is emptied as soon as the patch is stored, build output included.
+- **Gitignored output isn't carried in the patch.** It's named in the result instead — new ignored
+  paths under `change.ignored`, and ignored files that already existed and were rewritten or deleted
+  (a regenerated `worker-configuration.d.ts`, say) under `change.ignoredChanged`, with a warning to
+  regenerate them after applying. Changes deep inside an ignored directory such as `node_modules/`
+  are not tracked. The copy is emptied as soon as the patch is stored, build output included.
 - **The dispatcher is a cheap model too.** Occasionally it does the work itself instead of
   delegating; that call fails as `NOT_DELEGATED`, nothing from it is kept, and a retry usually works.
 - **Copies are separate folders, not separate machines.** Two workers in parallel share ports, the
