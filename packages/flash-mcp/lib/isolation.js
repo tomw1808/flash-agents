@@ -121,9 +121,12 @@ export const DEFAULT_COPY_EXCLUDE = Object.freeze(['.env', '.env.*', '.mcp.json'
  * Environment names a `slotEnv` entry may never name. The runtime's sandbox derives its
  * writable roots from the runtime's own `TMPDIR`, and every toolchain reads its own `HOME`;
  * pointing either at the copy withdrew grants the worker depends on (see `#runLocation` in
- * service.js). Both are refused rather than silently ignored.
+ * service.js). `DSH_HOME` is the harness's own home: a `cache:` entry survives between
+ * calls, so a worker could plant a profile there that governs the next runtime start on
+ * that slot. `FLASH_ROUTE_MODEL` is the server's choice alone; a slot that pinned it would
+ * make the model in the runtime key a lie. All are refused rather than silently ignored.
  */
-const FORBIDDEN_SLOT_ENV = new Set(['TMPDIR', 'TMP', 'TEMP', 'HOME'])
+const FORBIDDEN_SLOT_ENV = new Set(['TMPDIR', 'TMP', 'TEMP', 'HOME', 'DSH_HOME', 'FLASH_ROUTE_MODEL'])
 
 /** A `slotEnv` value pointing at one per-slot directory: `home:<name>` or `cache:<name>`. */
 const SLOT_ENV_VALUE = /^(home|cache):(.+)$/

@@ -57,9 +57,14 @@
 #
 #   * independence — a service must not break because a user-facing settings
 #     file moved, emptied, or started naming a credential that a headless
-#     process cannot supply. Nothing outside this file can change the route.
-#   * least privilege in the model dimension — exactly one model is registered,
-#     so no caller and no agent can select a larger, slower, or costlier one.
+#     process cannot supply. Nothing outside this file can change the provider,
+#     the endpoint, or which model ids are registered.
+#   * least privilege in the model dimension — exactly one model is registered
+#     per process. The server chooses that model when it starts the process, by
+#     setting FLASH_ROUTE_MODEL, and it only ever chooses from the user's
+#     allowlist (route.models in flash.config.json, or FLASH_MODELS). Without
+#     the variable this profile runs the installed default rendered below, so a
+#     caller cannot reach a model that is not on the allowlist.
 #
 # No `apiKeyEnv`: this route needs no credential. The Ollama daemon serves
 # these models — cloud models included — from its own sign-in, and pi-ai's
@@ -79,18 +84,19 @@
         headers:
           authorization: Bearer ollama
         models:
-          - id: ${route.model}
-            name: ${route.model}
+          - id: !!js process.env.FLASH_ROUTE_MODEL || ${route.model}
+            name: !!js process.env.FLASH_ROUTE_MODEL || ${route.model}
             input:
               - text
 
 # Keep the composition's own default consistent with the single registered
-# route, so an agent created without an explicit route cannot fall back to a
-# provider this profile does not serve.
+# route: it is the same FLASH_ROUTE_MODEL fallback as the provider list, so an
+# agent created without an explicit route cannot land on a model this profile
+# does not serve.
 - id: agent-default-model
   config:
     provider: ${route.provider}
-    model: ${route.model}
+    model: !!js process.env.FLASH_ROUTE_MODEL || ${route.model}
 
 # ── delegation surface: exactly one door per call ───────────────────────────
 #
@@ -174,16 +180,16 @@
         # without these a worker could read a private key and report it back.
         homeProtectedPaths: ${guard.homeProtectedPaths}
 
-    # The strict routing-contract provider: every child runs on the configured
-    # route whatever a caller asks for, and no child may start a child of its own
-    # (maxChildDepth 0).
+    # The strict routing-contract provider: every child runs on the route this
+    # process serves whatever a caller asks for, and no child may start a child of
+    # its own (maxChildDepth 0).
     - id: subagent-flash-in-process
       name: ./plugins/dsh-subagent-flash.js
       config:
         providerName: flash
         baseProvider: spawn
         provider: ${route.provider}
-        model: ${route.model}
+        model: !!js process.env.FLASH_ROUTE_MODEL || ${route.model}
         maxChildDepth: 0
 
     # The only model-visible delegation tool. It waits for the child, so one

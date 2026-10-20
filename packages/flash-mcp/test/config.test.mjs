@@ -15,7 +15,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { DEFAULT_CONFIG, loadConfig, mergeConfig, validateConfig } from '../lib/config.js'
+import { DEFAULT_CONFIG, allowedModels, loadConfig, mergeConfig, validateConfig } from '../lib/config.js'
+
+/** The allowlist the release ships. */
+const SHIPPED_MODELS = [
+  'deepseek-v4.1-flash:cloud',
+  'deepseek-v4.1-flash:1017-cloud',
+  'minimax-m3.1-flash:cloud',
+]
 
 /** The shipped configuration, read from the repository root. */
 function shippedRaw() {
@@ -113,6 +120,55 @@ test('a guard list must be an array of non-empty strings', () => {
   const emptyEntry = validateConfig({ guard: { homeProtectedPaths: ['.ssh', ''] } })
   assert.equal(emptyEntry.ok, false)
   assert.match(emptyEntry.errors.join('\n'), /guard\.homeProtectedPaths must be an array of non-empty strings/)
+})
+
+test('the shipped config lists the allowed models explicitly, with the documented default', () => {
+  assert.deepEqual(DEFAULT_CONFIG.route.models, SHIPPED_MODELS)
+  assert.deepEqual(shippedRaw().route.models, SHIPPED_MODELS)
+  assert.equal(DEFAULT_CONFIG.route.model, SHIPPED_MODELS[0])
+})
+
+test('route.models must be an array of non-empty strings', () => {
+  const notAnArray = validateConfig({ route: { models: 'deepseek-v4.1-flash:cloud' } })
+  assert.equal(notAnArray.ok, false)
+  assert.match(notAnArray.errors.join('\n'), /route\.models has type string; expected array/)
+
+  const emptyEntry = validateConfig({ route: { models: ['deepseek-v4.1-flash:cloud', ''] } })
+  assert.equal(emptyEntry.ok, false)
+  assert.match(emptyEntry.errors.join('\n'), /route\.models must be an array of non-empty strings/)
+
+  const numbers = validateConfig({ route: { models: [1] } })
+  assert.equal(numbers.ok, false)
+  assert.match(numbers.errors.join('\n'), /route\.models must be an array of non-empty strings/)
+
+  assert.equal(validateConfig({ route: { models: ['a:cloud'] } }).ok, true)
+})
+
+test('FLASH_MODELS replaces the allowlist, trimming entries and dropping empty ones', () => {
+  const fromEnv = loadConfig({ path: absentPath(), env: { FLASH_MODELS: ' a:cloud , ,b:cloud,  ' } })
+  assert.deepEqual(fromEnv.route.models, ['a:cloud', 'b:cloud'])
+  // The default model is unchanged; only the list is replaced.
+  assert.equal(fromEnv.route.model, DEFAULT_CONFIG.route.model)
+})
+
+test('a FLASH_MODELS that leaves no entries is ignored rather than emptying the list', () => {
+  for (const value of ['', ' ', ',,', ' , , ']) {
+    const config = loadConfig({ path: absentPath(), env: { FLASH_MODELS: value } })
+    assert.deepEqual(config.route.models, DEFAULT_CONFIG.route.models, JSON.stringify(value))
+  }
+})
+
+test('allowedModels puts the default first, keeps order, and removes duplicates', () => {
+  const config = mergeConfig({
+    route: { model: 'default:cloud', models: ['b:cloud', 'default:cloud', 'a:cloud', 'b:cloud'] },
+  })
+  assert.deepEqual(allowedModels(config), ['default:cloud', 'b:cloud', 'a:cloud'])
+  assert.deepEqual(allowedModels(DEFAULT_CONFIG), SHIPPED_MODELS)
+})
+
+test('allowedModels includes a default that the list omits', () => {
+  const config = mergeConfig({ route: { model: 'default:cloud', models: ['a:cloud'] } })
+  assert.deepEqual(allowedModels(config), ['default:cloud', 'a:cloud'])
 })
 
 test('the environment overrides the route when set and non-empty', () => {

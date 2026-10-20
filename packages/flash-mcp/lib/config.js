@@ -23,8 +23,8 @@ const SECTIONS = ['route', 'limits', 'guard', 'dsh']
 /** The sections holding numeric limits that must be positive safe integers. */
 const LIMIT_SECTIONS = new Set(['limits'])
 
-/** The guard entries that must be arrays of non-empty strings. */
-const STRING_ARRAY_PATHS = new Set(['guard.protectedSegments', 'guard.homeProtectedPaths'])
+/** The entries that must be arrays of non-empty strings. */
+const STRING_ARRAY_PATHS = new Set(['guard.protectedSegments', 'guard.homeProtectedPaths', 'route.models'])
 
 /**
  * The shipped defaults, frozen all the way down.
@@ -35,7 +35,13 @@ const STRING_ARRAY_PATHS = new Set(['guard.protectedSegments', 'guard.homeProtec
  * @type {Readonly<object>}
  */
 export const DEFAULT_CONFIG = deepFreeze({
-  route: { provider: 'ollama', model: 'deepseek-v4.1-flash:cloud' },
+  route: {
+    provider: 'ollama',
+    model: 'deepseek-v4.1-flash:cloud',
+    // The models a caller may choose from. `route.model` is always allowed even when
+    // this list omits it, so the installed default can never become unreachable.
+    models: ['deepseek-v4.1-flash:cloud', 'deepseek-v4.1-flash:1017-cloud', 'minimax-m3.1-flash:cloud'],
+  },
   limits: {
     slots: 2,
     maxTasks: 16,
@@ -171,8 +177,11 @@ export function mergeConfig(raw = {}) {
  * A missing file is not an error: the defaults are returned. A file that exists but
  * does not validate throws, naming the file and every error in it, so a
  * misconfiguration fails loudly at startup rather than silently at the first call.
- * After the merge the two route environment variables override the file when they
- * are set to a non-empty value.
+ * After the merge the route environment variables override the file when they
+ * are set to a non-empty value: `FLASH_SERVICE_PROVIDER` and `FLASH_SERVICE_MODEL`
+ * replace their route values, and `FLASH_MODELS` (comma-separated, entries trimmed,
+ * empty ones dropped) replaces the allowlist. A `FLASH_MODELS` that leaves no entries
+ * is ignored, so an empty variable means "keep the configured list".
  *
  * @param {object} [options] - where to read from and what environment to consult.
  * @param {string} [options.path] - configuration file to read; defaults to the repository's `flash.config.json`.
@@ -197,7 +206,29 @@ export function loadConfig({ path, env = process.env } = {}) {
   const config = mergeConfig(raw)
   if (isNonEmptyString(env.FLASH_SERVICE_PROVIDER)) config.route.provider = env.FLASH_SERVICE_PROVIDER
   if (isNonEmptyString(env.FLASH_SERVICE_MODEL)) config.route.model = env.FLASH_SERVICE_MODEL
+  const models = modelListFrom(env.FLASH_MODELS)
+  if (models !== undefined) config.route.models = models
   return config
+}
+
+/**
+ * The models a caller may choose, with the installed default first.
+ *
+ * The default `route.model` is always allowed, even when `route.models` omits it:
+ * otherwise editing the allowlist could strand the one model the profile runs
+ * without `FLASH_ROUTE_MODEL`. Duplicates are removed, keeping the first position.
+ *
+ * @param {object} [config] - a resolved configuration; defaults to `DEFAULT_CONFIG`.
+ * @returns {string[]} the allowed model ids, default first.
+ */
+export function allowedModels(config = DEFAULT_CONFIG) {
+  const primary = config?.route?.model
+  const listed = Array.isArray(config?.route?.models) ? config.route.models : []
+  const models = []
+  for (const model of [primary, ...listed]) {
+    if (isNonEmptyString(model) && !models.includes(model)) models.push(model)
+  }
+  return models
 }
 
 /**
@@ -255,6 +286,24 @@ function typeName(value) {
  */
 function isNonEmptyStringArray(value) {
   return Array.isArray(value) && value.every((entry) => typeof entry === 'string' && entry.length > 0)
+}
+
+/**
+ * Parse a comma-separated allowlist, where an empty result means "no override".
+ *
+ * Entries are trimmed and empty ones dropped, so `a, b` and `a,b` parse the same,
+ * and a value such as `",,"` is ignored rather than replacing the list with `[]`.
+ *
+ * @param {unknown} value - the raw environment value.
+ * @returns {string[] | undefined} the entries, or undefined when there are none.
+ */
+function modelListFrom(value) {
+  if (typeof value !== 'string' || value.length === 0) return undefined
+  const models = value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+  return models.length === 0 ? undefined : models
 }
 
 /**

@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
 
-import { CHECK_IDS, formatChecks, runChecks } from '../lib/doctor.js'
+import { CHECK_IDS, formatChecks, profileHonoursModelEnv, resolveDshHome, runChecks } from '../lib/doctor.js'
 
 /** Look up one check in a report by id. @param {object} result @param {string} id */
 function find(result, id) {
@@ -27,6 +27,11 @@ const DSH_ENTRY = `${DSH_DIR}/lib/bin.js`
 const DSH_MANIFEST = `${DSH_DIR}/package.json`
 const NODE_PTY_DIR = `${DSH_DIR}/node_modules/node-pty`
 const NODE_PTY_MANIFEST = `${NODE_PTY_DIR}/package.json`
+
+/** A fake harness home whose installed service profile honours FLASH_ROUTE_MODEL. */
+const FAKE_DSH_HOME = '/fake/home/.dsh'
+const FAKE_PROFILE_PATCH = `${FAKE_DSH_HOME}/profiles/flash-service/cordis.patch.yml`
+const HONOURING_PATCH = 'agent-default-model:\n  config:\n    model: !!js process.env.FLASH_ROUTE_MODEL || "deepseek-v4.1-flash:cloud"\n'
 
 /**
  * A filesystem probe over an in-memory tree, so the native-module check can run
@@ -93,7 +98,7 @@ function nativeInstall(spec = {}) {
   const prebuildDir = `${NODE_PTY_DIR}/prebuilds/${platform}-${arch}`
   const buildDir = `${NODE_PTY_DIR}/build/Release`
   const loadedDir = pty === 'build' ? buildDir : prebuildDir
-  const files = {}
+  const files = { [FAKE_PROFILE_PATCH]: HONOURING_PATCH }
   const executables = []
   if (locateDsh) files[DSH_MANIFEST] = JSON.stringify({ name: '@deepseek-ai/dsh' })
   if (pty === 'prebuild') files[`${prebuildDir}/${binary}`] = null
@@ -141,20 +146,20 @@ function fakeOptions(behaviors = {}, options = {}) {
     calls.push({ command, args })
     if (command === nodePath) return ptyProbe
     if (command === 'dsh') return args[0] === '--version' ? dsh : profileDump
-    if (command === 'ollama') return ollamaShow
+    if (command === 'ollama') return behaviors.ollamaShowFor?.(args[1]) ?? ollamaShow
     if (command === 'npm' || (command === 'cmd.exe' && args.at(-1) === 'npm --version')) return npm
     if (command === 'git') return git
     if (command === 'zstd') return zstd
     return { status: 1, stdout: '', stderr: 'not found' }
   }
   const native = nativeInstall()
-  return { options: { run, probe: async () => daemon, generate, nodePath, nodeVersion: '22.19.0', ...native, ...options }, calls }
+  return { options: { run, probe: async () => daemon, generate, nodePath, nodeVersion: '22.19.0', dshHome: FAKE_DSH_HOME, ...native, ...options }, calls }
 }
 
-test('reports nine ok checks for a fully working environment', async () => {
+test('reports ten ok checks for a fully working environment', async () => {
   const { options } = fakeOptions()
   const result = await runChecks(options)
-  assert.equal(result.checks.length, 9)
+  assert.equal(result.checks.length, 10)
   assert.deepEqual(result.checks.map((check) => check.id), [...CHECK_IDS])
   assert.ok(result.checks.every((check) => check.status === 'ok'))
   assert.equal(result.ok, true)
@@ -662,6 +667,131 @@ test('model: a non-cloud model never sends a request', async () => {
   assert.equal(asked, false)
 })
 
+/** The allowlist the release ships, used by the per-model rows. */
+const MODELS = ['deepseek-v4.1-flash:cloud', 'deepseek-v4.1-flash:1017-cloud', 'minimax-m3.1-flash:cloud']
+
+test('checks every allowed model: only the non-default unavailable one warns', async () => {
+  const asked = []
+  const generate = async (model) => {
+    asked.push(model)
+    return { ok: true, status: 200, ms: 5 }
+  }
+  const { options, calls } = fakeOptions(
+    {
+      ollamaShowFor: (model) =>
+        model === 'minimax-m3.1-flash:cloud'
+          ? { status: 1, stdout: '', stderr: 'not found' }
+          : { status: 0, stdout: '', stderr: '' },
+    },
+    { models: MODELS, generate },
+  )
+  const result = await runChecks(options)
+  assert.equal(find(result, 'model').status, 'ok')
+  assert.equal(find(result, `model:${MODELS[1]}`).status, 'ok')
+  const unavailable = find(result, `model:${MODELS[2]}`)
+  assert.equal(unavailable.status, 'warn')
+  assert.match(unavailable.detail, /minimax-m3\.1-flash:cloud is on the allowlist but is not available/)
+  assert.equal(unavailable.fix, 'ollama pull minimax-m3.1-flash:cloud')
+  assert.equal(result.ok, true)
+  assert.equal(result.warnings, 1)
+  // Only models that answered `ollama show` get a one-token request.
+  assert.deepEqual(asked, [MODELS[0], MODELS[1]])
+  assert.ok(calls.some((entry) => entry.command === 'ollama' && entry.args[1] === MODELS[2]))
+})
+
+test('the default model failing is still a failure while another model failing only warns', async () => {
+  const { options } = fakeOptions(
+    {
+      ollamaShowFor: (model) =>
+        model === 'deepseek-v4.1-flash:cloud'
+          ? { status: 1, stdout: '', stderr: 'not found' }
+          : { status: 0, stdout: '', stderr: '' },
+    },
+    { models: MODELS },
+  )
+  const result = await runChecks(options)
+  assert.equal(find(result, 'model').status, 'fail')
+  assert.equal(find(result, `model:${MODELS[1]}`).status, 'ok')
+  assert.equal(result.ok, false)
+  assert.equal(result.failures, 1)
+  assert.equal(result.warnings, 0)
+})
+
+test('a non-default model the cloud refuses warns and suggests ollama signin', async () => {
+  const generate = async (model) =>
+    model === MODELS[2] ? { ok: false, status: 401, error: 'unauthorized' } : { ok: true, status: 200, ms: 5 }
+  const { options } = fakeOptions({}, { models: MODELS, generate })
+  const result = await runChecks(options)
+  const refused = find(result, `model:${MODELS[2]}`)
+  assert.equal(refused.status, 'warn')
+  assert.match(refused.detail, /minimax-m3\.1-flash:cloud is installed but the cloud refused a request: unauthorized/)
+  assert.equal(refused.fix, 'ollama signin')
+  assert.equal(result.ok, true)
+})
+
+test('profile-models warns when the installed profile does not read FLASH_ROUTE_MODEL', async () => {
+  const { probe: fs } = fakeFs({ files: { [FAKE_PROFILE_PATCH]: 'model: "deepseek-v4.1-flash:cloud"\n' } })
+  const result = await runChecks(fakeOptions({}, { fs }).options)
+  const check = find(result, 'profile-models')
+  assert.equal(check.status, 'warn')
+  assert.match(check.detail, /does not read FLASH_ROUTE_MODEL/)
+  assert.match(check.detail, /only the default model can run/)
+  assert.equal(check.fix, 'node install.mjs')
+  assert.equal(result.ok, true)
+})
+
+test('profile-models is ok when the installed profile reads FLASH_ROUTE_MODEL', async () => {
+  const { probe: fs } = fakeFs({ files: { [FAKE_PROFILE_PATCH]: HONOURING_PATCH } })
+  const result = await runChecks(fakeOptions({}, { fs }).options)
+  const check = find(result, 'profile-models')
+  assert.equal(check.status, 'ok')
+  assert.match(check.detail, /every allowed model can run/)
+})
+
+test('profileHonoursModelEnv reads the installed patch and fails closed', () => {
+  const home = mkdtempSync(join(tmpdir(), 'flash-profile-home-'))
+  try {
+    assert.equal(profileHonoursModelEnv(home, 'flash-service'), false)
+    assert.equal(profileHonoursModelEnv('', 'flash-service'), false)
+    const dir = join(home, 'profiles', 'flash-service')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'cordis.patch.yml'), HONOURING_PATCH)
+    assert.equal(profileHonoursModelEnv(home, 'flash-service'), true)
+    assert.equal(profileHonoursModelEnv(home, 'flash-service-readonly'), false)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('resolveDshHome trims, expands a leading ~, and defaults to <home>/.dsh', () => {
+  const home = '/home/u'
+  assert.equal(resolveDshHome(undefined, home), join(home, '.dsh'))
+  assert.equal(resolveDshHome('', home), join(home, '.dsh'))
+  assert.equal(resolveDshHome('   ', home), join(home, '.dsh'))
+  assert.equal(resolveDshHome('~', home), home)
+  assert.equal(resolveDshHome('~/x', home), join(home, 'x'))
+  assert.equal(resolveDshHome('  ~/x  ', home), join(home, 'x'))
+  assert.equal(resolveDshHome('~\\x', home), join(home, 'x'))
+  // Anything else is the path dsh itself would use, only trimmed.
+  assert.equal(resolveDshHome(' /srv/dsh ', home), '/srv/dsh')
+  // `~user` is not a home-relative path dsh expands, so it is left as written.
+  assert.equal(resolveDshHome('~someone/dsh', home), '~someone/dsh')
+})
+
+test('runChecks resolves a ~-style dshHome against the injected home', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'flash-doctor-home-'))
+  try {
+    const patch = join(home, 'harness', 'profiles', 'flash-service', 'cordis.patch.yml')
+    const { probe: fs } = fakeFs({ files: { [patch]: HONOURING_PATCH } })
+    const result = await runChecks(fakeOptions({}, { fs, dshHome: ' ~/harness ', home }).options)
+    const check = find(result, 'profile-models')
+    assert.equal(check.status, 'ok')
+    assert.match(check.detail, /every allowed model can run/)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
 test('warns when zstd is missing while staying ok', async () => {
   const { options } = fakeOptions({ zstd: { status: 1, stdout: '', stderr: 'not found' } })
   const result = await runChecks(options)
@@ -700,7 +830,7 @@ test('formats one line per check and a Fix line per broken one', async () => {
   const text = formatChecks(result)
   const lines = text.split('\n')
   const checkLines = lines.filter((line) => /^(ok|warn|fail)\s/.test(line))
-  assert.equal(checkLines.length, 8)
+  assert.equal(checkLines.length, 9)
   // dsh did not start here, so its native-module check is not run at all.
   for (const id of CHECK_IDS.filter((id) => id !== 'dsh-native')) assert.ok(text.includes(id), `missing ${id}`)
   const fixLines = lines.filter((line) => line.startsWith('Fix:'))

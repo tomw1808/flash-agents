@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Check and finish the Flash Agents prerequisites — the harness, Ollama, the model, and the service profiles — then prove the pipeline with one real worker task.
+description: Check and finish the Flash Agents prerequisites — the harness, Ollama, the default and allowed models, and the service profiles — then prove the pipeline with one real worker task.
 disable-model-invocation: true
 ---
 
@@ -18,9 +18,11 @@ reporting what is missing. Do not silently skip a failing step.
 node "${CLAUDE_PLUGIN_ROOT}/packages/flash-mcp/lib/index.js" doctor
 ```
 
-Every line is a check; every failure prints the command that repairs it. If all checks
-pass, skip to step 5. Otherwise fix them in the order below — later checks depend on
-earlier ones.
+Every line is a check; every failure prints the command that repairs it. The doctor checks the
+default model and every model on the allowlist: the default's absence fails, while another one's
+absence only warns. A `profile-models` warning means the installed profile predates model choice
+and needs the installer rerun (step 4). If all checks pass and `profile-models` is not warning,
+skip to step 5. Otherwise fix them in the order below — later checks depend on earlier ones.
 
 ## 2. The harness
 
@@ -48,10 +50,15 @@ ollama serve                              # unless it already runs as a service
 ollama pull deepseek-v4.1-flash:cloud     # a ':cloud' model also needs: ollama signin
 ```
 
-Any model the local Ollama serves will do — set the plugin's **Worker model** setting, or
-`route.model` in `flash.config.json`, to something else if you prefer a fully local one.
-Expect more variance from smaller models: they are weaker at tool calling, which shows up
-as workers that do not delegate or do not finish.
+Any model the local Ollama serves will do. The plugin's **Default worker model** setting (or
+`route.model` in `flash.config.json`) is the model a call runs when it names none; the **Models a
+call may choose** setting (or `route.models`, or `FLASH_MODELS`) is the comma-separated allowlist for
+per-call choice. The default is always allowed, and every listed model must be pulled. Expect more
+variance from smaller models: they are weaker at tool calling, which shows up as workers that do
+not delegate or do not finish.
+
+A profile installed before 0.1.6 pinned one literal model, so after upgrading from 0.1.5 or older
+run the installer once (step 4) before relying on per-call choice.
 
 ## 4. The service profiles
 
@@ -60,8 +67,10 @@ node "${CLAUDE_PLUGIN_ROOT}/install.mjs"
 ```
 
 This renders two profiles into `$DSH_HOME/profiles` — the writing service and its
-read-only twin — from `flash.config.json`. Re-run it after changing that file. Then
-confirm with the doctor again; the `profile` check must pass.
+read-only twin — from `flash.config.json`. Re-run it after changing that file, and once after
+upgrading from 0.1.5 or older: a profile installed before 0.1.6 pins one literal model and cannot
+run a per-call choice. Then confirm with the doctor again; the `profile` check must pass, and
+`profile-models` must not warn.
 
 ## 5. Prove it end to end
 
@@ -73,9 +82,10 @@ node "${CLAUDE_PLUGIN_ROOT}/packages/flash-mcp/lib/index.js" doctor --e2e
 ```
 
 It asks a worker to create `flash-hello.txt` containing `it works`, and passes when the worker
-ended `ok` on the configured model, the patch holds exactly that file, and the temporary
-repository itself was not touched — the work happened in a disposable copy. Report those lines,
-the duration and the token count to the user.
+ended `ok` on the default model, the patch holds exactly that file, and the temporary repository
+itself was not touched — the work happened in a disposable copy. To prove a specific model from the
+allowlist, add `--model <id>`: the run then fails if the worker's `route` reports another model.
+Report those lines, the duration and the token count to the user.
 
 If it reports `NOT_DELEGATED`, say so plainly: the cheap dispatcher occasionally does the work
 itself instead of delegating, the call is discarded rather than trusted, and re-running usually
@@ -97,7 +107,8 @@ the project root (`copyExclude`, `slotEnv`; see the README's "Per-repository set
 
 Close with the tools and two caveats:
 - `flash_task` — one coherent task, one worker, a patch back (`taskFile` sends a long brief).
-- `flash_batch` — several independent tasks at once, sharing one copy.
+  Omit `model` for the default, or name one from the allowlist.
+- `flash_batch` — several independent tasks at once, sharing one copy and one model.
 - `flash_apply` — land a patch you decided to keep (`threeWay` when the tree moved on).
 - `flash_patch` — read a stored patch whole or page by page.
 - `background: true` with `flash_status`, `flash_result`, `flash_cancel` — run calls while

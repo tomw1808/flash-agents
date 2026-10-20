@@ -1,5 +1,5 @@
 {
-  "route": { "provider": "ollama", "model": "deepseek-v4.1-flash:cloud" },
+  "route": { "provider": "ollama", "model": "deepseek-v4.1-flash:cloud", "models": ["deepseek-v4.1-flash:cloud", "deepseek-v4.1-flash:1017-cloud", "minimax-m3.1-flash:cloud"] },
   "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 10800000, "idleTimeoutMs": 600000, "batchTimeoutMs": 10800000, "perItemChars": 12000, "maxResultChars": 24000, "diffChars": 20000, "maxConcurrentAgents": 4, "maxTotalAgents": 32, "maxItemsPerCall": 64, "workflowMaxResultChars": 250000, "patchRetentionDays": 14, "maxStateBytes": 21474836480 },
   "guard": { "protectedSegments": [".git"], "protectEnvFiles": true, "blockDestructiveGit": true, "fenceMutations": true, "homeProtectedPaths": [".ssh", ".aws", ".gnupg", ".dsh", ".config/gh", ".config/gcloud", ".docker/config.json"] },
   "dsh": { "package": "@deepseek-ai/dsh", "version": "0.2.0-rc.2" }

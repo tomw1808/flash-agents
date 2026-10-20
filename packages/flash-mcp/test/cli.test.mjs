@@ -16,14 +16,25 @@ import { existsSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { createService, parseOptions, runDoctor } from '../lib/index.js'
+import { createService, instructionsFor, jobLabel, listTools, parseOptions, runDoctor } from '../lib/index.js'
 import { DEFAULT_CONFIG, mergeConfig } from '../lib/config.js'
+
+/** The route the tests configure; recognisable so a value can be traced to it. */
+const TEST_MODEL = 'test-model:cloud'
 
 /** A configuration with recognisable limits, so a default can be traced to it. */
 const config = mergeConfig({
-  route: { provider: 'ollama', model: 'test-model:cloud' },
+  route: { provider: 'ollama', model: TEST_MODEL },
   limits: { slots: 7, maxTasks: 3, taskTimeoutMs: 1_234, diffChars: 99 },
 })
+
+/** A harness home that does not exist: these tests never read or write the real ~/.dsh. */
+const ABSENT_DSH_HOME = join(tmpdir(), 'flash-cli-absent-dsh-home')
+
+/** The environment a doctor test runs with, pointed away from the real harness home. */
+function doctorEnv(extra = {}) {
+  return { DSH_HOME: ABSENT_DSH_HOME, ...extra }
+}
 
 test('defaults are taken from the configuration, not from literals', () => {
   const options = parseOptions([], {}, config)
@@ -119,6 +130,57 @@ test('the parsed handshake timeout reaches the service', async () => {
   }
 })
 
+test('the tools expose the allowlist, and name the default in its description', () => {
+  const models = ['test-model:cloud', 'other-model:cloud']
+  const tools = listTools(models)
+  const single = tools.find((tool) => tool.name === 'flash_task')
+  const fleet = tools.find((tool) => tool.name === 'flash_batch')
+  for (const tool of [single, fleet]) {
+    assert.deepEqual(tool.inputSchema.properties.model.enum, models)
+    assert.match(tool.inputSchema.properties.model.description, /Default: test-model:cloud/)
+    assert.match(tool.inputSchema.properties.model.description, /routes? reports? the model that actually ran/)
+    assert.match(tool.inputSchema.properties.model.description, /other-model:cloud may be chosen per call/)
+  }
+  assert.match(fleet.inputSchema.properties.model.description, /whole fleet/)
+  // A fleet's task items cannot carry a model of their own.
+  assert.equal(fleet.inputSchema.properties.tasks.items.oneOf[1].properties.model, undefined)
+  // Without an argument the shipped default is named: no description hard-codes a route
+  // string that the configuration could contradict.
+  const fallback = listTools().find((tool) => tool.name === 'flash_task')
+  assert.deepEqual(fallback.inputSchema.properties.model.enum, [DEFAULT_CONFIG.route.model])
+})
+
+test('the handshake instructions name the default and the other allowed models', () => {
+  const text = instructionsFor(['test-model:cloud', 'other-model:cloud'])
+  assert.match(text, /test-model:cloud is the default and suits a quick hand-off/)
+  assert.match(text, /other-model:cloud can be chosen per call/)
+  assert.match(text, /routes? reports? the model that actually ran/)
+  assert.doesNotMatch(text, /ollama\/deepseek-v4\.1-flash:cloud/)
+})
+
+test('a background job label says which model it chose, unless it is the default', () => {
+  assert.equal(jobLabel('flash_task', { task: 'write the thing' }, TEST_MODEL), 'write the thing')
+  assert.equal(jobLabel('flash_task', { task: 'write the thing', model: TEST_MODEL }, TEST_MODEL), 'write the thing')
+  assert.equal(jobLabel('flash_task', { task: 'write the thing', model: 'other:cloud' }, TEST_MODEL), '[other:cloud] write the thing')
+  assert.equal(jobLabel('flash_batch', { tasks: ['a', 'b'], model: 'other:cloud' }, TEST_MODEL), '[other:cloud] 2 tasks')
+})
+
+test('the service allowlist holds its default first, whichever door named it', async () => {
+  const options = parseOptions(['--model', 'other:latest'], {}, config)
+  options.root = mkdtempSync(join(tmpdir(), 'flash-mcp-cli-model-'))
+  options.isolate = 'none'
+  const service = createService(options)
+  try {
+    assert.equal(service.model, 'other:latest')
+    // `--model` is folded in, so the model the operator asked for is never refused by
+    // the allowlist the same configuration supplied.
+    assert.equal(service.models[0], 'other:latest')
+    assert.ok(service.models.includes(TEST_MODEL))
+  } finally {
+    await service.close()
+  }
+})
+
 /** Injected effects for the doctor: no binary is run and no socket is opened. */
 function fakes({ dsh = { status: 0, stdout: `${config.dsh.version}\n`, stderr: '' }, daemon = true, show = { status: 0, stdout: '', stderr: '' } } = {}) {
   return {
@@ -135,7 +197,7 @@ function fakes({ dsh = { status: 0, stdout: `${config.dsh.version}\n`, stderr: '
 
 test('doctor exits zero when the prerequisites are met', async () => {
   const lines = []
-  const code = await runDoctor([], { env: {}, write: (text) => lines.push(text), ...fakes() })
+  const code = await runDoctor([], { env: doctorEnv(), write: (text) => lines.push(text), ...fakes() })
   assert.equal(code, 0)
   const text = lines.join('')
   assert.match(text, /all required checks passed/)
@@ -145,7 +207,7 @@ test('doctor exits zero when the prerequisites are met', async () => {
 test('doctor exits non-zero and prints a fix for each broken prerequisite', async () => {
   const lines = []
   const code = await runDoctor([], {
-    env: {},
+    env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes({ dsh: { status: 1, stdout: '', stderr: 'not found' }, daemon: false }),
   })
@@ -159,11 +221,27 @@ test('doctor exits non-zero and prints a fix for each broken prerequisite', asyn
 test('doctor asks about the model the service would actually run', async () => {
   const lines = []
   await runDoctor([], {
-    env: { FLASH_SERVICE_MODEL: 'someone-elses-model:latest' },
+    env: doctorEnv({ FLASH_SERVICE_MODEL: 'someone-elses-model:latest' }),
     write: (text) => lines.push(text),
     ...fakes({ show: { status: 1, stdout: '', stderr: 'not found' } }),
   })
   assert.match(lines.join(''), /someone-elses-model:latest/)
+})
+
+test('doctor checks the model named by --model, not the configured default', async () => {
+  const lines = []
+  const code = await runDoctor(['--model', 'minimax-m3.1-flash:cloud'], {
+    env: doctorEnv(),
+    write: (text) => lines.push(text),
+    ...fakes({ show: { status: 1, stdout: '', stderr: 'not found' } }),
+  })
+  const text = lines.join('')
+  assert.equal(code, 1)
+  assert.match(text, /fail\s+model\s+minimax-m3\.1-flash:cloud is not available/)
+  // The configured default is still on the computed allowlist, but only as a
+  // non-default row: its absence warns instead of failing the run twice.
+  assert.match(text, /warn\s+model:deepseek-v4\.1-flash:cloud/)
+  assert.doesNotMatch(text, /fail\s+model\s+deepseek-v4\.1-flash:cloud/)
 })
 
 /** A throwaway git repository with one committed file and one large untracked one. */
@@ -178,7 +256,7 @@ function tempRepository() {
 test('doctor --copy reports what a copy of a real repository costs', async () => {
   const repo = tempRepository()
   const lines = []
-  const code = await runDoctor(['--copy', '--root', repo], { env: {}, write: (text) => lines.push(text) })
+  const code = await runDoctor(['--copy', '--root', repo], { env: doctorEnv(), write: (text) => lines.push(text) })
   assert.equal(code, 0)
   const text = lines.join('')
   assert.match(text, /ok\s+copy\s+copied /)
@@ -194,7 +272,7 @@ test('doctor --copy exits 1 with the error the copy would have hit', async () =>
   const missing = join(tmpdir(), `flash-cli-missing-${String(process.pid)}`)
   assert.equal(existsSync(missing), false)
   const lines = []
-  const code = await runDoctor(['--copy', '--root', missing], { env: {}, write: (text) => lines.push(text) })
+  const code = await runDoctor(['--copy', '--root', missing], { env: doctorEnv(), write: (text) => lines.push(text) })
   assert.equal(code, 1)
   const text = lines.join('')
   assert.match(text, /fail\s+copy\s+the copy of .* failed/)
@@ -205,7 +283,7 @@ test('doctor --copy takes its root from CLAUDE_PROJECT_DIR, as the plugin starts
   const repo = tempRepository()
   const lines = []
   const code = await runDoctor(['--copy'], {
-    env: { CLAUDE_PROJECT_DIR: repo },
+    env: doctorEnv({ CLAUDE_PROJECT_DIR: repo }),
     write: (text) => lines.push(text),
   })
   assert.equal(code, 0)
@@ -216,7 +294,7 @@ test('doctor --e2e skips the run when a check failed', async () => {
   const lines = []
   let built = false
   const code = await runDoctor(['--e2e'], {
-    env: {},
+    env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes({ dsh: { status: 1, stdout: '', stderr: 'not found' }, daemon: false }),
     createService: () => {
@@ -277,7 +355,7 @@ function e2eResult() {
 test('doctor --e2e exits non-zero when the service will not close, even after a passing run', async () => {
   const lines = []
   const fake = fakeE2eService({ result: e2eResult(), closeError: new Error('the pool would not close') })
-  const code = await runDoctor(['--e2e'], { env: {}, write: (text) => lines.push(text), ...fakes(), createService: fake.createService })
+  const code = await runDoctor(['--e2e'], { env: doctorEnv(), write: (text) => lines.push(text), ...fakes(), createService: fake.createService })
   const text = lines.join('')
   assert.match(text, /fail\s+e2e\s+could not close the service: the pool would not close/)
   // A runtime or a tree may have been left behind; the exit code must say so too.
@@ -288,7 +366,7 @@ test('doctor --e2e proves a writing call in a throwaway repository', async () =>
   const lines = []
   const fake = fakeE2eService({ result: e2eResult() })
   const code = await runDoctor(['--e2e'], {
-    env: {},
+    env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes(),
     createService: fake.createService,
@@ -310,6 +388,13 @@ test('doctor --e2e proves a writing call in a throwaway repository', async () =>
   assert.notEqual(options.root, process.cwd())
   assert.equal(options.profile, 'flash-service')
   assert.equal(options.provider, 'ollama')
+  assert.equal(options.model, 'deepseek-v4.1-flash:cloud')
+  // The doctor's environment reaches the service (so the run reads no real harness
+  // home), and the model is a per-call argument now: the service puts it into the
+  // runtime's own environment rather than the doctor pre-setting the variable.
+  assert.equal(options.env.FLASH_ROUTE_MODEL, undefined)
+  assert.equal(options.env.DSH_HOME, ABSENT_DSH_HOME)
+  assert.equal(fake.calls[0].model, options.model)
   // A private state directory in its own temp tree: never the user's.
   assert.match(options.stateDir, /flash-doctor-state-.+[\\/]state$/)
 
@@ -326,6 +411,42 @@ test('doctor --e2e proves a writing call in a throwaway repository', async () =>
   assert.equal(existsSync(options.stateDir), false)
 })
 
+test('doctor --e2e runs on the model it was asked for', async () => {
+  const lines = []
+  const fake = fakeE2eService({
+    result: { ...e2eResult(), route: { provider: 'ollama', model: 'minimax-m3.1-flash:cloud' } },
+  })
+  const code = await runDoctor(['--e2e', '--model', 'minimax-m3.1-flash:cloud'], {
+    env: doctorEnv(),
+    write: (text) => lines.push(text),
+    ...fakes(),
+    createService: fake.createService,
+  })
+  const text = lines.join('')
+  assert.equal(code, 0, text)
+  assert.match(text, /ok\s+e2e\s+worker status ok on ollama\/minimax-m3\.1-flash:cloud/)
+  assert.equal(fake.built[0].model, 'minimax-m3.1-flash:cloud')
+  assert.equal(fake.calls[0].model, 'minimax-m3.1-flash:cloud')
+})
+
+test('doctor --e2e fails when the observed model differs from the one asked for', async () => {
+  const lines = []
+  const fake = fakeE2eService({
+    result: { ...e2eResult(), route: { provider: 'ollama', model: 'deepseek-v4.1-flash:1017-cloud' } },
+  })
+  const code = await runDoctor(['--e2e', '--model', 'minimax-m3.1-flash:cloud'], {
+    env: doctorEnv(),
+    write: (text) => lines.push(text),
+    ...fakes(),
+    createService: fake.createService,
+  })
+  assert.equal(code, 1)
+  assert.match(
+    lines.join(''),
+    /fail\s+e2e\s+worker status ok on ollama\/deepseek-v4\.1-flash:1017-cloud, but the model asked for was minimax-m3\.1-flash:cloud/,
+  )
+})
+
 test('doctor --e2e fails when the worker leaves the temp repository touched', async () => {
   const lines = []
   // A service that writes into the root it was given: exactly what isolation exists to
@@ -335,7 +456,7 @@ test('doctor --e2e fails when the worker leaves the temp repository touched', as
     onCall: async (options) => writeFileSync(join(options.root, 'flash-hello.txt'), 'it works\n'),
   })
   const code = await runDoctor(['--e2e'], {
-    env: {},
+    env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes(),
     createService: fake.createService,
@@ -351,7 +472,7 @@ test('doctor --e2e reports the exact error, with the note a NOT_DELEGATED run ne
   const failure = new Error('the orchestrator finished without delegating')
   failure.code = 'NOT_DELEGATED'
   const code = await runDoctor(['--e2e'], {
-    env: {},
+    env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes(),
     createService: () => ({

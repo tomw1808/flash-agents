@@ -3,9 +3,10 @@
 **Let Claude Code steer, and let a cheap model do the reading and the typing.**
 
 Flash Agents is a Claude Code plugin that hands bounded coding work — implement this slice,
-port these tests, review this diff, map this codebase — to **DeepSeek V4.1 Flash** workers
-instead of Claude subagents. Claude keeps the architecture, the acceptance criteria and the
-final review. The workers spend their tokens, not yours.
+port these tests, review this diff, map this codebase — to cheap **DeepSeek V4.1 Flash** workers
+instead of Claude subagents, or to another model on your list, such as **MiniMax M3.1 Flash**,
+chosen per hand-off. Claude keeps the architecture, the acceptance criteria and the final review.
+The workers spend their tokens, not yours.
 
 Every writing job runs in a **disposable copy of your repository** and comes back as a
 **patch**. Nothing touches your working tree until you (or Claude) apply it.
@@ -38,6 +39,9 @@ You ── "add retry with backoff to the API client, with tests" ──► Clau
   that as a patch you decline.
 - **You get evidence, not a story.** `filesChanged`, `diffstat` and the patch are computed by
   `git` from the copy — never taken from the worker's own account of what it did.
+- **You choose the worker, per hand-off.** Claude can send one slice to DeepSeek V4.1 Flash and the
+  next to MiniMax M3.1 Flash or the newer DeepSeek `1017` build, from a list you control. Each result
+  reports the model that actually ran, so you can compare them on your own work.
 - **Fan-out is built in.** `flash_batch` runs up to 16 independent tasks in one call, four at a
   time, and returns each result in task order.
 
@@ -61,13 +65,16 @@ encodes that loop, so Claude does it without being told.
 
 You need **Claude Code**, **Node 22.19+** (or 24.2+), and **[Ollama](https://ollama.com)**. About five minutes.
 
-**1. Install the worker runtime and the model**
+**1. Install the worker runtime and the default model**
 
 ```sh
 npm i -g @deepseek-ai/dsh@0.2.0-rc.2     # DeepSeek Harness, the version the profiles are written for
 ollama signin                            # the :cloud model runs on Ollama's cloud, under your account
 ollama pull deepseek-v4.1-flash:cloud
 ```
+
+The default allowlist also names two more models; pull any you want a call to choose from (see
+[Configuration](#configuration)).
 
 npm 11 skips dependency install scripts and lists the ones it blocked (`node-pty`,
 `@deepseek-ai/dsh-subprocess-local`, `koffi`, `protobufjs`, `@google/genai`). On macOS and the
@@ -90,8 +97,9 @@ Restart Claude Code when it asks you to.
 /flash-agents:setup
 ```
 
-It runs the doctor (Node, `dsh`, Ollama, the model, `git`), writes the two worker profiles into
-`~/.dsh/profiles` (plus a `flash-orchestrator` preset for dsh's own UI), and proves the pipeline end to end with one real task. Every failing check
+It runs the doctor (Node, `dsh`, Ollama, the default and allowed models, `git`), writes the two
+worker profiles into `~/.dsh/profiles` (plus a `flash-orchestrator` preset for dsh's own UI), and
+proves the pipeline end to end with one real task. Every failing check
 prints the exact command that fixes it.
 
 **4. Use it**
@@ -155,9 +163,29 @@ each rule, are in [docs/design.md](docs/design.md#permissions).
 
 ## Configuration
 
-The plugin's settings (`/plugin` → flash-agents) cover the worker model, how many copies may be
-in flight (each is a process, so this is a memory decision; default 2), and where patches live.
-**Any model your Ollama serves works** — smaller local models are just weaker at tool calling.
+The plugin's settings (`/plugin` → flash-agents) have two model knobs:
+
+- **Default worker model** — the model a call runs when it names none (`route.model`, or
+  `FLASH_SERVICE_MODEL` for a manual install). It must be served by your Ollama; the default is the
+  one this project is tuned for, and smaller local models are weaker at tool calling.
+- **Models a call may choose** — a comma-separated allowlist (`FLASH_MODELS`, or `route.models` in
+  `flash.config.json` for a manual install). The default is always allowed, even if the list omits
+  it. Each entry must be available in your Ollama (`ollama pull <model>`; a `:cloud` model also
+  needs `ollama signin`).
+
+Any model your Ollama serves can be used, but a call can only choose one that is on the list.
+
+Both `flash_task` and `flash_batch` take a `model` from that list: one task, or a whole fleet, can
+run on a different allowed model, and the result's `route` reports the model that actually ran.
+Omit `model` for the default.
+
+**After upgrading from 0.1.5 or older, run the setup once more** (`/flash-agents:setup`, or
+`node install.mjs` in a manual install). Before 0.1.6 the installed worker profile pinned one
+literal model: setting the plugin's model alone did not switch the worker, and a profile from an
+older release refuses a per-call choice until it is regenerated.
+
+The settings also cover how many copies may be in flight (each is a process, so this is a memory
+decision; default 2) and where patches live.
 
 Limits live in [`flash.config.json`](flash.config.json). The defaults: a call is stopped after
 **10 minutes without any activity** (stuck), or 3 hours in total (a ceiling for honest work);

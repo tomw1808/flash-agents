@@ -55,10 +55,14 @@ class FakeSdkClient {
     this.notificationHandlers = new Set()
     this.exitHandlers = new Set()
     this.diagnostics = ''
+    /** The model this runtime reports on its children's request headers (tests). */
+    this.routeModel = 'deepseek-v4.1-flash:cloud'
     /** Errors `initialize` rejects with, consumed one per call (tests). */
     this.initializeFailures = []
     /** When set, `initialize` waits this long before answering or failing (tests). */
     this.initializeDelayMs = 0
+    /** When set, `shutdown` waits for this deferred before finishing (tests). */
+    this.shutdownGate = undefined
   }
 
   start() {
@@ -103,6 +107,8 @@ class FakeSdkClient {
   async shutdown() {
     this.shutdowns += 1
     this.shutdownCwds.push(this.cwd)
+    // A test that models a slow shutdown parks here until it releases the gate.
+    if (this.shutdownGate !== undefined) await this.shutdownGate.promise
     this.running = false
   }
 
@@ -179,7 +185,7 @@ class FakeSdkClient {
           sessionId: childId(index),
           event: {
             type: 'request/header',
-            data: { header: { config: { provider: 'ollama', model: 'deepseek-v4.1-flash:cloud' } } },
+            data: { header: { config: { provider: 'ollama', model: this.routeModel } } },
           },
         })
       }
@@ -269,7 +275,7 @@ class FakeSdkClient {
         sessionId: childId(index),
         event: {
           type: 'request/header',
-          data: { header: { config: { provider: 'ollama', model: 'deepseek-v4.1-flash:cloud' } } },
+          data: { header: { config: { provider: 'ollama', model: this.routeModel } } },
         },
       })
     }
@@ -306,17 +312,41 @@ function initializeTimeout(timeoutMs) {
   return error
 }
 
+/** A promise the test resolves itself, to hold one runtime's shutdown open. */
+function deferred() {
+  let resolve
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
+/** Wait (briefly) for a condition a concurrent call will reach. */
+async function waitFor(predicate, label) {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.fail(`timed out waiting for ${label}`)
+}
+
 /** A service rooted at a fresh temporary directory. */
 function makeService({ script, ...overrides } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'flash-mcp-test-'))
   const client = new FakeSdkClient({ script })
   const service = new FlashTaskService({
     root,
-    clientFactory: () => client,
+    clientFactory: (profileName, cwd, extraEnv) => {
+      client.recordEnv(extraEnv)
+      return client
+    },
     log: () => {},
     // These tests pin the contract of a call that runs in the root itself. What a
     // call does when it is isolated is exercised in its own block below.
     isolate: { mode: 'none' },
+    // The installed profile is never read from this machine's home: the tests that
+    // choose another model decide what the fake profile reports.
+    honoursModelEnv: () => true,
     ...overrides,
   })
   return { root, client, service }
@@ -340,9 +370,38 @@ function makeIsolatedService({ slots = 2, file = 'worker-output.txt', script, ..
     },
     log: () => {},
     isolate: { slots, stateDir },
+    honoursModelEnv: () => true,
     ...overrides,
   })
   return { root, client, service, stateDir }
+}
+
+/**
+ * A service whose factory returns a fresh fake per runtime, so more than one model can be
+ * observed at once. Each client reports the model it was booted for, unless the test pins
+ * another one to model a worker that ran elsewhere.
+ */
+function makeModelService({ script, routeModel, models, ...overrides } = {}) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-model-')))
+  const clients = []
+  const logs = []
+  const service = new FlashTaskService({
+    root,
+    models,
+    clientFactory: (profileName, cwd, extraEnv) => {
+      const resolved = typeof script === 'function' ? script(extraEnv?.FLASH_ROUTE_MODEL) : script
+      const client = new FakeSdkClient({ script: resolved })
+      client.routeModel = routeModel ?? extraEnv?.FLASH_ROUTE_MODEL ?? 'deepseek-v4.1-flash:cloud'
+      client.recordEnv(extraEnv)
+      clients.push(client)
+      return client
+    },
+    log: (line) => logs.push(line),
+    isolate: { mode: 'none' },
+    honoursModelEnv: () => true,
+    ...overrides,
+  })
+  return { root, clients, logs, service }
 }
 
 test('runs one task through one child and returns a compact result', async () => {
@@ -504,6 +563,369 @@ test('boots the runtime lazily and reuses it across calls', async () => {
   assert.notEqual(client.prompts[0].sessionId, client.prompts[1].sessionId)
 })
 
+// ── model choice: one dsh process per model, and a bound on how many ─────────
+
+const DEFAULT_TEST_MODEL = 'deepseek-v4.1-flash:cloud'
+const OTHER_TEST_MODEL = 'minimax-m3.1-flash:cloud'
+const THIRD_TEST_MODEL = 'third-model:cloud'
+const FOURTH_TEST_MODEL = 'fourth-model:cloud'
+
+test('every runtime boots with FLASH_ROUTE_MODEL and initializes on the same model', async () => {
+  const { root, clients, service } = makeModelService({ models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL] })
+
+  const first = await service.flashTask({ task: 'one', cwd: root })
+  // The default is in the environment too: the profile always picks its model from it.
+  assert.deepEqual(clients[0].extraEnv, { FLASH_ROUTE_MODEL: DEFAULT_TEST_MODEL })
+  assert.equal(clients[0].initializes[0].model, DEFAULT_TEST_MODEL)
+  assert.equal(first.status, 'ok')
+
+  const second = await service.flashTask({ task: 'two', cwd: root, model: OTHER_TEST_MODEL })
+  assert.deepEqual(clients[1].extraEnv, { FLASH_ROUTE_MODEL: OTHER_TEST_MODEL })
+  assert.equal(clients[1].initializes[0].model, OTHER_TEST_MODEL)
+  assert.equal(second.status, 'ok')
+  // Two models are two dsh processes: the model is fixed for the life of one process.
+  assert.equal(clients.length, 2)
+  await service.close()
+})
+
+test('two calls on one model share its runtime; another model gets one of its own', async () => {
+  const { root, clients, service } = makeModelService({ models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL] })
+  await service.flashTask({ task: 'one', cwd: root })
+  await service.flashTask({ task: 'two', cwd: root })
+  assert.equal(clients.length, 1, 'the same model reuses one runtime')
+  assert.equal(clients[0].initializes.length, 1)
+  assert.equal(clients[0].starts, 1)
+
+  await service.flashTask({ task: 'three', cwd: root, model: OTHER_TEST_MODEL })
+  assert.equal(clients.length, 2)
+  assert.equal(clients[1].initializes[0].model, OTHER_TEST_MODEL)
+  await service.close()
+})
+
+test('another model on the same tree retires the idle runtime, and spares another tree', async () => {
+  const { root, clients, logs, service } = makeModelService({ models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL] })
+  mkdirSync(join(root, 'nested'))
+  await service.flashTask({ task: 'one', cwd: root })
+  await service.flashTask({ task: 'two', cwd: join(root, 'nested') })
+  assert.equal(clients.length, 2, 'two trees, two runtimes')
+
+  await service.flashTask({ task: 'three', cwd: root, model: OTHER_TEST_MODEL })
+
+  // The root's default runtime had no session in flight, so the new model took the tree:
+  // one process per tree rather than one per model the tree ever served.
+  assert.equal(clients[0].shutdowns, 1)
+  assert.equal(clients[1].shutdowns, 0, 'a runtime on another cwd is untouched')
+  assert.equal(service.runtimes.size, 2)
+  assert.ok(
+    logs.some((line) => new RegExp(`shut down the ${DEFAULT_TEST_MODEL} runtime on flash-service in .*: ${OTHER_TEST_MODEL} now serves that tree`).test(line)),
+    `expected one shutdown line, saw:\n${logs.join('\n')}`,
+  )
+  await service.close()
+})
+
+test('a fresh runtime under a key survives a stale retirement walk', async () => {
+  const { root, clients, service } = makeModelService({
+    models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL, THIRD_TEST_MODEL, FOURTH_TEST_MODEL],
+  })
+  const keyFor = (model) => `${service.profile}@${root}@${model}`
+  // Two idle runtimes on the one tree, as if two models had been booted while the other
+  // was busy. Seeding them is what makes the stale snapshot contain both.
+  const first = new FakeSdkClient()
+  const second = new FakeSdkClient()
+  for (const [model, client] of [
+    [OTHER_TEST_MODEL, first],
+    [THIRD_TEST_MODEL, second],
+  ]) {
+    service.runtimes.set(keyFor(model), {
+      client,
+      initialized: true,
+      starting: undefined,
+      startedAt: Date.now(),
+      profile: service.profile,
+      cwd: root,
+      model,
+      sessions: 0,
+    })
+  }
+  // The third model's retirement blocks on the first runtime's shutdown. It runs on the
+  // default model, so the two seeded models and it are three distinct keys.
+  const gate = deferred()
+  first.shutdownGate = gate
+  const third = service.flashTask({ task: 'third model', cwd: root })
+  await waitFor(() => first.shutdowns === 1, 'the third model to begin retiring')
+
+  // A fourth model retires the second runtime, then the second model is called again and
+  // boots a *fresh* runtime under the very key the stale walk still holds.
+  const fourth = await service.flashTask({ task: 'fourth model', cwd: root, model: FOURTH_TEST_MODEL })
+  assert.equal(fourth.status, 'ok')
+  assert.equal(second.shutdowns, 1, 'the fourth model retired the second runtime')
+  const fresh = await service.flashTask({ task: 'second model again', cwd: root, model: OTHER_TEST_MODEL })
+  assert.equal(fresh.status, 'ok')
+  const freshClient = clients.at(-1)
+  assert.equal(service.runtimes.get(keyFor(OTHER_TEST_MODEL))?.client, freshClient, 'the fresh runtime is mapped')
+  assert.equal(freshClient.shutdowns, 0)
+
+  // Resume the stale walk. Its snapshot still names the old second runtime under the key,
+  // but the map now holds the fresh one: the map, not the snapshot, decides.
+  gate.resolve()
+  const thirdResult = await third
+  assert.equal(thirdResult.status, 'ok')
+  assert.equal(
+    service.runtimes.get(keyFor(OTHER_TEST_MODEL))?.client,
+    freshClient,
+    'the stale walk must not delete the fresh runtime',
+  )
+  assert.equal(freshClient.shutdowns, 0, 'and must not shut the fresh runtime down')
+  assert.equal(second.shutdowns, 1, 'and must not shut the old runtime down twice')
+
+  await service.close()
+  assert.equal(freshClient.shutdowns, 1, 'close() still finds and stops the fresh runtime')
+})
+
+test('a runtime with a session in flight is never retired by another model', async () => {
+  const { root, clients, service } = makeModelService({
+    models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL],
+    // The first model holds its session open; the second finishes normally.
+    script: (model) => (model === DEFAULT_TEST_MODEL ? 'silent' : 'ok'),
+    taskTimeoutMs: 30_000,
+  })
+  const controller = new AbortController()
+  const holding = service
+    .flashTask({ task: 'hold the runtime', cwd: root }, { signal: controller.signal })
+    .catch((error) => error)
+  // Wait until the first runtime has really started its session.
+  for (let attempt = 0; attempt < 400 && (clients[0]?.prompts.length ?? 0) === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.equal(clients[0].prompts.length, 1)
+
+  const other = await service.flashTask({ task: 'second model', cwd: root, model: OTHER_TEST_MODEL })
+  assert.equal(other.status, 'ok')
+  assert.equal(clients.length, 2)
+  assert.equal(clients[0].shutdowns, 0, 'the busy runtime is left alone')
+
+  controller.abort()
+  const cancelled = await holding
+  assert.equal(cancelled.code, 'CANCELLED')
+  await service.close()
+})
+
+test('salvage shuts down a slot’s runtimes for every model', async () => {
+  const { root, service } = makeIsolatedService({ slots: 1, script: 'silent', taskTimeoutMs: 100 })
+  const slotDir = service.isolation.slots[0].dir
+  const seeded = []
+  // A tree that served two models can hold a runtime for each. They are busy here, so the
+  // process bound leaves them alone; salvage must still take every one of them down. The
+  // default model is deliberately not seeded: this call runs on it.
+  for (const model of [OTHER_TEST_MODEL, 'another-model:cloud']) {
+    const client = new FakeSdkClient({ script: 'silent' })
+    seeded.push(client)
+    service.runtimes.set(`${service.profile}@${slotDir}@${model}`, {
+      client,
+      initialized: true,
+      starting: undefined,
+      startedAt: Date.now(),
+      profile: service.profile,
+      cwd: slotDir,
+      model,
+      sessions: 1,
+    })
+  }
+
+  const error = await service.flashTask({ task: 'never finishes', cwd: root }).catch((caught) => caught)
+
+  assert.equal(error.code, 'TIMEOUT')
+  assert.deepEqual(seeded.map((client) => client.shutdowns), [1, 1])
+  assert.equal(service.runtimes.size, 0, 'no runtime on the retired tree survives')
+  await service.close()
+})
+
+test('a model outside the allowlist is refused before anything starts', async () => {
+  const { root, clients, service } = makeModelService({ models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL] })
+  const refused = (error) =>
+    error instanceof FlashTaskError &&
+    error.code === 'MODEL_NOT_ALLOWED' &&
+    error.message.includes(DEFAULT_TEST_MODEL) &&
+    error.message.includes(OTHER_TEST_MODEL)
+
+  await assert.rejects(service.flashTask({ task: 'x', cwd: root, model: 'not-allowed:cloud' }), refused)
+  await assert.rejects(service.flashBatch({ tasks: ['a', 'b'], cwd: root, model: 'not-allowed:cloud' }), refused)
+
+  // Nothing was leased, copied, or booted.
+  assert.equal(clients.length, 0)
+  assert.equal(service.isolation, undefined)
+  await service.close()
+})
+
+test('a model inside a batch item is refused: the model is chosen per fleet', async () => {
+  const { root, clients, service } = makeModelService({ models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL] })
+  await assert.rejects(
+    service.flashBatch({ tasks: [{ task: 'a', model: OTHER_TEST_MODEL }, 'b'], cwd: root }),
+    (error) =>
+      error instanceof FlashTaskError &&
+      error.code === 'INVALID_ARGUMENT' &&
+      /chosen per fleet/.test(error.message) &&
+      /top level of flash_batch/.test(error.message),
+  )
+  assert.equal(clients.length, 0)
+  await service.close()
+})
+
+test('a non-default model on an old profile is refused, and the default is never refused', async () => {
+  let asked = 0
+  const { root, clients, service } = makeModelService({
+    models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL],
+    honoursModelEnv: () => {
+      asked += 1
+      return false
+    },
+  })
+  const outdated = (error) =>
+    error instanceof FlashTaskError &&
+    error.code === 'PROFILE_OUTDATED' &&
+    /predates model choice/.test(error.message) &&
+    /install\.mjs/.test(error.message) &&
+    !/and restart/.test(error.message) &&
+    /would run as deepseek-v4\.1-flash:cloud/.test(error.message)
+
+  await assert.rejects(service.flashTask({ task: 'x', cwd: root, model: OTHER_TEST_MODEL }), outdated)
+  // A negative answer is not cached: the next non-default call checks again, so rerunning
+  // the installer takes effect without a restart.
+  await assert.rejects(service.flashBatch({ tasks: ['a'], cwd: root, model: OTHER_TEST_MODEL }), outdated)
+  assert.equal(asked, 2)
+  assert.equal(clients.length, 0)
+
+  // The default model is what an old profile runs; it never consults the check.
+  const result = await service.flashTask({ task: 'x', cwd: root })
+  assert.equal(result.status, 'ok')
+  assert.equal(asked, 2)
+  await service.close()
+})
+
+test('a positive profile answer is cached, and a later install takes effect without a restart', async () => {
+  let honoured = false
+  let asked = 0
+  const { root, service } = makeModelService({
+    models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL],
+    honoursModelEnv: () => {
+      asked += 1
+      return honoured
+    },
+  })
+
+  // The first non-default call refuses, and the negative answer is deliberately re-read.
+  await assert.rejects(service.flashTask({ task: 'x', cwd: root, model: OTHER_TEST_MODEL }), /predates model choice/)
+  honoured = true
+  const installed = await service.flashTask({ task: 'x', cwd: root, model: OTHER_TEST_MODEL })
+  assert.equal(installed.status, 'ok')
+  assert.equal(asked, 2, 'the negative answer was re-checked, and the install was seen')
+
+  // A positive answer is a fact for the life of the server: no further reads.
+  const again = await service.flashTask({ task: 'x', cwd: root, model: OTHER_TEST_MODEL })
+  assert.equal(again.status, 'ok')
+  assert.equal(asked, 2, 'the positive answer is cached')
+  await service.close()
+})
+
+test('DSH_HOME is resolved the way dsh reads it before the profile check', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'flash-mcp-home-'))
+  const dshHome = join(home, 'harness')
+  mkdirSync(join(dshHome, 'profiles', 'flash-service'), { recursive: true })
+  writeFileSync(
+    join(dshHome, 'profiles', 'flash-service', 'cordis.patch.yml'),
+    'model: !!js process.env.FLASH_ROUTE_MODEL || "deepseek-v4.1-flash:cloud"\n',
+  )
+  const { root, service } = makeModelService({
+    models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL],
+    // dsh trims the value and expands a leading ~; a literal read would miss this profile.
+    env: { DSH_HOME: '  ~/harness  ' },
+    home,
+    // No injected answer: the real doctor helper must resolve the path and read the patch.
+    honoursModelEnv: undefined,
+  })
+  const result = await service.flashTask({ task: 'x', cwd: root, model: OTHER_TEST_MODEL })
+  assert.equal(result.status, 'ok')
+  assert.equal(result.route.model, OTHER_TEST_MODEL)
+  await service.close()
+})
+
+test('checkModel refuses what a synchronous call would, without starting anything', async () => {
+  let asked = 0
+  const { root, clients, service } = makeModelService({
+    models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL],
+    honoursModelEnv: () => {
+      asked += 1
+      return false
+    },
+  })
+  assert.throws(
+    () => service.checkModel({ model: 'not-allowed:cloud' }, 'flash_task'),
+    (error) => error instanceof FlashTaskError && error.code === 'MODEL_NOT_ALLOWED',
+  )
+  assert.throws(
+    () => service.checkModel({ mode: 'nope' }, 'flash_task'),
+    (error) => error instanceof FlashTaskError && error.code === 'MODE_UNAVAILABLE',
+  )
+  assert.throws(
+    () => service.checkModel({ tasks: [{ task: 'a', model: OTHER_TEST_MODEL }] }, 'flash_batch'),
+    (error) => error instanceof FlashTaskError && error.code === 'INVALID_ARGUMENT' && /chosen per fleet/.test(error.message),
+  )
+  // The installed-profile check is the same one a call makes.
+  assert.throws(
+    () => service.checkModel({ model: OTHER_TEST_MODEL }, 'flash_task'),
+    (error) => error instanceof FlashTaskError && error.code === 'PROFILE_OUTDATED',
+  )
+  assert.equal(asked, 1)
+  assert.equal(clients.length, 0, 'nothing was booted')
+  await service.close()
+})
+
+test('a result says when the worker ran on another model than the one requested', async () => {
+  const { root, service } = makeModelService({
+    models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL],
+    routeModel: 'deepseek-v4.1-flash:1017-cloud',
+  })
+  const result = await service.flashTask({ task: 'x', cwd: root, model: OTHER_TEST_MODEL })
+  assert.match(
+    result.warnings.join('\n'),
+    /the worker ran on deepseek-v4\.1-flash:1017-cloud, not the requested minimax-m3\.1-flash:cloud/,
+  )
+  await service.close()
+})
+
+test('a fleet warns per task when a worker ran on another model', async () => {
+  const { root, service } = makeModelService({
+    script: 'batch',
+    models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL],
+    routeModel: 'deepseek-v4.1-flash:1017-cloud',
+  })
+  const result = await service.flashBatch({ tasks: ['a', 'b'], cwd: root, model: OTHER_TEST_MODEL })
+  const warnings = result.warnings.join('\n')
+  assert.match(warnings, /task 1: the worker ran on deepseek-v4\.1-flash:1017-cloud, not the requested minimax-m3\.1-flash:cloud/)
+  assert.match(warnings, /task 2: the worker ran on deepseek-v4\.1-flash:1017-cloud, not the requested minimax-m3\.1-flash:cloud/)
+  await service.close()
+})
+
+test('a fleet with no paired results still warns when it ran on another model', async () => {
+  const { root, service } = makeModelService({
+    // No label mapping and an unreadable return value: `results` is null, but the engine
+    // still reported the model each worker ran on.
+    script: 'batch-unreadable-nolabels',
+    models: [DEFAULT_TEST_MODEL, OTHER_TEST_MODEL],
+    routeModel: 'deepseek-v4.1-flash:1017-cloud',
+  })
+  const result = await service.flashBatch({ tasks: ['a', 'b'], cwd: root, model: OTHER_TEST_MODEL })
+  assert.equal(result.results, null)
+  const warnings = result.warnings.join('\n')
+  const modelWarnings = result.warnings.filter((line) => line.startsWith('the fleet ran on '))
+  assert.equal(modelWarnings.length, 1, `expected one fleet-level model warning, saw:\n${warnings}`)
+  assert.match(
+    modelWarnings[0],
+    /^the fleet ran on deepseek-v4\.1-flash:1017-cloud, not the requested minimax-m3\.1-flash:cloud$/,
+  )
+  await service.close()
+})
+
 test('retries one initialize timeout and then succeeds', async () => {
   const root = mkdtempSync(join(tmpdir(), 'flash-mcp-test-'))
   const clients = []
@@ -629,18 +1051,32 @@ test('concurrent callers all receive the outcome of the initialize retry', async
   assert.equal(logs.filter((line) => /starting it once more/.test(line)).length, 1)
 })
 
-test('pins the route regardless of caller-supplied selection', async () => {
-  const { root, client, service } = makeService()
+test('the provider stays pinned while the model is a per-call choice', async () => {
+  const logs = []
+  const { root, client, service } = makeService({
+    models: ['deepseek-v4.1-flash:cloud', 'deepseek-v4.1-flash:1017-cloud'],
+    log: (line) => logs.push(line),
+  })
+  client.routeModel = 'deepseek-v4.1-flash:1017-cloud'
   const result = await service.flashTask({
     task: 'x',
     cwd: root,
     provider: 'deepseek-official',
-    model: 'gpt-5',
+    model: 'deepseek-v4.1-flash:1017-cloud',
     sandbox: 'danger-full-access',
   })
-  assert.deepEqual(result.route, { provider: 'ollama', model: 'deepseek-v4.1-flash:cloud' })
-  assert.deepEqual(client.initializes[0].provider, 'ollama')
-  assert.deepEqual(client.initializes[0].model, 'deepseek-v4.1-flash:cloud')
+  // The provider is fixed: the argument is only logged, and the request still says ollama.
+  assert.deepEqual(result.route, { provider: 'ollama', model: 'deepseek-v4.1-flash:1017-cloud' })
+  assert.equal(client.initializes[0].provider, 'ollama')
+  assert.equal(client.initializes[0].model, 'deepseek-v4.1-flash:1017-cloud')
+  assert.ok(logs.some((line) => /ignoring unsupported flash_task argument "provider"/.test(line)))
+  assert.ok(logs.some((line) => /ignoring unsupported flash_task argument "sandbox"/.test(line)))
+  assert.equal(logs.some((line) => /ignoring unsupported flash_task argument "model"/.test(line)), false)
+  // The model a call asked for is on its start line, so the log says what it is spending on.
+  assert.ok(
+    logs.some((line) => /session .* prompted on deepseek-v4\.1-flash:1017-cloud/.test(line)),
+    `expected the model on the start line, saw:\n${logs.join('\n')}`,
+  )
 })
 
 test('fences cwd to the service root', async () => {
@@ -1415,8 +1851,9 @@ test('the runtime keeps the platform TMPDIR, and the worker is told about .flash
   // to the tree withdrew the platform temp area from that grant, and toolchains that
   // reach it directly — the Swift toolchain does — failed with EPERM inside their own
   // scratch files while `touch` in the same directory succeeded. So the environment
-  // the runtime boots with is left alone.
-  assert.equal(client.extraEnv, undefined)
+  // the runtime boots with is left alone, apart from the one variable that says which
+  // model this process serves.
+  assert.deepEqual(client.extraEnv, { FLASH_ROUTE_MODEL: 'deepseek-v4.1-flash:cloud' })
   // The tree still has a scratch directory of its own (created by `prepare`, see the
   // isolation tests), and the worker learns of it in the prompt rather than through the
   // environment.

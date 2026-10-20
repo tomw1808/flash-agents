@@ -723,6 +723,22 @@ test('forbidden slotEnv names are refused case-insensitively, as Windows treats 
   isolation.close()
 })
 
+test('DSH_HOME and FLASH_ROUTE_MODEL are refused as slotEnv names', () => {
+  const repo = makeRepo()
+  const logs = []
+  const { isolation } = makePool(repo, {
+    // A cached DSH_HOME would let a worker plant a profile governing the next runtime
+    // start on that slot; FLASH_ROUTE_MODEL is the server's choice alone.
+    slotEnv: { DSH_HOME: 'cache:dsh', FLASH_ROUTE_MODEL: 'home:route', CARGO_HOME: 'home:cargo' },
+    log: (line) => logs.push(line),
+  })
+  assert.deepEqual(Object.keys(isolation.slotEnv), ['CARGO_HOME'])
+  for (const name of ['DSH_HOME', 'FLASH_ROUTE_MODEL']) {
+    assert.ok(logs.some((line) => line.includes(`not redirecting ${name}`)), `${name} must be named`)
+  }
+  isolation.close()
+})
+
 test('a slotEnv option wins per variable over the settings file', () => {
   const repo = makeRepo()
   writeFileSync(join(repo, '.flash-agents.json'), JSON.stringify({ slotEnv: { CARGO_HOME: 'home:from-file', OTHER: 'home:other' } }))
@@ -1540,10 +1556,10 @@ test('source "head" on a root that is not a repository is refused', async () => 
 
 test('the resolved slotEnv is handed to the runtime factory, and only when configured', async () => {
   const repo = makeRepo()
-  // With no slotEnv the runtime's environment is untouched, exactly as before.
+  // With no slotEnv the only variable set is the one naming the model the process runs.
   const bare = makeService({ root: repo })
   await bare.service.flashTask({ task: 'x', cwd: repo })
-  assert.equal(bare.client.extraEnv, undefined)
+  assert.deepEqual(bare.client.extraEnv, { FLASH_ROUTE_MODEL: 'deepseek-v4.1-flash:cloud' })
   await bare.service.close()
 
   const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-svc-env-')))
@@ -1562,6 +1578,7 @@ test('the resolved slotEnv is handed to the runtime factory, and only when confi
   assert.deepEqual(client.extraEnv, {
     CARGO_HOME: join(slotDir, '.flash-home', 'cargo'),
     CARGO_TARGET_DIR: join(slotDir, '.flash-cache', 'cargo-target'),
+    FLASH_ROUTE_MODEL: 'deepseek-v4.1-flash:cloud',
   })
   // The prompt names the variables that were set, so the worker knows where to cache.
   assert.match(client.prompts[0].text, /CARGO_HOME, CARGO_TARGET_DIR/)

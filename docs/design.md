@@ -10,18 +10,23 @@ Cheap DeepSeek Harness workers, in two shapes:
 - **`flash-mcp`** — a local stdio MCP server that lends the same worker pipeline to an *external*
   coding agent (Claude Code and anything else that speaks MCP), one narrow task at a time.
 
-Everything delegated by either piece runs on **Ollama / `deepseek-v4.1-flash:cloud`**, even when the
-orchestrating session runs on an expensive model.
+Everything delegated by either piece runs on **Ollama**. The default is
+`deepseek-v4.1-flash:cloud`; the MCP server may choose another model from the user's allowlist for
+a call, while the interactive orchestrator preset runs its installed default. The orchestrating
+session may run on an expensive model.
 
 ## The routing contract
 
 `flash` is a **strict routing contract**, not a preference:
 
-- A child started through provider `flash` always uses `provider: ollama`,
-  `model: deepseek-v4.1-flash:cloud`.
+- A child started through provider `flash` always uses `provider: ollama` and the **one model its
+  profile process was started with**. That is the installed default unless the `flash-mcp` server
+  chose another allowed model for the process (`FLASH_ROUTE_MODEL`).
 - `request.agentOptions.provider` and `request.agentOptions.model` are **dropped** — a caller, a
-  model-authored workflow script, an MCP client, or an inherited parent route can never change the
-  route. Other requested options (`reasoningEffort`, `maxTokens`) still pass through.
+  model-authored workflow script, an MCP client, or an inherited parent route cannot change the
+  route that way. The provider stays fixed; for an MCP call the server is the only piece that picks
+  a model, and only from the user's allowlist. Other requested options (`reasoningEffort`,
+  `maxTokens`) still pass through.
 - Continuable children are **refused**: `flash` has no `prepareContinuable`, because the
   continuation manager resolves a continuable child's route outside the provider. Use the host
   `spawn` provider when you need a caller-selected or continuable child route.
@@ -47,7 +52,7 @@ packages/flash-mcp/                 MCP stdio server + SDK JSON-RPC client half
   lib/sdk.js                        client for one persistent `dsh` child over the shipped SDK protocol
   lib/service.js                    flash_task: fresh session per call, compact result, cwd fence
   lib/isolation.js                  disposable copies, patch provenance, and apply
-  lib/config.js                     the one source of truth: route, limits, guard lists
+  lib/config.js                     the one source of truth: route and model allowlist, limits, guard lists
   lib/doctor.js                     prerequisite checks, each with the command that fixes it
   lib/index.js                      CLI entry, tool contract, lifecycle
   test/mcp.test.mjs                 protocol-level server tests
@@ -66,7 +71,7 @@ presets/flash-orchestrator/         interactive agent preset (repo is the source
                                     compaction, delegation, remaining tools
   preset.yml                        roster metadata
 profiles/flash-service/             the headless SDK profile behind `flash-mcp`
-  cordis.patch.yml                  route, permissions, disabled competitors, provider, tool
+  cordis.patch.yml                  route (one model per process), permissions, disabled competitors, provider, tool
   package.json / cordis.yml / pnpm-workspace.yaml
 install.mjs                         idempotent installer / uninstaller
 package.json                        `npm test` / `npm run verify` entry points
@@ -143,7 +148,7 @@ The plugin ships three skills, each a way of working rather than a tool:
 |---|---|
 | `/flash-agents:delegate` | The default. A goal should be done by flash workers instead of Claude subagents: it frames, slices, dispatches, verifies every result, reviews with a read-only worker, and fixes in rounds until a review finds nothing real. Also loads on "use flash-agents" or "fan out". |
 | `/flash-agents:gauntlet` | Several genuinely different approaches are plausible and the result can be checked by running something: parallel builders, cheap critics, a blind duel. Costs the orchestrator more; the judge is a frontier-model step. |
-| `/flash-agents:setup` | Once, after installing: checks the harness, Ollama, the model and the profiles, and proves the pipeline with one real task. Manual-only. |
+| `/flash-agents:setup` | Once, after installing or upgrading: checks the harness, Ollama, every allowed model and the profiles, and proves the pipeline with one real task. Manual-only. |
 
 ### What to expect from a worker
 
@@ -172,7 +177,7 @@ Claude Code ──MCP stdio──► flash-mcp ──SDK stdio JSON-RPC──►
                                                                     │
                                                      dispatch prompt → `flash` / `workflow`
                                                                     │
-                                       one worker per task on ollama/deepseek-v4.1-flash:cloud
+                                       one worker per task on the selected Ollama model
                                        behind the flash-guard wall (tools/execute wrapper)
 ```
 
@@ -180,8 +185,15 @@ Claude Code ──MCP stdio──► flash-mcp ──SDK stdio JSON-RPC──►
   except through the shipped SDK stdio JSON-RPC protocol (`initialize`, `session/prompt`,
   `shutdown`, plus its notifications).
 - It **starts lazily** on the first `flash_task` and is **reused** across calls; every call gets a
-  fresh orchestration session *and* a fresh worker session. One process per mode: a call asking for
-  `read-only` boots the read-only profile instead, and keeps it.
+  fresh orchestration session *and* a fresh worker session. A call asking for `read-only` boots the
+  read-only profile instead, and keeps it.
+- **One process per profile, tree, and model.** One `dsh` process registers and runs exactly one
+  model, chosen by the `FLASH_ROUTE_MODEL` it starts with, so the model belongs in the runtime key.
+  Choosing another model on the same tree starts a second process; the first stays for its own
+  model. When a model's process starts on a tree, the service shuts down idle processes of other
+  models on that tree (one log line each); a process with a session in flight — or one another call
+  is about to use — is never touched. Without that bound, a copy that served three choices would
+  hold three workers for as long as the server lives.
 - Nothing is scraped: the runtime's stdout carries protocol frames, its stderr is kept only as a
   bounded diagnostic tail, and results come from the runtime's own `subagent.finished` notification
   plus the worker's logged `request/header` (which is where the reported route comes from — observed,
@@ -209,11 +221,14 @@ Optional on `flash_task` / `flash_batch`: `acceptance` (one string, or per task 
 `head`: start the copy from the last commit, keeping ignored files), `basePatch` (a patchId whose change
 is applied to the copy before the worker starts, merged three ways if the tree moved on; the call's
 own patch is then cumulative and replaces it), `taskFile` (instead of `task`: a file inside the root,
-at most 256 KB, sent exactly as written; per task in `flash_batch`), and `background` (answer at once
+at most 256 KB, sent exactly as written; per task in `flash_batch`), `model` (one id from the user's
+allowlist; omitted, the default runs), and `background` (answer at once
 with a job id; the job owns its own abort signal, so the starting request ending cannot cancel it).
 Jobs are in memory: they do not survive a restart, but a finished writing call's work is still
-salvaged as a patch by the next server. There is no model, provider, effort, or permission parameter: the route is not a caller
-capability, and neither is the sandbox. Unknown arguments are ignored rather than forwarded.
+salvaged as a patch by the next server. The provider, the reasoning effort, and the sandbox are not
+caller capabilities; `provider`, `reasoningEffort` and `agentOptions` are logged and ignored. A
+`flash_batch` takes one `model` for the whole fleet — a `model` inside a task is refused with
+`INVALID_ARGUMENT`. Unknown arguments are ignored rather than forwarded.
 
 A writing call does not run in your repository. It runs in a **disposable copy** of it and returns the
 change it made; `apply: "auto"` applies that change before returning, and `flash_apply { patchId }`
@@ -260,6 +275,11 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
   reported any.
   `inputTokens` counts uncached input only; cache hits are in `cacheReadTokens`, which is why
   `totalTokens` (as the Harness reports it) exceeds `inputTokens + outputTokens` on a warm cache.
+- `route` is the route the runtime **observed** (the worker's logged `request/header`), not an echo
+  of the request. When a call named a `model` and the worker reported another, the result carries a
+  warning naming both. A model outside the allowlist is refused with `MODEL_NOT_ALLOWED`; a
+  non-default model on a profile installed before 0.1.6 is refused with `PROFILE_OUTDATED` — both
+  before a tree is leased or a process started.
 - `isolation.uncommittedAtStart` (`{ count, files }`, only when non-zero) lists what was uncommitted in
   your tree when the copy was made. The copy's index mirrors yours, so the worker sees that work the
   way you left it, and its prompt says the work is not its own. A worker's own account of what it did
@@ -314,6 +334,9 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
 
 - `status` is `ok` only when every task is `ok`, `partial` when some are, `error` when none are, and
   `unknown` when the outcome could not be read.
+- `routes` is the set of routes actually observed across the fleet. A batch with `model` set
+  therefore reports exactly that one model; a worker that ran on another route adds a per-task
+  warning instead of being silently counted as the requested model.
 - The pairing is **not** a guess. The caller sends a fixed script that returns its entries in task
   order, and the engine reports each member under the label this service generated (`task-N`), so a
   member's own session and outcome are read back even if the return value is truncated away. If
@@ -510,7 +533,8 @@ Honest limits of this design:
 - The runtime is rooted at the **tree**, never at a subdirectory of it, even when the call names one:
   the sandbox root is fixed when a process starts, so keying a runtime on the requested `cwd` started
   one process per distinct directory and none of them ever exited. The subdirectory reaches the worker
-  in the prompt instead, and one tree is one process.
+  in the prompt instead, and one tree is one process per profile and model — never one process per
+  requested subdirectory.
 - Each copy carries a scratch directory, `.flash-tmp/`, excluded from the diff through the copy's own
   `.git/info/exclude`; the worker is told about it in its prompt. It is deliberately **not** handed
   over through `TMPDIR`: the Harness derives the sandbox's writable roots from the runtime's own
@@ -554,7 +578,9 @@ Honest limits of this design:
   call, and `cache:<name>` under `.flash-cache/`, which `prepare` keeps between calls in the same slot
   and retire, sweep and close remove with the slot. Both folders are excluded from the diff like
   `.flash-tmp/`. `TMPDIR`, `TMP`, `TEMP` and `HOME` are refused: the sandbox derives its writable roots
-  from the runtime's temp dir (see above), and every toolchain reads `HOME`.
+  from the runtime's temp dir (see above), and every toolchain reads `HOME`. So are `DSH_HOME`, since a
+  `cache:` folder outlives the call and a worker could plant a profile there for the next runtime on
+  that slot, and `FLASH_ROUTE_MODEL`, which only the server sets.
 - **The index mirrors yours.** The base is recorded through a private index (`GIT_INDEX_FILE`, seeded
   from the copy's own), so `git status` in the copy shows your staged, unstaged and untracked work
   exactly as you left it. Recording it on the real index used to make every uncommitted edit look
@@ -621,18 +647,31 @@ naming the path that is wrong instead of silently falling back to something else
 
 ```json
 {
-  "route": { "provider": "ollama", "model": "deepseek-v4.1-flash:cloud" },
+  "route": {
+    "provider": "ollama",
+    "model": "deepseek-v4.1-flash:cloud",
+    "models": ["deepseek-v4.1-flash:cloud", "deepseek-v4.1-flash:1017-cloud", "minimax-m3.1-flash:cloud"]
+  },
   "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 10800000, "idleTimeoutMs": 600000, "diffChars": 20000, "patchRetentionDays": 14, "maxStateBytes": 21474836480 },
   "guard": { "protectedSegments": [".git"], "fenceMutations": true },
   "dsh": { "package": "@deepseek-ai/dsh", "version": "0.2.0-rc.2" }
 }
 ```
 
-**Another model needs no code change.** Set `route.model` — or `FLASH_SERVICE_MODEL` — to
-anything the local Ollama serves; only Ollama itself is a hard prerequisite. Smaller local
-models are weaker at tool calling, so expect more variance and more `NOT_DELEGATED` calls
-than the pinned default. Support for other providers is a welcome pull request, not a
-shipped feature.
+**The provider is fixed; the model is chosen from an allowlist.** `route.provider` remains Ollama.
+`route.model` is the default a call runs when it names none, and it is always allowed — the
+allowlist cannot strand the one model the profile serves. `route.models` is the set a
+`flash_task` or `flash_batch` may choose from; `FLASH_MODELS` (comma-separated, entries trimmed)
+replaces it, and the tool schema's `enum` is that same list, so a client cannot even offer another.
+Only Ollama itself is a hard prerequisite, and every id must be one it serves
+(`ollama pull <id>`); smaller local models are weaker at tool calling, so expect more variance and
+more `NOT_DELEGATED` calls than the default. Support for other providers is a welcome pull
+request, not a shipped feature.
+
+**One installer run after upgrading.** A profile installed before 0.1.6 pins one literal model and
+cannot honour a per-call choice: a call that names another allowed model is refused with
+`PROFILE_OUTDATED` before anything starts. `node install.mjs` (or the setup skill) regenerates it so
+it reads `FLASH_ROUTE_MODEL`; the default model keeps working either way.
 
 The client that launches this server owns its own timeout for a tool call, and that timeout
 must be **longer than the service's task budget** in `flash.config.json` — otherwise the
@@ -656,11 +695,14 @@ hours. Either way the call salvages the worker's change as a patch and says why 
 node packages/flash-mcp/lib/index.js doctor
 ```
 
-One line per check — Node, `dsh` and its version, the service profile composing, the Ollama
-daemon, the configured model, `git`, and `zstd` — followed by the exact command that repairs
-anything broken. A warning (an old `dsh`, a missing `zstd`, which only session reading needs)
-does not fail the run; a real failure exits non-zero, so `doctor` doubles as a setup gate in
-a script or in CI.
+One line per check — Node, `dsh` and its version, the service profile composing, whether that
+profile reads `FLASH_ROUTE_MODEL` (`profile-models`), the Ollama daemon, the default model and
+every allowlisted one, `git`, and `zstd` — followed by the exact command that repairs anything
+broken. The default model's absence fails; another allowlisted model's absence only warns, since
+the service still works without that choice. `doctor --e2e --model <id>` proves one specific model
+end to end (the default without the flag). A warning (an old `dsh`, a missing `zstd`, which only
+session reading needs) does not fail the run; a real failure exits non-zero, so `doctor` doubles
+as a setup gate in a script or in CI.
 
 ### Environment
 
@@ -668,7 +710,10 @@ a script or in CI.
 |---|---|---|
 | `FLASH_SERVICE_ROOT` | cwd | sandbox root, runtime working directory, `cwd` fence |
 | `FLASH_SERVICE_PROFILE` | `flash-service` | profile the runtime boots |
-| `FLASH_SERVICE_PROVIDER` / `FLASH_SERVICE_MODEL` | `ollama` / `deepseek-v4.1-flash:cloud` | pinned orchestrator route (the worker route is pinned by the profile) |
+| `FLASH_SERVICE_PROVIDER` | `ollama` | the provider every runtime serves; not a per-call choice |
+| `FLASH_SERVICE_MODEL` | `deepseek-v4.1-flash:cloud` | the default worker model, used when a call names none; always allowed |
+| `FLASH_MODELS` | the three shipped ids | comma-separated allowlist of models a call may choose; the default is always included, and an all-empty value is ignored |
+| `FLASH_ROUTE_MODEL` | unset | set by the server on each runtime it starts, so one `dsh` process serves one model; a server→profile variable, not a user setting — a profile started by hand runs its installed default |
 | `FLASH_TASK_TIMEOUT_MS` | `10800000` | per-task wall-clock budget; a coherent feature slice that builds and tests between steps takes real minutes per cycle, and the call returns as soon as the worker finishes |
 | `FLASH_INIT_TIMEOUT_MS` | `120000` | how long a starting runtime may take to answer `initialize`; a timeout is retried once with a fresh process, and the error carries dsh's stderr tail |
 | `FLASH_IDLE_TIMEOUT_MS` | `600000` | how long a call may go without any event from its session or workers before it is stopped as stuck (`IDLE`); the change so far is salvaged as a patch |
@@ -743,22 +788,28 @@ session-per-call, route observation, and result projection are covered without a
 drives the real thing through the **official `@modelcontextprotocol/sdk` client** — a different
 implementation of the protocol the target agent speaks — and prints one line per check.
 
-### What was verified live
+### What the live suite checks
 
-`npm run verify` → **92/92 checks**, from a real MCP client over real stdio, against real
-`dsh --profile flash-service` and `flash-service-readonly` runtimes:
+`npm run verify` drives a real MCP client over real stdio against real
+`dsh --profile flash-service` and `flash-service-readonly` runtimes, and prints one line per
+check. The counts below are for the shipped three-model allowlist; the `models` stage expands with
+the allowlist and needs those models available in Ollama. `--models` narrows it, and with no
+non-default model the stage prints a skip note instead of failing. For 0.1.6 that is **116/116
+checks** passed live.
 
 | Stage | Checks | What it establishes |
 |---|---|---|
-| `boot` | 8 | the server identifies itself, exposes the task/fleet/apply doors, offers **no model-selection property**, and defaults to applying nothing |
+| `boot` | 9 | the server identifies itself, exposes the task/fleet/apply doors, gives both delegation tools a `model` enum that is exactly the allowlist (default first), still offers no `provider`/`route`/`effort` property, and defaults to applying nothing |
 | `lazy` | 1 | no runtime process exists before the first call |
-| `task` | 17 | a real worker writes and reads a repo-local file **without interactive approval**, the file is **not** in the caller's tree, the change comes back as a patch holding the worker's own line, `flash_apply` puts it there, and a second apply is refused |
-| `route` | 2 | the worker ran `ollama/deepseek-v4.1-flash:cloud` under `provider: flash` |
-| `hostile` | 2 | caller-supplied `provider`/`model`/`agentOptions` cannot change the child route and are not echoed |
+| `task` | 21 | a real worker writes and reads a repo-local file **without interactive approval**, the file is **not** in the caller's tree, the change comes back as a patch holding the worker's own line, usage and instruction facts are reported, `flash_patch` reads the patch, `flash_apply` puts it there, and a second apply is refused |
+| `route` | 2 | the worker ran the default `ollama/deepseek-v4.1-flash:cloud` route under `provider: flash` |
+| `hostile` | 4 | a model outside the allowlist is refused (`MODEL_NOT_ALLOWED`) and starts no runtime; `provider`/`reasoningEffort`/`agentOptions` without `model` cannot change the default route and are not echoed |
+| `models` | 6 | every non-default allowed model runs one discarded probe on its own route with no mismatch warning; a fleet runs only on the model chosen for it; a per-task model is refused |
 | `reuse` | 6 | one process, one handshake, same pid across calls, a fresh orchestration **and** worker session per call |
 | `local` | 2 | a repo-local command runs unattended, and the worker's reported output is real |
-| `batch` | 13 | a pre-split fleet runs one worker per task, in parallel, on the pinned route, paired back in task order with each member's session and a `runId`; the fleet writes nothing into the caller's tree, and one applied patch materialises all three files |
+| `batch` | 13 | a pre-split fleet runs one worker per task, in parallel, on the default route, paired back in task order with each member's session and a `runId`; the fleet writes nothing into the caller's tree, and one applied patch materialises all three files |
 | `isolation` | 10 | a worker told to delete its workspace's Markdown files really does delete them — **in the copy** — and the deletions arrive as a patch while the caller's README and sentinel survive; a worker told to delete the caller's file *by absolute path* fails; a dry run still changes nothing |
+| `jobs` | 11 | a background call answers at once, `flash_status`/`flash_result` follow and collect it, `apply: "discard"` reports a change and stores no patch, `taskFile` sends a brief, and `basePatch` returns the cumulative change |
 | `guard` | 18 | the wall refuses `.git` writes, a redirect into `.git`, and a secret read; **`rm -rf <service root>` and `rm -rf *` are stopped with `CRITICAL_PATH`**; an ordinary `rm -rf <scratch>` inside the root still runs; every denial comes back structured (`code`, `reason`) and attributed per task |
 | `readonly` | 7 | `mode: "read-only"` runs the call in its own process on the generated profile, the write is denied by the sandbox, reads still work, the call is **not** isolated, and an unknown mode is refused |
 | `fence` | 2 | a `cwd` outside the root fails closed with the confinement named |
@@ -798,9 +849,9 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
 | # | Requirement | Implementation |
 |---|---|---|
 | 1 | named backend `flash` | `subagent-flash-in-process` provider row on the host `subagents` registry |
-| 2 | V4.1 Flash via the configured Ollama route | row config `provider: ollama`, `model: deepseek-v4.1-flash:cloud`, forced in `start()` |
+| 2 | V4.1 Flash via the configured Ollama route | row config `provider: ollama`; the model is the installed default, or the allowlisted one the server chose for the process (`FLASH_ROUTE_MODEL`), forced in `start()` |
 | 3 | one narrow delegation tool | `tool-flash` (`@deepseek-ai/dsh-tool-subagent`) — one-shot, `maxDepth: 1`, narrow child persona |
-| 4 | child model independent of parent | the contract drops caller routing, so an expensive parent cannot leak; override a *child route* by using the `spawn` provider instead |
+| 4 | child model independent of parent | the contract drops caller routing, so an expensive parent cannot leak; the model is whatever allowlisted one the process serves. Override a *child route* by using the `spawn` provider instead |
 | 5 | bounded parallel execution | `@deepseek-ai/dsh-tool-workflow` + `@deepseek-ai/dsh-workflow-ptc` |
 | 6 | bounded fresh-agent gauntlet | `@deepseek-ai/dsh-tool-ralph` (shipped fixed script, workspace + structured handoff) |
 | 7 | hard limits | table above |
@@ -809,9 +860,9 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
 | 10 | prefer existing packages | 16 of 17 preset rows are shipped packages; the single custom row delegates the run to the shipped `spawn` provider |
 | 11 | external agent can use the workers | `flash-mcp`, a stdio MCP server over the shipped SDK JSON-RPC runtime |
 | 12 | only the shipped protocol crosses the boundary | `@deepseek-ai/dsh-sdk-protocol` frames; no embedding, no CLI scraping, no `dsh web` session |
-| 13 | persistent, reused runtime | one lazily started `dsh --profile flash-service` child; sessions per call, process per service |
+| 13 | persistent, reused runtime | lazily started `dsh` children, one per profile, tree, and model; sessions per call, process per service |
 | 14 | headless permissions solved explicitly | `workspace-write` + `approval: never`, `permission` disabled; in-workspace works, outside fails closed |
-| 15 | a fleet an external agent can split itself | `flash_batch` — one workflow run per call, pinned `flash` members, per-task results in task order |
+| 15 | a fleet an external agent can split itself | `flash_batch` — one workflow run per call, members pinned to provider `flash` and one model for the fleet, per-task results in task order |
 | 16 | permission escalations are visible to the caller | `flash-guard` denials are structured (`code`, `reason`) and attributed per task in `results[i].denials`; a sandbox denial stays a denial, never a prompt |
 | 17 | a caller can narrow, never widen | `mode: "read-only"` boots a second profile whose sandbox denies every mutation; unknown modes are refused |
 
@@ -846,12 +897,15 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
 - **The service profile composes Flash directly.** SDK-created agents join no preset — the SDK server
   calls `agents.create` without one — so the provider row and the `flash` tool are composed into the
   profile itself. There is no preset selection to get wrong, and no dependency on preset discovery.
-- **The route is declared by the profile, not read from user settings.** A service that silently
-  picks up whatever a user-facing settings document happens to say can break — or widen — outside
-  this repo's control. Declaring it also pins exactly one model, so no caller can select a larger or
-  costlier one. Omitting `apiKeyEnv` keeps the route credential-free (the Ollama daemon
-  authenticates cloud models from its own sign-in); the profile carries an `authorization` header
-  because pi-ai's completions transport requires either that or a key.
+- **The route is declared by the profile, and the provider is never a caller choice.** A service
+  that silently picks up whatever a user-facing settings document happens to say can break — or
+  widen — outside this repo's control. The profile declares `provider: ollama`; one process
+  registers and runs exactly one model, either the installed default or the one the server set in
+  `FLASH_ROUTE_MODEL` from the user's allowlist. A caller can therefore choose among the models the
+  user allowed, never a provider, and never an unlisted or costlier one. Omitting `apiKeyEnv` keeps
+  the route credential-free (the Ollama daemon authenticates cloud models from its own sign-in); the
+  profile carries an `authorization` header because pi-ai's completions transport requires either
+  that or a key.
 - **Two doors, and no others.** The service profile disables `tool-subagent`, `tool-subagent-fork`,
   `tool-subagent-control`, `tool-subagent-list-agents`, `tool-ralph`, and `tool-goal`, so a
   dispatcher cannot start unrouted or long-running work instead of the work it was given: it may
@@ -859,8 +913,9 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
 - **The caller splits the work; Harness runs it.** `flash_batch` adds no scheduler. It sends one
   prompt that carries a fixed script and the caller's tasks as arguments, the shipped engine owns
   fan-out, concurrency, and the child ceiling, and the profile pins `provider: flash` on that engine
-  so a fleet member cannot pick a route. This repo owns the contract — how many tasks a call may
-  carry, and how the fleet's outcome is projected back — and nothing below it.
+  so a fleet member cannot pick a provider; the fleet's one model is chosen by the service before
+  anything starts. This repo owns the contract — how many tasks a call may carry, and how the fleet's
+  outcome is projected back — and nothing below it.
 - **Per-task pairing is read, never inferred.** The script returns its entries in task order, and
   the engine reports each member under the label this service generated (`task-N`), which also
   carries the member's own child session and outcome. When neither the return value nor a complete
@@ -950,8 +1005,10 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
   in the data directory (see the state layout above) until the startup prune removes them after
   `limits.patchRetentionDays` (default 14), or `flash-agents clean` does. With a configured
   `--state-dir` they stay in `<dir>/calls`, one service per directory.
-- **The service needs a local Ollama serving the pinned model.** The route is registered by the
-  profile, so a missing daemon or model surfaces as a worker-turn error rather than a startup error.
+- **The service needs a local Ollama serving the default model and every model a call may choose.**
+  The route is registered by the profile, so a missing daemon or model surfaces as a worker-turn
+  error rather than a startup error; the doctor checks them earlier, and a missing non-default model
+  only warns because the service still works without that choice.
 - **The dispatcher is a model, and it occasionally does the work itself.** A cheap model reads the
   dispatch prompt ("call `flash` exactly once") most of the time, but not always: a live run had the
   orchestrator run `find . -name '*.md' -delete` itself instead of delegating. That is caught — the
@@ -966,9 +1023,9 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
 - **No failure/no-progress cap in the gauntlet.** Ralph's shipped loop is used as-is: a failed round
   ends the run, and a loop that keeps reporting `continue` is bounded by `maxRounds` alone.
 - **Continuable children are not available over `flash`** (by design — see the contract).
-- **Per-call model selection is not wired for `flash`.** The `subagent-model-selection` host setting
-  exists but is disabled; enabling it would have no effect on `flash` rows, whose routing is fixed.
-  `install.mjs` prints the settings snippet for the generic `spawn` provider.
+- **Per-call model selection does not use the host settings document.** `subagent-model-selection`
+  stays disabled: `flash-mcp` chooses by starting one process per model with `FLASH_ROUTE_MODEL`, not
+  by a settings entry. The generic `spawn` provider still follows the host setting.
 - **Machine-wide patch layers still apply.** Rows from `$DSH_HOME/cordis.patch.yml` reach this
   profile too — in the authoring session an MCP client row there added `mcp__memorix__*` tools to
   both the orchestrator and the workers. The service profile does not disable machine-wide rows;

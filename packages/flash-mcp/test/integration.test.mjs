@@ -188,7 +188,7 @@ test('the SDK client surfaces a runtime protocol error and shuts down', async ()
   assert.equal(client.running, false)
 })
 
-test('exposes the tools, none able to select a route', async () => {
+test('exposes the tools, and only a listed model may choose a route', async () => {
   const { server, request } = await connect()
   try {
     const { result } = await request('tools/list')
@@ -228,8 +228,17 @@ test('exposes the tools, none able to select a route', async () => {
     }
     for (const tool of result.tools) {
       assert.equal(tool.inputSchema.additionalProperties, false)
-      assert.equal(JSON.stringify(tool.inputSchema).match(/provider|model|reasoning/i), null)
+      assert.equal(JSON.stringify(tool.inputSchema).match(/provider|reasoning/i), null)
     }
+    // `model` is the one selection a call may make, and only from the allowlist the
+    // server was started with; its description names the default and says the result's
+    // route is the observed truth.
+    for (const tool of [result.tools[0], result.tools[1]]) {
+      assert.deepEqual(tool.inputSchema.properties.model.enum, ['deepseek-v4.1-flash:cloud'])
+      assert.match(tool.inputSchema.properties.model.description, /Default: deepseek-v4\.1-flash:cloud/)
+      assert.match(tool.inputSchema.properties.model.description, /routes? reports? the model that actually ran/)
+    }
+    assert.equal(batchItem.properties.model, undefined)
   } finally {
     await server.service.close()
   }

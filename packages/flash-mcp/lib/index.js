@@ -33,15 +33,15 @@ import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { serveStdio, describeError } from './mcp.js'
-import { FlashTaskService } from './service.js'
+import { DEFAULT_MODEL, FlashTaskService } from './service.js'
 import { DEFAULT_INITIALIZE_TIMEOUT_MS } from './sdk.js'
 import { JobRegistry, JOB_TOOLS } from './jobs.js'
-import { loadConfig } from './config.js'
-import { formatChecks, runChecks } from './doctor.js'
+import { allowedModels, loadConfig } from './config.js'
+import { formatChecks, resolveDshHome, runChecks } from './doctor.js'
 import { WorkspaceIsolation, cleanLayout } from './isolation.js'
 
 /** Server identity reported to the MCP client. */
-export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.5' })
+export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.6' })
 
 /**
  * How often a `flash_result` call that is waiting tells the MCP client it is alive. The
@@ -50,56 +50,82 @@ export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.5' }
  */
 export const WAIT_PROGRESS_INTERVAL_MS = 30_000
 
-/** Usage guidance offered to the client model at handshake. */
-const INSTRUCTIONS = [
-  'Delegates one bounded task at a time to a cheap DeepSeek Harness worker that runs on',
-  'ollama/deepseek-v4.1-flash:cloud inside a workspace-confined sandbox.',
-  '',
-  'Use flash_task for one coherent, self-contained goal: a feature slice with its tests',
-  '(a thousand lines is fine), a fix round of confirmed findings, a read-only map or review,',
-  'or a mechanical refactor. Every call is independent — the worker starts with an empty',
-  'conversation, so put everything it needs into `task`: the decisions already taken, the',
-  'files it owns and must not touch, the tests to write, and the exact verification commands.',
-  '',
-  'Use flash_batch to hand off a fleet of independent tasks in one call: the Harness workflow',
-  'engine fans them out under its own concurrency and total-agent caps, and each task returns',
-  'its own compact result in task order.',
-  '',
-  'The service is confined to its configured root. A `cwd` outside that root is rejected,',
-  'and worker operations outside it are denied by the Harness sandbox rather than executed.',
-  '',
-  'A writing call does not run in your repository: it runs in a disposable copy of it, and its',
-  'result carries the change it made (`change.filesChanged`, `change.diffstat`, `change.diff`).',
-  'Nothing reaches your tree until you apply it — pass `apply: "auto"` to apply a call\'s change',
-  'immediately, or call `flash_apply` with the `change.patchId` afterwards. Review the diff; the',
-  'worker\'s own account of what it did is not evidence that it did it. A long diff is clipped',
-  'at a file boundary; `flash_patch` reads the stored patch whole or by file.',
-  '',
-  'Project facts every worker needs (layout, check commands, style rules) belong in an',
-  '`AGENTS.md` or `CLAUDE.md` in the repository: the Harness loads those into every worker',
-  'from the repository root down to its working directory, so a task need not repeat them.',
-  'Every result reports what they cost under `instructions` (files, bytes, approximate tokens);',
-  'past the harness\'s 64 KB budget a warning says the worker was only given part of them.',
-  '',
-  'A read-only call cannot build or run tests (both write). For a review that must, run a',
-  'writing call with `apply: "discard"`: it works in a throwaway copy and stores nothing.',
-].join('\n')
+/**
+ * Usage guidance offered to the client model at handshake.
+ *
+ * The model names come from the allowlist the server was started with, never from a
+ * literal here: the configured default is named as the default, and the other allowed
+ * models are named as choices a call may make.
+ *
+ * @param {string[]} [models] - the allowed models, the default first.
+ * @returns {string} the instructions text.
+ */
+export function instructionsFor(models = [DEFAULT_MODEL]) {
+  const [primary, ...others] = modelChoices(undefined, models)
+  const choices =
+    others.length === 0
+      ? `${primary} is the default and suits a quick hand-off.`
+      : `${primary} is the default and suits a quick hand-off; ${others.join(', ')} can be chosen per call.`
+  return [
+    'Delegates one bounded task at a time to a cheap DeepSeek Harness worker inside a',
+    'workspace-confined sandbox.',
+    '',
+    'Each call may choose its worker model from the allowed list:',
+    choices,
+    "The result's route reports the model that actually ran.",
+    '',
+    'Use flash_task for one coherent, self-contained goal: a feature slice with its tests',
+    '(a thousand lines is fine), a fix round of confirmed findings, a read-only map or review,',
+    'or a mechanical refactor. Every call is independent — the worker starts with an empty',
+    'conversation, so put everything it needs into `task`: the decisions already taken, the',
+    'files it owns and must not touch, the tests to write, and the exact verification commands.',
+    '',
+    'Use flash_batch to hand off a fleet of independent tasks in one call: the Harness workflow',
+    'engine fans them out under its own concurrency and total-agent caps, and each task returns',
+    'its own compact result in task order.',
+    '',
+    'The service is confined to its configured root. A `cwd` outside that root is rejected,',
+    'and worker operations outside it are denied by the Harness sandbox rather than executed.',
+    '',
+    'A writing call does not run in your repository: it runs in a disposable copy of it, and its',
+    'result carries the change it made (`change.filesChanged`, `change.diffstat`, `change.diff`).',
+    'Nothing reaches your tree until you apply it — pass `apply: "auto"` to apply a call\'s change',
+    'immediately, or call `flash_apply` with the `change.patchId` afterwards. Review the diff; the',
+    'worker\'s own account of what it did is not evidence that it did it. A long diff is clipped',
+    'at a file boundary; `flash_patch` reads the stored patch whole or by file.',
+    '',
+    'Project facts every worker needs (layout, check commands, style rules) belong in an',
+    '`AGENTS.md` or `CLAUDE.md` in the repository: the Harness loads those into every worker',
+    'from the repository root down to its working directory, so a task need not repeat them.',
+    'Every result reports what they cost under `instructions` (files, bytes, approximate tokens);',
+    'past the harness\'s 64 KB budget a warning says the worker was only given part of them.',
+    '',
+    'A read-only call cannot build or run tests (both write). For a review that must, run a',
+    'writing call with `apply: "discard"`: it works in a throwaway copy and stores nothing.',
+  ].join('\n')
+}
 
 /**
  * The tools exposed by this service.
  *
- * Both are one-door contracts: neither carries a model, provider, or effort
- * argument, because routing is not a caller capability.
+ * The delegation tools are one-door contracts apart from `model`: the provider and the
+ * effort are not caller capabilities, but a call may choose one of the models the user
+ * allowed. The schema's `enum` is that allowlist, so a client cannot even offer another.
  *
+ * @param {string[]} [models] - the allowed models, the default first.
  * @returns {Array<object>} MCP tool descriptors.
  */
-export function listTools() {
+export function listTools(models = [DEFAULT_MODEL]) {
+  const choices = modelChoices(undefined, models)
+  const [primary, ...others] = choices
+  const allowed = others.length === 0 ? '' : `; ${others.join(', ')} may be chosen per call`
   return [
     {
       name: 'flash_task',
       description: [
         'Delegate one coherent task — a feature slice, a fix round, a review — to a cheap DeepSeek Harness worker',
-        '(ollama/deepseek-v4.1-flash:cloud) and return its compact result.',
+        'and return its compact result. Each call may name one of the allowed worker models; omitted, the',
+        `default ${primary} runs.`,
         '',
         'The worker runs in a fresh conversation inside a sandbox confined to the service',
         'root: repository-local reads, edits, and commands work without approval, while',
@@ -148,6 +174,11 @@ export function listTools() {
             type: 'string',
             description: "A patchId from an earlier writing call. Its change is applied to this call's copy before the worker starts (three-way merged if the tree moved on), and the result's patch then contains both that change and the new work; the stored base patch itself is not applied to your tree.",
           },
+          model: {
+            type: 'string',
+            enum: choices,
+            description: `Model for this call. Default: ${primary}, which suits a quick hand-off${allowed}. The result's route reports the model that actually ran.`,
+          },
           background: {
             type: 'boolean',
             description: 'Return at once with a jobId instead of holding your turn while the worker runs (minutes, often). Collect the result with flash_result, watch it with flash_status, stop it with flash_cancel. Meanwhile you can run tests or review an earlier patch.',
@@ -160,8 +191,9 @@ export function listTools() {
     {
       name: 'flash_batch',
       description: [
-        'Delegate several independent tasks at once to cheap DeepSeek Harness workers',
-        '(ollama/deepseek-v4.1-flash:cloud), and return one compact result per task.',
+        'Delegate several independent tasks at once to cheap DeepSeek Harness workers, and return one',
+        'compact result per task. One model serves the whole fleet — its dispatcher and every worker run in',
+        `one dsh process; omitted, the default ${primary} runs.`,
         '',
         'Split the work yourself and send explicit tasks: each becomes one worker in a fresh',
         'conversation, and the fleet runs in parallel under the Harness workflow engine\'s own',
@@ -230,6 +262,11 @@ export function listTools() {
           basePatch: {
             type: 'string',
             description: "A patchId from an earlier writing call. Its change is applied to this call's copy before the workers start (three-way merged if the tree moved on), and the result's patch then contains both that change and the new work; the stored base patch itself is not applied to your tree.",
+          },
+          model: {
+            type: 'string',
+            enum: choices,
+            description: `Model for the whole fleet: its dispatcher and every worker run in one dsh process. Default: ${primary}, which suits a quick hand-off${allowed}. The result's routes report the model that actually ran; a per-task model is refused.`,
           },
           background: {
             type: 'boolean',
@@ -358,6 +395,10 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
     profile: textFrom(env.FLASH_SERVICE_PROFILE) ?? 'flash-service',
     provider: config.route.provider,
     model: config.route.model,
+    // The models a call may choose, the default first. `--model` may name one that is not
+    // on this list; `createService` then folds it in, so the model the operator asked for
+    // is never refused by the service built for it.
+    models: allowedModels(config),
     taskTimeoutMs: numberFrom(env.FLASH_TASK_TIMEOUT_MS, config.limits.taskTimeoutMs),
     // The handshake is the one request that runs while a cold runtime is still reading
     // its profile and warming up, so it gets a longer, separately configurable budget.
@@ -503,7 +544,8 @@ Options:
   --root <path>             sandbox root and runtime working directory (default: cwd)
   --profile <id>            dsh profile to boot (default: flash-service)
   --provider <id>           pinned LLM provider route (default: ${route.provider})
-  --model <id>              pinned model on that route (default: ${route.model})
+  --model <id>              default worker model; each call may choose another from the
+                            allowlist (default: ${route.model})
   --timeout-ms <n>          per-task wall-clock budget (default: ${value('taskTimeoutMs')})
   --init-timeout-ms <n>     how long dsh may take to answer initialize (default: ${String(DEFAULT_INITIALIZE_TIMEOUT_MS)})
   --batch-timeout-ms <n>    per-fleet wall-clock budget (default: ${value('batchTimeoutMs')})
@@ -536,7 +578,7 @@ Options:
   -h, --help                show this help
 
 Environment: FLASH_SERVICE_ROOT, FLASH_SERVICE_PROFILE, FLASH_SERVICE_PROVIDER,
-FLASH_SERVICE_MODEL, FLASH_TASK_TIMEOUT_MS, FLASH_INIT_TIMEOUT_MS, FLASH_IDLE_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS,
+FLASH_SERVICE_MODEL, FLASH_MODELS, FLASH_TASK_TIMEOUT_MS, FLASH_INIT_TIMEOUT_MS, FLASH_IDLE_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS,
 FLASH_MAX_TASKS, FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
 FLASH_STATE_DIR, FLASH_COPY_EXCLUDE, FLASH_ALLOW_SLOT_SETUP, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_MAX_STATE_BYTES, FLASH_LOG_FILE,
 FLASH_DSH_BIN.
@@ -588,11 +630,24 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
    * Turn one background call into a running job and answer with its id. The service runs
    * under the job's own signal, so the starting request ending — or being cancelled —
    * cannot reach it, and its progress is recorded on the job instead of notified.
+   * The call's model is validated before the job exists; a refusal is answered exactly as
+   * the synchronous path answers it, so a bad model never becomes a failed job.
    */
   const startJob = (name, args) => {
+    // A background call answers before the service runs, so the model refusals a
+    // synchronous call raises from its own path have to be raised here: otherwise an
+    // unlisted model, or a non-default one on an old profile, would start a job and only
+    // fail in `flash_result` minutes later. A stand-in service without the check is
+    // accepted, exactly as the dispatcher accepts one without a real runtime.
+    try {
+      service.checkModel?.(args, name)
+    } catch (error) {
+      log(`${name} failed: ${describeError(error)}`)
+      return errorResult(`${name} failed: ${describeError(error)}`)
+    }
     const job = jobs.start({
       kind: name,
-      label: jobLabel(name, args),
+      label: jobLabel(name, args, service?.model),
       run: ({ signal, jobId, progress }) =>
         runFor(name, args, {
           signal,
@@ -819,19 +874,48 @@ function omit(args, key) {
  * The one-line label a job carries into `flash_status` and the log. It is read from the raw
  * arguments, before the service validates them, because a background call must answer at
  * once; a malformed call ends failed and keeps this label.
+ *
+ * A call that chose a model other than the default says so in front of the label, so a
+ * status listing shows which model a running job is spending on.
+ *
+ * @param {string} kind - the tool name.
+ * @param {object} args - the raw tool arguments.
+ * @param {string} [defaultModel] - the service's default model.
+ * @returns {string} the label.
  */
-function jobLabel(kind, args) {
+export function jobLabel(kind, args, defaultModel) {
+  const chosen = typeof args?.model === 'string' && args.model.length > 0 && args.model !== defaultModel
+  const prefix = chosen ? `[${args.model}] ` : ''
   if (kind === 'flash_batch') {
     const count = Array.isArray(args?.tasks) ? args.tasks.length : 0
-    return `${String(count)} tasks`
+    return `${prefix}${String(count)} tasks`
   }
   const firstLine = typeof args?.task === 'string' ? args.task.split('\n')[0].trim() : ''
-  return clip(firstLine.length === 0 ? '(untitled task)' : firstLine, 80)
+  return `${prefix}${clip(firstLine.length === 0 ? '(untitled task)' : firstLine, 80)}`
 }
 
 /** Bound a label to the width a status line is read at. */
 function clip(text, maxChars) {
   return text.length <= maxChars ? text : text.slice(0, maxChars)
+}
+
+/**
+ * The models a server exposes, its default first.
+ *
+ * The default is always present, even when the allowlist omits it: the one model a
+ * profile from before model choice can run must never become unreachable. The shipped
+ * default stands in when nothing at all was configured.
+ *
+ * @param {string} [model] - the default model, when the caller knows it.
+ * @param {string[]} [models] - the configured allowlist.
+ * @returns {string[]} the choices, default first.
+ */
+function modelChoices(model, models) {
+  const choices = []
+  for (const name of [model, ...(Array.isArray(models) ? models : [])]) {
+    if (typeof name === 'string' && name.length > 0 && !choices.includes(name)) choices.push(name)
+  }
+  return choices.length === 0 ? [DEFAULT_MODEL] : choices
 }
 
 /**
@@ -848,6 +932,9 @@ function clip(text, maxChars) {
 export function createService(options, log = () => {}) {
   return new FlashTaskService({
     ...options,
+    // The service's allowlist always holds its own default first, whichever door named it
+    // (`route.models`, FLASH_MODELS, or --model).
+    models: modelChoices(options?.model, options?.models),
     isolate: {
       mode: options.isolate,
       ...(options.slots === undefined ? {} : { slots: options.slots }),
@@ -910,10 +997,11 @@ export function startServer(options, input = process.stdin, output = process.std
     log(`isolation: ${String(service.isolation.size)} disposable tree(s) under ${service.stateDir}`)
   }
 
+  const models = modelChoices(service.model, service.models)
   const connection = serveStdio({
     serverInfo: SERVER_INFO,
-    instructions: INSTRUCTIONS,
-    listTools,
+    instructions: instructionsFor(models),
+    listTools: () => listTools(models),
     log,
     input,
     output,
@@ -1070,9 +1158,11 @@ export async function runDoctor(
   if (!flags.copy || flags.e2e) {
     const result = await runChecks({
       env,
-      model: config.route.model,
+      model: options.model,
+      models: allowedModels(config),
       dshVersion: config.dsh.version,
       profile: options.profile,
+      dshHome: resolveDshHome(textFrom(env.DSH_HOME)),
       ...(run === undefined ? {} : { run }),
       ...(probe === undefined ? {} : { probe }),
       ...(generate === undefined ? {} : { generate }),
@@ -1092,7 +1182,7 @@ export async function runDoctor(
     if (!checksOk) {
       emit(`${'skip'.padEnd(4)}  e2e  the checks failed, so the end-to-end run was skipped\n`)
     } else {
-      e2eOk = await runE2e({ options, emit, makeService })
+      e2eOk = await runE2e({ options, emit, makeService, env, model: options.model })
     }
   }
   return checksOk && copyOk && e2eOk ? 0 : 1
@@ -1154,19 +1244,21 @@ function envWithProjectRoot(env) {
  * @param {object} options.options - parsed CLI options (profile, route, copy excludes).
  * @param {(text: string) => void} options.emit - output sink.
  * @param {Function} options.makeService - service factory, injected by tests.
+ * @param {Record<string, string | undefined>} options.env - the doctor's environment.
+ * @param {string} options.model - the model the run must use.
  * @returns {Promise<boolean>} whether the run passed.
  */
-async function runE2e({ options, emit, makeService }) {
+async function runE2e({ options, emit, makeService, env, model }) {
   // A service that would not close may have left a runtime and a tree behind: the run
   // printed `fail` for it, and the exit code has to agree. The flag is set in `finally`,
   // which has run by the time the steps' promise settles.
   const cleanup = { failed: false }
-  const ok = await runE2eSteps({ options, emit, makeService, cleanup })
+  const ok = await runE2eSteps({ options, emit, makeService, env, model, cleanup })
   return ok && !cleanup.failed
 }
 
 /** The steps of `runE2e`; `cleanup.failed` records a close that did not succeed. */
-async function runE2eSteps({ options, emit, makeService, cleanup }) {
+async function runE2eSteps({ options, emit, makeService, env, model, cleanup }) {
   const line = (status, text) => emit(`${status.padEnd(4)}  e2e  ${text}\n`)
   let repo
   let stateRoot
@@ -1200,13 +1292,17 @@ async function runE2eSteps({ options, emit, makeService, cleanup }) {
         // touched, swept or trimmed by this run.
         stateDir: join(stateRoot, 'state'),
         taskTimeoutMs: E2E_TIMEOUT_MS,
+        // The doctor's environment, so the run reads (and writes) no real harness home.
+        env,
       },
       (message) => serviceLog.push(message),
     )
     const started = Date.now()
     let result
     try {
-      result = await service.flashTask({ task: E2E_TASK, cwd: repo, apply: 'none' })
+      // The model is a per-call choice now: the service puts it in the runtime's
+      // environment itself, so the proof exercises the same path a server call does.
+      result = await service.flashTask({ task: E2E_TASK, cwd: repo, apply: 'none', model })
     } catch (error) {
       line('fail', describeError(error))
       if (error?.code === 'NOT_DELEGATED') {
@@ -1224,7 +1320,14 @@ async function runE2eSteps({ options, emit, makeService, cleanup }) {
         ? String(result?.provider ?? 'unknown')
         : `${String(route.provider)}/${String(route.model)}`
     if (result?.status === 'ok') {
-      line('ok', `worker status ok on ${routeName}`)
+      // The proof includes the route: a run that reports another model did not exercise
+      // the one that was asked for, so it is a failure even though the worker succeeded.
+      if (route?.model === model) {
+        line('ok', `worker status ok on ${routeName}`)
+      } else {
+        ok = false
+        line('fail', `worker status ok on ${routeName}, but the model asked for was ${String(model)}`)
+      }
     } else {
       ok = false
       line('fail', `worker status ${JSON.stringify(result?.status)} (stop reason ${JSON.stringify(result?.stopReason)})`)

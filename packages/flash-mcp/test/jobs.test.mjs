@@ -34,6 +34,21 @@ const tick = () => new Promise((resolve) => setImmediate(resolve))
 class FakeService {
   constructor() {
     this.calls = []
+    this.models = ['deepseek-v4.1-flash:cloud', 'minimax-m3.1-flash:cloud']
+  }
+
+  /** The same refusals the real service makes before a call starts, for the model only. */
+  checkModel(args, toolName) {
+    if (args?.model !== undefined && !this.models.includes(args.model)) {
+      throw new Error(`model ${JSON.stringify(args.model)} is not allowed; the allowed models are ${this.models.join(', ')}`)
+    }
+    if (toolName === 'flash_batch' && Array.isArray(args?.tasks)) {
+      for (const [index, entry] of args.tasks.entries()) {
+        if (entry !== null && typeof entry === 'object' && entry.model !== undefined) {
+          throw new Error(`tasks[${String(index)}] carries "model"; the model is chosen per fleet`)
+        }
+      }
+    }
   }
 
   flashTask(args, ctx) {
@@ -129,6 +144,44 @@ test('background returns a job id at once and the job ends ok with the exact res
   assert.deepEqual(full.job, { jobId: job.jobId, state: 'ok', elapsedMs: 0 })
   // Reading twice returns the same result.
   assert.deepEqual(payloadOf(await call('flash_result', { jobId: job.jobId }, {})), full)
+})
+
+test('a background call refuses a bad model at once, before any job exists', async () => {
+  const { service, registry, call } = harness()
+  const refused = await call('flash_task', { task: 'x', model: 'not-allowed:cloud', background: true }, {})
+  assert.equal(refused.isError, true)
+  assert.match(textOf(refused), /^flash_task failed: model "not-allowed:cloud" is not allowed/)
+  assert.equal(service.calls.length, 0, 'the service was never asked to run anything')
+
+  // The fleet's per-item refusal is raised by the same door, not left for flash_result.
+  const itemRefused = await call(
+    'flash_batch',
+    { tasks: [{ task: 'a', model: 'minimax-m3.1-flash:cloud' }], background: true },
+    {},
+  )
+  assert.equal(itemRefused.isError, true)
+  assert.match(textOf(itemRefused), /^flash_batch failed: tasks\[0\] carries "model"; the model is chosen per fleet/)
+
+  const status = payloadOf(await call('flash_status', {}, {}))
+  assert.deepEqual(status.jobs, [], 'a refused call leaves no job to list')
+  assert.equal(registry.counts().running, 0)
+  assert.equal(registry.counts().ended, 0)
+})
+
+test('a background call with an allowed model still starts a job', async () => {
+  const { service, registry, call } = harness()
+  const started = await call(
+    'flash_task',
+    { task: 'x', model: 'minimax-m3.1-flash:cloud', background: true },
+    {},
+  )
+  assert.equal(started.isError, undefined, textOf(started))
+  const jobId = payloadOf(started).jobId
+  assert.equal(registry.status(jobId).state, 'running')
+  assert.equal(service.calls.length, 1)
+  service.calls[0].gate.resolve({ status: 'ok' })
+  await registry.get(jobId).settled
+  assert.equal(registry.status(jobId).state, 'ok')
 })
 
 test('flash_result reports running at once and waitSeconds returns the result when it settles', async () => {

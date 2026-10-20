@@ -50,6 +50,16 @@ acceptance, verification and judgement. Everything else goes out.
   not only the result after.
 - The service root is fixed at the project; `cwd` selects a directory inside it.
 
+## Choosing a model
+
+Leave `model` off for the installed default: it suits a quick hand-off. To run a slice on another
+model, pass `model` from the user's allowlist on `flash_task`, or once on `flash_batch` for the
+whole fleet — a per-task `model` is refused, because one fleet is one process. Read the result's
+`route`: it is the model that actually ran, and a mismatch arrives as a warning rather than a
+silent success. Comparing models on the same kind of task — same brief, same acceptance — is how
+you learn which suits that kind of work. A model the user did not allow is refused, and so is a
+non-default model while the installed profile predates 0.1.6; the error says to rerun the setup.
+
 ## 2. The loop
 
 1. **Frame.** Read what you must to own the design (the docs, the seams a slice will touch — a

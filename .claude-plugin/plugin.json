@@ -1,7 +1,7 @@
 {
   "name": "flash-agents",
   "displayName": "Flash Agents",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "author": {
     "name": "Thomas Wiesner",
     "url": "https://github.com/tomw1808"
@@ -24,6 +24,7 @@
       "env": {
         "FLASH_LOG_FILE": "${CLAUDE_PLUGIN_DATA}/flash.log",
         "FLASH_SERVICE_MODEL": "${user_config.model}",
+        "FLASH_MODELS": "${user_config.models}",
         "FLASH_SLOTS": "${user_config.slots}",
         "FLASH_ISOLATE": "${user_config.isolate}",
         "FLASH_STATE_DIR": "${user_config.state_dir}",
@@ -34,9 +35,15 @@
   "userConfig": {
     "model": {
       "type": "string",
-      "title": "Worker model",
-      "description": "Any model the local Ollama serves. The default is the one this project is tuned for; smaller local models are weaker at tool calling.",
+      "title": "Default worker model",
+      "description": "The model a call runs when it names none; it must be served by your Ollama. The default is the one this project is tuned for, and smaller local models are weaker at tool calling.",
       "default": "deepseek-v4.1-flash:cloud"
+    },
+    "models": {
+      "type": "string",
+      "title": "Models a call may choose",
+      "description": "Comma-separated model ids a call may choose from. The default worker model is always allowed. Each one must be available in your Ollama.",
+      "default": "deepseek-v4.1-flash:cloud,deepseek-v4.1-flash:1017-cloud,minimax-m3.1-flash:cloud"
     },
     "slots": {
       "type": "number",

@@ -16,16 +16,21 @@
  */
 
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 import { IsolationError, WorkspaceIsolation, canonicalTmpdir } from './isolation.js'
 import { estimateInstructions } from './instructions.js'
 import { HarnessSdkClient, DEFAULT_INITIALIZE_TIMEOUT_MS } from './sdk.js'
+import { profileHonoursModelEnv, resolveDshHome } from './doctor.js'
 
-/** Route the service pins; callers can never change it. */
+/** Route the service pins; callers can never change the provider. */
 export const DEFAULT_PROVIDER = 'ollama'
 export const DEFAULT_MODEL = 'deepseek-v4.1-flash:cloud'
+
+/** The environment variable a dsh profile reads to pick the model for its process. */
+export const ROUTE_MODEL_VAR = 'FLASH_ROUTE_MODEL'
 
 /** Default wall-clock budget for one delegated task. */
 const DEFAULT_TASK_TIMEOUT_MS = 300_000
@@ -160,7 +165,16 @@ export class FlashTaskService {
    * @param {string} options.root - sandbox root; also the runtime's working directory.
    * @param {string} [options.profile] - dsh profile to boot.
    * @param {string} [options.provider] - pinned orchestrator/worker provider route.
-   * @param {string} [options.model] - pinned model on that route.
+   * @param {string} [options.model] - the default model on that route, for a call that
+   *   names none.
+   * @param {string[]} [options.models] - every model a call may choose; the default is
+   *   always included (default `[model]`).
+   * @param {(profile: string) => boolean} [options.honoursModelEnv] - whether an installed
+   *   profile reads FLASH_ROUTE_MODEL, so it can boot a non-default model (default: the
+   *   doctor helper on `DSH_HOME`, resolved as dsh reads it against `home`). Injected by
+   *   tests; see `#resolveModel`.
+   * @param {string} [options.home] - home directory `DSH_HOME` expands a leading `~`
+   *   against (default the process's; injectable so no test reads the real home).
    * @param {number} [options.maxTokens] - optional output cap for SDK agents.
    * @param {number} [options.taskTimeoutMs] - per-task wall-clock budget.
    * @param {number} [options.maxResultChars] - returned child-message budget.
@@ -181,6 +195,9 @@ export class FlashTaskService {
     profile = 'flash-service',
     provider = DEFAULT_PROVIDER,
     model = DEFAULT_MODEL,
+    models = [model],
+    honoursModelEnv,
+    home = homedir(),
     maxTokens,
     taskTimeoutMs = DEFAULT_TASK_TIMEOUT_MS,
     idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
@@ -199,6 +216,35 @@ export class FlashTaskService {
     this.profile = profile
     this.provider = provider
     this.model = model
+    /**
+     * Every model a call may choose, the default first. The default is always present:
+     * otherwise editing the allowlist could strand the one model a profile installed
+     * before model choice can run at all.
+     *
+     * @type {string[]}
+     */
+    this.models = []
+    for (const name of [model, ...(Array.isArray(models) ? models : [])]) {
+      if (typeof name === 'string' && name.length > 0 && !this.models.includes(name)) this.models.push(name)
+    }
+    // The installed profile's support for FLASH_ROUTE_MODEL is a lazy fact: it is only
+    // read when a call asks for a model other than the default. A positive answer is cached
+    // for the life of the server; a negative one is not, because rerunning the installer
+    // must take effect without a restart (see `#honoursModelEnv`).
+    this.home = home
+    this.honoursModelEnv =
+      honoursModelEnv ??
+      ((profileName) => profileHonoursModelEnv(resolveDshHome(this.env?.DSH_HOME, this.home), profileName))
+    /** @type {Map<string, boolean>} installed-profile answers already established. */
+    this.modelEnvHonoured = new Map()
+    /**
+     * Calls that are about to use, or are using, the runtime for one key. A call holds
+     * its key from before the runtime is booted until its session ends, so the process
+     * limit in `#retireOtherModels` cannot shut down a runtime another call is reaching for.
+     *
+     * @type {Map<string, number>}
+     */
+    this.inFlight = new Map()
     this.maxTokens = maxTokens
     this.taskTimeoutMs = taskTimeoutMs
     this.idleTimeoutMs = idleTimeoutMs
@@ -273,20 +319,123 @@ export class FlashTaskService {
     this.sessions = 0
   }
 
-  /** The map key for one runtime: a profile is only meaningful together with a cwd. */
-  #runtimeKey(profileName, cwd) {
-    return `${profileName}@${cwd}`
+  /**
+   * The map key for one runtime: a profile and a model are only meaningful together
+   * with a cwd.
+   *
+   * One dsh process runs exactly one model, chosen by the environment it starts with
+   * (`FLASH_ROUTE_MODEL`), so the model belongs in the key: two models on one tree are
+   * two processes.
+   */
+  #runtimeKey(profileName, cwd, model) {
+    return `${profileName}@${cwd}@${model}`
   }
 
   /** Runtime facts for the returned payload, for the runtime that served the call. */
-  #runtimeInfo(profileName, cwd) {
-    const run = this.runtimes.get(this.#runtimeKey(profileName, cwd))
+  #runtimeInfo(profileName, cwd, model) {
+    const run = this.runtimes.get(this.#runtimeKey(profileName, cwd, model))
     return {
       pid: run?.client?.pid ?? null,
       booted: run?.initialized === true,
       uptimeMs: run?.startedAt === undefined ? 0 : Date.now() - run.startedAt,
       sessions: this.sessions,
       profile: profileName,
+    }
+  }
+
+  /**
+   * The model one call runs on, or the refusal that stops it before anything starts.
+   *
+   * A call may choose any model on the user's allowlist. A model that is not there is a
+   * refusal naming the list; a non-default one additionally needs an installed profile
+   * that reads FLASH_ROUTE_MODEL, because a profile from before model choice pins one
+   * literal model and would silently run the default instead.
+   *
+   * @param {unknown} requested - the call's `model` argument.
+   * @param {string} profileName - the profile that will serve the call.
+   * @returns {string} the model the call runs on.
+   * @throws {FlashTaskError} `MODEL_NOT_ALLOWED` or `PROFILE_OUTDATED`, before any work.
+   */
+  #resolveModel(requested, profileName) {
+    const model = requested === undefined || requested === null ? this.model : requireText(requested, 'model')
+    if (!this.models.includes(model)) {
+      throw new FlashTaskError(
+        `model ${JSON.stringify(model)} is not allowed; the allowed models are ${this.models.join(', ')}`,
+        'MODEL_NOT_ALLOWED',
+      )
+    }
+    if (model === this.model) return model
+    if (!this.#honoursModelEnv(profileName)) {
+      throw new FlashTaskError(
+        `the installed ${profileName} profile predates model choice, so ${model} would run as ` +
+          `${this.model} instead; run \`node install.mjs\` (or the plugin's setup skill)`,
+        'PROFILE_OUTDATED',
+      )
+    }
+    return model
+  }
+
+  /**
+   * Whether an installed profile honours FLASH_ROUTE_MODEL.
+   *
+   * Only a positive answer is remembered: the installed patch cannot lose the variable while
+   * this server lives, but it can gain it when the user reruns the installer, and a negative
+   * answer must not keep refusing models until a restart. A negative is therefore re-read on
+   * the next non-default call (one small file read), which also means a transient read error
+   * is not remembered as a verdict.
+   */
+  #honoursModelEnv(profileName) {
+    if (this.modelEnvHonoured.get(profileName) === true) return true
+    const honoured = this.honoursModelEnv(profileName) === true
+    if (honoured) this.modelEnvHonoured.set(profileName, true)
+    else this.modelEnvHonoured.delete(profileName)
+    return honoured
+  }
+
+  /** Note that a call is reaching for one runtime key. */
+  #holdRuntime(key) {
+    this.inFlight.set(key, (this.inFlight.get(key) ?? 0) + 1)
+  }
+
+  /** Release a hold; the runtime is free to be retired when the last one ends. */
+  #releaseRuntime(key) {
+    const held = (this.inFlight.get(key) ?? 0) - 1
+    if (held > 0) this.inFlight.set(key, held)
+    else this.inFlight.delete(key)
+  }
+
+  /**
+   * Shut down the other models' idle runtimes on one tree.
+   *
+   * Without this, a slot that served three models would keep three dsh processes for as
+   * long as the server lives: a model in the key bounds what a call can run on, not how
+   * many processes one tree accumulates. A runtime with a session in flight is left
+   * alone — including one another call is only about to use — and one line is logged per
+   * process shut down.
+   *
+   * @param {string} profileName - the profile the new runtime serves.
+   * @param {string} cwd - the tree the new runtime is rooted at.
+   * @param {string} model - the model the new runtime runs.
+   * @param {object} keep - the runtime that was just started, never a candidate.
+   */
+  async #retireOtherModels(profileName, cwd, model, keep) {
+    for (const [key, run] of [...this.runtimes]) {
+      // The walk is a snapshot and every shutdown is awaited (up to seconds). Another call
+      // can therefore retire the same key and boot a fresh runtime under it before this
+      // iteration resumes: deleting by key then would evict the fresh, running process,
+      // which no later `close()` could stop. The map is the authority on what is current.
+      if (this.runtimes.get(key) !== run) continue
+      if (run === keep) continue
+      if (run.profile !== profileName || run.cwd !== cwd || run.model === model) continue
+      if (run.initialized !== true || (run.sessions ?? 0) > 0) continue
+      if ((this.inFlight.get(key) ?? 0) > 0) continue
+      this.runtimes.delete(key)
+      try {
+        await run.client?.shutdown()
+        this.log(`shut down the ${run.model} runtime on ${profileName} in ${cwd}: ${model} now serves that tree`)
+      } catch (error) {
+        this.log(`could not shut down the ${run.model} runtime on ${profileName}: ${messageOf(error)}`)
+      }
     }
   }
 
@@ -429,12 +578,37 @@ export class FlashTaskService {
   }
 
   /**
+   * Validate the model a call names, without starting or leasing anything.
+   *
+   * The background door answers with a job id before `flashTask`/`flashBatch` runs, so the
+   * refusals those methods raise before any work have to be available here: a model off the
+   * allowlist, a non-default model on a profile that predates model choice, or a per-item
+   * `model` in a fleet. A background call then refuses at once instead of failing later in
+   * `flash_result`. Nothing is read except the installed profile's one marker file.
+   *
+   * @param {object} args - the MCP tool arguments, as the call received them.
+   * @param {string} toolName - `flash_task` or `flash_batch`.
+   * @returns {void}
+   * @throws {FlashTaskError} `MODE_UNAVAILABLE`, `MODEL_NOT_ALLOWED`, `PROFILE_OUTDATED`, or
+   *   the fleet's `INVALID_ARGUMENT` for a per-item model.
+   */
+  checkModel(args, toolName) {
+    const profileName = this.#profileForMode(args?.mode)
+    this.#resolveModel(args?.model, profileName)
+    if (toolName === 'flash_batch' && Array.isArray(args?.tasks)) {
+      for (const [index, entry] of args.tasks.entries()) refuseItemModel(entry, index)
+    }
+  }
+
+  /**
    * Run one delegated task.
    * @param {object} args - the MCP tool arguments.
    * @param {string} [args.task] - the work to delegate.
    * @param {string} [args.taskFile] - a file holding the work; exactly one of the two.
    * @param {string} args.cwd - working directory for the worker; must be inside the root.
    * @param {string} [args.acceptance] - optional acceptance criteria for the worker.
+   * @param {string} [args.model] - a model from the service allowlist; omitted, the
+   *   default one runs.
    * @param {AbortSignal} [options.signal] - client cancellation.
    * @param {(report: object) => void} [options.progress] - MCP progress sender.
    * @param {unknown} [options.progressToken] - the request's progress token, when it had one.
@@ -449,6 +623,9 @@ export class FlashTaskService {
 
     const sessionId = `flash-task-${randomUUID()}`
     const profileName = this.#profileForMode(args?.mode)
+    // Before anything is leased or copied: a model the user did not allow, or one an
+    // installed profile cannot run, is a refusal that starts nothing.
+    const model = this.#resolveModel(args?.model, profileName)
     const pool = this.#isolationFor(profileName)
     // `source` selects what the copy starts from. "head" is the escape hatch for running a
     // call while another session has uncommitted work in the same tree: the copy is reset to
@@ -559,6 +736,7 @@ export class FlashTaskService {
         profile: profileName,
         cwd: runtimeCwd,
         extraEnv,
+        model,
       })
 
       if (state.children.length === 0) {
@@ -576,6 +754,7 @@ export class FlashTaskService {
         started,
         profile: profileName,
         cwd: runtimeCwd,
+        model,
         // Measured where the worker sees them: inside the disposable copy for a writing call.
         instructions,
         slot,
@@ -635,10 +814,12 @@ export class FlashTaskService {
    * teaches nothing.
    *
    * Shutting the runtime down is the only cancellation this service has: the SDK cannot
-   * stop a session, but the service owns the process that runs it. The runtime that
-   * served this call is keyed by the tree it was rooted at, which is still the slot's
-   * directory here; dropping it from the map means the next call on this slot boots a
-   * fresh runtime for the slot's new directory, exactly as it would for any new cwd.
+   * stop a session, but the service owns the process that runs it. The runtimes are keyed
+   * by the tree they were rooted at, which is still the slot's directory here; dropping
+   * them from the map means the next call on this slot boots a fresh runtime for the
+   * slot's new directory, exactly as it would for any new cwd. Every model's runtime on
+   * that tree is dropped, not only the requested one: a session for any of them may be
+   * the one still writing.
    *
    * @param {WorkspaceIsolation} pool - the pool the slot belongs to.
    * @param {object} slot - the leased tree.
@@ -667,16 +848,18 @@ export class FlashTaskService {
       const reason = first.reason === undefined ? '' : ` (${first.reason})`
       refusals = `; ${String(denials.length)} tool refusal(s), first: ${first.code}${reason} ${first.message.slice(0, 160).replace(/\s+/g, ' ')}`
     }
-    // Stop the process before the slot moves: the runtime is keyed by the tree it was
+    // Stop the processes before the slot moves: a runtime is keyed by the tree it was
     // rooted at, and `retire` gives the slot a new directory. A session that is still
     // running can no longer be signalled through the SDK, but killing its runtime takes
-    // the worker processes it spawned with it.
-    const key = this.#runtimeKey(profileName, slot.dir)
-    const run = this.runtimes.get(key)
-    if (run !== undefined) {
+    // the worker processes it spawned with it. Every model's runtime on that tree goes:
+    // one slot can have held more than one, and the one that served this call is not
+    // necessarily the only one still alive.
+    for (const [key, run] of [...this.runtimes]) {
+      if (run.profile !== profileName || run.cwd !== slot.dir) continue
       this.runtimes.delete(key)
       try {
         await run.client?.shutdown()
+        this.log(`shut down the ${run.model} runtime of the orphaned session on ${slot.dir}`)
       } catch (shutdownError) {
         this.log(`could not shut down the runtime of the orphaned session: ${messageOf(shutdownError)}`)
       }
@@ -699,6 +882,8 @@ export class FlashTaskService {
    * @param {Array<string | {task: string, acceptance?: string}>} args.tasks - the work.
    * @param {string} [args.cwd] - working directory shared by every worker.
    * @param {string} [args.acceptance] - default acceptance criteria for every task.
+   * @param {string} [args.model] - a model from the service allowlist for the whole
+   *   fleet: one dsh process, so one model for the dispatcher and every member.
    * @param {AbortSignal} [options.signal] - client cancellation.
    * @param {(report: object) => void} [options.progress] - MCP progress sender.
    * @param {unknown} [options.progressToken] - the request's progress token, when it had one.
@@ -715,6 +900,8 @@ export class FlashTaskService {
 
     const sessionId = `flash-batch-${randomUUID()}`
     const profileName = this.#profileForMode(args?.mode)
+    // One fleet is one dsh process, so one model for the dispatcher and every member.
+    const model = this.#resolveModel(args?.model, profileName)
     // A fleet is one call and therefore one tree: its members share a working
     // directory exactly as they share a runtime, so they see each other's edits.
     const pool = this.#isolationFor(profileName)
@@ -817,6 +1004,7 @@ export class FlashTaskService {
         profile: profileName,
         cwd: runtimeCwd,
         extraEnv,
+        model,
       })
 
       if (state.subagentStarts === 0) {
@@ -835,6 +1023,7 @@ export class FlashTaskService {
         started,
         profile: profileName,
         cwd: runtimeCwd,
+        model,
         instructions,
         slot,
         change,
@@ -997,24 +1186,34 @@ export class FlashTaskService {
   }
 
   /** Start one session on the persistent runtime and wait for it to go idle. */
-  async #runSession({ sessionId, prompt, timeoutMs, label, note, signal, profile, cwd = this.root, extraEnv, activity = createActivity() }) {
-    const client = await this.#ensureRuntime(profile, cwd, extraEnv)
-    const key = this.#runtimeKey(profile, cwd)
+  async #runSession({ sessionId, prompt, timeoutMs, label, note, signal, profile, cwd = this.root, extraEnv, model, activity = createActivity() }) {
+    const key = this.#runtimeKey(profile, cwd, model)
+    // Held before the runtime is booted, not only while the session runs: a concurrent
+    // call for another model must not retire this process between "ready" and "prompted".
+    this.#holdRuntime(key)
     const state = createObserveState()
     state.activity = activity
     activity.at = Date.now()
     const started = Date.now()
     const completion = createDeferred()
-    const unsubscribe = client.onNotification((method, params) => {
-      observe(state, method, params, sessionId, completion, this.log)
-    })
-    const offExit = client.onExit(() => {
-      completion.reject(new FlashTaskError('the dsh runtime exited during the task', 'RUNTIME_EXITED'))
-    })
+    let run
+    let unsubscribe = () => {}
+    let offExit = () => {}
     try {
+      run = await this.#ensureRuntime(profile, cwd, extraEnv, model)
+      const client = run.client
+      run.sessions += 1
+      unsubscribe = client.onNotification((method, params) => {
+        observe(state, method, params, sessionId, completion, this.log)
+      })
+      offExit = client.onExit(() => {
+        completion.reject(new FlashTaskError('the dsh runtime exited during the task', 'RUNTIME_EXITED'))
+      })
       this.sessions += 1
       await client.prompt({ sessionId, text: prompt })
-      this.log(`session ${sessionId} prompted${note === undefined ? '' : ` (${note})`}`)
+      this.log(
+        `session ${sessionId} prompted on ${model}${note === undefined ? '' : ` (${note})`}`,
+      )
       await raceWithBudget(completion.promise, {
         timeoutMs,
         idleTimeoutMs: this.idleTimeoutMs,
@@ -1031,6 +1230,10 @@ export class FlashTaskService {
       if (error?.code === 'TIMEOUT' || error?.code === 'IDLE' || error?.code === 'CANCELLED') error.denials = state.denials
       throw error
     } finally {
+      // The runtime's own count is what `#retireOtherModels` reads; it falls with the
+      // session, on every path out of this method.
+      if (run !== undefined) run.sessions = Math.max(0, run.sessions - 1)
+      this.#releaseRuntime(key)
       unsubscribe()
       offExit()
     }
@@ -1054,18 +1257,31 @@ export class FlashTaskService {
   }
 
   /**
-   * Start and hand-shake one profile's runtime exactly once, even under
-   * concurrent calls. Each profile keeps its own persistent process.
+   * Start and hand-shake one profile-and-model's runtime exactly once, even under
+   * concurrent calls. Each profile keeps one persistent process per model: the model is
+   * fixed for the life of the process, so a call that chooses another needs its own.
    *
    * @param {string} profileName - the profile to run on.
-   * @returns {Promise<object>} the live client.
+   * @param {string} cwd - the tree the runtime is rooted at.
+   * @param {object | undefined} extraEnv - the slot's per-tree environment.
+   * @param {string} model - the model this process runs.
+   * @returns {Promise<object>} the runtime record; its `client` is the live client.
    */
-  async #ensureRuntime(profileName, cwd, extraEnv) {
-    const key = this.#runtimeKey(profileName, cwd)
+  async #ensureRuntime(profileName, cwd, extraEnv, model) {
+    const key = this.#runtimeKey(profileName, cwd, model)
     const existing = this.runtimes.get(key)
-    if (existing?.client?.running && existing.initialized) return existing.client
+    if (existing?.client?.running && existing.initialized) return existing
     if (existing?.starting !== undefined) return await existing.starting
-    const run = existing ?? { client: undefined, initialized: false, starting: undefined, startedAt: undefined }
+    const run = existing ?? {
+      client: undefined,
+      initialized: false,
+      starting: undefined,
+      startedAt: undefined,
+      profile: profileName,
+      cwd,
+      model,
+      sessions: 0,
+    }
     this.runtimes.set(key, run)
     run.starting = (async () => {
       let client
@@ -1075,19 +1291,22 @@ export class FlashTaskService {
       for (let attempt = 1; attempt <= 2; attempt += 1) {
         let diagnostics = ''
         try {
-          client = this.clientFactory(profileName, cwd, extraEnv)
+          // The profile reads this variable to pick the model its one process serves, and
+          // the handshake names the same model, so both ends agree on what will run.
+          client = this.clientFactory(profileName, cwd, { ...(extraEnv ?? {}), [ROUTE_MODEL_VAR]: model })
           client.start()
           const info = await client.initialize({
             cwd,
             provider: this.provider,
-            model: this.model,
+            model,
             ...(this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens }),
           })
           run.client = client
           run.initialized = true
           run.startedAt = Date.now()
-          this.log(`runtime ready: ${info.name} ${info.version} (pid ${String(client.pid)}) on ${profileName}`)
-          return client
+          this.log(`runtime ready: ${info.name} ${info.version} (pid ${String(client.pid)}) on ${profileName}/${model}`)
+          await this.#retireOtherModels(profileName, cwd, model, run)
+          return run
         } catch (error) {
           // Capture the tail before shutdown: closing the process is exactly when the
           // part that explains the failure would otherwise be discarded.
@@ -1292,7 +1511,7 @@ export class FlashTaskService {
   }
 
   /** Assemble the compact per-task fleet result. */
-  #buildBatchResult({ state, tasks, sessionId, started, profile, cwd, instructions, slot, change, applied, basePatch, setup, queuedMs = 0 }) {
+  #buildBatchResult({ state, tasks, sessionId, started, profile, cwd, model, instructions, slot, change, applied, basePatch, setup, queuedMs = 0 }) {
     const envelope = extractWorkflowValue(state.workflowText)
     const payload = envelope.value
     const warnings = []
@@ -1415,6 +1634,29 @@ export class FlashTaskService {
     if (state.children.some((child) => child.status !== 'ok')) {
       warnings.push('at least one worker ended with a non-ok status')
     }
+    // What the engine reported each member running on is the observed truth; when it is
+    // not the model this call asked for, the caller must not read the result as proof of it.
+    for (const entry of results ?? []) {
+      if (entry.childSessionId === undefined) continue
+      const observed = state.childRoutes.get(entry.childSessionId)?.model
+      if (observed !== undefined && observed !== model) {
+        warnings.push(`task ${String(entry.index + 1)}: the worker ran on ${observed}, not the requested ${model}`)
+      }
+    }
+    // With no paired results there is no per-task line to carry the observation, but the
+    // engine still reported what each worker ran on. A fleet that ran another model must
+    // not read as proof of the requested one just because its return value was unreadable.
+    if (results === null) {
+      const observedModels = []
+      for (const route of state.childRoutes.values()) {
+        if (typeof route.model === 'string' && route.model.length > 0 && !observedModels.includes(route.model)) {
+          observedModels.push(route.model)
+        }
+      }
+      if (observedModels.some((name) => name !== model)) {
+        warnings.push(`the fleet ran on ${observedModels.join(', ')}, not the requested ${model}`)
+      }
+    }
     if ((change?.ignoredChanged ?? []).length > 0) {
       warnings.push(ignoredChangedWarning(change))
     }
@@ -1456,14 +1698,14 @@ export class FlashTaskService {
       ...(usage === undefined ? {} : { usage }),
       instructions,
       ...(setup === undefined || setup.length === 0 ? {} : { setup }),
-      runtime: this.#runtimeInfo(profile, cwd),
+      runtime: this.#runtimeInfo(profile, cwd, model),
       ...this.#changeFields({ profileName: profile, slot, change, applied, basePatch }),
       ...(warnings.length === 0 ? {} : { warnings }),
     }
   }
 
   /** Assemble the compact result the MCP client receives. */
-  #buildResult({ state, sessionId, started, profile, cwd, instructions, slot, change, applied, basePatch, setup, queuedMs = 0 }) {
+  #buildResult({ state, sessionId, started, profile, cwd, model, instructions, slot, change, applied, basePatch, setup, queuedMs = 0 }) {
     const children = state.children.map((child) => {
       const clipped = truncate(child.result, this.maxResultChars)
       return {
@@ -1509,6 +1751,12 @@ export class FlashTaskService {
     if (slot !== undefined && this.isolation?.slotSetupWarning !== undefined) {
       warnings.push(this.isolation.slotSetupWarning)
     }
+    // The route the result carries is what the child was observed running on. When that
+    // is not the model this call asked for, the result must say so rather than let the
+    // caller take the requested model on trust.
+    if (primary.route?.model !== undefined && primary.route.model !== model) {
+      warnings.push(`the worker ran on ${primary.route.model}, not the requested ${model}`)
+    }
 
     return {
       status: primary.status,
@@ -1527,7 +1775,7 @@ export class FlashTaskService {
       ...(usage === undefined ? {} : { usage }),
       instructions,
       ...(setup === undefined || setup.length === 0 ? {} : { setup }),
-      runtime: this.#runtimeInfo(profile, cwd),
+      runtime: this.#runtimeInfo(profile, cwd, model),
       ...this.#changeFields({ profileName: profile, slot, change, applied, basePatch }),
       ...(warnings.length === 0 ? {} : { warnings }),
       ...(children.length === 1 ? {} : { children }),
@@ -2189,10 +2437,35 @@ export function buildBatchPrompt({ count, script, args }) {
 }
 
 /**
+ * Refuse a per-item `model` in a fleet, before anything reads the item's task text.
+ *
+ * One fleet is one dsh process, which runs one model for its dispatcher and every worker: a
+ * per-item model could not be honoured, so it is refused rather than ignored. Shared with
+ * `FlashTaskService.checkModel`, so the background door refuses exactly what `flashBatch`
+ * would, and neither message can drift from the other.
+ *
+ * @param {unknown} entry - one `tasks` entry.
+ * @param {number} index - its position, for the error.
+ * @returns {void}
+ * @throws {FlashTaskError} `INVALID_ARGUMENT` when the entry names a model.
+ */
+function refuseItemModel(entry, index) {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return
+  if (entry.model === undefined) return
+  throw new FlashTaskError(
+    `tasks[${String(index)}] carries "model"; the model is chosen per fleet: pass "model" at ` +
+      'the top level of flash_batch, not inside a task',
+    'INVALID_ARGUMENT',
+  )
+}
+
+/**
  * Validate and normalize the fleet's task list.
  *
  * An entry is a task string, or an object carrying its text either inline (`task`) or in a
- * file (`taskFile`), plus optional acceptance criteria. Reading a task file is the
+ * file (`taskFile`), plus optional acceptance criteria. A `model` inside an entry is
+ * refused: the fleet is one dsh process, so one model serves the dispatcher and every
+ * member, and only the call's top level may choose it. Reading a task file is the
  * caller's job — the service owns the fence around its root — so the reader is passed in;
  * the errors for the string and inline `task` forms are unchanged.
  *
@@ -2226,6 +2499,7 @@ export function normalizeTasks(tasks, maxTasks, { readTaskFile } = {}) {
         'INVALID_ARGUMENT',
       )
     }
+    refuseItemModel(entry, index)
     const hasTask = entry.task !== undefined && entry.task !== null
     const hasFile = entry.taskFile !== undefined && entry.taskFile !== null
     if (hasTask && hasFile) {
@@ -2294,9 +2568,14 @@ export function parseWorkflowHeader(text) {
   return { name: match[1], agentsStarted: Number(match[2]) }
 }
 
-/** Routing is not a caller capability; never forward a selection field. */
+/**
+ * Routing is not a caller capability; never forward a selection field.
+ *
+ * `model` is deliberately absent: a call may choose one from the user's allowlist. The
+ * provider is still fixed, so a `provider` argument is only logged.
+ */
 function warnAboutIgnoredArguments(args, toolName, log) {
-  for (const ignored of ['provider', 'model', 'reasoningEffort', 'agentOptions', 'permissions', 'sandbox']) {
+  for (const ignored of ['provider', 'reasoningEffort', 'agentOptions', 'permissions', 'sandbox']) {
     if (args?.[ignored] !== undefined) log(`ignoring unsupported ${toolName} argument "${ignored}"`)
   }
 }

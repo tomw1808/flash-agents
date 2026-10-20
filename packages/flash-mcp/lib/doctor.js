@@ -14,17 +14,19 @@
 import { spawnSync } from 'node:child_process'
 import { accessSync, constants, existsSync, readFileSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { resolveDshCommand } from './sdk.js'
 
-/** The check ids in the order they run. */
+/** The check ids in the order they run. Model rows expand to `model:<id>` per allowed model. */
 export const CHECK_IDS = Object.freeze([
   'node',
   'dsh',
   'dsh-version',
   'dsh-native',
   'profile',
+  'profile-models',
   'ollama',
   'model',
   'git',
@@ -33,6 +35,12 @@ export const CHECK_IDS = Object.freeze([
 
 /** The DeepSeek Harness version the profiles are written for and tested against. */
 const DEFAULT_DSH_VERSION = '0.2.0-rc.2'
+
+/** The model the service runs when neither the file nor the environment names another. */
+const DEFAULT_MODEL = 'deepseek-v4.1-flash:cloud'
+
+/** The environment variable a profile reads to pick the model for its process. */
+const ROUTE_MODEL_VAR = 'FLASH_ROUTE_MODEL'
 
 /**
  * The oldest Node each release line runs dsh on. dsh starts its CLI behind
@@ -126,6 +134,51 @@ const REAL_FS = Object.freeze({
   readText: (path) => readFileSync(path, 'utf8'),
   resolvePackage: (request, fromFile) => createRequire(fromFile).resolve(request),
 })
+
+/**
+ * The harness home a `DSH_HOME` value names, exactly as dsh reads it.
+ *
+ * dsh trims the value and expands a leading `~` (or `~/…`, and `~\…` on Windows) against
+ * the user's home directory, so a check that used the raw value read the wrong path for
+ * `DSH_HOME="~/x"` or one with surrounding whitespace. An empty value is the default
+ * `<home>/.dsh`.
+ *
+ * @param {unknown} value - the raw `DSH_HOME` value.
+ * @param {string} [home] - the user's home directory (default the process's).
+ * @returns {string} the absolute harness home.
+ */
+export function resolveDshHome(value, home = homedir()) {
+  const text = typeof value === 'string' ? value.trim() : ''
+  if (text === '') return join(home, '.dsh')
+  if (text === '~') return home
+  if (text.startsWith('~/') || text.startsWith('~\\')) return join(home, text.slice(2))
+  return text
+}
+
+/**
+ * Whether an installed profile honours FLASH_ROUTE_MODEL.
+ *
+ * The template renders that variable into every model value it writes, so its
+ * presence in the installed patch is the marker that this profile can boot on a
+ * model chosen by the server rather than only on its installed default. A profile
+ * installed by an older release has a literal model and cannot. The server slice can
+ * reuse this to refuse a non-default model on an old profile.
+ *
+ * @param {string} dshHome - the harness home holding `profiles/`.
+ * @param {string} [profile] - the installed profile to inspect (default 'flash-service').
+ * @param {object} [fs] - filesystem probe with exists/readText (default the node:fs calls).
+ * @returns {boolean} true when the installed patch reads FLASH_ROUTE_MODEL.
+ */
+export function profileHonoursModelEnv(dshHome, profile = 'flash-service', fs = REAL_FS) {
+  if (typeof dshHome !== 'string' || dshHome === '') return false
+  const patch = join(dshHome, 'profiles', profile, 'cordis.patch.yml')
+  try {
+    if (fs.exists(patch) !== true) return false
+    return fs.readText(patch).includes(`process.env.${ROUTE_MODEL_VAR}`)
+  } catch {
+    return false
+  }
+}
 
 /**
  * Run one command and report its exit status instead of throwing.
@@ -249,6 +302,25 @@ function firstLine(text) {
 /** The message of a thrown value, for a warning that has to name its reason. */
 function reasonOf(error) {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Whether a value is a non-empty string. */
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0
+}
+
+/**
+ * Whether an Ollama model id names a cloud model.
+ *
+ * Ollama's cloud tags are `:cloud` and variants such as `:1017-cloud`; both are
+ * served from the account rather than local weights, so both need the one-token
+ * request that proves the sign-in. A local model is proved by its files alone.
+ *
+ * @param {string} name - the model id.
+ * @returns {boolean} true when the id carries a cloud tag.
+ */
+function isCloudModel(name) {
+  return typeof name === 'string' && (name.endsWith(':cloud') || /:[\w.-]*-cloud$/i.test(name))
 }
 
 /**
@@ -459,7 +531,14 @@ function checkNativeModules(entry, platform, arch, fs, install, { run, nodePath 
  * @param {NodeJS.ProcessEnv} [options.env] - environment for the default runner (default process.env).
  * @param {string} [options.nodeVersion] - Node version to test (default process.versions.node).
  * @param {string} [options.profile] - service profile to compose (default 'flash-service').
- * @param {string} [options.model] - Ollama model to require (default 'deepseek-v4.1-flash:cloud').
+ * @param {string} [options.model] - the model the doctor was asked about, checked as
+ *        the default row (default 'deepseek-v4.1-flash:cloud').
+ * @param {string[]} [options.models] - every allowed model; the default is checked as
+ *        a failure when it is unavailable, the others only warn (default: just `model`).
+ * @param {string} [options.dshHome] - harness home whose installed profiles are checked
+ *        (default `$DSH_HOME`, then `~/.dsh`).
+ * @param {string} [options.home] - home directory a `~` in `dshHome` expands against
+ *        (default the process's; injectable so a check needs no real home).
  * @param {string} [options.dshVersion] - the dsh version the profiles are written for (default '0.2.0-rc.2').
  * @param {string} [options.platform] - platform whose node-pty prebuild to inspect (default process.platform).
  * @param {string} [options.arch] - architecture whose node-pty prebuild to inspect (default process.arch).
@@ -475,7 +554,8 @@ export async function runChecks(options = {}) {
   const env = config.env ?? process.env
   const nodeVersion = config.nodeVersion ?? process.versions.node
   const profile = config.profile ?? 'flash-service'
-  const model = config.model ?? 'deepseek-v4.1-flash:cloud'
+  const model = config.model ?? DEFAULT_MODEL
+  const dshHome = resolveDshHome(config.dshHome ?? env.DSH_HOME, config.home ?? homedir())
   const dshVersion = config.dshVersion ?? DEFAULT_DSH_VERSION
   const dshInstall = `npm i -g @deepseek-ai/dsh@${dshVersion}`
   const run = config.run ?? ((command, args) => defaultRun(command, args, env))
@@ -518,6 +598,11 @@ export async function runChecks(options = {}) {
 
   const checks = []
   const record = (id, title, status, detail, fix) => checks.push({ id, title, status, detail, fix })
+
+  const models = []
+  for (const name of [model, ...(Array.isArray(config.models) ? config.models : [])]) {
+    if (isNonEmptyString(name) && !models.includes(name)) models.push(name)
+  }
 
   if (nodeQualifies(nodeVersion)) {
     record('node', 'Node.js version', 'ok', `Node ${nodeVersion} can run dsh`, '')
@@ -594,6 +679,26 @@ export async function runChecks(options = {}) {
     }
   }
 
+  // The installed profile is a marker check, not a composition check: a profile from
+  // an older release pins one literal model, so no non-default model can run on it.
+  if (profileHonoursModelEnv(dshHome, profile, fs)) {
+    record(
+      'profile-models',
+      'profile model routing',
+      'ok',
+      `the ${profile} profile reads FLASH_ROUTE_MODEL, so every allowed model can run`,
+      '',
+    )
+  } else {
+    record(
+      'profile-models',
+      'profile model routing',
+      'warn',
+      `the installed ${profile} profile does not read FLASH_ROUTE_MODEL, so only the default model can run until it is regenerated (${join(dshHome, 'profiles', profile)})`,
+      'node install.mjs',
+    )
+  }
+
   const daemonUp = await safeProbe(OLLAMA_TAGS_URL)
   if (daemonUp) {
     record('ollama', 'Ollama daemon', 'ok', 'the Ollama daemon answers at 127.0.0.1:11434', '')
@@ -601,37 +706,69 @@ export async function runChecks(options = {}) {
     record('ollama', 'Ollama daemon', 'fail', 'the Ollama daemon is not reachable at 127.0.0.1:11434', 'ollama serve')
   }
 
-  const cloud = model.endsWith(':cloud')
-  const cloudNote = cloud ? '; a cloud model also needs `ollama signin`' : ''
-  if (!daemonUp) {
-    record('model', 'Ollama model', 'warn', `the Ollama daemon is not reachable, so ${model} could not be checked${cloudNote}`, `ollama pull ${model}`)
-  } else {
-    const show = safeRun('ollama', ['show', model])
+  // One row per allowed model: the model the doctor was asked about is the default
+  // and its absence is a failure, while another allowlisted model that cannot run only
+  // warns — the service still works, just not on that choice.
+  for (const [index, name] of models.entries()) {
+    const isDefault = index === 0
+    const id = isDefault ? 'model' : `model:${name}`
+    const title = isDefault ? 'Ollama model' : 'Ollama model (allowed)'
+    const cloud = isCloudModel(name)
+    const cloudNote = cloud ? '; a cloud model also needs `ollama signin`' : ''
+    if (!daemonUp) {
+      record(
+        id,
+        title,
+        'warn',
+        `the Ollama daemon is not reachable, so ${name} could not be checked${cloudNote}`,
+        `ollama pull ${name}`,
+      )
+      continue
+    }
+    const show = safeRun('ollama', ['show', name])
     if (show.status !== 0) {
-      record('model', 'Ollama model', 'fail', `${model} is not available${cloudNote}`, `ollama pull ${model}`)
-    } else if (!cloud) {
-      // A local model only answers after it is loaded, which is slow; its files
-      // being present is all this check needs to establish.
-      record('model', 'Ollama model', 'ok', `${model} is available${cloudNote}`, '')
-    } else {
-      const started = Date.now()
-      const answer = await safeGenerate(model)
-      const elapsed = typeof answer.ms === 'number' ? answer.ms : Date.now() - started
-      const seconds = (elapsed / 1000).toFixed(1)
-      const error = typeof answer.error === 'string' && answer.error.trim() !== '' ? answer.error.trim() : `HTTP ${String(answer.status ?? 0)}`
-      if (answer.ok === true) {
-        record('model', 'Ollama model', 'ok', `${model} is available and answered a one-token request in ${seconds} s`, '')
-      } else if (answer.status === 401 || answer.status === 403 || /unauthori[sz]ed|sign ?in|signin/i.test(error)) {
-        record('model', 'Ollama model', 'fail', `${model} is installed but the cloud refused a request: ${error}`, 'ollama signin')
+      if (isDefault) {
+        record(id, title, 'fail', `${name} is not available${cloudNote}`, `ollama pull ${name}`)
       } else {
         record(
-          'model',
-          'Ollama model',
+          id,
+          title,
           'warn',
-          `${model} is installed, but a one-token request failed: ${error}`,
-          'ollama signin; a slow or busy cloud can also time out',
+          `${name} is on the allowlist but is not available${cloudNote}; a call that chooses it will fail`,
+          `ollama pull ${name}`,
         )
       }
+      continue
+    }
+    if (!cloud) {
+      // A local model only answers after it is loaded, which is slow; its files
+      // being present is all this check needs to establish.
+      record(id, title, 'ok', `${name} is available${cloudNote}`, '')
+      continue
+    }
+    const started = Date.now()
+    const answer = await safeGenerate(name)
+    const elapsed = typeof answer.ms === 'number' ? answer.ms : Date.now() - started
+    const seconds = (elapsed / 1000).toFixed(1)
+    const error = typeof answer.error === 'string' && answer.error.trim() !== '' ? answer.error.trim() : `HTTP ${String(answer.status ?? 0)}`
+    if (answer.ok === true) {
+      record(id, title, 'ok', `${name} is available and answered a one-token request in ${seconds} s`, '')
+    } else if (answer.status === 401 || answer.status === 403 || /unauthori[sz]ed|sign ?in|signin/i.test(error)) {
+      record(
+        id,
+        title,
+        isDefault ? 'fail' : 'warn',
+        `${name} is installed but the cloud refused a request: ${error}`,
+        'ollama signin',
+      )
+    } else {
+      record(
+        id,
+        title,
+        'warn',
+        `${name} is installed, but a one-token request failed: ${error}`,
+        'ollama signin; a slow or busy cloud can also time out',
+      )
     }
   }
 

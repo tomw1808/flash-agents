@@ -388,13 +388,10 @@ function main() {
       `  3. Check the service profile resolves before first use:`,
       `       dsh --profile ${SERVICE_PROFILE} --dump-config > /dev/null`,
       '',
-      'Optional — per-call child model selection on the generic spawn provider',
-      '(not needed by either piece here, whose routing is pinned): add to $DSH_HOME/settings.yaml',
-      '  subagent-model-selection:',
-      '    enabled: true',
-      '    allowedModels:',
-      '      - provider: ollama',
-      '        model: deepseek-v4.1-flash:cloud',
+      'Model choice — the models a caller may ask for per call come from the allowlist:',
+      'route.models in flash.config.json, or the comma-separated FLASH_MODELS environment',
+      'variable. The default route.model is always allowed. The installed profiles honour',
+      'FLASH_ROUTE_MODEL, so no settings.yaml subagent-model-selection entry is needed.',
     ].join('\n') + '\n',
   )
 }

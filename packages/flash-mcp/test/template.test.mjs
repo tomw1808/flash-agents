@@ -63,13 +63,28 @@ test('the shipped profile template renders with the configured route and no left
   const config = loadConfig({ env: {} })
   const rendered = renderTemplate(profileTemplate(), values(), { source: 'flash-service' })
   assert.doesNotMatch(rendered, /\$\{|@\{/)
-  assert.ok(rendered.includes(`model: ${JSON.stringify(config.route.model)}`))
+  assert.ok(rendered.includes(`|| ${JSON.stringify(config.route.model)}`))
   assert.ok(rendered.includes(`maxConcurrentAgents: ${String(config.limits.maxConcurrentAgents)}`))
   assert.ok(rendered.includes(`homeProtectedPaths: ${JSON.stringify(config.guard.homeProtectedPaths)}`))
   // The markers the installer searches for survive rendering verbatim.
   assert.ok(rendered.includes('# >>> flash-service (managed by install.mjs'))
   assert.ok(rendered.includes('# <<< flash-service'))
   assert.ok(rendered.includes('mode: "workspace-write"'))
+})
+
+test('all four model values read FLASH_ROUTE_MODEL with the configured default as fallback', () => {
+  const config = loadConfig({ env: {} })
+  const expression = `!!js process.env.FLASH_ROUTE_MODEL || ${JSON.stringify(config.route.model)}`
+  for (const mode of ['workspace-write', 'read-only']) {
+    const rendered = renderTemplate(profileTemplate(), values({ name: `flash-service-${mode}`, mode }), { source: mode })
+    assert.equal(rendered.split(expression).length - 1, 4, `${mode} should carry the expression four times`)
+    // Two of them are the registered model's id and name, one the composition default,
+    // and one the in-process subagent row.
+    assert.ok(rendered.includes(`- id: ${expression}`))
+    assert.ok(rendered.includes(`name: ${expression}`))
+    assert.ok(rendered.includes(`provider: ${JSON.stringify(config.route.provider)}`))
+    assert.doesNotMatch(rendered, /\$\{|@\{/)
+  }
 })
 
 test('the read-only profile is the same template with one different value', () => {

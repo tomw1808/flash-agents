@@ -11,10 +11,11 @@
  * MCP_SDK_DIR) only so this script needs no dependency of its own.
  *
  * Usage:
- *   node packages/flash-mcp/scripts/verify-live.mjs [--only <stages>] [--root <dir>] [--timeout-ms <n>]
+ *   node packages/flash-mcp/scripts/verify-live.mjs [--only <stages>] [--root <dir>]
+ *     [--models <ids>] [--timeout-ms <n>]
  *
- * Stages: boot, lazy, task, route, hostile, reuse, local, batch, isolation, guard, readonly,
- * fence, escape.
+ * Stages: boot, lazy, task, route, hostile, models, reuse, local, batch, isolation, jobs,
+ * guard, readonly, fence, escape.
  *
  * By default every stage runs against a **throwaway snapshot of this repository**
  * (a copy-on-write copy in the temp area), because these stages ask Flash workers
@@ -34,8 +35,19 @@ import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import { allowedModels, loadConfig } from '../lib/config.js'
+
 const SERVER = resolve(import.meta.dirname, '..', 'lib', 'index.js')
 const REPO = resolve(import.meta.dirname, '..', '..', '..')
+
+/**
+ * The default model and the models a call may choose, resolved exactly as the server
+ * under test resolves them: `flash.config.json` plus `FLASH_SERVICE_MODEL` and
+ * `FLASH_MODELS` from this process's environment, which the server inherits.
+ */
+const CONFIG = loadConfig()
+const DEFAULT_MODEL = CONFIG.route.model
+const ALLOWED_MODELS = allowedModels(CONFIG)
 
 /**
  * Locate the MCP SDK that ships with the installed Harness.
@@ -116,9 +128,18 @@ function prepareWorkspace() {
 
 const workspace = prepareWorkspace()
 const ROOT = workspace.root
-const ONLY = flag('--only', 'boot,lazy,task,route,hostile,reuse,local,batch,isolation,jobs,guard,readonly,fence,escape').split(',')
+const ONLY = flag('--only', 'boot,lazy,task,route,hostile,models,reuse,local,batch,isolation,jobs,guard,readonly,fence,escape').split(',')
 const TIMEOUT_MS = Number(flag('--timeout-ms', '300000'))
 if (!Number.isSafeInteger(TIMEOUT_MS) || TIMEOUT_MS <= 0) throw new Error('--timeout-ms must be a positive integer')
+
+// The `models` stage exercises every allowed model other than the default. `--models`
+// selects a narrower comma-separated set, for a run against a custom allowlist.
+const MODELS_FLAG = flag('--models', undefined)
+const SELECTED_MODELS =
+  MODELS_FLAG === undefined
+    ? ALLOWED_MODELS
+    : MODELS_FLAG.split(',').map((entry) => entry.trim()).filter((entry) => entry.length > 0)
+const NON_DEFAULT_MODELS = [...new Set(SELECTED_MODELS.filter((model) => model !== DEFAULT_MODEL))]
 
 /** Collected verdicts, printed as a table at the end. */
 const results = []
@@ -215,7 +236,14 @@ try {
     const batchSchema = tools.tools[1].inputSchema
     check('boot', 'a fleet is addressed by tasks only', JSON.stringify(batchSchema.required) === '["tasks"]', JSON.stringify(batchSchema.required))
     const properties = [...Object.keys(schema.properties ?? {}), ...Object.keys(batchSchema.properties ?? {})]
-    check('boot', 'no model-selection surface exists', !properties.some((key) => /provider|model|route|effort/i.test(key)), properties.join(', '))
+    check(
+      'boot',
+      'both delegation doors offer exactly the allowed models, default first',
+      JSON.stringify(schema.properties?.model?.enum) === JSON.stringify(ALLOWED_MODELS) &&
+        JSON.stringify(batchSchema.properties?.model?.enum) === JSON.stringify(ALLOWED_MODELS),
+      `task: ${JSON.stringify(schema.properties?.model?.enum)}; batch: ${JSON.stringify(batchSchema.properties?.model?.enum)}`,
+    )
+    check('boot', 'provider and effort are still not caller capabilities', !properties.some((key) => /provider|route|effort/i.test(key)), properties.join(', '))
     check('boot', 'a writing call changes nothing unless it is asked to', JSON.stringify(schema.properties?.apply?.enum) === '["none","auto","discard"]', JSON.stringify(schema.properties?.apply?.enum))
     const applyTool = tools.tools[2]
     check('boot', 'applying work takes a patch id, not a task', JSON.stringify(applyTool.inputSchema.required) === '["patchId"]' && applyTool.inputSchema.properties?.task === undefined, JSON.stringify(applyTool.inputSchema.required))
@@ -277,21 +305,41 @@ try {
 
   if (stage('route')) {
     const { payload } = await flashTask({ task: 'Reply with the single word: ready', cwd: ROOT })
-    check('route', 'worker ran on the pinned route', payload.route?.provider === 'ollama' && payload.route?.model === 'deepseek-v4.1-flash:cloud', JSON.stringify(payload.route))
+    check('route', 'worker ran on the default route', payload.route?.provider === 'ollama' && payload.route?.model === DEFAULT_MODEL, JSON.stringify(payload.route))
     check('route', 'worker provider is the flash contract', payload.provider === 'flash', String(payload.provider))
   }
 
   if (stage('hostile')) {
+    // A model the user did not allow is a refusal before anything is leased or booted,
+    // and the refusal names the allowlist. The `MODEL_NOT_ALLOWED` code is internal: the
+    // MCP error text carries the message, so the model name and "not allowed" are what a
+    // client can actually branch on here.
+    const boots = startedRuntime().length
+    const unlisted = await flashTask({
+      task: 'Report which model you are running as, in one short line.',
+      cwd: ROOT,
+      model: 'deepseek-reasoner',
+    })
+    const refusal = String(unlisted.payload.unparsed ?? JSON.stringify(unlisted.payload))
+    check(
+      'hostile',
+      'an unlisted model is refused before anything starts (MODEL_NOT_ALLOWED)',
+      unlisted.response.isError === true && /not allowed/i.test(refusal) && refusal.includes(DEFAULT_MODEL),
+      refusal.slice(0, 240),
+    )
+    check('hostile', 'the refused model started no runtime', startedRuntime().length === boots, `${String(boots)} → ${String(startedRuntime().length)} boots`)
+
+    // The other route-shaped fields are still not capabilities: without a `model`, the
+    // default runs and nothing the caller sent is echoed back as the route.
     const { payload } = await flashTask({
       task: 'Report which model you are running as, in one short line.',
       cwd: ROOT,
       provider: 'deepseek-official',
-      model: 'deepseek-reasoner',
       reasoningEffort: 'high',
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-reasoner' },
     })
-    check('hostile', 'caller-supplied route fields cannot change the child route', payload.route?.provider === 'ollama' && payload.route?.model === 'deepseek-v4.1-flash:cloud', JSON.stringify(payload.route))
-    check('hostile', 'hostile fields are not echoed into the result', payload.route?.model !== 'deepseek-reasoner')
+    check('hostile', 'caller-supplied route fields cannot change the child route', payload.route?.provider === 'ollama' && payload.route?.model === DEFAULT_MODEL, JSON.stringify(payload.route))
+    check('hostile', 'hostile fields are not echoed into the result', payload.route?.model !== 'deepseek-reasoner' && payload.provider === 'flash')
   }
 
   if (stage('reuse')) {
@@ -306,6 +354,67 @@ try {
     check('reuse', 'the runtime was initialized once', elapsed() === 1, `${String(elapsed())} handshakes`)
     check('reuse', 'every call gets a fresh orchestration session', second.payload.sessionId !== first.payload.sessionId, `${String(first.payload.sessionId)} vs ${String(second.payload.sessionId)}`)
     check('reuse', 'every call gets a fresh worker session', second.payload.childSessionId !== first.payload.childSessionId && second.payload.childSessionId != null, `${String(first.payload.childSessionId)} vs ${String(second.payload.childSessionId)}`)
+  }
+
+  if (stage('models')) {
+    // One process serves one model, and the server puts the chosen model into that
+    // process's environment. Prove the choice per call and per fleet, and that the
+    // result reports the route that actually ran. `apply: "discard"` keeps each probe
+    // in a throwaway copy and stores nothing, so this stage leaves no trace.
+    if (NON_DEFAULT_MODELS.length === 0) {
+      process.stdout.write('  skip  [models] no non-default model is on the allowlist, so there is nothing to choose\n')
+    } else {
+      for (const model of NON_DEFAULT_MODELS) {
+        const probe = await flashTask({
+          task: 'Create a file named flash-model-probe.txt in the working directory containing exactly the line "model probe", then reply done.',
+          cwd: ROOT,
+          acceptance: 'flash-model-probe.txt exists and holds "model probe"',
+          apply: 'discard',
+          model,
+        })
+        check(
+          'models',
+          `the call ran on the chosen model ${model}`,
+          probe.response.isError !== true && probe.payload.status === 'ok' && probe.payload.route?.model === model,
+          JSON.stringify(probe.payload.route ?? probe.payload),
+        )
+        check(
+          'models',
+          `no route-mismatch warning for ${model}`,
+          !(probe.payload.warnings ?? []).some((warning) => String(warning).includes('not the requested')),
+          JSON.stringify(probe.payload.warnings ?? []).slice(0, 240),
+        )
+      }
+
+      const fleetModel = NON_DEFAULT_MODELS[0]
+      const fleet = await flashBatch({
+        tasks: ['Reply with the single word: alpha', 'Reply with the single word: beta'],
+        cwd: ROOT,
+        apply: 'discard',
+        model: fleetModel,
+      })
+      const routes = Array.isArray(fleet.payload.routes) ? fleet.payload.routes : []
+      check(
+        'models',
+        'a fleet runs only on the model chosen for it',
+        fleet.response.isError !== true && routes.length === 1 && routes[0].model === fleetModel,
+        JSON.stringify(routes),
+      )
+
+      // A fleet is one process, so a per-task choice cannot be honoured and is refused.
+      const perTask = await flashBatch({
+        tasks: [{ task: 'Reply with the single word: alpha', model: fleetModel }],
+        cwd: ROOT,
+        apply: 'discard',
+      })
+      const perTaskText = String(perTask.payload.unparsed ?? JSON.stringify(perTask.payload))
+      check(
+        'models',
+        'a per-task model is refused: the fleet chooses one',
+        perTask.response.isError === true && /chosen per fleet/.test(perTaskText) && /top level/.test(perTaskText),
+        perTaskText.slice(0, 240),
+      )
+    }
   }
 
   if (stage('local')) {
@@ -344,7 +453,7 @@ try {
     check('batch', 'every task succeeded', results.length === 3 && results.every((entry) => entry.status === 'ok'), JSON.stringify(results.map((entry) => entry.status)))
     check('batch', 'results come back in task order', JSON.stringify(results.map((entry) => entry.index)) === '[0,1,2]', JSON.stringify(results.map((entry) => entry.index)))
     check('batch', 'the fleet really ran workers in parallel', payload.maxParallel >= 2, `peak concurrency ${String(payload.maxParallel)}`)
-    check('batch', 'every member ran on the pinned route', Array.isArray(payload.routes) && payload.routes.length === 1 && payload.routes[0].provider === 'ollama' && payload.routes[0].model === 'deepseek-v4.1-flash:cloud', JSON.stringify(payload.routes))
+    check('batch', 'every member ran on the default route', Array.isArray(payload.routes) && payload.routes.length === 1 && payload.routes[0].provider === 'ollama' && payload.routes[0].model === DEFAULT_MODEL, JSON.stringify(payload.routes))
     check('batch', 'the workflow run is identified', typeof payload.runId === 'string' && payload.runId.length > 0, JSON.stringify(payload.runId))
     check('batch', 'every result names the worker session that produced it', results.every((entry) => typeof entry.childSessionId === 'string' && entry.childSessionId.length > 0), JSON.stringify(results.map((entry) => entry.childSessionId)))
     check('batch', 'the fleet ran in one disposable copy', payload.isolation?.mode === 'copy' && typeof payload.isolation?.slot === 'number', JSON.stringify(payload.isolation))
