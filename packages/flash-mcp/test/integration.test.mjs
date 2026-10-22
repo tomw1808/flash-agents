@@ -43,6 +43,10 @@ async function connect({ env = {}, root } = {}) {
       provider: 'ollama',
       model: 'deepseek-v4.1-flash:cloud',
       taskTimeoutMs: 10_000,
+      // The retry of an early, empty first attempt waits ten seconds in production; the
+      // NO-DELEGATE scenario below is exactly such an attempt, and this harness gives a
+      // tools/call two seconds. The wait is injectable for this reason.
+      earlyRetryDelayMs: 0,
       env: { ...process.env, FLASH_DSH_BIN: FAKE_DSH, ...env },
     },
     input,

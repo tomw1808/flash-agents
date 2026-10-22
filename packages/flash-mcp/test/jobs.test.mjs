@@ -9,6 +9,9 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { createToolCaller } from '../lib/index.js'
 import { ENDED_RETENTION_MS, JOB_TOOLS, JobRegistry } from '../lib/jobs.js'
@@ -65,7 +68,17 @@ class FakeService {
 
   #park(kind, args, ctx) {
     const gate = deferred()
-    this.calls.push({ kind, args, signal: ctx.signal, progress: ctx.progress, progressToken: ctx.progressToken, gate })
+    this.calls.push({
+      kind,
+      args,
+      signal: ctx.signal,
+      progress: ctx.progress,
+      progressToken: ctx.progressToken,
+      // The rest of the options object, so a test can pin what the job door passes on.
+      background: ctx.background,
+      jobId: ctx.jobId,
+      gate,
+    })
     ctx.signal?.addEventListener('abort', () => gate.reject(new Error(`${kind} was cancelled by the client`)), {
       once: true,
     })
@@ -130,6 +143,11 @@ test('background returns a job id at once and the job ends ok with the exact res
   assert.equal(service.calls.length, 1)
   assert.deepEqual(service.calls[0].args, { task: 'write the thing', cwd: '/tmp' })
   assert.equal(service.calls[0].progressToken, job.jobId)
+  // The call knows it is a background job, and which job it is: the first is what keeps a
+  // queued wait from being reported as holding the caller's turn, the second is what a
+  // stored patch records.
+  assert.equal(service.calls[0].background, true)
+  assert.equal(service.calls[0].jobId, job.jobId)
   assert.equal(registry.status(job.jobId).state, 'running')
 
   service.calls[0].gate.resolve({ status: 'ok', message: 'done', change: { filesChanged: ['a.js'] } })
@@ -704,4 +722,63 @@ test('a tool that throws synchronously still answers with an error result', asyn
     assert.equal(answer.isError, true)
     assert.match(answer.content[0].text, new RegExp(`^${name} failed: `))
   }
+})
+
+test('a running job’s status shows what its call is running and what keeps failing', async () => {
+  const { service, registry, call } = harness()
+  const jobId = await start(call, 'flash_task', { task: 'build the vendored openssl' })
+
+  const since = '2026-01-02T03:04:05.000Z'
+  service.calls[0].progress({
+    progress: 61,
+    total: 300,
+    message: 'flash_task running 1m1s; tool bash · last event 2s ago; running "make -j8" for 1m1s',
+    detail: {
+      current: [{ tool: 'bash', command: 'make -j8 build_libs', since, runningMs: 61_000 }],
+      warnings: ['"cargo build" failed 3 times in this call (last: exit code 101, 40s ago); …'],
+    },
+  })
+
+  const status = payloadOf(await call('flash_status', { jobId }, {}))
+  assert.equal(status.state, 'running')
+  assert.deepEqual(status.current, [{ tool: 'bash', command: 'make -j8 build_libs', since, runningMs: 61_000 }])
+  assert.deepEqual(status.warnings, ['"cargo build" failed 3 times in this call (last: exit code 101, 40s ago); …'])
+  // The message itself is unchanged, and the structured detail stays out of `lastProgress`.
+  assert.match(status.lastProgress.message, /running "make -j8" for 1m1s/)
+  assert.equal(status.lastProgress.detail, undefined)
+
+  // An ended job shows neither: what it was running an hour ago is not its status.
+  service.calls[0].gate.resolve({ status: 'ok', message: 'done' })
+  const job = registry.get(jobId)
+  await job.settled
+  const ended = payloadOf(await call('flash_status', { jobId }, {}))
+  assert.equal(ended.state, 'ok')
+  assert.equal('current' in ended, false)
+  assert.equal('warnings' in ended, false)
+})
+
+test('an empty detail leaves the status exactly as it was', async () => {
+  const { service, call } = harness()
+  const jobId = await start(call, 'flash_task', { task: 'quiet' })
+  service.calls[0].progress({ message: 'quiet', detail: { current: [], warnings: [] } })
+  const status = payloadOf(await call('flash_status', { jobId }, {}))
+  assert.equal('current' in status, false)
+  assert.equal('warnings' in status, false)
+  assert.deepEqual(Object.keys(status.lastProgress).sort(), ['at', 'message'])
+})
+
+test('a job label reads the brief its taskFile names', async () => {
+  // A realpath root: a temp path on macOS is a symlink, and the service's own fence
+  // resolves the root once and compares real paths.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-job-label-')))
+  writeFileSync(join(root, 'brief.txt'), '\n#  Port the parser  \n\nbody\n')
+  const service = new FakeService()
+  // A real service names the root every taskFile resolves against; the label reads it the
+  // same way, so the job says which brief it is running instead of "(untitled task)".
+  service.root = root
+  const call = createToolCaller({ service, jobs: new JobRegistry({ log: () => {} }), log: () => {} })
+  const started = payloadOf(await call('flash_task', { taskFile: 'brief.txt', cwd: root, background: true }, {}))
+  // The job and the patch a background call stores name the brief identically: the heading's
+  // `#` markers are stripped by the helper both read.
+  assert.equal(started.label, 'Port the parser')
 })

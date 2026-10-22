@@ -50,15 +50,18 @@
 import { execFileSync, spawn } from 'node:child_process'
 import {
   chmodSync,
+  closeSync,
   constants,
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -66,6 +69,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
+import { rm as removeTree } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
@@ -76,6 +80,18 @@ import { homedir, tmpdir } from 'node:os'
  * read any `.patch` on disk.
  */
 const PATCH_ID = /^flash-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+/**
+ * A unique prefix of a patch id: at least eight hex digits, with or without the `flash-`
+ * prefix, and with the dashes a full uuid carries allowed after the eighth digit — reports
+ * and people quote `1a2b3c4d` or `flash-1a2b3c4d-5e6f`, never the whole id. The pattern is
+ * still checked before anything is read, so a prefix cannot name a path either; the id is
+ * only used to build one after it has been resolved to a full, validated id.
+ */
+const PATCH_ID_PREFIX = /^(?:flash-)?([0-9a-f]{8}[0-9a-f-]*)$/
+
+/** How many full ids an ambiguous-prefix error names before it says how many there were. */
+const PATCH_PREFIX_NAMES = 5
 
 /** The git mode of a submodule pointer (a gitlink): it names a commit, not a blob. */
 const GITLINK_MODE = '160000'
@@ -128,8 +144,27 @@ export const DEFAULT_COPY_EXCLUDE = Object.freeze(['.env', '.env.*', '.mcp.json'
  */
 const FORBIDDEN_SLOT_ENV = new Set(['TMPDIR', 'TMP', 'TEMP', 'HOME', 'DSH_HOME', 'FLASH_ROUTE_MODEL'])
 
+/**
+ * Environment names that decide how a program is found or how the runtime loads code, for
+ * every kind of `slotEnv` entry. A `value:` entry reaches the dsh runtime itself, which
+ * runs outside the worker's sandbox: a `NODE_OPTIONS=--require …` there would run a
+ * worker-supplied file inside the runtime, and a `PATH` or `LD_PRELOAD` would replace the
+ * programs it starts. Names beginning with `LD_` or `DYLD_` are covered by their prefix
+ * (see `mergeSlotEnv`), so only the fixed Windows and Node names are listed here.
+ */
+const LOADER_SLOT_ENV = new Set(['PATH', 'PATHEXT', 'NODE_OPTIONS', 'NODE_PATH'])
+
 /** A `slotEnv` value pointing at one per-slot directory: `home:<name>` or `cache:<name>`. */
 const SLOT_ENV_VALUE = /^(home|cache):(.+)$/
+
+/** The prefix of a `slotEnv` value that is handed to the worker verbatim. */
+const SLOT_ENV_TEXT = 'value:'
+
+/**
+ * How long one `value:` entry may be. 32,767 characters is the Windows limit for a single
+ * environment variable; a longer value would be truncated there, or refused by the system.
+ */
+const SLOT_ENV_TEXT_MAX = 32767
 
 /**
  * A `slotEnv` value reserving a range of TCP ports for the slot: `port:<base>` or
@@ -193,6 +228,29 @@ const UNCOMMITTED_FILES = 100
 const SCOPE_MARKER = '.flash-scope'
 
 /**
+ * The file inside a copy's own git directory that names the task the worker is doing.
+ *
+ * It exists so a patch salvaged after a crash can say which task made it: the caller had a
+ * fifteen-file patch and had to guess its task from its files. Git never reports a file
+ * under `.git`, so it never appears in the diff, and it lives exactly as long as the tree.
+ */
+const TASK_FILE = 'flash-task.json'
+
+/** How much of a task's label, file path and ids a record keeps. */
+const TASK_LABEL_MAX = 200
+const TASK_FILE_PATH_MAX = 1024
+const TASK_ID_MAX = 100
+
+/** The largest `flash-task.json` a salvage will read; a bigger one is somebody else's file. */
+const TASK_FILE_MAX_BYTES = 16 * 1024
+
+/** How much of a worker's final report a patch record keeps. */
+const FINAL_MESSAGE_MAX = 8000
+
+/** The task kinds a call may name. */
+const TASK_KINDS = new Set(['flash_task', 'flash_batch'])
+
+/**
  * Private ref that holds a slot's base commit. The base is written with `git commit-tree`, so no branch
  * moves: a worker that commits and pushes from the copy (the only durable route out of a nested
  * repository) must not carry a "flash base" commit into the caller's history.
@@ -251,6 +309,20 @@ function scopeIsSafe(scope) {
 }
 
 /**
+ * Whether a record's optional `scope` may be joined onto a root.
+ *
+ * A whole-root record has no scope at all (an old record may even carry `undefined`), and
+ * a scoped one must be a safe relative path. Used where a record is only being *counted* —
+ * prefix resolution — so an unusable one is skipped instead of throwing.
+ *
+ * @param {unknown} scope - the record's scope.
+ * @returns {boolean} true when the record may be applied by this root.
+ */
+function scopeIsSafeOrEmpty(scope) {
+  return scope === undefined || scope === '' || scopeIsSafe(scope)
+}
+
+/**
  * The scope a slot was prepared with, read back from its marker; `''` when there is none.
  * @param {string} slotDir - a slot tree.
  * @returns {string} the recorded scope.
@@ -262,6 +334,125 @@ function readScopeMarker(slotDir) {
     return scopeIsSafe(scope) ? scope : ''
   } catch {
     return ''
+  }
+}
+
+/**
+ * Normalize a caller's `task` description into the shape a patch record keeps, or drop it.
+ *
+ * The value arrives from a tool call, so it is bounded and reduced to the keys the record
+ * knows: an unknown key would otherwise ride along into a file a later version has to
+ * interpret, and an unbounded label would make a record as large as the worker's report.
+ * A task without a non-empty label says nothing, so it is ignored rather than stored empty.
+ * The same rules run when a dead tree's `flash-task.json` is read, because a worker could
+ * have written that file.
+ *
+ * @param {unknown} task - the candidate `{kind, label, sessionId?, jobId?, taskFile?}`.
+ * @returns {{kind?: string, label: string, sessionId?: string, jobId?: string,
+ *   taskFile?: string} | undefined} the bounded value, or undefined when it names no task.
+ */
+function normalizeTask(task) {
+  if (task === null || typeof task !== 'object' || Array.isArray(task)) return undefined
+  const label = typeof task.label === 'string' ? task.label.trim().slice(0, TASK_LABEL_MAX) : ''
+  if (label === '') return undefined
+  const normalized = { label }
+  if (TASK_KINDS.has(task.kind)) normalized.kind = task.kind
+  for (const [key, max] of [
+    ['sessionId', TASK_ID_MAX],
+    ['jobId', TASK_ID_MAX],
+    ['taskFile', TASK_FILE_PATH_MAX],
+  ]) {
+    const value = typeof task[key] === 'string' ? task[key].trim().slice(0, max) : ''
+    if (value !== '') normalized[key] = value
+  }
+  return normalized
+}
+
+/**
+ * Where a prepared copy records its task, inside the copy's own git directory.
+ *
+ * `.git` is the one directory every git command treats as its own state and never reports,
+ * so the file cannot reach a patch, and `prepare` empties the tree between calls, so it
+ * cannot outlive the tree it describes. `detachGitLink` has already replaced a linked
+ * worktree's `.git` FILE with a directory by the time this is written, which is why a plain
+ * join is safe here.
+ *
+ * @param {string} repoDir - the copy's repository.
+ * @returns {string} the task file path for that copy.
+ */
+function taskFileIn(repoDir) {
+  return join(repoDir, '.git', TASK_FILE)
+}
+
+/**
+ * Read the task one dead tree recorded, tolerating anything a worker may have left there.
+ *
+ * A missing file is the ordinary case; an oversized one, unreadable one or malformed JSON
+ * is ignored with at most one log line, and the value is re-validated because a worker could
+ * have written it. Salvage must never fail because of this file: the tree's diff is what the
+ * caller needs.
+ *
+ * The path is worker-writable, so it is not trusted to be a file at all. A FIFO there used
+ * to pass the size check and block the sweep forever in `readFileSync`, and a symlink could
+ * point `readFileSync` at any file on disk; a sweep is synchronous and also runs inside
+ * `lease`, so either one wedged the server. Only a regular file is opened (`lstatSync`, plus
+ * `O_NOFOLLOW` where the platform has it, so a symlink swapped in between is refused), and
+ * the read is bounded at `TASK_FILE_MAX_BYTES + 1` bytes through a descriptor: a file that
+ * grew between the stat and the read still cannot be read unbounded.
+ *
+ * @param {string} repoDir - the dead tree's repository.
+ * @param {(message: string) => void} log - where to name an ignored file.
+ * @returns {object | undefined} the bounded task, or undefined when there is none.
+ */
+function readSalvagedTask(repoDir, log) {
+  const file = taskFileIn(repoDir)
+  let info
+  try {
+    // lstat, not stat: a symlink is refused rather than followed to somebody else's file.
+    info = lstatSync(file)
+  } catch (error) {
+    // The common case is a tree prepared before this file existed, or an empty retired tree.
+    if (error?.code !== 'ENOENT') log(`ignoring ${file}: it could not be read (${messageOf(error)})`)
+    return undefined
+  }
+  if (!info.isFile()) {
+    log(`ignoring ${file}: it is not a regular file, so it is not a task this service wrote`)
+    return undefined
+  }
+  if (info.size > TASK_FILE_MAX_BYTES) {
+    log(`ignoring ${file}: it is ${String(info.size)} bytes, over the ${String(TASK_FILE_MAX_BYTES)}-byte limit for a task file`)
+    return undefined
+  }
+  let raw
+  let fd
+  try {
+    // `O_NOFOLLOW` is not defined on Windows; `0` there leaves the lstat above as the guard.
+    fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    const buffer = Buffer.alloc(TASK_FILE_MAX_BYTES + 1)
+    let length = 0
+    while (length < buffer.length) {
+      const read = readSync(fd, buffer, length, buffer.length - length, length)
+      if (read === 0) break
+      length += read
+    }
+    if (length > TASK_FILE_MAX_BYTES) {
+      log(`ignoring ${file}: it grew past the ${String(TASK_FILE_MAX_BYTES)}-byte limit while it was read`)
+      return undefined
+    }
+    raw = buffer.toString('utf8', 0, length)
+  } catch (error) {
+    log(`ignoring ${file}: it could not be read (${messageOf(error)})`)
+    return undefined
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+  try {
+    const task = normalizeTask(JSON.parse(raw))
+    if (task === undefined) log(`ignoring ${file}: it does not name a task with a label`)
+    return task
+  } catch (error) {
+    log(`ignoring ${file}: it is not valid JSON (${messageOf(error)})`)
+    return undefined
   }
 }
 
@@ -282,8 +473,52 @@ export const PATCH_RETENTION_DAYS = 14
  * How often a running pool looks for dead owners and trims its state. Startup alone was
  * not enough: with two servers on one root, the survivor never swept the one that died,
  * and its 35 GB of trees waited for some later server to start.
+ *
+ * The same interval spaces the salvage attempts of a kept owner: `prepare` sweeps before
+ * every call, so without it three calls in a row would spend all `SALVAGE_MAX_ATTEMPTS`
+ * within seconds and delete work a later, successful attempt could have read.
  */
-const SWEEP_INTERVAL_MS = 10 * 60 * 1000
+export const SWEEP_INTERVAL_MS = 10 * 60 * 1000
+
+/**
+ * The prefix of a dead owner's directory while its tree is being deleted.
+ *
+ * The sweep used to `rmSync` the directory whole, and on NTFS a slot holding a multi-
+ * gigabyte `cargo target` takes minutes to delete: the client's 30 s connect timeout
+ * expired, the server was killed mid-sweep, and the next start repeated the work. A
+ * rename to `trash-<pid>-<epochMs>` is instant on the same filesystem and takes the tree
+ * out of every future sweep's path at once; the deletion itself then runs in the
+ * background. The name keeps the dead owner's pid, so a log line still says whose tree
+ * it is, and the timestamp keeps a retried removal from colliding with an earlier one.
+ */
+const TRASH_PREFIX = 'trash-'
+
+/**
+ * How often the background removal retries a tree something still holds open. Windows
+ * answers EBUSY/EPERM for a file a dying process has not released yet; `fs.promises.rm`
+ * retries exactly that class of error with a short backoff.
+ */
+const TRASH_RETRIES = 3
+
+/**
+ * The file a dead owner keeps while one of its slots cannot be salvaged.
+ *
+ * It holds `{attempts, salvaged}`: how many sweeps have failed, and which slots already
+ * produced a patch. The second fact is what keeps a retry from storing the same tree
+ * twice — a salvage stages the tree with `git add -A`, so a second pass would see the
+ * same staged change and write a second, identical patch.
+ */
+const SALVAGE_ATTEMPTS_FILE = 'salvage-attempts'
+
+/**
+ * How many sweeps try to salvage a dead owner before its trees are removed anyway.
+ *
+ * A salvage can fail for a transient reason (a dying process still holding a git file,
+ * a lock on Windows). One failure must not delete the only copy of the work, but a tree
+ * that has resisted three passes is not coming back, and keeping it forever is the disk
+ * leak the sweep exists to prevent.
+ */
+const SALVAGE_MAX_ATTEMPTS = 3
 
 /** One day in milliseconds, the unit of the retention window. */
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -378,14 +613,22 @@ export function canonicalTmpdir() {
  * path to a different worker, whose patch could carry their work.
  *
  * The pid level is kept as its own directory so a dead process's copies can be swept as
- * a unit, and the nonce lives below it.
+ * a unit, and the nonce lives below it: `<base>/<digest>/<pid>/<instance>`, with the
+ * server's slots in `<stateDir>/slots/<name>`.
+ *
+ * `baseDir`, `pid` and `instance` exist so a test can name a place under an injected base
+ * without writing into the real temp state base, and so a test can lay out a dead owner
+ * exactly the way this function lays out a live one.
  *
  * @param {string} root - the canonical service root.
+ * @param {object} [options] - where the layout sits and which owner it names.
+ * @param {string} [options.baseDir] - the state base directory, usually `$TMPDIR/flash-mcp`.
+ * @param {number} [options.pid] - the owning process id; this process by default.
+ * @param {string} [options.instance] - the per-pool nonce; a random 8-hex one by default.
  * @returns {string} the state directory for this process, root, and pool.
  */
-function defaultStateDir(root) {
-  const instance = randomUUID().slice(0, 8)
-  return join(stateBaseDir(), rootDigest(root), String(process.pid), instance)
+export function defaultStateDir(root, { baseDir = stateBaseDir(), pid = process.pid, instance = randomUUID().slice(0, 8) } = {}) {
+  return join(baseDir, rootDigest(root), String(pid), instance)
 }
 
 /**
@@ -435,6 +678,10 @@ function processAlive(pid) {
 
 /**
  * The numeric per-pid owner directories of one root digest.
+ *
+ * Only numeric names count: a `patches/` directory, a lock file or a `trash-*` directory
+ * left by an interrupted removal is never mistaken for a process that owns trees.
+ *
  * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
  * @returns {string[]} the owner directory names, in readdir order.
  */
@@ -530,6 +777,26 @@ function digestDirs(baseDir) {
 }
 
 /**
+ * The trash directories sitting in one digest directory.
+ *
+ * A `trash-*` name is what a removal leaves behind between its `renameSync` and the end
+ * of the background `rm` — or forever, when the process died in between. Only the default
+ * layout has them: a configured state directory has no dead-owner sweep.
+ *
+ * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
+ * @returns {string[]} the `trash-*` names, in readdir order.
+ */
+function trashDirsIn(digestDir) {
+  try {
+    return readdirSync(digestDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith(TRASH_PREFIX))
+      .map((entry) => entry.name)
+  } catch {
+    return []
+  }
+}
+
+/**
  * Count and size the slot trees and patches of one root digest.
  *
  * The legacy temp store is read from `<digestDir>/patches`. A default pool keeps its
@@ -542,24 +809,29 @@ function digestDirs(baseDir) {
  * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
  * @param {string[]} [extraPatchDirs] - further patch directories that belong to this
  *   digest, such as the durable store.
- * @returns {{slotTrees: number, slotBytes: number, patches: number, patchBytes: number}} the facts.
+ * @returns {{slotTrees: number, slotBytes: number, trashDirs: number, trashBytes: number,
+ *   patches: number, patchBytes: number}} the facts.
  */
 function digestStats(digestDir, extraPatchDirs = []) {
   let slotTrees = 0
   let slotBytes = 0
+  // `deadSlotsIn` knows both layouts: `<pid>/<instance>/slots/<name>` from a current
+  // server and `<pid>/slots/<name>` from an older one. Counting only the older one made
+  // `clean` report zero slot trees for every root a current server had written.
   for (const pid of ownerDirs(digestDir)) {
-    const slotsDir = join(digestDir, pid, 'slots')
-    let slots
-    try {
-      slots = readdirSync(slotsDir, { withFileTypes: true })
-    } catch {
-      continue
-    }
-    for (const slot of slots) {
-      if (!slot.isDirectory()) continue
+    for (const slot of deadSlotsIn(join(digestDir, pid))) {
       slotTrees += 1
-      slotBytes += directorySize(join(slotsDir, slot.name))
+      slotBytes += directorySize(slot.dir)
     }
+  }
+  // A trash directory is a dead tree whose deletion has not finished. It is disk in use,
+  // so it is counted with the slot trees' bytes — but it is not a slot (no slot-tree
+  // count) and it is not an owner, so nothing here offers it to salvage.
+  let trashDirs = 0
+  let trashBytes = 0
+  for (const name of trashDirsIn(digestDir)) {
+    trashDirs += 1
+    trashBytes += directorySize(join(digestDir, name))
   }
   let patches = 0
   let patchBytes = 0
@@ -586,7 +858,7 @@ function digestStats(digestDir, extraPatchDirs = []) {
       // No `patches/` directory: nothing stored for this root.
     }
   }
-  return { slotTrees, slotBytes, patches, patchBytes }
+  return { slotTrees, slotBytes: slotBytes + trashBytes, trashDirs, trashBytes, patches, patchBytes }
 }
 
 /**
@@ -684,7 +956,9 @@ export function prunePatches(patchDir, { retentionDays = PATCH_RETENTION_DAYS, n
  * Remove the dead owners' directories of one digest, without salvage.
  *
  * Used by `clean --all` for a foreign root: salvage needs the root string, which the
- * digest does not carry, so the trees go and the patches beside them stay.
+ * digest does not carry, so the trees go and the patches beside them stay. A foreign
+ * digest's `trash-*` directories are not touched here: `clean` removes those for this
+ * root only, and `ownerDirs` never mistakes one for an owner.
  *
  * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
  * @param {(message: string) => void} [log] - progress log.
@@ -702,6 +976,411 @@ function removeDeadOwnerDirs(digestDir, log = () => {}) {
     }
   }
   return removed
+}
+
+/**
+ * Start removing one tree without blocking the caller.
+ *
+ * `fs.promises.rm` walks the tree on the libuv thread pool, so a multi-gigabyte
+ * `cargo target` no longer freezes the event loop: protocol requests are answered while
+ * the deletion runs. Its outcome is logged, never thrown — the next sweep retries a tree
+ * that would not go away.
+ *
+ * @param {string} dir - the tree to remove.
+ * @param {(message: string) => void} log - where to report the outcome.
+ * @returns {Promise<void>} resolves when the removal settled, whatever its outcome.
+ */
+function removeInBackground(dir, log) {
+  return removeTree(dir, { recursive: true, force: true, maxRetries: TRASH_RETRIES })
+    .then(() => log(`removed ${dir}`))
+    .catch((error) => log(`could not remove ${dir}: ${messageOf(error)}; the next sweep retries it`))
+}
+
+/**
+ * The trash directories this process already has a removal in flight for.
+ *
+ * A sweep runs before every `prepare` and on the housekeeping timer, and each one adopts
+ * every `trash-*` directory it sees. Without this set, a tree that takes a while to delete
+ * was renamed, then handed to a second `fs.promises.rm` on every pass — two or more
+ * deletions racing over the same tree, and the same work restarted every ten minutes.
+ * The entry is removed when the removal settles, whatever its outcome.
+ *
+ * @type {Set<string>}
+ */
+const trashInFlight = new Set()
+
+/**
+ * Start the background removal of one `trash-*` tree, at most once per directory.
+ *
+ * `removeInBackground` never rejects, so the entry is cleared in `finally` whether the
+ * tree went away or will be retried by a later sweep.
+ *
+ * @param {string} dir - the trash directory.
+ * @param {(message: string) => void} log - where to report the outcome.
+ * @returns {boolean} whether this call started a removal.
+ */
+function startTrashRemoval(dir, log) {
+  const key = resolve(dir)
+  if (trashInFlight.has(key)) return false
+  trashInFlight.add(key)
+  void removeInBackground(dir, log).finally(() => trashInFlight.delete(key))
+  return true
+}
+
+/**
+ * Start the background removal of trash an earlier, interrupted removal left behind.
+ *
+ * A process killed between the rename and the end of the `rm` leaves a `trash-*` directory
+ * that no future sweep would ever look at again: it is not an owner (not numeric) and not
+ * salvaged (it was already accounted for). Every sweep therefore adopts them, which is
+ * what makes the rename-then-delete protocol recover from its own interruption. A tree
+ * this process is already deleting is skipped (see `trashInFlight`).
+ *
+ * @param {string} digestDir - this root's digest directory.
+ * @param {(message: string) => void} [log] - progress log.
+ * @returns {void}
+ */
+function removeLeftoverTrash(digestDir, log = () => {}) {
+  for (const name of trashDirsIn(digestDir)) {
+    const dir = join(digestDir, name)
+    if (!startTrashRemoval(dir, log)) continue
+    log(`removing ${dir}, left behind by an earlier removal that did not finish`)
+  }
+}
+
+/**
+ * Remove trash synchronously, for the `clean` command.
+ *
+ * `clean` is an explicit operator command with no protocol connection to keep answering,
+ * and it promises the disk back before the process exits: a background removal would be
+ * abandoned by `process.exit`. A server's sweep never does this.
+ *
+ * @param {string} digestDir - this root's digest directory.
+ * @param {(message: string) => void} [log] - progress log.
+ * @returns {number} how many trash directories were removed.
+ */
+function removeTrashSync(digestDir, log = () => {}) {
+  let removed = 0
+  for (const name of trashDirsIn(digestDir)) {
+    const dir = join(digestDir, name)
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: TRASH_RETRIES })
+      removed += 1
+      log(`removed ${dir}, left behind by an earlier removal that did not finish`)
+    } catch (error) {
+      log(`could not remove ${dir}: ${messageOf(error)}`)
+    }
+  }
+  return removed
+}
+
+/**
+ * Take one dead owner out of the accounting, deleting its tree in the background or now.
+ *
+ * The rename is the fast, atomic step: after it, the owner is gone from `ownerDirs`, so no
+ * later sweep salvages or counts it again. The deletion follows in the background — unless
+ * `removal` is `'sync'`, which `clean` asks for because it exits the process right after
+ * the report and a background removal would be abandoned half done. When the rename itself
+ * fails — a file still locked on Windows, a directory held open — the tree is removed in
+ * place as before, with a log line saying why that path is slower.
+ *
+ * @param {string} ownerDir - the dead owner's per-pid directory.
+ * @param {object} options - where its trash belongs and how to report.
+ * @param {string} options.parent - the digest directory that holds the owner.
+ * @param {number} options.pid - the dead owner's pid, kept in the trash name.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {'sync' | 'background'} [options.removal] - how the renamed trash is deleted.
+ * @returns {boolean} whether the owner was taken out of the accounting.
+ */
+function removeDeadOwnerDir(ownerDir, { parent, pid, log, removal = 'background' }) {
+  const trashDir = join(parent, `${TRASH_PREFIX}${String(pid)}-${String(Date.now())}`)
+  try {
+    renameSync(ownerDir, trashDir)
+  } catch (error) {
+    log(
+      `could not rename dead owner ${String(pid)} out of the way (${messageOf(error)}); ` +
+        'removing it in place, which can block the server while it runs',
+    )
+    try {
+      rmSync(ownerDir, { recursive: true, force: true })
+      return true
+    } catch (rmError) {
+      // A tree that will not go away is retried by the next sweep; refusing to start over
+      // it would be the wedge this function exists to prevent.
+      log(`could not remove dead owner ${String(pid)}: ${messageOf(rmError)}`)
+      return false
+    }
+  }
+  if (removal === 'sync') {
+    log(`renamed dead owner ${String(pid)} to ${trashDir}; removing it now`)
+    try {
+      rmSync(trashDir, { recursive: true, force: true, maxRetries: TRASH_RETRIES })
+    } catch (error) {
+      log(`could not remove ${trashDir}: ${messageOf(error)}`)
+      return false
+    }
+    return true
+  }
+  log(`renamed dead owner ${String(pid)} to ${trashDir}; removing it in the background`)
+  startTrashRemoval(trashDir, log)
+  return true
+}
+
+/**
+ * Whether a recorded slot label names one slot of one owner unambiguously.
+ *
+ * The attempts file is written by this service but sits in a directory a crash can leave
+ * half-written, so a label is only trusted when it has the shape `deadSlotsIn` produces:
+ * `slots/<name>` or `<instance>/slots/<name>`, with no empty, `.` or `..` segment and no
+ * path separator the label does not define.
+ *
+ * @param {unknown} label - the recorded value.
+ * @returns {boolean} true when the label names one slot.
+ */
+function slotLabelIsSafe(label) {
+  if (typeof label !== 'string' || label === '' || label.includes('\0') || label.includes('\\')) return false
+  const parts = label.split('/')
+  if (parts.length !== 2 && parts.length !== 3) return false
+  if (parts[parts.length - 2] !== 'slots') return false
+  return parts.every((part) => part !== '' && part !== '.' && part !== '..')
+}
+
+/**
+ * Whether a kept owner's next salvage attempt is due.
+ *
+ * `prepare` runs a sweep before every call, so three calls in a row used to spend all
+ * `SALVAGE_MAX_ATTEMPTS` within seconds and delete work a later, successful attempt could
+ * have read. A failed attempt now spaces the next one by `SWEEP_INTERVAL_MS`: before that
+ * the owner is skipped entirely — no git work, no attempt counted.
+ *
+ * @param {{attempts: number, lastAttemptAt: number}} prior - the owner's record.
+ * @param {number} now - the current epoch milliseconds.
+ * @returns {boolean} true when this sweep may try the owner.
+ */
+function salvageAttemptDue(prior, now) {
+  if (prior.attempts <= 0) return true
+  if (!Number.isFinite(prior.lastAttemptAt) || prior.lastAttemptAt <= 0) return true
+  return now - prior.lastAttemptAt >= SWEEP_INTERVAL_MS
+}
+
+/**
+ * Read the record of failed salvage attempts for one dead owner.
+ *
+ * A missing file is the ordinary case (the first attempt); a malformed one is treated the
+ * same way, because a file a crash left half-written must not stop the sweep. An `attempts`
+ * count or `lastAttemptAt` that is not a positive number is ignored, and a `salvaged` entry
+ * that does not name one slot (`slotLabelIsSafe`) is dropped rather than trusted as a path.
+ *
+ * @param {string} ownerDir - the dead owner's per-pid directory.
+ * @returns {{attempts: number, salvaged: string[], lastAttemptAt: number}} what earlier
+ *   sweeps recorded; `lastAttemptAt` is 0 when no failed attempt was ever recorded.
+ */
+function readSalvageAttempts(ownerDir) {
+  let parsed
+  try {
+    parsed = JSON.parse(readFileSync(join(ownerDir, SALVAGE_ATTEMPTS_FILE), 'utf8'))
+  } catch {
+    return { attempts: 0, salvaged: [], lastAttemptAt: 0 }
+  }
+  const attempts = Number.isSafeInteger(parsed?.attempts) && parsed.attempts > 0 ? parsed.attempts : 0
+  const lastAttemptAt = Number.isFinite(parsed?.lastAttemptAt) && parsed.lastAttemptAt > 0 ? parsed.lastAttemptAt : 0
+  const salvaged = Array.isArray(parsed?.salvaged) ? parsed.salvaged.filter(slotLabelIsSafe) : []
+  return { attempts, salvaged, lastAttemptAt }
+}
+
+/**
+ * Record a dead owner's failed attempt, when it was last tried, and the slots it already
+ * gave up its work for.
+ *
+ * A failure to write the file must not fail the sweep: the owner is then simply retried
+ * with the count it had before, which is no worse than keeping it forever.
+ *
+ * @param {string} ownerDir - the dead owner's per-pid directory.
+ * @param {{attempts: number, salvaged: string[], lastAttemptAt: number}} record - what to persist.
+ * @param {(message: string) => void} log - where to report a write that failed.
+ * @returns {void}
+ */
+function writeSalvageAttempts(ownerDir, record, log) {
+  try {
+    writeFileSync(join(ownerDir, SALVAGE_ATTEMPTS_FILE), `${JSON.stringify(record)}\n`)
+  } catch (error) {
+    log(`could not record the salvage attempt for ${ownerDir}: ${messageOf(error)}`)
+  }
+}
+
+/**
+ * Every slot tree of a dead owner, with a label that names it across its instance.
+ *
+ * A server's default state directory is `<base>/<digest>/<pid>/<instance>/`, so its slots
+ * are `<pid>/<instance>/slots/<name>`. The sweep used to look at `<pid>/slots/<name>` — one
+ * directory too high — so it never found a current server's slots, judged the dead owner
+ * clean, and removed the whole directory with the uncommitted work still inside it.
+ *
+ * Both layouts are enumerated: `<pid>/slots/<name>` from a version that kept the slots one
+ * level up and may still be on disk, and `<instance>/slots/<name>` for every instance
+ * directory under the pid. Names are not assumed: a slot that was retired once lives at
+ * `slot-<id>-1`, and a future naming change must not silently drop work.
+ *
+ * The label is unique within the owner — `<instance>/slots/<name>` or `slots/<name>` —
+ * because the attempts file records which slots were already stored and two instances
+ * may each have a `slot-0`.
+ *
+ * @param {string} ownerDir - the dead owner's per-pid directory.
+ * @returns {{label: string, dir: string}[]} the slot trees, in a stable order.
+ */
+function deadSlotsIn(ownerDir) {
+  const slots = []
+  const collect = (label, slotsDir) => {
+    let names
+    try {
+      names = readdirSync(slotsDir)
+    } catch {
+      // No `slots/` here (or an unreadable one) is the common, fast case: nothing to keep.
+      return
+    }
+    for (const name of names) slots.push({ label: `${label}/${name}`, dir: join(slotsDir, name) })
+  }
+  // The older layout first: one cheap listing, and it may still be the only one present.
+  collect('slots', join(ownerDir, 'slots'))
+  let instances
+  try {
+    instances = readdirSync(ownerDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name !== 'slots')
+      .map((entry) => entry.name)
+      // Sorted, so a salvage stores the same slots in the same order on every sweep.
+      .sort()
+  } catch {
+    return slots
+  }
+  for (const instance of instances) collect(`${instance}/slots`, join(ownerDir, instance, 'slots'))
+  return slots
+}
+
+/**
+ * Salvage one slot of a dead owner, turning a thrown error into a recorded failure.
+ *
+ * The sweep used to let a failed salvage fall through to the removal: a transient error
+ * deleted the only copy of the work. A failure is now data — the slot is named, the owner
+ * is kept, and a later sweep tries again — while the slot's own log line still explains
+ * what went wrong.
+ *
+ * @param {string} label - the slot's owner-unique label, as `deadSlotsIn` produces it.
+ * @param {string} slotDir - the slot tree.
+ * @param {object} options - root, patch directory, dead pid, sweep time, log and the
+ *   slots a previous attempt already stored.
+ * @param {string} options.root - the canonical service root.
+ * @param {string} options.patchDir - the root's patch directory.
+ * @param {number} options.pid - the dead owner's pid.
+ * @param {number} options.sweptAt - when this sweep started, for the record.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {Set<string>} options.alreadySalvaged - slot labels a previous attempt stored.
+ * @returns {{patchId?: string, name?: string, failed?: {name: string, slotDir: string,
+ *   message: string}, skipped?: true}} the outcome for this slot.
+ */
+function salvageSlotStep(label, slotDir, { root, patchDir, pid, sweptAt, log, alreadySalvaged }) {
+  if (alreadySalvaged.has(label)) {
+    // Staging the tree again would store a second patch for the same change: the first
+    // attempt left the work staged with `git add -A`, so `git status` is not empty.
+    log(`dead owner ${String(pid)} slot ${slotDir} was already salvaged by an earlier sweep`)
+    return { skipped: true }
+  }
+  try {
+    const salvaged = salvageSlot(slotDir, { root, patchDir, pid, sweptAt, log })
+    if (salvaged === null) return {}
+    log(
+      `salvaged ${salvaged.patchId} from dead owner ${String(pid)} slot ${slotDir}: ` +
+        salvaged.diffstat.replace(/\s*\n\s*/g, '; ') +
+        (salvaged.task === undefined ? '' : ` for "${salvaged.task.label}"`),
+    )
+    return { patchId: salvaged.patchId, name: label }
+  } catch (error) {
+    log(`could not salvage ${slotDir} from dead owner ${String(pid)}: ${messageOf(error)}`)
+    return { failed: { name: label, slotDir, message: messageOf(error) } }
+  }
+}
+
+/**
+ * Store every salvageable tree under one dead owner, across all of its instances.
+ *
+ * This is the synchronous pass the constructor, `prepare`, the housekeeping timer and
+ * `clean` use. It reports what failed instead of swallowing it, so the caller can keep an
+ * owner whose work it could not read.
+ *
+ * @param {string} ownerDir - the dead owner's per-pid directory.
+ * @param {object} options - root, patch directory, log, owner pid and stored slots.
+ * @param {string} options.root - the canonical service root.
+ * @param {string} options.patchDir - the root's patch directory.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {number} options.pid - the dead owner's pid.
+ * @param {string[]} [options.salvaged] - slot labels an earlier attempt already stored.
+ * @returns {{patches: number, failed: {name: string, slotDir: string, message: string}[],
+ *   stored: string[]}} what was stored and what could not be read.
+ */
+function salvageOwner(ownerDir, { root, patchDir, log, pid, salvaged = [] }) {
+  const alreadySalvaged = new Set(salvaged)
+  const sweptAt = Date.now()
+  const failed = []
+  const stored = []
+  let patches = 0
+  for (const { label, dir } of deadSlotsIn(ownerDir)) {
+    const outcome = salvageSlotStep(label, dir, { root, patchDir, pid, sweptAt, log, alreadySalvaged })
+    if (outcome.patchId !== undefined) {
+      patches += 1
+      stored.push(label)
+    }
+    if (outcome.failed !== undefined) failed.push(outcome.failed)
+  }
+  return { patches, failed, stored }
+}
+
+/**
+ * The asynchronous form of `salvageOwner`, used by the deferred start-up sweep.
+ *
+ * It yields to the event loop before each slot, so the server keeps answering requests
+ * while a salvage runs `git add -A` and `git diff` over a large tree. A stop request (the
+ * pool closed) aborts between slots; what was already stored is recorded before returning,
+ * so the next sweep cannot store it a second time.
+ *
+ * @param {string} ownerDir - the dead owner's per-pid directory.
+ * @param {object} options - as `salvageOwner`, plus the previous attempt and the stop check.
+ * @param {string} options.root - the canonical service root.
+ * @param {string} options.patchDir - the root's patch directory.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {number} options.pid - the dead owner's pid.
+ * @param {{attempts: number, salvaged: string[], lastAttemptAt: number}} options.prior -
+ *   the previous attempt.
+ * @param {() => boolean} [options.stopped] - whether the pool has closed.
+ * @returns {Promise<{patches: number, failed: object[], stored: string[], stopped: boolean}>}
+ *   what was stored, what could not be read, and whether the pass was cut short.
+ */
+async function salvageOwnerLater(ownerDir, { root, patchDir, log, pid, prior, stopped = () => false }) {
+  const alreadySalvaged = new Set(prior.salvaged)
+  const sweptAt = Date.now()
+  const failed = []
+  const stored = []
+  let patches = 0
+  for (const { label, dir } of deadSlotsIn(ownerDir)) {
+    // Yield first, then check: a `close()` that happened during the yield must stop the
+    // pass before another slot's git work starts, not after it.
+    await new Promise((resolveTick) => setImmediate(resolveTick))
+    if (stopped()) {
+      if (patches > 0) {
+        writeSalvageAttempts(
+          ownerDir,
+          { attempts: prior.attempts, salvaged: [...new Set([...prior.salvaged, ...stored])], lastAttemptAt: prior.lastAttemptAt },
+          log,
+        )
+      }
+      return { patches, failed, stored, stopped: true }
+    }
+    const outcome = salvageSlotStep(label, dir, { root, patchDir, pid, sweptAt, log, alreadySalvaged })
+    if (outcome.patchId !== undefined) {
+      patches += 1
+      stored.push(label)
+    }
+    if (outcome.failed !== undefined) failed.push(outcome.failed)
+  }
+  return { patches, failed, stored, stopped: false }
 }
 
 /**
@@ -745,83 +1424,166 @@ function removeEmptyForeignDigests(root, { baseDir = stateBaseDir(), log = () =>
  * constructor's blanket `rm -rf slots` did not have.
  *
  * A dead owner's tree may hold a worker's mid-task edit, and removing the directory
- * whole used to lose it with the restart. Every slot under `slots/` — under whatever
- * name, including the retired `<id>-<n>` generations — is therefore examined before the
- * owner is removed, and a dirty tree is stored as a patch beside the surviving ones. A
- * tree that cannot be read is logged and skipped: the sweep's job is to start the next
- * server, never to wedge on a corpse.
+ * whole used to lose it with the restart. Every slot of every instance under the pid —
+ * under whatever name, including the retired `<id>-<n>` generations — is therefore
+ * examined before the owner is removed, and a dirty tree is stored as a patch beside the
+ * surviving ones (see `deadSlotsIn`; the old `<pid>/slots` layout is read too). A slot
+ * whose salvage throws keeps its owner: one transient failure must not delete the only
+ * copy of the work, so the owner is retried by a later sweep up to
+ * `SALVAGE_MAX_ATTEMPTS` times, spaced by `SWEEP_INTERVAL_MS`.
+ *
+ * Removal does not block a server: the owner is renamed to `trash-<pid>-<ms>` and deleted
+ * in the background (see `removeDeadOwnerDir`). Leftover trash from an interrupted
+ * removal is adopted and deleted too, at the start of every pass. A caller that exits
+ * right after the sweep — `clean` — asks for `removal: 'sync'` instead, so the deletion
+ * is not abandoned with the process.
  *
  * @param {string} root - the canonical service root.
  * @param {object} options - where to put salvaged patches and how to report.
  * @param {string} options.patchDir - the root's patch directory.
  * @param {string} [options.baseDir] - the state base directory.
  * @param {(message: string) => void} [options.log] - progress log.
- * @returns {number} how many dead owners were removed.
+ * @param {'sync' | 'background'} [options.removal] - how a dead owner's trash is deleted.
+ * @returns {{removed: number, kept: number, salvaged: number, patches: number,
+ *   trashRemoved: number}} what the pass did.
  */
-function sweepDeadOwners(root, { patchDir, baseDir = stateBaseDir(), log = () => {} } = {}) {
+function sweepDeadOwners(root, { patchDir, baseDir = stateBaseDir(), log = () => {}, removal = 'background' } = {}) {
+  const stats = { removed: 0, kept: 0, salvaged: 0, patches: 0, trashRemoved: 0 }
   const parent = join(baseDir, rootDigest(root))
-  if (!existsSync(parent)) return 0
-  let removed = 0
+  if (!existsSync(parent)) return stats
+  if (removal === 'sync') stats.trashRemoved = removeTrashSync(parent, log)
+  else removeLeftoverTrash(parent, log)
+  const now = Date.now()
   for (const entry of ownerDirs(parent)) {
-    if (Number(entry) === process.pid) continue
-    if (processAlive(Number(entry))) continue
+    const pid = Number(entry)
+    if (pid === process.pid) continue
+    if (processAlive(pid)) continue
     const ownerDir = join(parent, entry)
-    try {
-      salvageOwner(ownerDir, { root, patchDir, log, pid: Number(entry) })
-    } catch (error) {
-      // Salvage is best-effort: whatever went wrong, the dead directory is still dead
-      // weight and the new server must come up.
-      log(`could not salvage work from dead owner ${entry}: ${messageOf(error)}`)
+    const prior = readSalvageAttempts(ownerDir)
+    if (!salvageAttemptDue(prior, now)) {
+      // No git work and no attempt counted: the failure is recent, and burning the
+      // remaining attempts seconds apart would delete the work far too soon.
+      const ageSeconds = Math.round((now - prior.lastAttemptAt) / 1000)
+      stats.kept += 1
+      log(
+        `skipping dead owner ${String(pid)} at ${ownerDir}: its last salvage attempt failed ${String(ageSeconds)}s ago, ` +
+          `and the next is due after ${String(Math.round(SWEEP_INTERVAL_MS / 1000))}s`,
+      )
+      continue
     }
-    try {
-      rmSync(ownerDir, { recursive: true, force: true })
-      removed += 1
-    } catch (error) {
-      // A directory that will not go away is retried by the next sweep; refusing to start
-      // over it would be the wedge this function exists to prevent.
-      log(`could not remove dead owner ${entry}: ${messageOf(error)}`)
-    }
+    const salvage = salvageOwner(ownerDir, { root, patchDir, log, pid, salvaged: prior.salvaged })
+    if (salvage.patches > 0) stats.salvaged += 1
+    stats.patches += salvage.patches
+    const result = finishDeadOwner(ownerDir, { parent, pid, log, prior, salvage, removal })
+    if (result.status === 'removed') stats.removed += 1
+    else stats.kept += 1
   }
-  return removed
+  return stats
 }
 
 /**
- * Store every salvageable tree under one dead owner's `slots/` directory.
+ * The deferred sweep's form of `sweepDeadOwners`: the same order and the same decisions,
+ * but it yields to the event loop between dead owners and between slots.
  *
- * Names are not assumed: a slot that was retired once lives at `slot-<id>-1`, and a
- * future naming change must not silently drop work. The directory is read as a plain
- * list and every entry is offered to `salvageSlot`.
+ * A server that starts with `deferStartupSweep` answers `initialize` before this runs, and
+ * the client's 30 s connect timeout must not run out while a salvage walks a large tree.
+ * Yielding is what keeps the event loop free for protocol messages; it is not a speed-up.
+ * The pass stops as soon as the pool is closed.
+ *
+ * @param {string} root - the canonical service root.
+ * @param {object} options - where to put salvaged patches and how to report.
+ * @param {string} options.patchDir - the root's patch directory.
+ * @param {string} [options.baseDir] - the state base directory.
+ * @param {(message: string) => void} [options.log] - progress log.
+ * @param {() => boolean} [options.stopped] - whether the pool has closed.
+ * @returns {Promise<{salvaged: number, kept: number, removed: number, patches: number,
+ *   stopped: boolean}>} what the pass did, for the one-line summary.
+ */
+async function sweepDeadOwnersLater(root, { patchDir, baseDir = stateBaseDir(), log = () => {}, stopped = () => false } = {}) {
+  const stats = { salvaged: 0, kept: 0, removed: 0, patches: 0, stopped: false }
+  const parent = join(baseDir, rootDigest(root))
+  if (!existsSync(parent)) return stats
+  removeLeftoverTrash(parent, log)
+  const now = Date.now()
+  for (const entry of ownerDirs(parent)) {
+    if (stopped()) {
+      stats.stopped = true
+      return stats
+    }
+    const pid = Number(entry)
+    if (pid === process.pid || processAlive(pid)) continue
+    const ownerDir = join(parent, entry)
+    const prior = readSalvageAttempts(ownerDir)
+    if (!salvageAttemptDue(prior, now)) {
+      const ageSeconds = Math.round((now - prior.lastAttemptAt) / 1000)
+      stats.kept += 1
+      log(
+        `skipping dead owner ${String(pid)} at ${ownerDir}: its last salvage attempt failed ${String(ageSeconds)}s ago, ` +
+          `and the next is due after ${String(Math.round(SWEEP_INTERVAL_MS / 1000))}s`,
+      )
+      continue
+    }
+    const salvage = await salvageOwnerLater(ownerDir, { root, patchDir, log, pid, prior, stopped })
+    if (salvage.patches > 0) stats.salvaged += 1
+    stats.patches += salvage.patches
+    if (salvage.stopped) {
+      stats.stopped = true
+      return stats
+    }
+    const result = finishDeadOwner(ownerDir, { parent, pid, log, prior, salvage })
+    if (result.status === 'removed') stats.removed += 1
+    else stats.kept += 1
+    // Between dead owners too: one owner with many slots must not monopolise the loop.
+    await new Promise((resolveTick) => setImmediate(resolveTick))
+  }
+  return stats
+}
+
+/**
+ * Decide what happens to one dead owner now that its slots were offered to salvage.
+ *
+ * A clean pass removes the owner. A pass in which any slot threw keeps it, records the
+ * failure, when it happened and the slots already stored, and lets a later sweep try
+ * again — a transient error must not be the end of the work, and `salvageAttemptDue` keeps
+ * the retries minutes apart. After `SALVAGE_MAX_ATTEMPTS` failures the trees go anyway,
+ * because an owner that cannot be read forever is a disk leak; the log then names every
+ * slot whose work is lost, so the caller is not left guessing.
  *
  * @param {string} ownerDir - the dead owner's per-pid directory.
- * @param {object} options - root, patch directory, log, and the owner's pid.
- * @returns {void}
+ * @param {object} options - where the trash belongs and what this pass found.
+ * @param {string} options.parent - the digest directory that holds the owner.
+ * @param {number} options.pid - the dead owner's pid.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {{attempts: number, salvaged: string[], lastAttemptAt: number}} options.prior -
+ *   the previous record.
+ * @param {{patches: number, failed: {name: string, slotDir: string, message: string}[],
+ *   stored: string[]}} options.salvage - this pass's outcome.
+ * @param {'sync' | 'background'} [options.removal] - how the trash is deleted.
+ * @returns {{status: 'removed' | 'kept', patches: number}} what happened to the owner.
  */
-function salvageOwner(ownerDir, { root, patchDir, log, pid }) {
-  let names
-  try {
-    names = readdirSync(join(ownerDir, 'slots'))
-  } catch {
-    // No `slots/` at all (or an unreadable one) is the common, fast case: nothing to keep.
-    return
+function finishDeadOwner(ownerDir, { parent, pid, log, prior, salvage, removal = 'background' }) {
+  const { patches, failed, stored } = salvage
+  if (failed.length === 0) {
+    const removed = removeDeadOwnerDir(ownerDir, { parent, pid, log, removal })
+    return { status: removed ? 'removed' : 'kept', patches }
   }
-  const sweptAt = Date.now()
-  for (const name of names) {
-    const slotDir = join(ownerDir, 'slots', name)
-    try {
-      const salvaged = salvageSlot(slotDir, { root, patchDir, pid, sweptAt, log })
-      if (salvaged !== null) {
-        log(
-          `salvaged ${salvaged.patchId} from dead owner ${String(pid)} slot ${slotDir}: ` +
-            salvaged.diffstat.replace(/\s*\n\s*/g, '; '),
-        )
-      }
-    } catch (error) {
-      // A tree that cannot be read or whose diff fails is named and removed anyway. The
-      // alternative — wedging the next server on a corpse until a human intervenes — is
-      // exactly the failure this sweep exists to avoid.
-      log(`could not salvage ${slotDir} from dead owner ${String(pid)}: ${messageOf(error)}`)
-    }
+  const attempts = prior.attempts + 1
+  const unsalvaged = failed.map((entry) => entry.slotDir).join(', ')
+  if (attempts < SALVAGE_MAX_ATTEMPTS) {
+    writeSalvageAttempts(ownerDir, { attempts, salvaged: [...new Set([...prior.salvaged, ...stored])], lastAttemptAt: Date.now() }, log)
+    log(
+      `keeping dead owner ${String(pid)} at ${ownerDir}: salvage attempt ${String(attempts)} of ` +
+        `${String(SALVAGE_MAX_ATTEMPTS)} could not read ${unsalvaged}; ` +
+        `the next attempt is due in ${String(Math.round(SWEEP_INTERVAL_MS / 60000))} minutes`,
+    )
+    return { status: 'kept', patches }
   }
+  log(
+    `removing dead owner ${String(pid)} at ${ownerDir} after ${String(attempts)} failed salvage attempts: ` +
+      `the work in ${unsalvaged} could not be salvaged and is lost`,
+  )
+  const removed = removeDeadOwnerDir(ownerDir, { parent, pid, log, removal })
+  return { status: removed ? 'removed' : 'kept', patches }
 }
 
 /**
@@ -835,7 +1597,7 @@ function salvageOwner(ownerDir, { root, patchDir, log, pid }) {
  *
  * @param {string} slotDir - the tree to salvage.
  * @param {object} options - the root, patch directory, dead pid, sweep time, and log.
- * @returns {{patchId: string, diffstat: string} | null} the stored patch, or null.
+ * @returns {{patchId: string, diffstat: string, task?: object} | null} the stored patch, or null.
  */
 function salvageSlot(slotDir, { root, patchDir, pid, sweptAt, log = () => {} }) {
   const scope = readScopeMarker(slotDir)
@@ -843,6 +1605,9 @@ function salvageSlot(slotDir, { root, patchDir, pid, sweptAt, log = () => {} }) 
   if (!isGitWorkTree(repoDir)) return null
   const base = findFlashBase(repoDir)
   if (base === null) return null
+  // Read before the tree is diffed, from the copy's own git directory: it names the task
+  // the dead worker was doing, which is the one fact its files cannot tell the caller.
+  const task = readSalvagedTask(repoDir, log)
   git(['add', '-A'], repoDir)
   if (git(['status', '--porcelain'], repoDir).trim() === '') return null
   const patchId = `flash-${randomUUID()}`
@@ -874,8 +1639,9 @@ function salvageSlot(slotDir, { root, patchDir, pid, sweptAt, log = () => {} }) 
     salvagedFrom: { pid, slotDir, sweptAt },
   }
   if (preimage !== undefined) record.preimage = preimage
+  if (task !== undefined) record.task = task
   writePatchMeta(record)
-  return { patchId, diffstat }
+  return { patchId, diffstat, ...(task === undefined ? {} : { task }) }
 }
 
 /**
@@ -995,14 +1761,16 @@ function gitAllowFailure(args, cwd, env = process.env) {
  * Write a patch's record next to it, keeping only the fields a restart must trust.
  *
  * `patchPath` and `metaPath` are derivable from the patch directory and the id, so they
- * are not persisted; `salvagedFrom` is persisted only when it exists, so an ordinary
- * patch's record keeps its previous shape.
+ * are not persisted; `salvagedFrom`, `task` and `finalMessage` are persisted only when they
+ * exist, so an ordinary patch's record keeps its previous shape and a record written before
+ * these fields existed stays readable.
  *
  * @param {object} record - the record to store.
  * @returns {void}
  */
 function writePatchMeta(record) {
-  const { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt, salvagedFrom, preimage } = record
+  const { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt, salvagedFrom, preimage, task, finalMessage, finalMessageTruncated } =
+    record
   const meta = { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt }
   if (salvagedFrom !== undefined) meta.salvagedFrom = salvagedFrom
   // Persisted only for a nested repository, so a whole-root record keeps its old shape and
@@ -1012,6 +1780,11 @@ function writePatchMeta(record) {
   // were saved: a record whose saving failed (or that predates saving) must stay readable
   // and must let the merge report that the base is unavailable rather than merge wrongly.
   if (Array.isArray(preimage)) meta.preimage = preimage
+  // Who the work was for, and what the worker said when it finished. A record that has
+  // neither says exactly what a record always said.
+  if (task !== undefined) meta.task = task
+  if (typeof finalMessage === 'string') meta.finalMessage = finalMessage
+  if (finalMessageTruncated === true) meta.finalMessageTruncated = true
   writeFileSync(record.metaPath, `${JSON.stringify(meta, null, 2)}\n`)
 }
 
@@ -1817,31 +2590,61 @@ function normalizeRepoPath(raw) {
  * Merge the per-slot environment from the file and the pool options, validating each entry.
  *
  * Options are applied last, so a pool option wins per variable. A name that may not be
- * redirected (see FORBIDDEN_SLOT_ENV), a value that is not `home:<name>`, `cache:<name>` or
- * `port:<base>[/<stride>]`, a `<name>` that is not one path segment, or a port range whose
- * highest slot would not fit below 65536 is named and dropped; the entry never makes it into
- * the environment the worker boots with.
+ * redirected (see FORBIDDEN_SLOT_ENV and LOADER_SLOT_ENV), a value that is not
+ * `home:<name>`, `cache:<name>`, `port:<base>[/<stride>]` or `value:<text>`, a `<name>` that
+ * is not one path segment, a `value:` over the Windows limit or holding a NUL, or a port
+ * range whose highest slot would not fit below 65536 is named and dropped; the entry never
+ * makes it into the environment the worker boots with.
  *
  * @param {object} fromFile - the `slotEnv` object from the settings file, if any.
  * @param {unknown} fromOptions - the `slotEnv` pool option, if any.
  * @param {(message: string) => void} log - where to name a rejected entry.
  * @param {number} slotCount - how many slots the pool has, for the highest-port check.
  * @returns {Record<string, {kind: 'home' | 'cache', segment: string} |
- *   {kind: 'port', base: number, stride: number}>} the accepted entries.
+ *   {kind: 'port', base: number, stride: number} | {kind: 'value', value: string}>} the
+ *   accepted entries.
  */
 function mergeSlotEnv(fromFile, fromOptions, log, slotCount) {
   const merged = {}
   const apply = (source, label) => {
     if (source === undefined || source === null) return
     if (typeof source !== 'object' || Array.isArray(source)) {
-      log(`ignoring ${label}: slotEnv must be an object of "home:<name>", "cache:<name>" or "port:<base>[/<stride>]" values`)
+      log(
+        `ignoring ${label}: slotEnv must be an object of "home:<name>", "cache:<name>", "port:<base>[/<stride>]" or "value:<text>" values`,
+      )
       return
     }
     for (const [name, value] of Object.entries(source)) {
       // Windows environment names are case-insensitive, and a worker on that platform sees
       // `Home` and `HOME` as the same variable; the check has to fold case the same way.
-      if (FORBIDDEN_SLOT_ENV.has(name.toUpperCase())) {
+      const upper = name.toUpperCase()
+      if (FORBIDDEN_SLOT_ENV.has(upper)) {
         log(`not redirecting ${name} for the worker: the runtime's sandbox and toolchains depend on it`)
+        continue
+      }
+      // A plain value would reach the runtime process itself, which runs outside the
+      // worker's sandbox, so a name that decides which program runs or how code is loaded
+      // is refused for every kind — `home:` and `cache:` included, as before.
+      if (LOADER_SLOT_ENV.has(upper) || upper.startsWith('LD_') || upper.startsWith('DYLD_')) {
+        log(`not redirecting ${name} for the worker: it changes how the runtime loads programs`)
+        continue
+      }
+      if (typeof value === 'string' && value.startsWith(SLOT_ENV_TEXT)) {
+        // Everything after the first `value:` is the variable's text, verbatim: a Windows
+        // path, another `:`-bearing value and an empty value are all legitimate.
+        const text = value.slice(SLOT_ENV_TEXT.length)
+        if (text.includes('\0')) {
+          log(`ignoring ${label}.${name}: a value: entry may not contain a NUL character`)
+          continue
+        }
+        if (text.length > SLOT_ENV_TEXT_MAX) {
+          log(
+            `ignoring ${label}.${name}: a value: entry is ${String(text.length)} characters, ` +
+              `over the ${String(SLOT_ENV_TEXT_MAX)}-character limit for one variable`,
+          )
+          continue
+        }
+        merged[name] = { kind: 'value', value: text }
         continue
       }
       const match = typeof value === 'string' ? SLOT_ENV_VALUE.exec(value) : null
@@ -1855,7 +2658,10 @@ function mergeSlotEnv(fromFile, fromOptions, log, slotCount) {
       }
       const port = typeof value === 'string' ? PORT_ENV_VALUE.exec(value) : null
       if (port === null) {
-        log(`ignoring ${label}.${name}: expected "home:<name>", "cache:<name>" or "port:<base>[/<stride>]", got ${JSON.stringify(value)}`)
+        log(
+          `ignoring ${label}.${name}: expected "home:<name>", "cache:<name>", "port:<base>[/<stride>]" or "value:<text>", ` +
+            `got ${JSON.stringify(value)}`,
+        )
         continue
       }
       const base = Number(port[1])
@@ -2227,6 +3033,13 @@ function slotDirectory(stateDir, id, index) {
  * never removed by `--all`: they are the only copy of a finished worker's work, and a
  * root without a live server is precisely where a caller might still want one.
  *
+ * This root's `trash-*` directories — a removal a crash left unfinished — are removed
+ * too, and counted in `actions.trashRemoved`; each one is also named in the log.
+ *
+ * Unlike a server's sweep, every removal here is synchronous (`removal: 'sync'` by
+ * default): `clean` prints its report and exits the process, so a deletion left running in
+ * the background was abandoned with the process while the summary claimed it happened.
+ *
  * @param {object} options - what to report and reclaim.
  * @param {string} [options.baseDir] - the state base directory, usually `$TMPDIR/flash-mcp`.
  * @param {string} [options.dataDir] - the durable data directory; defaults to `durableBaseDir()`.
@@ -2234,10 +3047,11 @@ function slotDirectory(stateDir, id, index) {
  * @param {boolean} [options.all] - also remove the trees of roots with no live server.
  * @param {number} [options.retentionDays] - the patch retention window.
  * @param {number} [options.now] - the current time, for tests.
+ * @param {'sync' | 'background'} [options.removal] - how dead owners' trash is deleted.
  * @param {(message: string) => void} [options.log] - progress log.
  * @returns {{baseDir: string, own: string, patchDir: string, legacyPatchDir?: string, stats: object[], actions: object}} the report.
  */
-export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = false, retentionDays = PATCH_RETENTION_DAYS, now = Date.now(), log = () => {} } = {}) {
+export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = false, retentionDays = PATCH_RETENTION_DAYS, now = Date.now(), removal = 'sync', log = () => {} } = {}) {
   const own = rootDigest(root)
   const ownDir = join(baseDir, own)
   const patchDir = dataDir === undefined ? defaultPatchDir(root) : join(dataDir, own, 'patches')
@@ -2251,10 +3065,16 @@ export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = fal
     livePids: livePidsIn(join(baseDir, digest)),
     ...digestStats(join(baseDir, digest), digest === own ? [patchDir] : []),
   }))
-  const actions = { deadOwnersRemoved: 0, patchesPruned: 0, emptyDigestsRemoved: 0, foreignTreesRemoved: 0 }
+  const actions = { deadOwnersRemoved: 0, trashRemoved: 0, patchesPruned: 0, emptyDigestsRemoved: 0, foreignTreesRemoved: 0 }
   if (existsSync(ownDir)) {
-    // Salvage goes to the durable store too, exactly as a startup sweep would.
-    actions.deadOwnersRemoved = sweepDeadOwners(root, { patchDir, baseDir, log })
+    // Leftover trash is removed first, the owners' trees are salvaged and removed, and all
+    // of it synchronously: `clean` is an operator command that promises the disk back before
+    // it exits, and it has no protocol connection whose event loop a background deletion
+    // would protect. Salvage goes to the durable store too, exactly as a startup sweep
+    // would, and the counts come back from the same pass (see `sweepDeadOwners`).
+    const swept = sweepDeadOwners(root, { patchDir, baseDir, removal, log })
+    actions.deadOwnersRemoved = swept.removed
+    actions.trashRemoved = swept.trashRemoved
   }
   actions.patchesPruned = prunePatches(patchDir, { retentionDays, now })
   if (resolve(legacyPatchDir) !== resolve(patchDir)) {
@@ -2855,6 +3675,10 @@ export class WorkspaceIsolation {
    *   it is omitted the layout is per root *and* per process, so two services cannot
    *   share a tree or a patch directory by accident. A configured directory is used as
    *   given: one service per directory is then the deployment's responsibility.
+   * @param {string} [options.baseDir] - the state base directory the default layout lives
+   *   under, `$TMPDIR/flash-mcp` unless given. The sweep, the legacy-store migration and
+   *   `trim` all work inside it, so a test that injects one never touches the real temp
+   *   base, and the per-pid layout stays exactly what `defaultStateDir` computes.
    * @param {number} [options.patchRetentionDays] - how many days an unapplied patch is
    *   kept before the startup prune removes it.
    * @param {number} [options.maxStateBytes] - how much this root's patches and retired
@@ -2864,30 +3688,40 @@ export class WorkspaceIsolation {
    * @param {string[]} [options.copyExclude] - names or relative paths left out of the copy
    *   where it is safe; merged over `.flash-agents.json`, options last.
    * @param {Record<string, string>} [options.slotEnv] - `ENV_NAME: "home:<name>" | "cache:<name>" |
-   *   "port:<base>[/<stride>]"` entries pointing the worker's runtime at writable per-slot
-   *   directories, or reserving a per-slot port range; options win per variable over the
-   *   settings file.
+   *   "port:<base>[/<stride>]" | "value:<text>"` entries pointing the worker's runtime at
+   *   writable per-slot directories, reserving a per-slot port range, or setting a plain
+   *   value in every slot; options win per variable over the settings file.
    * @param {boolean} [options.allowSlotSetup] - whether the `slotSetup` steps in
    *   `.flash-agents.json` may run on the host. Off by default: a setup step is host code
    *   outside the worker's sandbox, so it needs an explicit opt-in.
+   * @param {boolean} [options.deferStartupSweep] - whether to leave the store migration,
+   *   the dead-owner sweep, the disk hygiene and the patch load to `startupSweep()`. Off
+   *   by default, so a pool built by the doctor, by `clean` or by a test sees the swept
+   *   state the moment its constructor returns. A server sets it so it can answer the
+   *   MCP `initialize` handshake before the sweep — which on a machine that died with
+   *   multi-gigabyte slot trees used to take minutes — starts.
    * @param {(message: string) => void} [options.log] - progress log.
    */
   constructor({
     root,
     slots = 2,
     stateDir,
+    baseDir,
     copyExclude,
     slotEnv,
     allowSlotSetup = false,
     patchRetentionDays = PATCH_RETENTION_DAYS,
     maxStateBytes = 0,
     sweepIntervalMs = SWEEP_INTERVAL_MS,
+    deferStartupSweep = false,
     log = () => {},
   }) {
     this.root = resolve(root)
     /** Whether this instance owns a private state directory it may clear. */
     this.ownsStateDir = stateDir === undefined || stateDir === null || stateDir === ''
-    this.stateDir = this.ownsStateDir ? defaultStateDir(this.root) : resolve(stateDir)
+    /** The base every default-layout directory of this root sits under. */
+    this.baseDir = baseDir === undefined || baseDir === null || baseDir === '' ? stateBaseDir() : resolve(baseDir)
+    this.stateDir = this.ownsStateDir ? defaultStateDir(this.root, { baseDir: this.baseDir }) : resolve(stateDir)
     /**
      * Where patches are stored. With a private state directory they live in the durable
      * per-root store (`FLASH_DATA_DIR` or the platform data directory), not beside this
@@ -2899,6 +3733,21 @@ export class WorkspaceIsolation {
     this.patchRetentionDays = patchRetentionDays
     this.maxStateBytes = maxStateBytes
     this.log = log
+    /**
+     * Whether the heavy start-up work was deferred to `startupSweep()`.
+     * @type {boolean}
+     */
+    this.deferStartupSweep = deferStartupSweep === true
+    /**
+     * Whether the deferred sweep has finished. Without deferral the constructor has
+     * already done that work, so this starts true.
+     * @type {boolean}
+     */
+    this.startupSweepDone = false
+    /** The one promise `startupSweep` hands out, so a second call cannot start a pass. */
+    this.startupSweepPromise = undefined
+    /** Whether `close()` has run; a sweep in flight stops at its next step. */
+    this.closed = false
     // Read once, at construction: the settings describe the repository, not the call, and
     // every call prepares faster when the file is not re-read. A broken file only logs; the
     // service still starts.
@@ -2909,9 +3758,10 @@ export class WorkspaceIsolation {
     const slotCount = Math.max(1, slots)
     /**
      * Accepted `slotEnv` entries, resolved per slot by `slotEnvFor`. A `port` entry creates
-     * no directory; its value is derived from `slot.id` alone.
+     * no directory and a `value` entry is plain text, so neither makes the copy name
+     * `.flash-home` or `.flash-cache`.
      *
-     * @type {Record<string, {kind: string, segment?: string, base?: number, stride?: number}>}
+     * @type {Record<string, {kind: string, segment?: string, base?: number, stride?: number, value?: string}>}
      */
     this.slotEnv = mergeSlotEnv(settings.slotEnv, slotEnv, this.log, slotCount)
     /** Whether `.flash-agents.json`'s `slotSetup` steps may run on the host. */
@@ -2986,39 +3836,29 @@ export class WorkspaceIsolation {
     // pruned. Both happen before `#loadPatches`, so the in-memory view only ever holds
     // patches that still exist on disk. The prune runs for a configured state directory
     // too, because an unapplied patch ages out wherever it is stored.
+    //
+    // With `deferStartupSweep` all of that moves to `startupSweep()`, which the server
+    // starts only after it answered `initialize`: on the machine that prompted this, a
+    // dead owner's slot trees held multi-gigabyte `cargo` targets, and deleting them in
+    // the constructor made the client's 30 s connect timeout expire.
     mkdirSync(this.stateDir, { recursive: true })
     // A configured `calls` directory is part of the configured state and is made eagerly
     // as before. The durable default store is made on demand: constructing a pool that
     // never stores a patch must not leave an empty directory in the user's data
     // directory, which is also what keeps a read-only test run out of the real home.
     if (!this.ownsStateDir) mkdirSync(this.patchDir, { recursive: true })
-    if (this.ownsStateDir) {
-      // A patch written by an older version lives in the temp tree. Normally it is moved
-      // before the sweep and the load, so the upgrade keeps exactly the work the caller was
-      // told it could still apply. But an old server may be running on this root right now,
-      // with its in-memory paths already pointing into that directory: moving the files out
-      // from under it would make its `flash_apply` fail. Deferring is safe because this pool
-      // lists and applies those records in place until the migration can run (see
-      // `#sweepDeadOwners`), and an incomplete id is never moved (see `migrateLegacyPatches`).
-      const legacyDir = join(stateBaseDir(), rootDigest(this.root), 'patches')
-      const otherPids = livePidsIn(join(stateBaseDir(), rootDigest(this.root))).filter((pid) => pid !== process.pid)
-      if (otherPids.length > 0) {
-        this.legacyPatchDir = legacyDir
-        this.log(
-          `deferred moving stored patches from ${legacyDir} to ${this.patchDir}: ` +
-            `process(es) ${otherPids.join(', ')} still use the old store`,
-        )
-      } else {
-        migrateLegacyPatches(legacyDir, this.patchDir, { log: this.log })
-      }
-      sweepDeadOwners(this.root, { patchDir: this.patchDir, log: this.log })
-      removeEmptyForeignDigests(this.root, { log: this.log })
-    }
-    prunePatches(this.patchDir, { retentionDays: this.patchRetentionDays })
+    if (!this.deferStartupSweep) this.#startupWorkSync()
     rmSync(join(this.stateDir, 'slots'), { recursive: true, force: true })
-    // Patches already on disk are made available to `apply` and `listPatches` up front,
-    // so one this sweep just salvaged behaves exactly like one this process collected.
-    this.#loadPatches()
+    if (this.deferStartupSweep) {
+      // Nothing is loaded yet: `listPatches` documents that it answers with what is loaded
+      // so far, while a full id still resolves from disk through `readPatch`/`apply`.
+    } else {
+      // Patches already on disk are made available to `apply` and `listPatches` up front,
+      // so one this sweep just salvaged behaves exactly like one this process collected.
+      this.#loadPatches()
+      this.startupSweepDone = true
+      this.startupSweepPromise = Promise.resolve()
+    }
     for (const slot of this.slots) {
       mkdirSync(slot.dir, { recursive: true })
       slot.tmpDir = join(slot.dir, SLOT_TMP)
@@ -3028,8 +3868,143 @@ export class WorkspaceIsolation {
       sweepIntervalMs > 0 ? setInterval(() => this.#housekeeping(), sweepIntervalMs).unref() : undefined
   }
 
-  /** The timer's pass: sweep dead owners, then trim, never throwing into the event loop. */
+  /**
+   * The heavy part of construction, unchanged: migrate the legacy store, salvage and
+   * remove dead owners, drop empty foreign digests, prune expired patches.
+   *
+   * Kept synchronous and separate from `startupSweep` so the default construction still
+   * returns with the swept state in hand — `doctor`, `clean` and every test that plants a
+   * dead owner depend on that — while the deferred path can run the same steps in the
+   * same order with yields between them.
+   *
+   * @returns {void}
+   */
+  #startupWorkSync() {
+    if (this.ownsStateDir) {
+      this.#migrateLegacyStore()
+      sweepDeadOwners(this.root, { patchDir: this.patchDir, baseDir: this.baseDir, log: this.log })
+      removeEmptyForeignDigests(this.root, { baseDir: this.baseDir, log: this.log })
+    }
+    prunePatches(this.patchDir, { retentionDays: this.patchRetentionDays })
+  }
+
+  /**
+   * Move the legacy temp patch store into the durable one, or watch it in place.
+   *
+   * A patch written by an older version lives in the temp tree. Normally it is moved
+   * before the sweep and the load, so the upgrade keeps exactly the work the caller was
+   * told it could still apply. But an old server may be running on this root right now,
+   * with its in-memory paths already pointing into that directory: moving the files out
+   * from under it would make its `flash_apply` fail. Deferring is safe because this pool
+   * lists and applies those records in place until the migration can run (see
+   * `#sweepDeadOwners`), and an incomplete id is never moved (see `migrateLegacyPatches`).
+   *
+   * @returns {void}
+   */
+  #migrateLegacyStore() {
+    const digestDir = join(this.baseDir, rootDigest(this.root))
+    const legacyDir = join(digestDir, 'patches')
+    const otherPids = livePidsIn(digestDir).filter((pid) => pid !== process.pid)
+    if (otherPids.length > 0) {
+      this.legacyPatchDir = legacyDir
+      this.log(
+        `deferred moving stored patches from ${legacyDir} to ${this.patchDir}: ` +
+          `process(es) ${otherPids.join(', ')} still use the old store`,
+      )
+    } else {
+      migrateLegacyPatches(legacyDir, this.patchDir, { log: this.log })
+    }
+  }
+
+  /**
+   * Run the start-up work the constructor skipped, once, without ever blocking on it.
+   *
+   * The client is already connected when this runs: the sweep yields to the event loop
+   * between dead owners and between slots, so requests are answered while it salvages.
+   * It never rejects — a sweep that fails must not take the server with it, and the
+   * housekeeping timer and `prepare` retry later. A second call returns the same promise,
+   * so the `notifications/initialized` trigger and the 5 s fallback cannot race.
+   *
+   * Until it has finished, `lease` waits for it, `#housekeeping` and `prepare`'s sweep do
+   * nothing, and `listPatches` only holds what was loaded so far.
+   *
+   * @returns {Promise<void>} resolves when the pass finished, was stopped by `close()`, or
+   *   was already done.
+   */
+  startupSweep() {
+    if (this.startupSweepPromise === undefined) this.startupSweepPromise = this.#runStartupSweep()
+    return this.startupSweepPromise
+  }
+
+  /**
+   * Whether the deferred start-up sweep has not finished yet.
+   *
+   * Read-only, so a service can tell a waiting call what it is waiting for ("the start-up
+   * sweep is still reclaiming disk") instead of guessing from a silent `lease`. It is false
+   * for a pool whose constructor already did the work, and becomes false the moment the
+   * pass finishes, however it finished.
+   *
+   * @returns {boolean} true while the deferred sweep is still running or not yet started.
+   */
+  get startupSweepPending() {
+    return !this.startupSweepDone
+  }
+
+  /**
+   * The body of `startupSweep`: the skipped constructor work with yield points.
+   *
+   * @returns {Promise<void>} resolves when the pass ended, whatever happened in it.
+   */
+  async #runStartupSweep() {
+    if (this.closed) {
+      this.startupSweepDone = true
+      this.log('startup sweep skipped: the pool was closed before it started')
+      return
+    }
+    const started = Date.now()
+    const stats = { salvaged: 0, kept: 0, removed: 0, patches: 0 }
+    try {
+      if (this.ownsStateDir) {
+        this.#migrateLegacyStore()
+        const swept = await sweepDeadOwnersLater(this.root, {
+          patchDir: this.patchDir,
+          baseDir: this.baseDir,
+          log: this.log,
+          stopped: () => this.closed,
+        })
+        Object.assign(stats, { salvaged: swept.salvaged, kept: swept.kept, removed: swept.removed, patches: swept.patches })
+        if (swept.stopped) return
+        removeEmptyForeignDigests(this.root, { baseDir: this.baseDir, log: this.log })
+      }
+      // Between every remaining step: a `close()` that ran during the sweep must not leave
+      // pruning or a reload happening after it returned.
+      if (this.closed) return
+      prunePatches(this.patchDir, { retentionDays: this.patchRetentionDays })
+      if (this.closed) return
+      this.#loadPatches()
+    } catch (error) {
+      // Never reject: the pool is already serving, and the timer or the next `prepare`
+      // retries whatever this pass could not finish.
+      this.log(`startup sweep failed: ${messageOf(error)}`)
+    } finally {
+      this.startupSweepDone = true
+      const seconds = ((Date.now() - started) / 1000).toFixed(1)
+      this.log(
+        `startup sweep finished in ${seconds}s: ${String(stats.salvaged)} dead owner(s) salvaged, ` +
+          `${String(stats.kept)} kept, ${String(stats.removed)} removed, ` +
+          `${String(stats.patches)} patch(es) salvaged`,
+      )
+    }
+  }
+
+  /**
+   * The timer's pass: sweep dead owners, then trim, never throwing into the event loop.
+   *
+   * Silent until the deferred start-up sweep has finished: the pass it would run is
+   * already about to run, and a trim would measure a layout the sweep is still changing.
+   */
   #housekeeping() {
+    if (!this.startupSweepDone) return
     try {
       this.#sweepDeadOwners()
       this.trim()
@@ -3050,18 +4025,25 @@ export class WorkspaceIsolation {
    * it, and once that process is gone the same periodic pass moves the patches to the
    * durable store and reloads them from there.
    *
+   * Silent while a deferred start-up sweep is still running: that pass is the same work,
+   * and running it again here would sweep the layout a second time concurrently.
+   *
    * @returns {void}
    */
   #sweepDeadOwners() {
     if (!this.ownsStateDir) return
+    if (!this.startupSweepDone) return
     const migrated = this.#retryLegacyMigration()
-    const swept = sweepDeadOwners(this.root, { patchDir: this.patchDir, log: this.log }) > 0
+    const swept = sweepDeadOwners(this.root, { patchDir: this.patchDir, baseDir: this.baseDir, log: this.log })
     // While a live old server keeps writing into the legacy store, the in-memory view is
     // refreshed from it too: the old server may have committed a patch since construction,
     // and the caller of this server must be able to list it. The reload is two small
     // directory listings, and only while the old store is being watched.
     const watchingLegacy = this.legacyPatchDir !== undefined
-    if (migrated || swept || watchingLegacy) this.#loadPatches()
+    // Reload when a patch was salvaged, not only when an owner was removed: an owner kept
+    // because one of its slots could not be read can still have had another slot salvaged,
+    // and that patch would otherwise be missing from `listPatches` until a restart.
+    if (migrated || swept.patches > 0 || watchingLegacy) this.#loadPatches()
   }
 
   /**
@@ -3077,7 +4059,7 @@ export class WorkspaceIsolation {
   #retryLegacyMigration() {
     const legacyDir = this.legacyPatchDir
     if (legacyDir === undefined) return false
-    const others = livePidsIn(join(stateBaseDir(), rootDigest(this.root))).filter((pid) => pid !== process.pid)
+    const others = livePidsIn(join(this.baseDir, rootDigest(this.root))).filter((pid) => pid !== process.pid)
     if (others.length > 0) return false
     const moved = migrateLegacyPatches(legacyDir, this.patchDir, { log: this.log })
     // A fully migrated store is gone. Forgetting the flag then keeps later sweeps from
@@ -3097,6 +4079,13 @@ export class WorkspaceIsolation {
    * Unapplied patches are never removed here — one may be the only copy of finished
    * work, and the retention window already ages them out — so a root still over the
    * cap after that is reported in the log rather than trimmed further.
+   *
+   * `trash-*` directories are neither measured nor counted. A trash tree is disk a
+   * background removal is already freeing, and measuring it here was a synchronous
+   * recursive walk — the event-loop freeze this change exists to remove — whose bytes then
+   * made `trim` delete applied patches and retired trees to pay for space that was already
+   * on its way back. `clean`'s report may still count them (see `digestStats`), because it
+   * is a synchronous command with no server to keep answering.
    *
    * @returns {{bytes: number, removedTrees: number, removedPatches: number}} what is
    *   left, and what was removed.
@@ -3146,7 +4135,7 @@ export class WorkspaceIsolation {
     if (total > this.maxStateBytes) {
       this.log(
         `trim: this root's state holds ${formatBytes(total)}, over the ${formatBytes(this.maxStateBytes)} cap; ` +
-          'what is left is unapplied patches, which are kept until they expire',
+          'what is left is unapplied patches and retired trees whose work is already collected, which are kept',
       )
     }
     result.bytes = total
@@ -3192,7 +4181,9 @@ export class WorkspaceIsolation {
    * A durable record wins over a legacy one with the same id because the durable store is
    * read first and an id already held is skipped. The record keeps the directory it came
    * from (`storeDir`) and its paths point there, so an update — marking it applied, say —
-   * is written next to that record and never split across the two stores.
+   * is written next to that record and never split across the two stores. Every field the
+   * file carries is kept — `task` and `finalMessage` included — so a reloaded record
+   * answers the same questions a freshly collected one does.
    *
    * @param {string} patchDir - the store to read.
    * @returns {void}
@@ -3232,7 +4223,14 @@ export class WorkspaceIsolation {
    * the ones from earlier calls — including any a previous server salvaged from a tree
    * that was mid-task when it died.
    *
-   * @returns {object[]} the patch records, most recently created first.
+   * A pool constructed with `deferStartupSweep` has loaded nothing until `startupSweep()`
+   * has finished, so this returns only what has been loaded so far — before the sweep,
+   * an empty list even when patches exist on disk. Addressing one by its full id still
+   * works throughout: `readPatch` and `apply` fall back to the store on disk (see
+   * `#lookupFullPatch`), which is what lets a salvaged patch be applied before the sweep's
+   * own load reached it.
+   *
+   * @returns {object[]} the loaded patch records, most recently created first.
    */
   listPatches() {
     return [...this.patches.values()].sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0))
@@ -3245,6 +4243,13 @@ export class WorkspaceIsolation {
    * cancelled or out of time must not go on to lease a tree, copy a repository, and
    * only then discover that nobody is waiting for the answer.
    *
+   * A deferred start-up sweep is awaited first: no call may copy into a tree while the
+   * sweep may still be reclaiming disk, and the first call's `prepare` must not start a
+   * second sweep beside the one already running. That wait is itself bounded by the same
+   * signal and deadline as the wait for a tree (see `#awaitStartupSweep`): the very first
+   * call after a crash must not be wedged behind a sweep nobody can cancel, and giving up
+   * on the wait does not stop the sweep.
+   *
    * @param {object} [options] - how long the caller may wait.
    * @param {AbortSignal} [options.signal] - client cancellation.
    * @param {number} [options.deadline] - epoch milliseconds this call must be done by.
@@ -3252,6 +4257,8 @@ export class WorkspaceIsolation {
    * @throws {IsolationError} with code `CANCELLED` or `TIMEOUT`.
    */
   async lease({ signal, deadline } = {}) {
+    if (signal?.aborted === true) throw new IsolationError('the call was cancelled before a tree could be leased', 'CANCELLED')
+    await this.#awaitStartupSweep({ signal, deadline })
     const budget = deadline === undefined ? undefined : Math.max(0, deadline - Date.now())
     if (signal?.aborted === true) throw new IsolationError('the call was cancelled before a tree could be leased', 'CANCELLED')
     if (budget === 0) throw new IsolationError('the call had no time left before a tree could be leased', 'TIMEOUT')
@@ -3278,6 +4285,62 @@ export class WorkspaceIsolation {
         signal.addEventListener('abort', waiter.onAbort, { once: true })
       }
       this.waiting.push(waiter)
+    })
+  }
+
+  /**
+   * Wait for the deferred start-up sweep while the call still has time and its client
+   * still wants the answer.
+   *
+   * `lease` used to await `startupSweep()` before its own deadline and abort handling
+   * existed, so the first call after a crash waited for the whole sweep — unbounded by the
+   * call's budget, and impossible to cancel: neither `TIMEOUT` nor `CANCELLED` could end
+   * the wait. The sweep is not stopped when a caller gives up; it is reclaiming disk for
+   * every later call, and other calls await the same promise.
+   *
+   * @param {object} options - the caller's budget.
+   * @param {AbortSignal} [options.signal] - client cancellation.
+   * @param {number} [options.deadline] - epoch milliseconds this call must be done by.
+   * @returns {Promise<void>} resolves when the sweep finished, or at once when it already had.
+   * @throws {IsolationError} with code `CANCELLED` or `TIMEOUT`.
+   */
+  async #awaitStartupSweep({ signal, deadline } = {}) {
+    const sweep = this.startupSweep()
+    if (!this.startupSweepPending) return
+    const budget = deadline === undefined ? undefined : Math.max(0, deadline - Date.now())
+    if (signal?.aborted === true) {
+      throw new IsolationError('the call was cancelled while waiting for the start-up sweep', 'CANCELLED')
+    }
+    if (budget === 0) {
+      throw new IsolationError('the call had no time left while the start-up sweep was still running', 'TIMEOUT')
+    }
+    await new Promise((resolveWait, rejectWait) => {
+      let settled = false
+      const finish = (settle, value) => {
+        if (settled) return
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        signal?.removeEventListener?.('abort', onAbort)
+        settle(value)
+      }
+      const onAbort = () => {
+        finish(rejectWait, new IsolationError('the call was cancelled while waiting for the start-up sweep', 'CANCELLED'))
+      }
+      const timer =
+        budget === undefined
+          ? undefined
+          : setTimeout(() => {
+              finish(
+                rejectWait,
+                new IsolationError(`the start-up sweep was still running after the call's ${String(budget)}ms budget`, 'TIMEOUT'),
+              )
+            }, budget)
+      if (signal !== undefined) signal.addEventListener('abort', onAbort, { once: true })
+      // The sweep itself never rejects; both outcomes mean the wait is over.
+      sweep.then(
+        () => finish(resolveWait),
+        () => finish(resolveWait),
+      )
     })
   }
 
@@ -3322,10 +4385,17 @@ export class WorkspaceIsolation {
    * @param {string} [options.cwd] - the call's working directory, which selects the scope.
    * @param {'working-tree' | 'head'} [options.source] - what the copy starts from.
    * @param {object} [options.fs] - an `fs`-like override passed to `copyTree`; tests only.
+   * @param {object} [options.task] - the task this copy is working on, kept on the stored
+   *   patch: `{kind: 'flash_task' | 'flash_batch', label: string, sessionId?: string,
+   *   jobId?: string, taskFile?: string}`. Bounded here and written into the copy's git
+   *   directory, so a patch salvaged after a crash can still name it.
    * @returns {{base: string | null, mechanism: 'clone' | 'copy', scope: string,
    *   excluded: string[], uncommitted: {count: number, files: string[]}, reason?: string}} the base.
    */
-  prepare(slot, { cwd, source = 'working-tree', fs } = {}) {
+  prepare(slot, { cwd, source = 'working-tree', fs, task } = {}) {
+    // The task belongs to the call, not to the slot: the next call in this tree must not
+    // inherit the last one's identity.
+    slot.task = normalizeTask(task)
     // A server that died while this one ran leaves its trees behind; the next call is the
     // cheapest moment to notice, since it is about to need disk anyway.
     this.#sweepDeadOwners()
@@ -3415,12 +4485,13 @@ export class WorkspaceIsolation {
     }
     try {
       detachGitLink(original, repoDir)
+      this.#writeTaskFile(repoDir, slot.task)
       // Exclusions go in *after* the link is detached: a linked worktree gets a fresh .git
       // here, and an exclusion written before that would not be in it. `.flash-tmp` always
       // exists; `.flash-home` is named only when a `slotEnv` entry creates it, and
       // `.flash-cache` when one does or when a setup step keeps something in the slot, so
       // an ordinary copy's ignore list stays exactly what it was.
-      const hasDirEnv = Object.values(this.slotEnv).some((spec) => spec.kind !== 'port')
+      const hasDirEnv = Object.values(this.slotEnv).some((spec) => spec.kind === 'home' || spec.kind === 'cache')
       const slotNames = [SLOT_TMP]
       if (hasDirEnv) slotNames.push(SLOT_HOME)
       if (hasDirEnv || this.slotSetup.length > 0) slotNames.push(SLOT_CACHE)
@@ -3567,6 +4638,37 @@ export class WorkspaceIsolation {
   }
 
   /**
+   * Record the call's task inside the copy, so the patch it produces can be traced to it.
+   *
+   * The file goes in the copy's own git directory: git never reports anything there, so it
+   * cannot become part of the worker's diff, and it is emptied with the tree. A copy that
+   * is not a repository has no such directory to write into — creating a bare `.git` would
+   * make every later git call treat the tree as a broken repository — so it is skipped. A
+   * failed write is logged and the call continues: losing the annotation is not losing work.
+   *
+   * @param {string} repoDir - the copy's repository.
+   * @param {object | undefined} task - the bounded task, when the call named one.
+   * @returns {void}
+   */
+  #writeTaskFile(repoDir, task) {
+    if (task === undefined) return
+    let info
+    try {
+      info = statSync(join(repoDir, '.git'))
+    } catch {
+      // No git directory: nothing to record into.
+      return
+    }
+    if (!info.isDirectory()) return
+    const file = taskFileIn(repoDir)
+    try {
+      writeFileSync(file, `${JSON.stringify(task)}\n`)
+    } catch (error) {
+      this.log(`could not record the task for this copy in ${file}: ${messageOf(error)}`)
+    }
+  }
+
+  /**
    * Create the per-slot directories the configured `slotEnv` entries point at.
    *
    * Called from `prepare` after the slot has been emptied (which preserves `.flash-cache`)
@@ -3580,8 +4682,9 @@ export class WorkspaceIsolation {
   #createSlotEnv(slot) {
     if (Object.keys(this.slotEnv).length === 0) return
     for (const spec of Object.values(this.slotEnv)) {
-      // A port entry reserves a number, not a directory: there is nothing to create.
-      if (spec.kind === 'port') continue
+      // A port entry reserves a number and a value entry is plain text: neither names a
+      // directory, so neither may create one.
+      if (spec.kind !== 'home' && spec.kind !== 'cache') continue
       mkdirSync(join(slot.dir, spec.kind === 'home' ? SLOT_HOME : SLOT_CACHE, spec.segment), { recursive: true })
     }
   }
@@ -3591,16 +4694,21 @@ export class WorkspaceIsolation {
    *
    * The runtime is rooted at `slot.dir`, so directory paths are stable for the life of the
    * slot; `retire` gives the slot a new directory and the next boot resolves new paths. A
-   * `port:` entry resolves from `slot.id` alone, so it is stable across `retire` too. A
-   * fresh object is returned every call, so a runtime cannot mutate the pool's settings.
+   * `port:` entry resolves from `slot.id` alone, so it is stable across `retire` too, and a
+   * `value:` entry is the text the caller gave, unchanged. A fresh object is returned every
+   * call, so a runtime cannot mutate the pool's settings.
    *
    * @param {Slot} slot - the slot the worker will run in.
-   * @returns {Record<string, string>} ENV_NAME to absolute path or decimal port; empty when
-   *   none is configured.
+   * @returns {Record<string, string>} ENV_NAME to absolute path, decimal port or plain value;
+   *   empty when none is configured.
    */
   slotEnvFor(slot) {
     const env = {}
     for (const [name, spec] of Object.entries(this.slotEnv)) {
+      if (spec.kind === 'value') {
+        env[name] = spec.value
+        continue
+      }
       if (spec.kind === 'port') {
         env[name] = String(spec.base + slot.id * spec.stride)
         continue
@@ -4085,6 +5193,7 @@ export class WorkspaceIsolation {
     slot.ignoredFiles = undefined
     slot.scope = undefined
     slot.repoDir = undefined
+    slot.task = undefined
     this.log(`retired ${orphan} in place: its session may still be writing there; the slot moved to ${nextDir}`)
   }
 
@@ -4191,6 +5300,9 @@ export class WorkspaceIsolation {
         appliedAt: null,
       }
       if (preimage !== undefined) record.preimage = preimage
+      // The task the copy was prepared for travels with the patch: after a crash or a
+      // restart, the record itself says whose work this was.
+      if (slot.task !== undefined) record.task = slot.task
       // The record is the commit point: until it lands, the patch and its blobs are
       // unreferenced and a prune may reclaim them.
       this.#writeMeta(record)
@@ -4239,23 +5351,24 @@ export class WorkspaceIsolation {
    * repository, only the saved blobs.
    *
    * @param {object} options - the patch to apply.
-   * @param {string} options.patchId - a patch id from an earlier call.
+   * @param {string} options.patchId - a patch id from an earlier call, or a unique prefix of
+   *   one (at least eight hex digits, with or without the `flash-` prefix).
    * @param {boolean} [options.dryRun] - check that it applies without changing anything.
    * @param {boolean} [options.force] - apply again even though the record says it was applied.
    * @param {boolean} [options.threeWay] - merge it when the plain apply fails.
-   * @returns {{patchId: string, applied: boolean, dryRun: boolean, root: string, filesChanged: string[], diffstat: string, threeWay: boolean, conflicts: string[], indexTouched: boolean, note?: string}} the outcome.
+   * @returns {{patchId: string, applied: boolean, dryRun: boolean, root: string, filesChanged: string[], diffstat: string, threeWay: boolean, conflicts: string[], indexTouched: boolean, note?: string, task?: object}} the outcome, with the full id and the task that made the patch when the record has one.
    * @throws {Error} when the patch is unknown, belongs to another repository, was already
    *   applied, does not apply, or its base is not available for a three-way merge.
    */
   apply({ patchId, dryRun = false, force = false, threeWay = false }) {
     const record = this.#lookupPatch(patchId)
-    if (!existsSync(record.patchPath)) throw new Error(`the patch file for ${patchId} is gone (${record.patchPath})`)
+    if (!existsSync(record.patchPath)) throw new Error(`the patch file for ${record.patchId} is gone (${record.patchPath})`)
     // A patch that was applied once is not idempotent: `git apply` may well find a
     // second place to put the change when the surrounding lines repeat. Recording the
     // apply is what makes "already applied" a rule instead of a coincidence.
     if (!dryRun && !force && record.appliedAt !== null && record.appliedAt !== undefined) {
       throw new Error(
-        `patch ${patchId} was already applied to ${this.root} at ${new Date(record.appliedAt).toISOString()}; pass force: true to apply it again`,
+        `patch ${record.patchId} was already applied to ${this.root} at ${new Date(record.appliedAt).toISOString()}; pass force: true to apply it again`,
       )
     }
     // A patch computed inside one nested repository applies inside that repository.
@@ -4263,7 +5376,15 @@ export class WorkspaceIsolation {
     const filesChanged = plainPaths(record.filesChanged)
     const diffstat = (record.diffstat ?? '').trim()
     const outcome = this.#applyTo(record, { target, dryRun, threeWay, mark: !dryRun })
-    return { patchId, dryRun, root: target, filesChanged, diffstat, ...outcome }
+    return {
+      patchId: record.patchId,
+      dryRun,
+      root: target,
+      filesChanged,
+      diffstat,
+      ...(record.task === undefined ? {} : { task: record.task }),
+      ...outcome,
+    }
   }
 
   /**
@@ -4281,7 +5402,7 @@ export class WorkspaceIsolation {
    * marked applied: it reached a throwaway tree, not the caller's.
    *
    * @param {Slot} slot - a slot `prepare` has already filled.
-   * @param {string} patchId - the stored patch to continue from.
+   * @param {string} patchId - the stored patch to continue from, or a unique prefix of its id.
    * @returns {{patchId: string, applied: true, threeWay: boolean, conflicts: string[],
    *   filesChanged: string[]}} what landed in the copy.
    * @throws {Error} when the patch is unknown, belongs to another root or scope, its file is
@@ -4289,7 +5410,7 @@ export class WorkspaceIsolation {
    */
   applyBasePatch(slot, patchId) {
     const record = this.#lookupPatch(patchId)
-    if (!existsSync(record.patchPath)) throw new Error(`the patch file for ${patchId} is gone (${record.patchPath})`)
+    if (!existsSync(record.patchPath)) throw new Error(`the patch file for ${record.patchId} is gone (${record.patchPath})`)
     // The copy was made from the scope the call's cwd resolves to, and a patch only means
     // the same edit inside the repository it was computed in.
     const scope = slot.scope ?? ''
@@ -4297,7 +5418,7 @@ export class WorkspaceIsolation {
     if (patchScope !== scope) {
       const where = (value) => (value === '' ? 'the service root' : `the repository ${value}`)
       throw new Error(
-        `patch ${patchId} was computed for ${where(patchScope)}, but this call's cwd resolves to ${where(scope)}; ` +
+        `patch ${record.patchId} was computed for ${where(patchScope)}, but this call's cwd resolves to ${where(scope)}; ` +
           'a base patch must come from the same repository as the call',
       )
     }
@@ -4310,7 +5431,7 @@ export class WorkspaceIsolation {
     } catch (error) {
       throw new Error(
         `${messageOf(error)} Continuing from this patch is not possible in the copy. ` +
-          `Pass source: "head" to start from the last commit instead, or apply patch ${patchId} to your tree with flash_apply first.`,
+          `Pass source: "head" to start from the last commit instead, or apply patch ${record.patchId} to your tree with flash_apply first.`,
       )
     }
     // The copy's state now includes the base patch's change, so what it started with changed
@@ -4701,17 +5822,18 @@ export class WorkspaceIsolation {
    * the possibly-clipped `change.diff` in a result.
    *
    * @param {object} options - which patch, and which slice of it.
-   * @param {string} options.patchId - a patch id from an earlier call.
+   * @param {string} options.patchId - a patch id from an earlier call, or a unique prefix of
+   *   one (at least eight hex digits, with or without the `flash-` prefix).
    * @param {string[]} [options.files] - read only these files' sections.
    * @param {number} [options.offset] - character offset into the selected text.
    * @param {number} options.maxChars - the page budget.
-   * @returns {{patchId: string, patchPath: string, applied: boolean, filesChanged: string[], diffstat: string, totalChars: number, offset: number, diff: string, files: string[], nextOffset: number | null}} the page.
+   * @returns {{patchId: string, patchPath: string, applied: boolean, filesChanged: string[], diffstat: string, totalChars: number, offset: number, diff: string, files: string[], nextOffset: number | null, task?: object, finalMessage?: string, finalMessageTruncated?: true}} the page; `task` rides on every page, while the worker's final message is only on the page that starts at offset 0.
    * @throws {Error} when the patch is unknown, belongs to another repository, is gone, or
    *   `files` names a file the patch does not contain.
    */
   readPatch({ patchId, files, offset = 0, maxChars }) {
     const record = this.#lookupPatch(patchId)
-    if (!existsSync(record.patchPath)) throw new Error(`the patch file for ${patchId} is gone (${record.patchPath})`)
+    if (!existsSync(record.patchPath)) throw new Error(`the patch file for ${record.patchId} is gone (${record.patchPath})`)
     const diff = readFileSync(record.patchPath, 'utf8')
     const sections = diffSections(diff)
     const known = sections.map((section) => section.path).filter((path) => path !== null)
@@ -4721,7 +5843,7 @@ export class WorkspaceIsolation {
       const unknown = files.filter((name) => !known.includes(name))
       if (unknown.length > 0) {
         throw new Error(
-          `patch ${patchId} does not contain ${unknown.map((name) => JSON.stringify(name)).join(', ')}; ` +
+          `patch ${record.patchId} does not contain ${unknown.map((name) => JSON.stringify(name)).join(', ')}; ` +
             (known.length === 0 ? 'it changes no files' : `it changes: ${known.join(', ')}`),
         )
       }
@@ -4738,7 +5860,7 @@ export class WorkspaceIsolation {
     const text = rebased.map((section) => section.text).join('')
     const page = pageSections(rebased, text, offset, maxChars)
     return {
-      patchId,
+      patchId: record.patchId,
       patchPath: record.patchPath,
       applied: record.appliedAt !== null && record.appliedAt !== undefined,
       filesChanged: plainPaths(record.filesChanged),
@@ -4748,28 +5870,157 @@ export class WorkspaceIsolation {
       diff: page.diff,
       files: page.files,
       nextOffset: page.nextOffset,
+      ...(record.task === undefined ? {} : { task: record.task }),
+      // The worker's report is a preamble to the patch, not part of it: repeating ten
+      // thousand characters on every page would be most of what a paging caller reads.
+      ...(page.offset === 0 && typeof record.finalMessage === 'string'
+        ? {
+            finalMessage: record.finalMessage,
+            ...(record.finalMessageTruncated === true ? { finalMessageTruncated: true } : {}),
+          }
+        : {}),
     }
   }
 
   /**
-   * Find one patch, and refuse to hand back one this service may not apply.
+   * Attach the worker's final report to a stored patch.
    *
-   * Two refusals matter here. The id must have the shape this service issues, because
-   * the id is used to build a path — `../` used to reach any `.patch` on disk. And the
-   * record must name *this* repository: a patch computed for another root is not a
-   * merge, it is a different edit to different files, and applying it produced a tree
-   * holding another caller's work under this caller's name.
+   * A call's patch is collected before its runtime's last message is known, so the report is
+   * written afterwards — and the record has to survive a crash between the two, which is why
+   * this rewrites the record on disk through the same shape `collect` uses. The message is
+   * bounded: a record is read by every later `flash_patch`, and a worker's report can be
+   * longer than the change it describes.
    *
-   * @param {string} patchId - the id to look for.
-   * @returns {object} the held or re-read record.
-   * @throws {Error} when the id is malformed, unknown, or belongs to another root.
+   * @param {string} patchId - the patch to annotate, or a unique prefix of its id.
+   * @param {object} [options] - what the worker said.
+   * @param {string} [options.finalMessage] - the worker's final report; the first 8,000
+   *   characters are kept, and `finalMessageTruncated` says when it was cut.
+   * @returns {void}
+   * @throws {Error} when the id is malformed, unknown, or belongs to another root, exactly
+   *   as `apply` refuses one.
+   */
+  annotatePatch(patchId, { finalMessage } = {}) {
+    const record = this.#lookupPatch(patchId)
+    if (typeof finalMessage === 'string') {
+      record.finalMessage = finalMessage.slice(0, FINAL_MESSAGE_MAX)
+      if (finalMessage.length > FINAL_MESSAGE_MAX) record.finalMessageTruncated = true
+      else delete record.finalMessageTruncated
+    }
+    this.#writeMeta(record)
+    this.patches.set(record.patchId, record)
+  }
+
+  /**
+   * Find one patch, resolving a short id first, and refuse to hand back one this service
+   * may not apply.
+   *
+   * Three refusals matter here. The id must have the shape this service issues — a full
+   * `flash-<uuid>` or a unique prefix of one — because the id is used to build a path,
+   * and `../` used to reach any `.patch` on disk. A prefix must name exactly one patch:
+   * two reports quoting the same eight digits is an answer nobody can act on, so it is
+   * refused with the full ids instead of silently picking one. And the record must name
+   * *this* repository: a patch computed for another root is not a merge, it is a different
+   * edit to different files, and applying it produced a tree holding another caller's work
+   * under this caller's name.
+   *
+   * @param {string} patchId - the id, or a unique prefix, to look for.
+   * @returns {object} the held or re-read record, carrying the full `patchId`.
+   * @throws {Error} when the id is malformed, unknown, ambiguous, or belongs to another root.
    */
   #lookupPatch(patchId) {
-    if (typeof patchId !== 'string' || !PATCH_ID.test(patchId)) {
+    // A full id is the case that must behave exactly as it always has; only a shorter one
+    // is resolved against the store, and it is resolved *before* any path is built from it.
+    if (typeof patchId === 'string' && PATCH_ID.test(patchId)) return this.#lookupFullPatch(patchId)
+    const prefix = typeof patchId === 'string' ? PATCH_ID_PREFIX.exec(patchId) : null
+    if (prefix === null) {
       throw new Error(
-        `patchId ${JSON.stringify(patchId)} is not an id this service issues; ids look like "flash-<uuid>"`,
+        `patchId ${JSON.stringify(patchId)} is not an id this service issues; ids look like "flash-<uuid>", ` +
+          'or give a unique prefix of at least 8 hex digits',
       )
     }
+    const matches = this.#matchingPatchIds(prefix[1])
+    if (matches.length === 0) {
+      throw new Error(`no patch ${patchId} is held by this service; patches are kept in ${this.patchDir}`)
+    }
+    if (matches.length > 1) {
+      const named = matches.slice(0, PATCH_PREFIX_NAMES).join(', ')
+      const more = matches.length > PATCH_PREFIX_NAMES ? ', …' : ''
+      throw new Error(
+        `patchId ${JSON.stringify(patchId)} matches ${String(matches.length)} stored patches: ${named}${more}; give more of the id`,
+      )
+    }
+    return this.#lookupFullPatch(matches[0])
+  }
+
+  /**
+   * The full ids one hex prefix could mean, restricted to records this pool may apply.
+   *
+   * Both the held records and the ids present in the store directories count, because a
+   * sibling service may have stored one since this pool loaded. A foreign root's record is
+   * not a candidate at all: counting it would make a caller's own prefix look ambiguous,
+   * and returning it would hand over another repository's patch. Its scope is checked the
+   * same way, since an unsafe scope is a record `apply` refuses.
+   *
+   * @param {string} hexPrefix - at least eight hex digits, dashes already allowed.
+   * @returns {string[]} the matching full ids.
+   */
+  #matchingPatchIds(hexPrefix) {
+    const wanted = hexPrefix.replaceAll('-', '')
+    const matches = new Set()
+    const candidate = (id) => id.startsWith('flash-') && id.slice('flash-'.length).replaceAll('-', '').startsWith(wanted)
+    for (const [id, record] of this.patches) {
+      if (!candidate(id)) continue
+      if (record?.root !== this.root) continue
+      if (!scopeIsSafeOrEmpty(record?.scope)) continue
+      matches.add(id)
+    }
+    const stores = [this.patchDir, ...(this.legacyPatchDir === undefined ? [] : [this.legacyPatchDir])]
+    for (const store of stores) {
+      let names
+      try {
+        names = readdirSync(store)
+      } catch {
+        // A store that does not exist yet holds nothing, which is not an error here.
+        continue
+      }
+      for (const name of names) {
+        if (!name.endsWith('.json')) continue
+        const id = name.slice(0, -'.json'.length)
+        if (!PATCH_ID.test(id) || !candidate(id) || matches.has(id)) continue
+        if (this.#storedPatchApplies(store, id)) matches.add(id)
+      }
+    }
+    return [...matches]
+  }
+
+  /**
+   * Whether one record on disk is a patch this pool may apply.
+   *
+   * Only the two facts `#lookupFullPatch` checks before it returns a record are read here:
+   * the root it was computed for, and a scope that stays inside it. An unreadable record is
+   * not a patch anybody can apply, so it is not a candidate for a prefix either.
+   *
+   * @param {string} store - the directory the record lives in.
+   * @param {string} patchId - the record's id.
+   * @returns {boolean} true when this pool could apply that record.
+   */
+  #storedPatchApplies(store, patchId) {
+    try {
+      const record = JSON.parse(readFileSync(join(store, `${patchId}.json`), 'utf8'))
+      return record?.patchId === patchId && record?.root === this.root && scopeIsSafeOrEmpty(record?.scope)
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Find one patch by its full id, re-reading the record when this pool does not hold it.
+   *
+   * @param {string} patchId - a validated full patch id.
+   * @returns {object} the held or re-read record.
+   * @throws {Error} when the record is unknown, unreadable, or belongs to another root.
+   */
+  #lookupFullPatch(patchId) {
     const held = this.patches.get(patchId)
     if (held !== undefined) {
       this.#assertScopeSafe(held)
@@ -4895,13 +6146,21 @@ export class WorkspaceIsolation {
     slot.base = null
     slot.scope = undefined
     slot.repoDir = undefined
+    slot.task = undefined
   }
 
   /**
    * Remove the slot trees and every orphan they left in place. Stored patches stay: an
    * apply may still be coming.
+   *
+   * A deferred start-up sweep still in flight stops at its next yield point: the event
+   * loop is single-threaded, so setting the flag here is enough to keep it from starting
+   * another slot or owner after this method returns. A background removal of a tree that
+   * was already renamed to `trash-*` is left to finish on its own; it only deletes, and
+   * the next sweep adopts it if this process exits first.
    */
   close() {
+    this.closed = true
     if (this.sweepTimer !== undefined) clearInterval(this.sweepTimer)
     for (const slot of this.slots) {
       rmSync(slot.dir, { recursive: true, force: true })

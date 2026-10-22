@@ -133,7 +133,9 @@ Rules that held up:
   seconds to a minute. Where it is not (a large Rust workspace), the repository's
   `.flash-agents.json` can leave `target/` out of the copy and keep a warm per-slot one instead
   (`"slotEnv": { "CARGO_TARGET_DIR": "cache:cargo-target" }`), and give tools that write to the
-  home folder a writable one (see the README's per-repository settings). A project whose tests
+  home folder a writable one (see the README's per-repository settings). A setting the whole
+  project shares — a prebuilt OpenSSL, `RUSTC_WRAPPER` — belongs there too as
+  `"NAME": "value:<text>"`, not repeated in every brief. A project whose tests
   need an environment built inside the copy (a Python venv with editable installs, `node_modules`)
   can have it built once per slot with `slotSetup`; ask the user before enabling it, because those
   commands run outside the sandbox. Keep the recipe in project memory so every task carries it verbatim.
@@ -173,8 +175,11 @@ Rules that held up:
   patch.
 - `background: true` returns a job id at once. Use it when there is something to do meanwhile —
   verifying the previous patch, writing the next task — and collect with `flash_result`
-  (`waitSeconds: 300` per wait); `flash_status` shows progress, `flash_cancel` stops a call whose
-  framing turned out wrong.
+  (`waitSeconds: 300` per wait); `flash_cancel` stops a call whose framing turned out wrong.
+  Prefer it for writing calls when copies may be busy: a foreground one that has to wait for a
+  free copy holds your whole turn, and says so while it waits and in its warnings. When a job runs
+  long, `flash_status` says what its workers are doing — `current` lists each open tool call
+  (`command`, `runningMs`) and `warnings` names a command that has failed three times.
 
 ## 5. The review task
 
@@ -205,7 +210,9 @@ remarks. Then confirm each finding yourself before it enters a fix round.
 - `NOT_DELEGATED`: the dispatcher did the work itself instead of delegating; re-run the call.
 - A worker that **stopped partway** (it says why, first) left a good start: send the next task
   with `basePatch: <that patchId>` and say what is left. The copy starts with that change already
-  applied, and the new patch is cumulative — apply it instead of the old one, never both.
+  applied, and the new patch is cumulative — apply it instead of the old one, never both. An id can
+  be quoted short: `flash_apply`, `flash_patch` and `basePatch` take any unique prefix of at least
+  eight hex digits, with or without `flash-`, and refuse an ambiguous one with the matches named.
 - `emptyResult: true` with `status: "error"`: the worker ended without a report and without a
   change. Treat it as failed and send the task again.
 - Refusals appear in the result's `denials` and in the log with their reason; a worker that hit

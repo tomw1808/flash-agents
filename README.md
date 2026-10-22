@@ -133,13 +133,34 @@ reports what it changed, and keeps nothing.
 Pass `background: true` and a call returns at once with a job id, so Claude can run tests or
 review an earlier patch while workers run; `flash_result` collects the result (and can wait for
 it), `flash_cancel` stops it. `flash_status` lists running jobs first, then the last few that
-ended; a call still waiting for a free copy says so (`queued … waiting for a free tree`).
+ended, and for a running one says what its workers are doing: `current` holds each open tool call
+(`tool`, `command`, `since`, `runningMs`, as of the last heartbeat) and `warnings` names a command
+that failed three or more times in the call. A job sent with `taskFile` is labelled with the brief's
+first line rather than `(untitled task)`, so a long brief's job is recognisable in the listing. A
+call still waiting for a free copy says so — `queued 1m10s: waiting for a free tree (2 of 2 in use)`,
+and `queued in the foreground …` for a writing call sent without `background: true`, which holds
+your turn while it waits; that call's result carries the same warning.
+
+A first attempt that ends early with nothing — under three minutes and at most twelve model calls,
+nothing delegated or only empty reports, and no change in the copy — is retried once after ten
+seconds in the same copy, because that shape is usually a cold runtime rather than a real attempt.
+The result carries `retried` (the reason, and the first attempt's session, duration and usage) and a
+warning. A slow failure, and any attempt that left a change in the copy, is not retried: that is a
+verdict.
 
 A long brief can be written to a file and sent with `taskFile` instead of `task` — exactly as
 written, once. When a worker stopped partway, `basePatch: <its patchId>` starts the next call
 from that work: the patch is applied to the new copy first (merged if your tree moved on), and
 the new call's patch holds both, so you apply only the last one. A call whose worker ends with an empty report and no change comes back as
 `status: "error"` with `emptyResult: true`, not as a quiet success.
+
+A patch id can be quoted short: `flash_apply`, `flash_patch` and `basePatch` take any unique prefix
+of at least eight hex digits, with or without the leading `flash-` (`1a2b3c4d`,
+`flash-1a2b3c4d-5e6f`), and an ambiguous prefix is refused naming the patches it could mean. Each
+stored patch records the task that made it — the brief's first line, the job id, the session, and
+the `taskFile` path — and, once the call finished, the worker's final report (first 8,000
+characters). `flash_patch` returns the task on every page and the report on the first; `flash_apply`
+returns the task. A patch salvaged after a crash still names its task.
 
 Every result reports the tokens the call used (`usage`), and lists any uncommitted files the copy
 started with (`isolation.uncommittedAtStart`). If another session has uncommitted work in the same
@@ -201,7 +222,8 @@ is read when the server starts, so restart Claude Code after changing it.
   "copyExclude": ["target"],
   "slotEnv": {
     "CARGO_TARGET_DIR": "cache:cargo-target",
-    "XDG_CONFIG_HOME": "home:config"
+    "XDG_CONFIG_HOME": "home:config",
+    "OPENSSL_NO_VENDOR": "value:1"
   }
 }
 ```
@@ -219,8 +241,15 @@ is read when the server starts, so restart Claude Code after changing it.
   emptied for every call; `cache:<name>` is kept between calls in the same slot, so
   `CARGO_TARGET_DIR: "cache:cargo-target"` keeps incremental builds warm without copying `target/`.
   `port:<base>` gives each slot its own port base (`base + slot × 10`; `port:41000/100` for a
-  stride of 100), for test servers that would otherwise share a fixed port. `HOME` and `TMPDIR`
-  can't be moved.
+  stride of 100), for test servers that would otherwise share a fixed port. `value:<text>` sets a
+  plain value in every slot, for a setting the whole project shares rather than one brief:
+  `"OPENSSL_NO_VENDOR": "value:1"` in the example above, `"OPENSSL_DIR": "value:C:\\openssl"` for a
+  Rust project with a prebuilt OpenSSL, or `"RUSTC_WRAPPER": "value:sccache"`. A `value:` entry
+  reaches the worker and its `slotSetup` steps. `HOME`, `TMPDIR`, `TMP`, `TEMP`, `DSH_HOME` and
+  `FLASH_ROUTE_MODEL` can't be moved, and neither can `PATH`, `PATHEXT`, `NODE_OPTIONS`, `NODE_PATH`
+  or any `LD_*`/`DYLD_*` name: the slot environment is also the environment of the `dsh` runtime
+  process, which runs outside the worker's sandbox, so a `PATH` or a `NODE_OPTIONS=--require …`
+  would act there. Only a writing call has a slot; a `read-only` call sees none of this.
 - **`slotSetup`** — commands that build what the copy needs before the worker starts, such as a
   virtual environment whose editable installs must point into the copy, not into your checkout:
 
@@ -269,6 +298,12 @@ To watch workers live, set a log file and `tail -f` it — see
   are not tracked. The copy is emptied as soon as the patch is stored, build output included.
 - **The dispatcher is a cheap model too.** Occasionally it does the work itself instead of
   delegating; that call fails as `NOT_DELEGATED`, nothing from it is kept, and a retry usually works.
+  One shape of that is retried automatically — an attempt that ended within three minutes and at
+  most twelve model calls with no delegation, or only empty reports, and no change in the copy — once,
+  after ten seconds. Anything else it got wrong is a verdict, not a hiccup.
+- **A repeated-failure warning reads the shell's exit code, so a pipe hides it.** A command piped
+  into `tee` reports `tee`'s exit code, not the failing command's, so a build that fails on the left
+  of a pipe cannot be counted; read the worker's output for those.
 - **Copies are separate folders, not separate machines.** Two workers in parallel share ports, the
   keyring and other per-user services: a test server on a fixed port can answer the other copy's
   tests. Pick a free port per run.
@@ -278,6 +313,17 @@ To watch workers live, set a log file and `tail -f` it — see
 - **A nested repository the root's git ignores is read-only in effect**: a worker can edit it in its
   copy, but the change can't travel in the root's patch. Point `cwd` into that repository to work
   on it.
+- **Jobs are this server's, not your machine's.** `flash_status` and `flash_result` know only the
+  jobs the running server process started: another session's jobs, or one from before a restart, are
+  not listed. A finished writing call's work survives that as a patch, which `flash_apply` can still
+  apply by id.
+- **A crash used to lose the unfinished work; 0.1.7 fixes that.** Before 0.1.7 the start-up sweep
+  looked for a dead server's copies one directory too high, found nothing to salvage, and deleted
+  them. It now finds them and salvages a copy that holds work as a patch named in the log, and keeps a copy it
+  could not read — retried at most once every ten minutes, up to three attempts — instead of deleting
+  it. The dead server's directory is renamed out of the way and deleted in the background, and the
+  handshake is answered before any of it runs, so a large clean-up cannot outlast Claude Code's
+  connect timeout.
 - macOS and Linux are what we test on. Windows 11 works in daily use by at least one user; directory
   junctions are recreated as junctions inside the copy.
 

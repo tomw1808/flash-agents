@@ -15,8 +15,9 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
 
-import { createService, instructionsFor, jobLabel, listTools, parseOptions, runDoctor } from '../lib/index.js'
+import { createService, instructionsFor, jobLabel, listTools, parseOptions, runDoctor, startServer } from '../lib/index.js'
 import { DEFAULT_CONFIG, mergeConfig } from '../lib/config.js'
 
 /** The route the tests configure; recognisable so a value can be traced to it. */
@@ -163,6 +164,33 @@ test('a background job label says which model it chose, unless it is the default
   assert.equal(jobLabel('flash_task', { task: 'write the thing', model: TEST_MODEL }, TEST_MODEL), 'write the thing')
   assert.equal(jobLabel('flash_task', { task: 'write the thing', model: 'other:cloud' }, TEST_MODEL), '[other:cloud] write the thing')
   assert.equal(jobLabel('flash_batch', { tasks: ['a', 'b'], model: 'other:cloud' }, TEST_MODEL), '[other:cloud] 2 tasks')
+})
+
+test('a taskFile job is labelled with the brief it names, and names the path when it cannot read it', () => {
+  // A brief written the way callers write them: a heading, then prose.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-label-')))
+  writeFileSync(
+    join(root, 'brief.txt'),
+    ['#  Port the parser  ', '', ...Array.from({ length: 20 }, (_, index) => `line ${String(index)}`)].join('\n'),
+  )
+  assert.equal(jobLabel('flash_task', { taskFile: 'brief.txt' }, TEST_MODEL, root), 'Port the parser')
+  // An absolute path resolves the same way, and the model prefix still leads.
+  assert.equal(
+    jobLabel('flash_task', { taskFile: join(root, 'brief.txt'), model: 'other:cloud' }, TEST_MODEL, root),
+    '[other:cloud] Port the parser',
+  )
+  // Unreadable: the path is the one fact a status reader can act on.
+  assert.equal(jobLabel('flash_task', { taskFile: 'missing.txt' }, TEST_MODEL, root), 'taskFile missing.txt')
+  // A brief outside the root is refused by the same fence the service applies, so it is
+  // labelled by path here too rather than read.
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-outside-')))
+  writeFileSync(join(outside, 'brief.txt'), '# not yours\n')
+  assert.equal(
+    jobLabel('flash_task', { taskFile: join(outside, 'brief.txt') }, TEST_MODEL, root),
+    `taskFile ${join(outside, 'brief.txt')}`,
+  )
+  // A call that named a task keeps today's label; the brief is not read at all.
+  assert.equal(jobLabel('flash_task', { task: 'inline task', taskFile: 'brief.txt' }, TEST_MODEL, root), 'inline task')
 })
 
 test('the service allowlist holds its default first, whichever door named it', async () => {
@@ -488,3 +516,148 @@ test('doctor --e2e reports the exact error, with the note a NOT_DELEGATED run ne
   assert.match(text, /note\s+e2e\s+the cheap dispatcher sometimes does the work itself; a rerun usually passes/)
 })
 
+
+// ── the stdio server's deferred start-up sweep ──────────────────────────────
+
+/** Wait, with a bound, until `predicate` holds. */
+async function waitUntil(predicate, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.fail(`condition was not met within ${timeoutMs}ms`)
+}
+
+/**
+ * Start a real server over an in-memory byte stream, recording the frames it writes.
+ *
+ * The service is real — that is the wiring under test — while the sweep itself is replaced
+ * by a spy in the tests, so nothing here scans a temp directory on a timer.
+ *
+ * @param {object} options - parsed service options.
+ * @param {object} [timing] - passed through to `startServer`.
+ * @returns {{server: object, input: PassThrough, frames: object[],
+ *   send: (message: object) => void, waitForFrame: (count: number) => Promise<void>}}
+ */
+function startTestServer(options, timing) {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  output.setEncoding('utf8')
+  const frames = []
+  let buffer = ''
+  output.on('data', (chunk) => {
+    buffer += chunk
+    for (;;) {
+      const index = buffer.indexOf('\n')
+      if (index < 0) break
+      const line = buffer.slice(0, index)
+      buffer = buffer.slice(index + 1)
+      if (line.trim() !== '') frames.push(JSON.parse(line))
+    }
+  })
+  const server = startServer(options, input, output, timing)
+  return {
+    server,
+    input,
+    frames,
+    send: (message) => input.write(`${JSON.stringify(message)}\n`),
+    waitForFrame: (count) => waitUntil(() => frames.length >= count),
+  }
+}
+
+/** The service options the two startServer tests run with: throwaway root and state. */
+function serveOptions() {
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-serve-root-')))
+  return {
+    root: repo,
+    profile: 'flash-service',
+    provider: 'ollama',
+    model: TEST_MODEL,
+    isolate: 'copy',
+    slots: 1,
+    // Never the real durable store: a configured state directory keeps its own `calls`.
+    stateDir: realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-serve-state-'))),
+    env: doctorEnv(),
+  }
+}
+
+test('startServer defers the sweep until the client has initialized', async () => {
+  const options = serveOptions()
+  const { server, input, frames, send, waitForFrame } = startTestServer(options, { startupSweepDelayMs: 60_000 })
+  const sweeps = []
+  server.service.isolation.startupSweep = () => {
+    sweeps.push('sweep')
+    return Promise.resolve()
+  }
+  try {
+    // The pool really is deferred: the flag reached it through createService and service.js.
+    assert.equal(server.service.isolation.deferStartupSweep, true)
+    // And it can say what a waiting call is waiting for, so the service does not have to
+    // guess why `lease` has not answered yet.
+    assert.equal(server.service.isolation.startupSweepPending, true, 'the deferred sweep has not run')
+    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
+    await waitForFrame(1)
+    assert.deepEqual(sweeps, [], 'the handshake alone does not start the sweep')
+
+    send({ jsonrpc: '2.0', method: 'notifications/initialized' })
+    await waitUntil(() => sweeps.length === 1)
+    // A second notification cannot start a second pass.
+    send({ jsonrpc: '2.0', method: 'notifications/initialized' })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.deepEqual(sweeps, ['sweep'])
+    assert.equal(frames[0].id, 1)
+  } finally {
+    input.end()
+    await server.done
+  }
+})
+
+test('startServer starts the sweep on the fallback timer when initialized never arrives', async () => {
+  const options = serveOptions()
+  // A handshake is answered quickly; the delay is long enough that the frame below cannot
+  // race the timer, and short enough to keep the test fast.
+  const { server, input, frames, send, waitForFrame } = startTestServer(options, { startupSweepDelayMs: 100 })
+  const sweeps = []
+  server.service.isolation.startupSweep = () => {
+    sweeps.push('sweep')
+    return Promise.resolve()
+  }
+  try {
+    // A client that handshakes but never sends `notifications/initialized` must still get
+    // its dead owners cleaned up; the fallback is unref'd, so it never holds a process open.
+    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
+    await waitForFrame(1)
+    assert.equal(sweeps.length, 0, 'the timer has not fired yet')
+    await waitUntil(() => sweeps.length === 1)
+    assert.deepEqual(sweeps, ['sweep'])
+    assert.equal(frames[0].id, 1)
+  } finally {
+    input.end()
+    await server.done
+  }
+})
+
+test('createService only defers the sweep when the serve wiring asks for it', async () => {
+  // `doctor --e2e` builds its service through this same factory and reads the swept state
+  // immediately, so the deferral must be the server's wiring, not a factory-wide default.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-create-root-')))
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-create-state-')))
+  const options = { ...parseOptions([], {}, config), root, isolate: 'copy', slots: 1, stateDir, env: doctorEnv() }
+  const immediate = createService(options)
+  try {
+    assert.equal(immediate.isolation.deferStartupSweep, false)
+    assert.equal(immediate.isolation.startupSweepDone, true, 'the constructor already did the work')
+    assert.equal(immediate.isolation.startupSweepPending, false, 'nothing is left to wait for')
+  } finally {
+    await immediate.close()
+  }
+  const deferred = createService(options, () => {}, { deferStartupSweep: true })
+  try {
+    assert.equal(deferred.isolation.deferStartupSweep, true)
+    assert.equal(deferred.isolation.startupSweepDone, false)
+    assert.equal(deferred.isolation.startupSweepPending, true)
+  } finally {
+    await deferred.close()
+  }
+})

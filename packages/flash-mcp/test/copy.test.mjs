@@ -794,7 +794,7 @@ test('an out-of-range port base, stride or highest slot is refused with a log li
   assert.match(text, /ZERO_STRIDE: the port stride must be a whole number in 1\.\.10000/)
   assert.match(text, /WIDE_STRIDE: the port stride must be a whole number in 1\.\.10000/)
   assert.match(text, /OVER_TOP: port:65535\/10 reaches 65545 at slot 1, past 65535/)
-  assert.match(text, /NOT_A_PORT: expected "home:<name>", "cache:<name>" or "port:<base>\[\/<stride>\]"/)
+  assert.match(text, /NOT_A_PORT: expected "home:<name>", "cache:<name>", "port:<base>\[\/<stride>\]" or "value:<text>"/)
   isolation.close()
 })
 
@@ -811,6 +811,132 @@ test('the prompt names port variables apart from the writable directories', () =
   assert.match(prompt, /E2E_PORT hold a port base reserved for this slot; use ports from there instead of fixed ones\./)
   assert.doesNotMatch(prompt, /The environment sets .*E2E_PORT/)
   assert.doesNotMatch(prompt, /E2E_PORT.*writable per-slot directories/)
+})
+
+// ── value: slotEnv entries ───────────────────────────────────────────────────
+
+test('value: entries are handed over verbatim, and create no directory', async () => {
+  const repo = makeRepo()
+  const { isolation } = makePool(repo, {
+    slotEnv: {
+      OPENSSL_NO_VENDOR: 'value:1',
+      OPENSSL_DIR: 'value:C:\\openssl',
+      RUSTC_WRAPPER: 'value:sccache',
+      EMPTY: 'value:',
+      TRICKY: 'value:a:b = c:/x\\y value:z',
+    },
+  })
+  // The spec the pool holds is the text alone, not the `value:` spelling.
+  assert.deepEqual(isolation.slotEnv.OPENSSL_DIR, { kind: 'value', value: 'C:\\openssl' })
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  assert.deepEqual(isolation.slotEnvFor(slot), {
+    OPENSSL_NO_VENDOR: '1',
+    OPENSSL_DIR: 'C:\\openssl',
+    RUSTC_WRAPPER: 'sccache',
+    EMPTY: '',
+    // Everything after the FIRST `value:` belongs to the value, `value:` included.
+    TRICKY: 'a:b = c:/x\\y value:z',
+  })
+  // A plain value is not a folder: no per-slot home or cache was invented for it.
+  assert.equal(existsSync(join(slot.dir, '.flash-home')), false)
+  assert.equal(existsSync(join(slot.dir, '.flash-cache')), false)
+  const exclude = readFileSync(join(slot.dir, '.git', 'info', 'exclude'), 'utf8')
+  assert.doesNotMatch(exclude, /\.flash-home/)
+  assert.doesNotMatch(exclude, /\.flash-cache/)
+  isolation.close()
+})
+
+test('a value: entry in .flash-agents.json is accepted like a pool option', () => {
+  const repo = makeRepo()
+  writeFileSync(
+    join(repo, '.flash-agents.json'),
+    JSON.stringify({ slotEnv: { OPENSSL_DIR: 'value:C:\\Program Files\\OpenSSL' } }),
+  )
+  const { isolation } = makePool(repo)
+  assert.deepEqual(isolation.slotEnv.OPENSSL_DIR, { kind: 'value', value: 'C:\\Program Files\\OpenSSL' })
+  isolation.close()
+})
+
+test('value: entries mix with home:, cache: and port: entries', async () => {
+  const repo = makeRepo()
+  const { isolation } = makePool(repo, {
+    slots: 2,
+    slotEnv: {
+      CARGO_HOME: 'home:cargo',
+      CARGO_TARGET_DIR: 'cache:cargo-target',
+      E2E_PORT: 'port:41000',
+      RUSTC_WRAPPER: 'value:sccache',
+    },
+  })
+  const first = await isolation.lease()
+  isolation.prepare(first)
+  assert.deepEqual(isolation.slotEnvFor(first), {
+    CARGO_HOME: join(first.dir, '.flash-home', 'cargo'),
+    CARGO_TARGET_DIR: join(first.dir, '.flash-cache', 'cargo-target'),
+    E2E_PORT: '41000',
+    RUSTC_WRAPPER: 'sccache',
+  })
+  // Only the directory entries created a directory.
+  assert.equal(existsSync(join(first.dir, '.flash-home', 'cargo')), true)
+  assert.equal(existsSync(join(first.dir, '.flash-cache', 'cargo-target')), true)
+  assert.equal(existsSync(join(first.dir, '.flash-home', 'sccache')), false)
+  assert.equal(existsSync(join(first.dir, '.flash-cache', 'sccache')), false)
+  isolation.close()
+})
+
+test('a value: entry with a NUL or over the Windows limit is refused with a log line', () => {
+  const repo = makeRepo()
+  const logs = []
+  const longest = 'x'.repeat(32767)
+  const { isolation } = makePool(repo, {
+    slotEnv: {
+      NUL: 'value:before\0after',
+      TOO_LONG: `value:${'y'.repeat(32768)}`,
+      AT_LIMIT: `value:${longest}`,
+      KEPT: 'value:1',
+    },
+    log: (line) => logs.push(line),
+  })
+  assert.deepEqual(Object.keys(isolation.slotEnv), ['AT_LIMIT', 'KEPT'])
+  assert.deepEqual(isolation.slotEnv.AT_LIMIT, { kind: 'value', value: longest })
+  const text = logs.join('\n')
+  assert.match(text, /NUL: .*may not contain a NUL character/)
+  assert.match(text, /TOO_LONG: a value: entry is 32768 characters, over the 32767-character limit/)
+  assert.doesNotMatch(text, /AT_LIMIT/)
+  isolation.close()
+})
+
+test('PATH, NODE_OPTIONS and loader names are refused for every kind of entry', () => {
+  const repo = makeRepo()
+  const logs = []
+  const { isolation } = makePool(repo, {
+    // A plain value reaches the dsh runtime process, which runs outside the worker's
+    // sandbox: a name that decides which program runs, or how code is loaded, would let a
+    // project's configuration run code in the runtime itself.
+    slotEnv: {
+      PATH: 'value:/tmp/bin',
+      Path: 'home:bin',
+      PATHEXT: 'cache:pathext',
+      NODE_OPTIONS: 'value:--require /tmp/x.js',
+      NODE_PATH: 'cache:node',
+      LD_PRELOAD: 'value:/tmp/x.so',
+      LD_LIBRARY_PATH: 'home:lib',
+      DYLD_INSERT_LIBRARIES: 'value:/tmp/x.dylib',
+      dyld_library_path: 'cache:dyld',
+      CARGO_HOME: 'home:cargo',
+    },
+    log: (line) => logs.push(line),
+  })
+  assert.deepEqual(Object.keys(isolation.slotEnv), ['CARGO_HOME'])
+  const refused = ['PATH', 'Path', 'PATHEXT', 'NODE_OPTIONS', 'NODE_PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'dyld_library_path']
+  for (const name of refused) {
+    assert.ok(
+      logs.some((line) => line.includes(`not redirecting ${name}`) && line.includes('it changes how the runtime loads programs')),
+      `${name} must be refused with the loader reason`,
+    )
+  }
+  isolation.close()
 })
 
 

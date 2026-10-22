@@ -33,7 +33,7 @@ import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { serveStdio, describeError } from './mcp.js'
-import { DEFAULT_MODEL, FlashTaskService } from './service.js'
+import { DEFAULT_MODEL, FlashTaskService, readTaskFile, taskLabel } from './service.js'
 import { DEFAULT_INITIALIZE_TIMEOUT_MS } from './sdk.js'
 import { JobRegistry, JOB_TOOLS } from './jobs.js'
 import { allowedModels, loadConfig } from './config.js'
@@ -41,7 +41,7 @@ import { formatChecks, resolveDshHome, runChecks } from './doctor.js'
 import { WorkspaceIsolation, cleanLayout } from './isolation.js'
 
 /** Server identity reported to the MCP client. */
-export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.6' })
+export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.7' })
 
 /**
  * How often a `flash_result` call that is waiting tells the MCP client it is alive. The
@@ -93,6 +93,23 @@ export function instructionsFor(models = [DEFAULT_MODEL]) {
     'immediately, or call `flash_apply` with the `change.patchId` afterwards. Review the diff; the',
     'worker\'s own account of what it did is not evidence that it did it. A long diff is clipped',
     'at a file boundary; `flash_patch` reads the stored patch whole or by file.',
+    '',
+    'A stored patch outlives the call that made it. Its record names the task that made it —',
+    'the brief\'s first line, the job id, the session and any taskFile path — and, once the call',
+    'finished, the worker\'s final report (the first 8,000 characters). `flash_patch` returns the',
+    'task on every page and the report on the first one, and `flash_apply` returns the task, so a',
+    'patch applied days later still says what it was asked to do. `flash_apply`, `flash_patch`',
+    'and `basePatch` accept a unique prefix of a patch id — at least eight hex digits, with or',
+    'without the `flash-` prefix — so an id can be quoted the way a log line spells it; a prefix that',
+    'matches more than one stored patch is refused with the matches named.',
+    '',
+    'A first attempt that ends early with nothing — under three minutes and at most twelve model',
+    'calls, nothing delegated or only empty reports, and no change in the copy — is retried once',
+    'after ten seconds in the same copy, and the result says so under `retried`.',
+    '',
+    '`flash_status` on a running job reports what its workers are doing: `current` lists each open',
+    'tool call (`tool`, `command`, `since`, `runningMs`) as of the last heartbeat, and `warnings`',
+    'names a command that failed three or more times in the call.',
     '',
     'Project facts every worker needs (layout, check commands, style rules) belong in an',
     '`AGENTS.md` or `CLAUDE.md` in the repository: the Harness loads those into every worker',
@@ -172,7 +189,7 @@ export function listTools(models = [DEFAULT_MODEL]) {
           },
           basePatch: {
             type: 'string',
-            description: "A patchId from an earlier writing call. Its change is applied to this call's copy before the worker starts (three-way merged if the tree moved on), and the result's patch then contains both that change and the new work; the stored base patch itself is not applied to your tree.",
+            description: "A patchId from an earlier writing call, or a unique prefix of one (at least 8 hex digits, with or without the `flash-` prefix). Its change is applied to this call's copy before the worker starts (three-way merged if the tree moved on), and the result's patch then contains both that change and the new work; the stored base patch itself is not applied to your tree.",
           },
           model: {
             type: 'string',
@@ -181,7 +198,7 @@ export function listTools(models = [DEFAULT_MODEL]) {
           },
           background: {
             type: 'boolean',
-            description: 'Return at once with a jobId instead of holding your turn while the worker runs (minutes, often). Collect the result with flash_result, watch it with flash_status, stop it with flash_cancel. Meanwhile you can run tests or review an earlier patch.',
+            description: 'Return at once with a jobId instead of holding your turn while the worker runs (minutes, often). Collect the result with flash_result, watch it with flash_status, stop it with flash_cancel. Meanwhile you can run tests or review an earlier patch. A writing call sent without this that has to wait for a busy copy says so while it waits and in its result\'s warnings, holding your whole turn; prefer `background: true` when copies may be busy.',
           },
         },
         required: ['cwd'],
@@ -261,7 +278,7 @@ export function listTools(models = [DEFAULT_MODEL]) {
           },
           basePatch: {
             type: 'string',
-            description: "A patchId from an earlier writing call. Its change is applied to this call's copy before the workers start (three-way merged if the tree moved on), and the result's patch then contains both that change and the new work; the stored base patch itself is not applied to your tree.",
+            description: "A patchId from an earlier writing call, or a unique prefix of one (at least 8 hex digits, with or without the `flash-` prefix). Its change is applied to this call's copy before the workers start (three-way merged if the tree moved on), and the result's patch then contains both that change and the new work; the stored base patch itself is not applied to your tree.",
           },
           model: {
             type: 'string',
@@ -288,12 +305,13 @@ export function listTools(models = [DEFAULT_MODEL]) {
         'files — and nothing else.',
         '',
         'The patch applied here is the *stored* one, not the possibly-truncated `change.diff`',
-        'in the result, so a long change still applies whole.',
+        'in the result, so a long change still applies whole. The result names the task that made',
+        'the patch (`task`), so a change applied later still says which work it belongs to.',
         '',
         'If the server that ran a call died before the call finished, the next server on the',
         'same root salvages the unfinished work from the dead server’s tree as a patch. That',
         'salvage is named in the server log (patch id and diffstat) and can be applied here by',
-        'id like any other patch.',
+        'id like any other patch; it carries the task too.',
         '',
         'Pass `dryRun: true` to check that it still applies without changing anything. A patch that',
         'was already applied is refused; pass `force: true` to apply it again anyway. Patches do not',
@@ -311,7 +329,7 @@ export function listTools(models = [DEFAULT_MODEL]) {
         properties: {
           patchId: {
             type: 'string',
-            description: 'The change.patchId from the result of the call whose work should be applied.',
+            description: 'The change.patchId from the result of the call whose work should be applied, or a unique prefix of it (at least 8 hex digits, with or without the `flash-` prefix).',
           },
           dryRun: {
             type: 'boolean',
@@ -343,13 +361,18 @@ export function listTools(models = [DEFAULT_MODEL]) {
         'Pages end at a file boundary where one fits, so a page never splits a line; pass the returned',
         '`nextOffset` back as `offset` to read the rest, and stop when `nextOffset` is null. `files`',
         'names the files each page covers.',
+        '',
+        'The patch\'s record names the task that made it: `task` (the brief\'s first line, the job',
+        'id, the session and any taskFile path) is on every page, and the worker\'s final report',
+        '(`finalMessage`, the first 8,000 characters; `finalMessageTruncated` says when it was cut)',
+        'is on the page that starts at offset 0.',
       ].join('\n'),
       inputSchema: {
         type: 'object',
         properties: {
           patchId: {
             type: 'string',
-            description: 'The change.patchId from the result of the call whose patch should be read.',
+            description: 'The change.patchId from the result of the call whose patch should be read, or a unique prefix of it (at least 8 hex digits, with or without the `flash-` prefix).',
           },
           files: {
             type: 'array',
@@ -615,16 +638,21 @@ leave a setting blank rather than having to omit it.
 export function createToolCaller({ service, jobs, log = () => {}, waitProgressIntervalMs = WAIT_PROGRESS_INTERVAL_MS }) {
   // A thunk, not a call: `flashApply` and `flashPatch` throw synchronously on a bad id, and
   // that throw must land inside the caller's try rather than escape the dispatcher.
-  const runFor = (name, args, { signal, progress, progressToken }) =>
-    name === 'flash_task'
-      ? () => service.flashTask(args, { signal, progress, progressToken })
+  // `background` and `jobId` travel with a job's call: the first is what makes a queued
+  // writing call say it is holding the caller's turn, the second is what a stored patch
+  // records as the job the change belongs to.
+  const runFor = (name, args, { signal, progress, progressToken, background = false, jobId = undefined }) => {
+    const context = { signal, progress, progressToken, background, ...(jobId === undefined ? {} : { jobId }) }
+    return name === 'flash_task'
+      ? () => service.flashTask(args, context)
       : name === 'flash_batch'
-        ? () => service.flashBatch(args, { signal, progress, progressToken })
+        ? () => service.flashBatch(args, context)
         : name === 'flash_apply'
           ? () => service.flashApply(args)
           : name === 'flash_patch'
             ? () => service.flashPatch(args)
             : undefined
+  }
 
   /**
    * Turn one background call into a running job and answer with its id. The service runs
@@ -647,7 +675,7 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
     }
     const job = jobs.start({
       kind: name,
-      label: jobLabel(name, args, service?.model),
+      label: jobLabel(name, args, service?.model, service?.root),
       run: ({ signal, jobId, progress }) =>
         runFor(name, args, {
           signal,
@@ -656,6 +684,8 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
           // only reads whether one is present. There is no client here, so the job's own id
           // stands in, and every heartbeat reaches the job's recorder.
           progressToken: jobId,
+          background: true,
+          jobId,
         })(),
     })
     return okResult({
@@ -878,20 +908,58 @@ function omit(args, key) {
  * A call that chose a model other than the default says so in front of the label, so a
  * status listing shows which model a running job is spending on.
  *
+ * A `taskFile` call is labelled with the brief's own first line: a job that reports
+ * "(untitled task)" for hours tells the caller nothing about which of its calls is running.
+ * The file is read through `readTaskFile`, the service's own fence and limits, with its log
+ * silenced — the service reads the same file again when the call runs, and one "task read
+ * from" line is enough. A file that cannot be read leaves `taskFile <path>` as the label,
+ * which is at least the one fact a status reader can act on.
+ *
  * @param {string} kind - the tool name.
  * @param {object} args - the raw tool arguments.
  * @param {string} [defaultModel] - the service's default model.
+ * @param {string} [root] - the service root a relative `taskFile` resolves against.
  * @returns {string} the label.
  */
-export function jobLabel(kind, args, defaultModel) {
+export function jobLabel(kind, args, defaultModel, root) {
   const chosen = typeof args?.model === 'string' && args.model.length > 0 && args.model !== defaultModel
   const prefix = chosen ? `[${args.model}] ` : ''
   if (kind === 'flash_batch') {
     const count = Array.isArray(args?.tasks) ? args.tasks.length : 0
     return `${prefix}${String(count)} tasks`
   }
-  const firstLine = typeof args?.task === 'string' ? args.task.split('\n')[0].trim() : ''
+  // An inline task keeps its historical label: its very first line, blank or not.
+  const firstLine = typeof args?.task === 'string' ? (args.task.split('\n')[0] ?? '').trim() : ''
+  if (firstLine.length === 0 && typeof args?.taskFile === 'string' && args.taskFile.length > 0) {
+    const fromFile = taskFileLabel(root, args.taskFile)
+    // The unreadable case keeps the whole path: it is the only fact there is to act on, and
+    // truncating it would name a file that does not exist.
+    return fromFile === undefined ? `${prefix}taskFile ${args.taskFile}` : `${prefix}${fromFile}`
+  }
   return `${prefix}${clip(firstLine.length === 0 ? '(untitled task)' : firstLine, 80)}`
+}
+
+/**
+ * The first line of a brief, or undefined when the file cannot be read.
+ *
+ * The label comes from `taskLabel`, the same helper a stored patch's task record uses: a
+ * Markdown heading's `#` is noise on a status line, and the job the caller watches and the
+ * patch that outlives it must name one brief identically.
+ *
+ * @param {string | undefined} root - the service root; without one nothing can be read.
+ * @param {string} taskFile - the `taskFile` argument, as given.
+ * @returns {string | undefined} the brief's label, or undefined when it has none.
+ */
+function taskFileLabel(root, taskFile) {
+  if (typeof root !== 'string' || root.length === 0) return undefined
+  try {
+    const text = readTaskFile(root, taskFile, { log: () => {} })
+    const line = taskLabel(text, 80)
+    return line.length === 0 ? undefined : line
+  } catch {
+    // A label is not worth failing a background call over; the path is still the answer.
+    return undefined
+  }
 }
 
 /** Bound a label to the width a status line is read at. */
@@ -927,9 +995,15 @@ function modelChoices(model, models) {
  *
  * @param {object} options - parsed options (see `parseOptions`).
  * @param {(message: string) => void} [log] - diagnostic sink.
+ * @param {object} [wiring] - how this service will be run, which the options do not say.
+ * @param {boolean} [wiring.deferStartupSweep] - leave the store migration, dead-owner
+ *   sweep, disk hygiene and patch load to `startupSweep()`. Only the stdio server does:
+ *   it answers `initialize` first and starts the sweep once the client has finished the
+ *   handshake (see `startServer`). The doctor's `--e2e` run and every other caller keep
+ *   the constructor's behaviour, because they read the swept state immediately.
  * @returns {FlashTaskService} the service.
  */
-export function createService(options, log = () => {}) {
+export function createService(options, log = () => {}, { deferStartupSweep = false } = {}) {
   return new FlashTaskService({
     ...options,
     // The service's allowlist always holds its own default first, whichever door named it
@@ -944,19 +1018,44 @@ export function createService(options, log = () => {}) {
       ...(options.diffChars === undefined ? {} : { diffChars: options.diffChars }),
       ...(options.patchRetentionDays === undefined ? {} : { patchRetentionDays: options.patchRetentionDays }),
       ...(options.maxStateBytes === undefined ? {} : { maxStateBytes: options.maxStateBytes }),
+      ...(deferStartupSweep ? { deferStartupSweep: true } : {}),
     },
     log,
   })
 }
 
 /**
+ * How long `serve` waits for the client's `notifications/initialized` before starting the
+ * deferred start-up sweep anyway.
+ *
+ * The notification is what tells the server the handshake is done, and every client
+ * sends it, but the sweep must not depend on it: a client that never sends it would
+ * otherwise leave every dead owner's trees on disk forever.
+ */
+const STARTUP_SWEEP_FALLBACK_MS = 5_000
+
+/**
  * Start the server on stdio.
+ *
+ * The service is built with the start-up sweep deferred, so the `initialize` answer is
+ * written before any migration, salvage or deletion runs: on a machine whose dead slots
+ * held multi-gigabyte build trees, deleting them inside the constructor outlasted the
+ * client's 30 s connect timeout and the client killed the server mid-sweep. The sweep
+ * starts when the client reports the handshake finished, or after the fallback delay.
+ *
  * @param {object} [options] - parsed options.
  * @param {NodeJS.ReadableStream} [input] - protocol input.
  * @param {NodeJS.WritableStream} [output] - protocol output.
+ * @param {object} [timing] - timings a test can shorten.
+ * @param {number} [timing.startupSweepDelayMs] - fallback delay before the start-up sweep.
  * @returns {{service: FlashTaskService, connection: {close: () => void}, done: Promise<void>}}
  */
-export function startServer(options, input = process.stdin, output = process.stdout) {
+export function startServer(
+  options,
+  input = process.stdin,
+  output = process.stdout,
+  { startupSweepDelayMs = STARTUP_SWEEP_FALLBACK_MS } = {},
+) {
   const logFile =
     typeof options.logFile === 'string' && options.logFile.length > 0 ? options.logFile : undefined
   /** Open the append target once; any failure degrades to stderr-only logging. */
@@ -986,7 +1085,7 @@ export function startServer(options, input = process.stdin, output = process.std
       reportLogFileFailure(error)
     }
   }
-  const service = createService(options, log)
+  const service = createService(options, log, { deferStartupSweep: true })
   log(`root ${service.root}; profile ${service.profile}; route ${service.provider}/${service.model}`)
   if (service.isolation === undefined) {
     log(
@@ -995,6 +1094,16 @@ export function startServer(options, input = process.stdin, output = process.std
     )
   } else {
     log(`isolation: ${String(service.isolation.size)} disposable tree(s) under ${service.stateDir}`)
+  }
+
+  // One trigger wins, and `startupSweep` is idempotent anyway: the notification normally
+  // comes first, the timer is the fallback for a client that never sends it.
+  let sweepStarted = false
+  const startSweep = (trigger) => {
+    if (sweepStarted) return
+    sweepStarted = true
+    log(`startup sweep started (${trigger})`)
+    void service.isolation?.startupSweep()
   }
 
   const models = modelChoices(service.model, service.models)
@@ -1006,10 +1115,15 @@ export function startServer(options, input = process.stdin, output = process.std
     input,
     output,
     callTool: createToolCaller({ service, jobs: new JobRegistry({ log }), log }),
+    onInitialized: () => startSweep('after initialize'),
   })
+  // Unref'd: the fallback must never be the reason a finished process stays alive.
+  const sweepTimer = setTimeout(() => startSweep('after 5s without initialized'), startupSweepDelayMs)
+  sweepTimer.unref?.()
 
   const done = new Promise((resolveDone) => {
     const finish = async () => {
+      clearTimeout(sweepTimer)
       connection.close()
       output.off?.('close', finish)
       await service.close().catch((error) => log(`runtime shutdown failed: ${describeError(error)}`))
@@ -1651,7 +1765,9 @@ directories. Patches are never removed by --all.
  * per-root patch store under the platform data directory (or `FLASH_DATA_DIR`). A legacy
  * `patches/` directory under the temp tree is pruned too, so an upgrade leaves nothing
  * behind to age out twice. Sizes are printed in MB because the report answers a disk
- * question, not a file-count one.
+ * question, not a file-count one. Every removal the run reports is finished before the
+ * report is printed, `trash-*` directories included: `clean` exits the process right after
+ * the summary, so a background deletion would be abandoned half done.
  *
  * @param {string[]} [argv] - arguments after `clean`.
  * @param {object} [options] - injected effects, for tests.
@@ -1690,6 +1806,10 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, n
     root: canonicalRoot(root),
     all,
     retentionDays: retentionDays ?? config.limits.patchRetentionDays,
+    // The process exits right after this report, so every removal must be finished before
+    // `cleanLayout` returns: a background deletion would be abandoned with the process
+    // while the summary claimed the disk had been reclaimed.
+    removal: 'sync',
     ...(now === undefined ? {} : { now }),
     log: (message) => emit(`[flash-mcp clean] ${message}\n`),
   })
@@ -1709,6 +1829,9 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, n
     `removed: ${String(actions.deadOwnersRemoved)} dead owner(s), ${String(actions.patchesPruned)} expired patch(es), ` +
       `${String(actions.emptyDigestsRemoved)} empty digest(s)` +
       (all ? `, ${String(actions.foreignTreesRemoved)} foreign tree(s)` : '') +
+      // The trash a crash left between the rename and the delete is disk `clean` reclaimed
+      // too; a summary that left it out named a smaller removal than actually happened.
+      `, ${String(actions.trashRemoved)} trash director${actions.trashRemoved === 1 ? 'y' : 'ies'}` +
       '\n',
   )
   return 0

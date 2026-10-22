@@ -101,7 +101,9 @@ It makes one copy the way a writing call would, prints its size, time and what w
 and deletes it. If the copy fails, every writing call would fail the same way — report the error.
 If it is large or slow, point at the largest entries it lists and at a `.flash-agents.json` in
 the project root (`copyExclude`, `slotEnv`; see the README's "Per-repository settings"). `.env`,
-`.env.*` and `.mcp.json` are already left out by default.
+`.env.*` and `.mcp.json` are already left out by default. `slotEnv` takes `"NAME": "value:<text>"`
+for a plain value set in every copy — a prebuilt OpenSSL, `RUSTC_WRAPPER` — so briefs need not
+repeat it.
 
 ## 6. Tell them what they have
 

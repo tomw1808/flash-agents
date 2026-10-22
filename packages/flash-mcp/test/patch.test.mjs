@@ -30,10 +30,16 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { WorkspaceIsolation, prunePatches } from '../lib/isolation.js'
+import { WorkspaceIsolation, prunePatches, rootDigest } from '../lib/isolation.js'
 import { FlashTaskError, FlashTaskService } from '../lib/service.js'
 
 const GIT_ID = ['-c', 'user.email=t@t', '-c', 'user.name=t']
+
+/**
+ * Default-layout pools store patches in the durable data directory; keep every one in this
+ * file out of the real user data directory.
+ */
+process.env.FLASH_DATA_DIR = realpathSync(mkdtempSync(join(tmpdir(), 'flash-patch-data-')))
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -677,6 +683,40 @@ test('trim removes an applied patch together with its saved blobs', async () => 
   assert.equal(existsSync(join(stateDir, 'calls', `${change.patchId}.json`)), false)
   assert.equal(existsSync(blobs), false, 'the saved blobs go with the patch they belong to')
   isolation.close()
+})
+
+test('trim ignores trash, so a large interrupted removal cannot cost an applied patch', async () => {
+  // The defect this guards: `trim` walked every `trash-*` tree synchronously — the
+  // event-loop freeze the sweep change exists to remove — and added its bytes to the total,
+  // so it deleted applied patches to pay for disk a background removal was already freeing.
+  const repo = makeRepo({ 'f.txt': 'l1\nl2\nl3\n' })
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-patch-base-')))
+  const isolation = new WorkspaceIsolation({ root: repo, slots: 1, baseDir: base, sweepIntervalMs: 0 })
+  try {
+    const { slot, change } = await collectInCopy(isolation, (dir) => {
+      writeFileSync(join(dir, 'f.txt'), 'l1\nl2 WORKER\nl3\n')
+    })
+    isolation.release(slot)
+    assert.equal(isolation.apply({ patchId: change.patchId }).applied, true)
+
+    // A `trash-*` tree from a removal that is in flight (or one a crash left), far larger
+    // than the cap below.
+    const trash = join(base, rootDigest(repo), 'trash-4242-1700000000000', 'slots', 'slot-0')
+    mkdirSync(trash, { recursive: true })
+    writeFileSync(join(trash, 'target.bin'), 'x'.repeat(512 * 1024))
+
+    // The cap is above the patch's own few hundred bytes and far below the trash's half
+    // megabyte: with the trash counted, the applied patch was the only thing left to delete.
+    isolation.maxStateBytes = 64 * 1024
+    const trimmed = isolation.trim()
+    assert.equal(trimmed.removedPatches, 0, 'the applied patch is kept')
+    assert.equal(existsSync(change.patchPath), true)
+    assert.ok(trimmed.bytes < isolation.maxStateBytes, `only the real state counts (${String(trimmed.bytes)} bytes)`)
+    assert.equal(existsSync(trash), true, 'trim never deletes trash; the background removal owns it')
+  } finally {
+    isolation.close()
+    rmSync(base, { recursive: true, force: true })
+  }
 })
 
 test('prune removes an expired patch together with its saved blobs', () => {
@@ -1416,5 +1456,216 @@ test('a base patch with no saved blobs fails the call, naming it and offering a 
   )
   isolation.discard(slot)
   isolation.release(slot)
+  isolation.close()
+})
+
+// ── short patch ids ─────────────────────────────────────────────────────────
+
+test('an eight-hex prefix, with or without flash-, names the patch it starts', async () => {
+  const repo = makeRepo({ 'f.txt': 'one\n' })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => writeFileSync(join(dir, 'worker.txt'), 'work\n'))
+  const uuid = change.patchId.slice('flash-'.length)
+  const short = uuid.slice(0, 8)
+  // A report quotes the first eight digits; a person may paste the uuid's first group too.
+  for (const patchId of [short, `flash-${short}`, `flash-${uuid.slice(0, 13)}`]) {
+    const page = isolation.readPatch({ patchId, maxChars: 1_000_000 })
+    assert.equal(page.patchId, change.patchId, `${patchId} must resolve to the full id`)
+    assert.match(page.diff, /work/)
+  }
+
+  const applied = isolation.apply({ patchId: short })
+  assert.equal(applied.applied, true)
+  assert.equal(applied.patchId, change.patchId, 'the result names the full id, not the prefix')
+  assert.equal(readFileSync(join(repo, 'worker.txt'), 'utf8'), 'work\n')
+  isolation.close()
+})
+
+test('a prefix two stored patches share is refused, naming both full ids', () => {
+  const repo = makeRepo({ 'README.md': '# project\n' })
+  const { isolation } = makePool(repo)
+  // The first eight hex digits are the whole prefix, so these two are indistinguishable
+  // until more of the id is given.
+  const shared = 'abcdef12'
+  const firstId = `flash-${shared}-1111-4111-8111-111111111111`
+  const secondId = `flash-${shared}-2222-4222-8222-222222222222`
+  storeRawPatch(isolation, firstId, 'diff --git a/x b/x\n', ['A\tx'], { base: 'base' })
+  storeRawPatch(isolation, secondId, 'diff --git a/x b/x\n', ['A\tx'], { base: 'base' })
+
+  assert.throws(
+    () => isolation.apply({ patchId: shared }),
+    (error) =>
+      /patchId "abcdef12" matches 2 stored patches/.test(error.message) &&
+      error.message.includes(firstId) &&
+      error.message.includes(secondId) &&
+      /give more of the id/.test(error.message),
+  )
+  assert.throws(() => isolation.readPatch({ patchId: `flash-${shared}`, maxChars: 1000 }), /matches 2 stored patches/)
+  isolation.close()
+})
+
+test('a short id is checked before any path is built, and a malformed one is refused', () => {
+  const repo = makeRepo({ 'README.md': '# project\n' })
+  const { isolation } = makePool(repo)
+  // Seven hex digits are too few, a non-hex character is not an id, and a path fragment
+  // must never reach a `join()`.
+  for (const patchId of ['abcdef1', 'flash-abcdef1', 'abcdefg1', '../x', 'flash-../x', 'flash-abcd-ef12']) {
+    assert.throws(
+      () => isolation.readPatch({ patchId, maxChars: 1000 }),
+      (error) =>
+        /is not an id this service issues/.test(error.message) &&
+        /unique prefix of at least 8 hex digits/.test(error.message),
+      `${patchId} must be refused as malformed`,
+    )
+    assert.throws(() => isolation.apply({ patchId }), /is not an id this service issues/)
+  }
+  isolation.close()
+})
+
+test('a matching record from another root neither resolves a prefix nor makes one ambiguous', async () => {
+  const repo = makeRepo({ 'f.txt': 'one\n' })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => writeFileSync(join(dir, 'worker.txt'), 'work\n'))
+  const short = change.patchId.slice('flash-'.length, 'flash-'.length + 8)
+  // A sibling service stored a record with the same prefix for a different repository.
+  const foreignId = `flash-${short}-9999-4999-8999-999999999999`
+  storeRawPatch(isolation, foreignId, 'diff --git a/x b/x\n', [], { root: join(tmpdir(), 'flash-elsewhere') })
+  assert.equal(
+    isolation.readPatch({ patchId: short, maxChars: 1_000_000 }).patchId,
+    change.patchId,
+    'the foreign record must not count toward ambiguity',
+  )
+
+  // A prefix only a foreign record matches is "no patch", never another root's patch.
+  const foreignOnly = `flash-deadbeef-9999-4999-8999-999999999999`
+  storeRawPatch(isolation, foreignOnly, 'diff --git a/x b/x\n', [], { root: join(tmpdir(), 'flash-elsewhere') })
+  assert.throws(() => isolation.readPatch({ patchId: 'deadbeef', maxChars: 1000 }), /no patch deadbeef is held/)
+  assert.throws(() => isolation.apply({ patchId: 'deadbeef' }), /no patch deadbeef is held/)
+  isolation.close()
+})
+
+// ── the task that made a patch, and the worker's final report ───────────────
+
+test('a collected patch’s record holds the task that made it', async () => {
+  const repo = makeRepo({ 'f.txt': 'one\n' })
+  const { isolation } = makePool(repo)
+  const label =
+    'Repair the Windows installer cache so every worker sees the vendored OpenSSL and the pinned MSVC toolchain ' +
+    'without repeating the two variables in every brief'
+  assert.ok(label.length > 150, 'a real task label, not a placeholder')
+  const sessionId = `sess-${'a'.repeat(140)}`
+  const taskFile = `/tasks/${'installer-cache/'.repeat(80)}task.md`
+  const slot = await isolation.lease()
+  isolation.prepare(slot, {
+    task: { kind: 'flash_task', label: `  ${label}  `, sessionId, jobId: 'job-7', taskFile, unsupported: 'dropped' },
+  })
+  // The copy carries the task in its own git directory, and git does not see the file there.
+  const inCopy = JSON.parse(readFileSync(join(slot.dir, '.git', 'flash-task.json'), 'utf8'))
+  assert.equal(inCopy.label, label, 'the label is trimmed')
+  assert.equal(inCopy.kind, 'flash_task')
+  assert.equal(inCopy.sessionId.length, 100, 'ids are cut to 100 characters')
+  assert.equal(inCopy.taskFile.length, 1024, 'taskFile is cut to 1,024 characters')
+  assert.equal(inCopy.unsupported, undefined)
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: slot.dir, encoding: 'utf8' }), '', 'the task file is not the worker’s change')
+
+  writeFileSync(join(slot.dir, 'worker.txt'), 'work\n')
+  const change = isolation.collect(slot)
+  assert.equal(change.available, true)
+  const meta = readRecord(isolation, change.patchId)
+  assert.deepEqual(meta.task, inCopy)
+  // Every path that reads the patch back says whose work it was.
+  assert.deepEqual(isolation.listPatches().find((record) => record.patchId === change.patchId).task, meta.task)
+  assert.deepEqual(isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 }).task, meta.task)
+  assert.deepEqual(isolation.apply({ patchId: change.patchId }).task, meta.task)
+  isolation.close()
+})
+
+test('a task without a label is ignored, so the record keeps its ordinary shape', async () => {
+  const repo = makeRepo({ 'f.txt': 'one\n' })
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot, { task: { kind: 'flash_task', label: '   ', sessionId: 'sess-1' } })
+  assert.equal(existsSync(join(slot.dir, '.git', 'flash-task.json')), false)
+  writeFileSync(join(slot.dir, 'a.txt'), 'a\n')
+  const change = isolation.collect(slot)
+  assert.equal(readRecord(isolation, change.patchId).task, undefined)
+  isolation.close()
+})
+
+test('a record without a task, as 0.1.6 wrote it, is still read and applied', async () => {
+  const repo = makeRepo({ 'f.txt': 'one\n' })
+  const { isolation, stateDir } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot, { task: { kind: 'flash_task', label: 'made before the field existed' } })
+  writeFileSync(join(slot.dir, 'old.txt'), 'old work\n')
+  const change = isolation.collect(slot)
+  // Rewrite the record to the shape a version before `task` persisted.
+  const metaPath = join(isolation.patchDir, `${change.patchId}.json`)
+  const oldShape = JSON.parse(readFileSync(metaPath, 'utf8'))
+  delete oldShape.task
+  writeFileSync(metaPath, `${JSON.stringify(oldShape, null, 2)}\n`)
+  isolation.close()
+
+  const next = new WorkspaceIsolation({ root: repo, slots: 1, stateDir })
+  try {
+    const page = next.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+    assert.equal(page.task, undefined)
+    assert.equal(page.finalMessage, undefined)
+    const applied = next.apply({ patchId: change.patchId })
+    assert.equal(applied.applied, true)
+    assert.equal(applied.task, undefined)
+    assert.equal(readFileSync(join(repo, 'old.txt'), 'utf8'), 'old work\n')
+  } finally {
+    next.close()
+  }
+})
+
+test('annotatePatch stores the final report, truncates it, and survives a restart', async () => {
+  const repo = makeRepo({ 'README.md': '# project\n' })
+  const { isolation, stateDir } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => writeFileSync(join(dir, 'worker.txt'), 'work\n'))
+  const message = 'The worker replaced the vendored OpenSSL build and reran the installer suite. '.repeat(120)
+  assert.ok(message.length > 8000, 'a report longer than one record keeps')
+  isolation.annotatePatch(change.patchId, { finalMessage: message })
+
+  const truncated = message.slice(0, 8000)
+  const held = isolation.listPatches().find((record) => record.patchId === change.patchId)
+  assert.equal(held.finalMessage, truncated)
+  assert.equal(held.finalMessageTruncated, true)
+  const meta = readRecord(isolation, change.patchId)
+  assert.equal(meta.finalMessage, truncated)
+  assert.equal(meta.finalMessageTruncated, true)
+
+  // Page 0 carries the report; a later page does not, so paging a patch stays cheap.
+  const page0 = isolation.readPatch({ patchId: change.patchId, maxChars: 80 })
+  assert.equal(page0.finalMessage, truncated)
+  assert.equal(page0.finalMessageTruncated, true)
+  assert.ok(page0.nextOffset > 0)
+  const later = isolation.readPatch({ patchId: change.patchId, offset: page0.nextOffset, maxChars: 80 })
+  assert.equal(later.finalMessage, undefined)
+  assert.equal(later.finalMessageTruncated, undefined)
+
+  // A fresh pool loading the store sees what the first one wrote.
+  isolation.close()
+  const next = new WorkspaceIsolation({ root: repo, slots: 1, stateDir })
+  try {
+    const reloaded = next.listPatches().find((record) => record.patchId === change.patchId)
+    assert.equal(reloaded.finalMessage, truncated)
+    assert.equal(reloaded.finalMessageTruncated, true)
+    assert.equal(next.readPatch({ patchId: change.patchId, maxChars: 1_000_000 }).finalMessage, truncated)
+  } finally {
+    next.close()
+  }
+})
+
+test('annotatePatch refuses an unknown or foreign id, and does not rewrite that record', () => {
+  const repo = makeRepo({ 'README.md': '# project\n' })
+  const { isolation } = makePool(repo)
+  assert.throws(() => isolation.annotatePatch(`flash-${randomUUID()}`, { finalMessage: 'x' }), /no patch .* is held by this service/)
+  const foreignId = `flash-${randomUUID()}`
+  storeRawPatch(isolation, foreignId, 'diff --git a/x b/x\n', [], { root: join(tmpdir(), 'flash-elsewhere') })
+  assert.throws(() => isolation.annotatePatch(foreignId, { finalMessage: 'x' }), /computed for/)
+  const foreign = JSON.parse(readFileSync(join(isolation.patchDir, `${foreignId}.json`), 'utf8'))
+  assert.equal(foreign.finalMessage, undefined)
   isolation.close()
 })

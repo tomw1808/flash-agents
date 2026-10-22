@@ -14,20 +14,34 @@
  */
 
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, sep } from 'node:path'
 import { test } from 'node:test'
 
-import { WorkspaceIsolation, canonicalTmpdir, durableBaseDir, migrateLegacyPatches, rootDigest } from '../lib/isolation.js'
+import {
+  SWEEP_INTERVAL_MS,
+  WorkspaceIsolation,
+  canonicalTmpdir,
+  defaultStateDir,
+  durableBaseDir,
+  migrateLegacyPatches,
+  rootDigest,
+} from '../lib/isolation.js'
 
 /**
  * Patches default to the durable data directory. Keep every default-layout pool in this
  * file out of the real user data directory, whichever platform the suite runs on.
  */
 process.env.FLASH_DATA_DIR = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-data-')))
+
+/**
+ * The state base every default-layout pool in this file is given, so a test never plants a
+ * dead owner (or a slot tree) under the real `$TMPDIR/flash-mcp`.
+ */
+const STATE_BASE = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-base-')))
 
 /** A throwaway repository, realpath'd so macOS `/var` vs `/private/var` cannot bite. */
 function makeRepo() {
@@ -48,24 +62,29 @@ function makePool(repo, slots = 2) {
 }
 
 /**
- * Lay out a dead owner's per-pid directory with one slot tree under `repo`'s default
- * layout, and return the paths so a test can populate the tree.
+ * Lay out a dead owner with one slot tree under `repo`'s default layout, and return the
+ * paths so a test can populate the tree.
  *
- * A throwaway default-layout pool is constructed only to learn where the layout keeps
- * per-pid directories for this root; it is closed before the dead owner is created.
+ * The layout is the real one a server writes: `<base>/<digest>/<pid>/<instance>/slots/<name>`.
+ * It is derived through `defaultStateDir`, the same function the constructor uses, so a
+ * test cannot plant a dead owner one directory away from where the sweep looks — the
+ * mistake that made salvage silently delete a crashed server's work.
  *
  * @param {string} repo - the service root.
- * @param {object} [options] - dead owner pid and slot name.
- * @returns {{owner: string, parent: string, slotDir: string}} the dead owner paths.
+ * @param {object} [options] - dead owner pid, slot name and instance nonce.
+ * @param {string} [options.baseDir] - the injected state base.
+ * @param {number} [options.pid] - the dead owner's pid.
+ * @param {string} [options.instance] - the 8-hex per-pool nonce.
+ * @param {string} [options.slot] - the slot directory name.
+ * @returns {{owner: string, parent: string, instance: string, stateDir: string,
+ *   slotDir: string}} the dead owner paths.
  */
-function makeDeadOwner(repo, { pid = 4194303, slot = 'slot-0' } = {}) {
-  const anchor = new WorkspaceIsolation({ root: repo, slots: 1 })
-  const parent = dirname(dirname(anchor.stateDir))
-  anchor.close()
-  const owner = join(parent, String(pid))
-  const slotDir = join(owner, 'slots', slot)
+function makeDeadOwner(repo, { baseDir = STATE_BASE, pid = 4194303, instance = 'dead0001', slot = 'slot-0' } = {}) {
+  const parent = join(baseDir, rootDigest(repo))
+  const stateDir = defaultStateDir(repo, { baseDir, pid, instance })
+  const slotDir = join(stateDir, 'slots', slot)
   mkdirSync(slotDir, { recursive: true })
-  return { owner, parent, slotDir }
+  return { owner: join(parent, String(pid)), parent, instance, stateDir, slotDir }
 }
 
 /** Make `dir` a git tree sitting on a `flash base` commit, exactly as `prepare` leaves one. */
@@ -433,8 +452,8 @@ test('two services over one repository do not share a state directory', async ()
   const repo = makeRepo()
   // No state directory configured: this is the default layout, which used to be
   // $TMPDIR/flash-mcp for every instance of every root.
-  const first = new WorkspaceIsolation({ root: repo, slots: 1 })
-  const second = new WorkspaceIsolation({ root: repo, slots: 1 })
+  const first = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
+  const second = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
   try {
     assert.notEqual(first.stateDir, second.stateDir)
     const slot = await first.lease()
@@ -443,7 +462,7 @@ test('two services over one repository do not share a state directory', async ()
     assert.equal(existsSync(join(slot.dir, 'in-flight.txt')), true)
 
     // Starting the second service must not clear the first one's in-flight tree.
-    const other = new WorkspaceIsolation({ root: repo, slots: 1 })
+    const other = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
     try {
       assert.equal(existsSync(join(slot.dir, 'in-flight.txt')), true)
       assert.notEqual(other.stateDir, first.stateDir)
@@ -517,7 +536,7 @@ test('a patch written by an earlier process can still be applied', async () => {
 test('a default pool stores patches in the durable data directory, while a configured state directory keeps calls', async () => {
   const repo = makeRepo()
   const digest = rootDigest(repo)
-  const pool = new WorkspaceIsolation({ root: repo, slots: 1 })
+  const pool = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
   try {
     assert.equal(pool.patchDir, join(process.env.FLASH_DATA_DIR, digest, 'patches'))
     const slot = await pool.lease()
@@ -528,7 +547,7 @@ test('a default pool stores patches in the durable data directory, while a confi
     // The patch is in the durable store, and not in the temp layout.
     assert.equal(existsSync(join(pool.patchDir, `${change.patchId}.patch`)), true)
     assert.equal(existsSync(join(pool.patchDir, `${change.patchId}.json`)), true)
-    const legacyDir = join(canonicalTmpdir(), 'flash-mcp', digest, 'patches')
+    const legacyDir = join(STATE_BASE, digest, 'patches')
     assert.equal(existsSync(join(legacyDir, `${change.patchId}.patch`)), false, 'a new patch is not written to the temp tree')
 
     // Applying it still works, and then the caller's tree has the worker's change.
@@ -699,7 +718,7 @@ test('a sweep reclaims a dead owner’s trees without taking its patches', async
   // sweep deleted the first one's whole per-process directory — including the patch the
   // caller had just been told to apply. Patches therefore live beside those directories.
   const repo = makeRepo()
-  const first = new WorkspaceIsolation({ root: repo })
+  const first = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE })
   const slot = await first.lease()
   first.prepare(slot)
   writeFileSync(join(slot.dir, 'from-worker.txt'), 'work worth keeping\n')
@@ -710,11 +729,12 @@ test('a sweep reclaims a dead owner’s trees without taking its patches', async
   const pidDir = dirname(first.stateDir)
   assert.ok(!first.patchDir.startsWith(pidDir + sep), `${first.patchDir} must not sit under ${pidDir}`)
 
-  // A dead owner's leftovers, then the next service starting on the same root. The pid is
-  // above every platform maximum, so it can never name a live process.
-  const deadOwner = join(dirname(pidDir), '4194303')
-  mkdirSync(join(deadOwner, 'slots', 'slot-0'), { recursive: true })
-  const second = new WorkspaceIsolation({ root: repo })
+  // A dead owner's leftovers in the real layout, then the next service starting on the
+  // same root. The pid is above every platform maximum, so it can never name a live process.
+  const deadState = defaultStateDir(repo, { baseDir: STATE_BASE, pid: 4194303, instance: 'dead0001' })
+  const deadOwner = dirname(deadState)
+  mkdirSync(join(deadState, 'slots', 'slot-0'), { recursive: true })
+  const second = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE })
   assert.equal(existsSync(deadOwner), false, 'a dead owner’s trees are still reclaimed')
 
   // The work survived the first service, and the second one can still apply it.
@@ -739,7 +759,7 @@ test('a sweep salvages a dead owner’s unfinished work as an applicable patch',
   writeFileSync(join(slotDir, 'new.txt'), 'also lost\n')
 
   const logLines = []
-  const next = new WorkspaceIsolation({ root: repo, slots: 1, log: (message) => logLines.push(message) })
+  const next = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, log: (message) => logLines.push(message) })
   try {
     assert.ok(
       next.patchDir.startsWith(join(process.env.FLASH_DATA_DIR, rootDigest(repo)) + sep),
@@ -794,13 +814,647 @@ test('a sweep of a dead owner with a clean slot leaves no patch', async () => {
   // A prepared tree at its base with nothing staged or modified: there is no work to keep.
   makeFlashBaseTree(slotDir)
 
-  const next = new WorkspaceIsolation({ root: repo, slots: 1 })
+  const next = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
   try {
     assert.equal(existsSync(owner), false, 'the clean dead owner is still removed')
     assert.equal(existsSync(slotDir), false)
     assert.equal(salvagedPatch(next), undefined, 'a clean slot must not produce a patch')
   } finally {
     next.close()
+  }
+})
+
+test('a salvaged patch carries the task the dead copy was working on', async () => {
+  const repo = makeRepo()
+  const { slotDir } = makeDeadOwner(repo)
+  makeFlashBaseTree(slotDir)
+  // A label long enough to be a real task, and short enough that bounding leaves it whole.
+  const label = 'Rebuild the vendored Windows installer cache ' + 'and verify every hashed artefact '.repeat(4)
+  assert.ok(label.length > 150)
+  // `prepare` writes this file; a worker could also have written it, which is why salvage
+  // re-validates it.
+  writeFileSync(
+    join(slotDir, '.git', 'flash-task.json'),
+    `${JSON.stringify({ kind: 'flash_batch', label, sessionId: 'sess-salvage', jobId: 'job-7', taskFile: '/tasks/installer.md', extra: 'dropped' })}\n`,
+  )
+  writeFileSync(join(slotDir, 'keep.txt'), 'the lost fix\n')
+
+  const logLines = []
+  const next = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, log: (message) => logLines.push(message) })
+  try {
+    const record = salvagedPatch(next)
+    assert.ok(record, 'the dead tree is still salvaged')
+    assert.equal(record.task.kind, 'flash_batch')
+    assert.equal(record.task.label, label.trim())
+    assert.equal(record.task.sessionId, 'sess-salvage')
+    assert.equal(record.task.jobId, 'job-7')
+    assert.equal(record.task.taskFile, '/tasks/installer.md')
+    assert.equal(record.task.extra, undefined, 'an unknown key never reaches the record')
+
+    // The record travels on disk with it, and reads back through the ordinary path.
+    const meta = JSON.parse(readFileSync(join(next.patchDir, `${record.patchId}.json`), 'utf8'))
+    assert.deepEqual(meta.task, record.task)
+    assert.equal(next.readPatch({ patchId: record.patchId, maxChars: 100000 }).task.label, label.trim())
+
+    // One salvage line, now saying which task the work was for.
+    const line = logLines.find((entry) => entry.startsWith('salvaged '))
+    assert.ok(line, `expected a salvage log line in ${JSON.stringify(logLines)}`)
+    assert.ok(line.includes(`for "${label.trim()}"`), `the salvage line names the task: ${line}`)
+    assert.doesNotMatch(line, /\n/)
+  } finally {
+    next.close()
+  }
+})
+
+test('a dead tree with a malformed or oversized task file still salvages, without a task', async () => {
+  const repo = makeRepo()
+  const { owner, slotDir } = makeDeadOwner(repo)
+  makeFlashBaseTree(slotDir)
+  writeFileSync(join(slotDir, '.git', 'flash-task.json'), 'not json{')
+  writeFileSync(join(slotDir, 'keep.txt'), 'malformed task\n')
+  // A second slot under the same dead owner, whose task file is over the 16 KB limit.
+  const oversizedSlot = join(dirname(slotDir), 'slot-1')
+  mkdirSync(oversizedSlot, { recursive: true })
+  makeFlashBaseTree(oversizedSlot)
+  writeFileSync(join(oversizedSlot, '.git', 'flash-task.json'), 'x'.repeat(17 * 1024))
+  writeFileSync(join(oversizedSlot, 'keep.txt'), 'oversized task\n')
+
+  const logLines = []
+  const next = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, log: (message) => logLines.push(message) })
+  try {
+    const records = next.listPatches().filter((record) => record.salvagedFrom !== undefined)
+    assert.equal(records.length, 2, 'both trees are salvaged despite their task files')
+    for (const record of records) assert.equal(record.task, undefined)
+    assert.deepEqual(
+      records.map((record) => record.salvagedFrom.slotDir).sort(),
+      [slotDir, oversizedSlot].sort(),
+    )
+    // Each unusable file is named once, so a caller can see why a record has no task.
+    assert.equal(logLines.filter((line) => line.includes('flash-task.json')).length, 2)
+  } finally {
+    next.close()
+  }
+})
+
+// ── deferred start-up sweep, trash and retried salvage ──────────────────────
+
+test('a deferred start-up sweep leaves a dead owner alone until startupSweep salvages it', async () => {
+  // The failure this guards: the constructor migrated, salvaged and `rmSync`ed every dead
+  // owner before `serveStdio` answered `initialize`. A slot holding a multi-gigabyte
+  // `cargo target` took minutes to delete, the client's 30 s connect timeout expired, and
+  // the next start repeated the work. Construction must now touch none of it.
+  const repo = makeRepo()
+  const { owner, slotDir } = makeDeadOwner(repo, { pid: 4194305 })
+  makeFlashBaseTree(slotDir)
+  writeFileSync(join(slotDir, 'keep.txt'), 'the deferred fix\n')
+
+  const logLines = []
+  const isolation = new WorkspaceIsolation({
+    root: repo,
+    slots: 1,
+    baseDir: STATE_BASE,
+    sweepIntervalMs: 0,
+    deferStartupSweep: true,
+    log: (message) => logLines.push(message),
+  })
+  try {
+    assert.equal(isolation.deferStartupSweep, true)
+    assert.equal(existsSync(owner), true, 'construction does not touch the dead owner')
+    assert.equal(existsSync(slotDir), true, 'the dead tree is still there')
+    assert.deepEqual(isolation.listPatches(), [], 'nothing is loaded before the sweep')
+
+    const sweep = isolation.startupSweep()
+    assert.equal(isolation.startupSweep(), sweep, 'a second call returns the same promise')
+    await sweep
+
+    assert.equal(isolation.startupSweepDone, true)
+    assert.equal(existsSync(owner), false, 'the sweep salvaged the work and removed the owner')
+    const record = salvagedPatch(isolation)
+    assert.ok(record, 'the salvaged patch was loaded when the sweep finished')
+    assert.equal(record.salvagedFrom.slotDir, slotDir)
+    const summary = logLines.find((line) => line.startsWith('startup sweep finished'))
+    assert.ok(summary, `expected a summary log line in ${JSON.stringify(logLines)}`)
+    assert.match(summary, /1 patch\(es\) salvaged/)
+    assert.match(summary, /1 dead owner\(s\) salvaged/)
+  } finally {
+    isolation.close()
+  }
+})
+
+test('lease waits for the deferred sweep instead of copying while it might still reclaim disk', async () => {
+  const repo = makeRepo()
+  const { owner, slotDir } = makeDeadOwner(repo, { pid: 4194306 })
+  makeFlashBaseTree(slotDir)
+  writeFileSync(join(slotDir, 'keep.txt'), 'waited for\n')
+
+  const isolation = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0, deferStartupSweep: true })
+  try {
+    // Lease first, sweep started but not awaited here: the call may only hold a tree once
+    // the sweep is done, so `prepare` cannot copy beside a reclamation.
+    const sweep = isolation.startupSweep()
+    const slot = await isolation.lease()
+    try {
+      assert.equal(isolation.startupSweepDone, true, 'the sweep finished before the tree was handed out')
+      assert.equal(existsSync(owner), false, 'the dead owner was reclaimed before the lease resolved')
+      assert.ok(salvagedPatch(isolation), 'the salvaged patch is loaded before the call prepares')
+      assert.equal(typeof slot.id, 'number')
+    } finally {
+      isolation.release(slot)
+    }
+    await sweep
+  } finally {
+    isolation.close()
+  }
+})
+
+test('a patch salvaged by a deferred sweep is readable by id before another pool has loaded it', async () => {
+  const repo = makeRepo()
+  const { slotDir } = makeDeadOwner(repo, { pid: 4194307 })
+  makeFlashBaseTree(slotDir)
+  writeFileSync(join(slotDir, 'new.txt'), 'only in the patch\n')
+
+  const first = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0, deferStartupSweep: true })
+  let record
+  try {
+    await first.startupSweep()
+    record = salvagedPatch(first)
+    assert.ok(record, 'the dead tree was salvaged')
+  } finally {
+    first.close()
+  }
+
+  // A later pool defers its own sweep, so nothing is in memory: the full id must still
+  // resolve from the store on disk, or a patch just announced to the caller would be
+  // unreachable until a sweep it never asked for finished.
+  const later = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0, deferStartupSweep: true })
+  try {
+    assert.deepEqual(later.listPatches(), [], 'the deferred pool has loaded nothing')
+    const read = later.readPatch({ patchId: record.patchId, maxChars: 100000 })
+    assert.equal(read.patchId, record.patchId)
+    assert.match(read.diff, /only in the patch/)
+    assert.equal(later.apply({ patchId: record.patchId }).applied, true)
+    assert.equal(readFileSync(join(repo, 'new.txt'), 'utf8'), 'only in the patch\n')
+  } finally {
+    later.close()
+  }
+})
+
+test('a deferred sweep does the legacy migration it deferred', async () => {
+  const repo = makeRepo()
+  const digest = rootDigest(repo)
+  const legacyDir = join(STATE_BASE, digest, 'patches')
+  mkdirSync(legacyDir, { recursive: true })
+  const patchId = writePatchRecord(legacyDir, repo, { createdAt: Date.now() })
+
+  const isolation = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0, deferStartupSweep: true })
+  try {
+    assert.equal(existsSync(join(legacyDir, `${patchId}.json`)), true, 'construction leaves the legacy store alone')
+    assert.deepEqual(isolation.listPatches(), [])
+    await isolation.startupSweep()
+    assert.equal(existsSync(join(legacyDir, `${patchId}.json`)), false, 'the sweep moved the legacy record')
+    assert.ok(isolation.listPatches().some((record) => record.patchId === patchId), 'the moved patch is loaded')
+  } finally {
+    isolation.close()
+    rmSync(join(STATE_BASE, digest), { recursive: true, force: true })
+  }
+})
+
+test('a deferred sweep keeps a dead owner whose slot could not be salvaged', async () => {
+  const repo = makeRepo()
+  const { owner, slotDir } = makeDeadOwner(repo, { pid: 4194311 })
+  makeFlashBaseTree(slotDir)
+  writeFileSync(join(slotDir, '.git', 'HEAD'), 'not a commit\n')
+
+  const isolation = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0, deferStartupSweep: true })
+  try {
+    await isolation.startupSweep()
+    assert.equal(existsSync(owner), true, 'the owner survives an unreadable slot')
+    assert.equal(JSON.parse(readFileSync(join(owner, 'salvage-attempts'), 'utf8')).attempts, 1)
+  } finally {
+    isolation.close()
+  }
+})
+
+test('a dead owner is renamed to trash and deleted in the background', async () => {
+  const repo = makeRepo()
+  const { owner, parent } = makeDeadOwner(repo, { pid: 4194308 })
+  const logLines = []
+  const isolation = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0, log: (message) => logLines.push(message) })
+  try {
+    assert.equal(existsSync(owner), false, 'the owner is out of the accounting at once')
+    const line = logLines.find((entry) => entry.includes('renamed dead owner'))
+    assert.ok(line, `expected a rename log line in ${JSON.stringify(logLines)}`)
+    const match = /renamed dead owner \d+ to (.+); removing it in the background/.exec(line)
+    assert.ok(match, `expected the trash path in ${line}`)
+    const trashDir = match[1]
+    assert.match(trashDir, new RegExp(`trash-4194308-\\d+$`), 'the trash name keeps the owner pid and a timestamp')
+    assert.ok(trashDir.startsWith(parent + sep), `${trashDir} must sit in ${parent}`)
+    // The sweep does not await the deletion; a bounded poll observes it settling.
+    await waitFor(() => !existsSync(trashDir))
+  } finally {
+    isolation.close()
+  }
+})
+
+test('a sweep adopts the trash an interrupted removal left behind', async () => {
+  const repo = makeRepo()
+  const { owner, parent } = makeDeadOwner(repo, { pid: 4194309 })
+  // The owner directory itself is not part of this test: only the trash from an earlier
+  // crash, renamed but never deleted, is planted.
+  rmSync(owner, { recursive: true, force: true })
+  const leftover = join(parent, 'trash-4194309-1700000000000')
+  mkdirSync(join(leftover, 'slots', 'slot-0'), { recursive: true })
+  writeFileSync(join(leftover, 'slots', 'slot-0', 'left.txt'), 'left behind\n')
+
+  const logLines = []
+  const isolation = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0, log: (message) => logLines.push(message) })
+  try {
+    assert.ok(logLines.some((line) => line.includes(leftover)), `the leftover trash is named in ${JSON.stringify(logLines)}`)
+    await waitFor(() => !existsSync(leftover))
+    assert.equal(logLines.some((line) => line.startsWith('salvaged ')), false, 'trash is never offered to salvage')
+  } finally {
+    isolation.close()
+  }
+})
+
+test('trim neither measures nor counts trash, so it cannot trim to pay for it', async () => {
+  const repo = makeRepo()
+  const isolation = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0 })
+  // A removal that is still in flight, or one an earlier crash left. It is disk in use, but
+  // a background removal is already freeing it, so measuring it here was a synchronous walk
+  // of the whole tree whose bytes then made `trim` delete live state to pay for space that
+  // was on its way back anyway.
+  const digestDir = join(STATE_BASE, rootDigest(repo))
+  const trash = join(digestDir, 'trash-4242-1700000000000')
+  mkdirSync(trash, { recursive: true })
+  writeFileSync(join(trash, 'left.bin'), 'x'.repeat(4096))
+  try {
+    isolation.maxStateBytes = 1024
+    const result = isolation.trim()
+    assert.equal(result.bytes, 0, 'trash is not part of what trim measures')
+    assert.equal(result.removedTrees, 0)
+    assert.equal(result.removedPatches, 0)
+    assert.equal(existsSync(trash), true, 'trim leaves the deletion to the background removal')
+    assert.equal(isolation.trim().bytes, 0, 'the measured state does not depend on the trash size')
+  } finally {
+    rmSync(trash, { recursive: true, force: true })
+    isolation.close()
+  }
+})
+
+test('a dead owner whose salvage fails is kept and retried, and its stored sibling is never duplicated', async () => {
+  const repo = makeRepo()
+  const { owner, slotDir, instance } = makeDeadOwner(repo, { pid: 4194310 })
+  makeFlashBaseTree(slotDir)
+  writeFileSync(join(slotDir, 'keep.txt'), 'sibling work\n')
+  // A second slot whose git state cannot be read: `findFlashBase` runs `git log`, which a
+  // corrupt HEAD makes fail, so that one slot's salvage throws.
+  const broken = join(dirname(slotDir), 'slot-1')
+  mkdirSync(broken, { recursive: true })
+  makeFlashBaseTree(broken)
+  writeFileSync(join(broken, 'keep.txt'), 'unreadable work\n')
+  writeFileSync(join(broken, '.git', 'HEAD'), 'not a commit\n')
+  const attemptsFile = join(owner, 'salvage-attempts')
+  const readAttempts = () => JSON.parse(readFileSync(attemptsFile, 'utf8'))
+  // A retry is only due after the sweep interval; each further attempt here rewrites the
+  // clock rather than waiting ten minutes for it.
+  const ageAttempt = () => {
+    writeFileSync(attemptsFile, `${JSON.stringify({ ...readAttempts(), lastAttemptAt: Date.now() - SWEEP_INTERVAL_MS - 1 })}\n`)
+  }
+  const siblingPatches = (isolation) => isolation.listPatches().filter((record) => record.salvagedFrom?.slotDir === slotDir)
+
+  const firstLogs = []
+  const first = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0, log: (message) => firstLogs.push(message) })
+  try {
+    assert.equal(existsSync(owner), true, 'one failed slot must not delete the owner')
+    assert.ok(firstLogs.some((line) => line.includes(`could not salvage ${broken}`)), 'the failure is named')
+    assert.ok(firstLogs.some((line) => line.includes('keeping dead owner')), 'the owner is kept and explained')
+    const record = readAttempts()
+    assert.equal(record.attempts, 1)
+    // The label names the instance, so two instances' `slot-0` cannot be confused.
+    assert.deepEqual(record.salvaged, [`${instance}/slots/slot-0`])
+    assert.equal(typeof record.lastAttemptAt, 'number', 'the attempt is timestamped, so retries can be spaced')
+    assert.equal(siblingPatches(first).length, 1, 'the readable sibling was salvaged on the first attempt')
+  } finally {
+    first.close()
+  }
+
+  ageAttempt()
+  const second = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0 })
+  try {
+    assert.equal(existsSync(owner), true, 'the second failed attempt still keeps the owner')
+    assert.equal(readAttempts().attempts, 2)
+    assert.equal(siblingPatches(second).length, 1, 'the sibling tree was not stored a second time')
+  } finally {
+    second.close()
+  }
+
+  ageAttempt()
+
+  const thirdLogs = []
+  const third = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0, log: (message) => thirdLogs.push(message) })
+  try {
+    assert.equal(existsSync(owner), false, 'after three failed attempts the owner is removed anyway')
+    const lost = thirdLogs.find((line) => line.includes('is lost'))
+    assert.ok(lost, `expected a lost-work log line in ${JSON.stringify(thirdLogs)}`)
+    assert.ok(lost.includes(broken), 'the line names the slot whose work is lost')
+    assert.match(lost, /3 failed salvage attempts/)
+    assert.equal(siblingPatches(third).length, 1, 'still exactly one patch for the sibling, across all three sweeps')
+  } finally {
+    third.close()
+  }
+})
+
+test('a dead owner laid out by a real pool is salvaged from its instance directory', async () => {
+  // The defect this pins: a server's slots live in `<pid>/<instance>/slots/<name>`, and a
+  // sweep that looked at `<pid>/slots/<name>` found nothing, judged the dead owner clean
+  // and removed the whole directory with the uncommitted work still in it. The directory
+  // here is not hand-built: a real pool computes it, `prepare` builds the tree and the
+  // task file, and only then is the pid level moved under a dead pid, which is exactly
+  // what a crashed server leaves behind.
+  const repo = makeRepo()
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-real-')))
+  const anchor = new WorkspaceIsolation({ root: repo, slots: 1, baseDir: base, sweepIntervalMs: 0 })
+  const instance = anchor.stateDir.split(sep).pop()
+  const slot = await anchor.lease()
+  anchor.prepare(slot, { task: { kind: 'flash_task', label: 'the crashed pool’s task' } })
+  writeFileSync(join(slot.dir, 'keep.txt'), 'work from a real prepared slot\n')
+  anchor.release(slot)
+  const livePidDir = dirname(anchor.stateDir)
+  const deadPidDir = join(base, rootDigest(repo), '4194303')
+  // Renamed before `close()`: close only removes this pool's own state directory, which is
+  // no longer at its recorded path, so the dead owner's tree survives for the next sweep.
+  renameSync(livePidDir, deadPidDir)
+  anchor.close()
+  const deadSlot = join(deadPidDir, instance, 'slots', 'slot-0')
+
+  const next = new WorkspaceIsolation({ root: repo, slots: 1, baseDir: base, sweepIntervalMs: 0 })
+  try {
+    assert.equal(existsSync(deadPidDir), false, 'the dead owner is removed after the salvage')
+    const record = salvagedPatch(next)
+    assert.ok(record, 'the real layout is found and salvaged')
+    assert.equal(record.salvagedFrom.slotDir, deadSlot)
+    assert.equal(record.task.label, 'the crashed pool’s task', 'the task file inside the copy is carried')
+    assert.match(readFileSync(record.patchPath, 'utf8'), /work from a real prepared slot/)
+  } finally {
+    next.close()
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test('a sweep salvages every instance under one dead pid, and labels them apart', () => {
+  const repo = makeRepo()
+  const first = makeDeadOwner(repo, { pid: 4194303, instance: 'dead0001', slot: 'slot-0' })
+  makeFlashBaseTree(first.slotDir)
+  writeFileSync(join(first.slotDir, 'keep.txt'), 'work from instance one\n')
+  const second = makeDeadOwner(repo, { pid: 4194303, instance: 'dead0002', slot: 'slot-0' })
+  makeFlashBaseTree(second.slotDir)
+  writeFileSync(join(second.slotDir, 'keep.txt'), 'work from instance two\n')
+
+  const next = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0 })
+  try {
+    const records = next.listPatches().filter((record) => record.salvagedFrom !== undefined)
+    assert.equal(records.length, 2, 'both instances are salvaged, not only the first one found')
+    assert.deepEqual(records.map((record) => record.salvagedFrom.slotDir).sort(), [first.slotDir, second.slotDir].sort())
+    assert.equal(existsSync(first.owner), false)
+  } finally {
+    next.close()
+  }
+})
+
+test('a dead owner from the older <pid>/slots layout is still salvaged', () => {
+  // An older version kept slots one level up. A machine upgrading with a crashed server
+  // still on disk has that layout, so the sweep must read it as well as the current one.
+  const repo = makeRepo()
+  const slotDir = join(STATE_BASE, rootDigest(repo), '4194303', 'slots', 'slot-0')
+  mkdirSync(slotDir, { recursive: true })
+  makeFlashBaseTree(slotDir)
+  writeFileSync(join(slotDir, 'keep.txt'), 'older layout work\n')
+
+  const next = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0 })
+  try {
+    const record = salvagedPatch(next)
+    assert.ok(record, 'the older layout is still swept')
+    assert.equal(record.salvagedFrom.slotDir, slotDir)
+    assert.match(readFileSync(record.patchPath, 'utf8'), /older layout work/)
+  } finally {
+    next.close()
+  }
+})
+
+test('a FIFO where the task file belongs is ignored without blocking the sweep', { skip: process.platform === 'win32' }, () => {
+  // A FIFO at `.git/flash-task.json` used to pass the size check and block `readFileSync`
+  // forever, which wedged the sweep and with it `lease`. The sweep is synchronous, so no
+  // in-process timer can interrupt that block: the pool runs in a child process and the
+  // boundary is the child's timeout, which fails this test instead of hanging the suite.
+  const repo = makeRepo()
+  const { slotDir } = makeDeadOwner(repo, { pid: 4194312 })
+  makeFlashBaseTree(slotDir)
+  execFileSync('mkfifo', [join(slotDir, '.git', 'flash-task.json')])
+  writeFileSync(join(slotDir, 'keep.txt'), 'work beside a fifo\n')
+
+  const moduleUrl = new URL('../lib/isolation.js', import.meta.url).href
+  const script = `
+    import { WorkspaceIsolation } from ${JSON.stringify(moduleUrl)}
+    const isolation = new WorkspaceIsolation({
+      root: ${JSON.stringify(repo)},
+      baseDir: ${JSON.stringify(STATE_BASE)},
+      slots: 1,
+      sweepIntervalMs: 0,
+      log: (message) => process.stderr.write(message + '\\n'),
+    })
+    const record = isolation.listPatches().find((entry) => entry.salvagedFrom !== undefined)
+    if (record === undefined) {
+      process.stderr.write('no salvaged patch\\n')
+      process.exit(3)
+    }
+    process.stdout.write(JSON.stringify({ task: record.task ?? null, slotDir: record.salvagedFrom.slotDir }))
+    isolation.close()
+  `
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf8',
+    timeout: 20_000,
+  })
+  // A blocked FIFO read never reaches its own assertion; the child is killed by the timeout
+  // and that is the failure this test reports.
+  assert.equal(child.error, undefined, `the sweep did not finish with a FIFO in the task file's place: ${String(child.error)}\n${child.stderr ?? ''}`)
+  assert.equal(child.status, 0, `the sweep child failed: ${child.stderr ?? ''}`)
+  assert.ok(child.stderr.includes('not a regular file'), 'the FIFO is named and ignored')
+  const result = JSON.parse(child.stdout)
+  assert.equal(result.task, null, 'a FIFO is not a task')
+  assert.equal(result.slotDir, slotDir, 'the tree is still salvaged')
+})
+
+test('a symlinked task file is never followed', { timeout: 10_000 }, (t) => {
+  // The path is worker-writable, and a symlink there could point `readFileSync` at any
+  // file on disk. Only a regular file is read, so somebody else's JSON never becomes the
+  // task of a salvaged patch.
+  const repo = makeRepo()
+  const { slotDir } = makeDeadOwner(repo, { pid: 4194313 })
+  makeFlashBaseTree(slotDir)
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-task-')))
+  const outsideTask = join(outside, 'task.json')
+  writeFileSync(outsideTask, `${JSON.stringify({ kind: 'flash_task', label: 'somebody else’s task' })}\n`)
+  try {
+    symlinkSync(outsideTask, join(slotDir, '.git', 'flash-task.json'))
+  } catch (error) {
+    if (error?.code === 'EPERM' || error?.code === 'EACCES') {
+      t.skip('this platform does not allow creating a symlink')
+      return
+    }
+    throw error
+  }
+  writeFileSync(join(slotDir, 'keep.txt'), 'work beside a symlink\n')
+
+  const logs = []
+  const next = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0, log: (message) => logs.push(message) })
+  try {
+    const record = salvagedPatch(next)
+    assert.ok(record, 'the tree is salvaged despite the symlink')
+    assert.equal(record.task, undefined, 'the link target was never read as a task')
+    assert.ok(logs.some((line) => line.includes('not a regular file')), `the link is named in ${JSON.stringify(logs)}`)
+  } finally {
+    next.close()
+    rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+test('a failed salvage is retried only after the sweep interval, so three calls count one attempt', async () => {
+  const repo = makeRepo()
+  const { owner, slotDir } = makeDeadOwner(repo, { pid: 4194314 })
+  makeFlashBaseTree(slotDir)
+  // A corrupt HEAD makes the salvage throw, which keeps the owner and records the attempt.
+  writeFileSync(join(slotDir, '.git', 'HEAD'), 'not a commit\n')
+  const attemptsFile = join(owner, 'salvage-attempts')
+
+  const isolation = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0 })
+  try {
+    // The constructor's sweep is the first attempt.
+    assert.equal(JSON.parse(readFileSync(attemptsFile, 'utf8')).attempts, 1)
+    // `prepare` sweeps before every call; three calls in a row used to spend all three
+    // attempts within seconds and delete the work.
+    for (let call = 0; call < 3; call += 1) {
+      const slot = await isolation.lease()
+      try {
+        isolation.prepare(slot)
+      } finally {
+        isolation.release(slot)
+      }
+    }
+    const spaced = JSON.parse(readFileSync(attemptsFile, 'utf8'))
+    assert.equal(spaced.attempts, 1, 'a recent failed attempt is skipped entirely, not counted again')
+    assert.equal(existsSync(owner), true, 'the work is still there after three calls')
+    // After the interval the next attempt is due and counts.
+    writeFileSync(attemptsFile, `${JSON.stringify({ ...spaced, lastAttemptAt: Date.now() - SWEEP_INTERVAL_MS - 1 })}\n`)
+    const later = await isolation.lease()
+    try {
+      isolation.prepare(later)
+    } finally {
+      isolation.release(later)
+    }
+    assert.equal(JSON.parse(readFileSync(attemptsFile, 'utf8')).attempts, 2)
+  } finally {
+    isolation.close()
+  }
+})
+
+test("a kept owner's salvaged sibling is listed at once, without waiting for a removal", async () => {
+  const repo = makeRepo()
+  const isolation = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0 })
+  try {
+    const { owner, slotDir } = makeDeadOwner(repo, { pid: 4194315 })
+    makeFlashBaseTree(slotDir)
+    writeFileSync(join(slotDir, 'keep.txt'), 'readable sibling\n')
+    const broken = join(dirname(slotDir), 'slot-1')
+    mkdirSync(broken, { recursive: true })
+    makeFlashBaseTree(broken)
+    writeFileSync(join(broken, '.git', 'HEAD'), 'not a commit\n')
+
+    const slot = await isolation.lease()
+    try {
+      isolation.prepare(slot)
+      assert.equal(existsSync(owner), true, 'the unreadable slot keeps the owner')
+      const record = salvagedPatch(isolation)
+      assert.ok(record, 'the patch from the readable sibling is loaded by the sweep that kept the owner')
+      assert.equal(record.salvagedFrom.slotDir, slotDir)
+      assert.equal(isolation.readPatch({ patchId: record.patchId, maxChars: 100000 }).patchId, record.patchId)
+    } finally {
+      isolation.release(slot)
+    }
+  } finally {
+    isolation.close()
+  }
+})
+
+test('two sweeps in one process start one removal of the same trash', async () => {
+  const repo = makeRepo()
+  const logs = []
+  const isolation = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0, log: (message) => logs.push(message) })
+  try {
+    const trash = join(STATE_BASE, rootDigest(repo), 'trash-4242-1700000000000')
+    mkdirSync(join(trash, 'slots', 'slot-0'), { recursive: true })
+    writeFileSync(join(trash, 'slots', 'slot-0', 'left.txt'), 'left behind\n')
+    const slot = await isolation.lease()
+    try {
+      // Two sweeps in one tick: the first removal cannot have settled before the second
+      // sweep runs, so a second `fs.promises.rm` would race the first over the same tree.
+      isolation.prepare(slot)
+      isolation.prepare(slot)
+    } finally {
+      isolation.release(slot)
+    }
+    const starts = logs.filter((line) => line.startsWith('removing ') && line.includes(trash))
+    assert.equal(starts.length, 1, `one removal is started, not one per sweep: ${JSON.stringify(starts)}`)
+    await waitFor(() => !existsSync(trash))
+  } finally {
+    isolation.close()
+  }
+})
+
+test('lease gives up on a pending start-up sweep when its call is cancelled or out of time', async () => {
+  const repo = makeRepo()
+  // Empty slots cost one event-loop turn each, so the sweep cannot finish before the call
+  // is asked to give up; nothing here needs a real git tree.
+  const plantSlots = (pid, instance) => {
+    for (let index = 0; index < 20; index += 1) {
+      makeDeadOwner(repo, { pid, instance, slot: `slot-${String(index)}` })
+    }
+  }
+  const deadOwner = (pid) => join(STATE_BASE, rootDigest(repo), String(pid))
+
+  plantSlots(4194316, 'dead0003')
+  const cancelledPool = new WorkspaceIsolation({ root: repo, slots: 1, baseDir: STATE_BASE, sweepIntervalMs: 0, deferStartupSweep: true })
+  try {
+    assert.equal(cancelledPool.startupSweepPending, true, 'the deferred sweep has not started yet')
+    const sweep = cancelledPool.startupSweep()
+    const controller = new AbortController()
+    const waiting = cancelledPool.lease({ signal: controller.signal })
+    controller.abort()
+    await assert.rejects(waiting, (error) => error.code === 'CANCELLED' && /start-up sweep/.test(error.message))
+    assert.equal(cancelledPool.startupSweepPending, true, 'the call gave up before the sweep finished, not after it')
+    await sweep
+    assert.equal(cancelledPool.startupSweepPending, false, 'the sweep the call gave up on kept going')
+    assert.equal(existsSync(deadOwner(4194316)), false, 'and it still reclaimed the dead owner')
+  } finally {
+    cancelledPool.close()
+  }
+
+  plantSlots(4194317, 'dead0004')
+  const timedPool = new WorkspaceIsolation({ root: repo, slots: 1, baseDir: STATE_BASE, sweepIntervalMs: 0, deferStartupSweep: true })
+  try {
+    const sweep = timedPool.startupSweep()
+    await assert.rejects(
+      timedPool.lease({ deadline: Date.now() - 1 }),
+      (error) => error.code === 'TIMEOUT' && /start-up sweep/.test(error.message),
+    )
+    assert.equal(timedPool.startupSweepPending, true, 'an expired deadline does not wait for the sweep')
+    await sweep
+    assert.equal(timedPool.startupSweepPending, false)
+    // A call that did not give up gets a tree once the sweep is done.
+    const slot = await timedPool.lease()
+    timedPool.release(slot)
+  } finally {
+    timedPool.close()
   }
 })
 
@@ -856,7 +1510,7 @@ test('an old temp patch store is migrated into the durable one, blobs included, 
   seed.close()
 
   // Lay this real patch out exactly where an older version left it: under the temp base.
-  const legacyDir = join(canonicalTmpdir(), 'flash-mcp', digest, 'patches')
+  const legacyDir = join(STATE_BASE, digest, 'patches')
   mkdirSync(legacyDir, { recursive: true })
   for (const suffix of ['.patch', '.json', '.blobs']) {
     const from = join(seed.patchDir, `${change.patchId}${suffix}`)
@@ -865,7 +1519,7 @@ test('an old temp patch store is migrated into the durable one, blobs included, 
   assert.equal(existsSync(join(legacyDir, `${change.patchId}.blobs`)), true, 'the collected patch has its preimage blobs')
 
   const logLines = []
-  const next = new WorkspaceIsolation({ root: repo, slots: 1, log: (message) => logLines.push(message) })
+  const next = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, log: (message) => logLines.push(message) })
   try {
     assert.equal(next.patchDir, join(process.env.FLASH_DATA_DIR, digest, 'patches'))
     for (const suffix of ['.patch', '.json', '.blobs']) {
@@ -887,7 +1541,7 @@ test('an old temp patch store is migrated into the durable one, blobs included, 
     // The pool's default state directory sits under this throwaway repo's digest in the
     // shared temp base. Remove it whole: the digest belongs to a repository no later test
     // can use, and leaving it would be the very temp-tree residue the suite checks for.
-    rmSync(join(canonicalTmpdir(), 'flash-mcp', digest), { recursive: true, force: true })
+    rmSync(join(STATE_BASE, digest), { recursive: true, force: true })
   }
 })
 
@@ -1068,7 +1722,7 @@ test('a migration deferred for a live old server lists and applies legacy patche
   seed.close()
 
   // Lay it out where an OLD server keeps it: under this root's digest in the temp base.
-  const legacyDir = join(canonicalTmpdir(), 'flash-mcp', digest, 'patches')
+  const legacyDir = join(STATE_BASE, digest, 'patches')
   mkdirSync(legacyDir, { recursive: true })
   for (const suffix of ['.patch', '.json', '.blobs']) {
     const from = join(seedPatchDir, `${change.patchId}${suffix}`)
@@ -1076,11 +1730,11 @@ test('a migration deferred for a live old server lists and applies legacy patche
   }
   // Another live process still owns state for this root: the old server, whose in-memory
   // `patchPath` points into `legacyDir`. `process.ppid` is alive for the whole test.
-  const oldOwner = join(canonicalTmpdir(), 'flash-mcp', digest, String(process.ppid))
+  const oldOwner = join(STATE_BASE, digest, String(process.ppid))
   mkdirSync(oldOwner, { recursive: true })
 
   const logLines = []
-  const next = new WorkspaceIsolation({ root: repo, slots: 1, sweepIntervalMs: 20, log: (message) => logLines.push(message) })
+  const next = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 20, log: (message) => logLines.push(message) })
   try {
     const deferred = logLines.find((message) => message.includes('deferred moving stored patches'))
     assert.ok(deferred, `expected a deferral log line in ${JSON.stringify(logLines)}`)
@@ -1108,7 +1762,7 @@ test('a migration deferred for a live old server lists and applies legacy patche
   } finally {
     next.close()
     rmSync(oldOwner, { recursive: true, force: true })
-    rmSync(join(canonicalTmpdir(), 'flash-mcp', digest), { recursive: true, force: true })
+    rmSync(join(STATE_BASE, digest), { recursive: true, force: true })
   }
 })
 
@@ -1171,7 +1825,7 @@ test('the patch retention window is configurable', async () => {
 
 test('startup drops other roots’ empty digest directories and keeps ones with content', async () => {
   const repo = makeRepo()
-  const anchor = new WorkspaceIsolation({ root: repo, slots: 1 })
+  const anchor = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
   const base = dirname(dirname(dirname(anchor.stateDir)))
   anchor.close()
 
@@ -1184,7 +1838,7 @@ test('startup drops other roots’ empty digest directories and keeps ones with 
   mkdirSync(usedSlot, { recursive: true })
   writeFileSync(join(usedSlot, 'left.txt'), 'work\n')
 
-  const next = new WorkspaceIsolation({ root: repo, slots: 1 })
+  const next = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
   try {
     assert.equal(existsSync(emptyDigest), false, 'an empty digest of another root is removed')
     assert.equal(existsSync(usedSlot), true, 'a digest holding a tree is kept')
@@ -1198,11 +1852,25 @@ test('startup drops other roots’ empty digest directories and keeps ones with 
 test('a pool with no configured state directory lives under the canonical temp directory', () => {
   const repo = makeRepo()
   try {
-    const pool = new WorkspaceIsolation({ root: repo })
     const canonical = realpathSync(tmpdir())
     assert.equal(canonicalTmpdir(), canonical)
-    assert.ok(pool.stateDir.startsWith(canonical + sep) || pool.stateDir === canonical,
-      `state dir ${pool.stateDir} is not under the canonical temp directory ${canonical}`)
+    // The default path is computed, not constructed: creating a pool there would write into
+    // the real temp state base this suite must leave alone. `defaultStateDir` is the same
+    // function the constructor calls, so its shape is the layout a server really writes.
+    const computed = defaultStateDir(repo)
+    assert.equal(dirname(computed), join(canonical, 'flash-mcp', rootDigest(repo), String(process.pid)))
+    assert.match(computed, /[\\/][0-9a-f]{8}$/, 'the per-pool instance is an 8-hex nonce')
+
+    // The same shape under an injected base, which is what every default-layout test uses.
+    const pool = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
+    try {
+      assert.ok(
+        pool.stateDir.startsWith(join(STATE_BASE, rootDigest(repo), String(process.pid)) + sep),
+        `state dir ${pool.stateDir} is not under the injected base ${STATE_BASE}`,
+      )
+    } finally {
+      pool.close()
+    }
   } finally {
     rmSync(repo, { recursive: true, force: true })
   }
@@ -1349,7 +2017,7 @@ test('a submodule travels with the copy', async () => {
 test('a dead owner is swept while the pool runs, before the next call and on the timer', async () => {
   const repo = makeRepo()
   // Default layout, so the pool owns its state and sweeps its root's dead owners.
-  const isolation = new WorkspaceIsolation({ root: repo, slots: 1, sweepIntervalMs: 0 })
+  const isolation = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 0 })
   const first = makeDeadOwner(repo, { pid: 4194299 })
   makeFlashBaseTree(first.slotDir)
   writeFileSync(join(first.slotDir, 'keep.txt'), 'unfinished work\n')
@@ -1361,7 +2029,7 @@ test('a dead owner is swept while the pool runs, before the next call and on the
   isolation.release(slot)
   isolation.close()
 
-  const timed = new WorkspaceIsolation({ root: repo, slots: 1, sweepIntervalMs: 20 })
+  const timed = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, sweepIntervalMs: 20 })
   const second = makeDeadOwner(repo, { pid: 4194298 })
   const deadline = Date.now() + 2_000
   while (existsSync(second.owner) && Date.now() < deadline) await new Promise((done) => setTimeout(done, 20))
@@ -1418,7 +2086,7 @@ test('a sweep salvages a dead owner’s scoped tree from the recorded repository
   writeFileSync(join(slotDir, '.flash-scope'), `${join('Repos', 'alpha')}\n`)
   writeFileSync(join(inner, 'keep.txt'), 'unfinished work\n')
 
-  const isolation = new WorkspaceIsolation({ root: repo, slots: 1 })
+  const isolation = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
   const record = salvagedPatch(isolation)
   assert.ok(record, 'the scoped tree was salvaged')
   assert.equal(record.scope, join('Repos', 'alpha'))

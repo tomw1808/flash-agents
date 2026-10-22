@@ -92,6 +92,36 @@ const DEFAULT_SLOTS = 2
  */
 const DEFAULT_PROGRESS_INTERVAL_MS = 20_000
 
+/**
+ * How much of an open tool call an activity record keeps. A shell command line is kept
+ * nearly whole, because "which build is this worker stuck in" is read from it; any other
+ * tool's call is a name and a JSON blob, and a short prefix is enough to recognise it.
+ */
+const ACTIVITY_COMMAND_CHARS = 300
+const ACTIVITY_TOOL_CHARS = 120
+
+/**
+ * How many times one command must fail before the call warns about it. Twice is a flaky
+ * step or a typo the worker already fixed; three times of the same command is the pattern
+ * a worker repeating a step its sandbox cannot finish leaves behind.
+ */
+const REPEATED_FAILURE_THRESHOLD = 3
+
+/** How much of a task a stored patch's task record keeps for each kind of call. */
+const TASK_LABEL_CHARS = 160
+const BATCH_TASK_LABEL_CHARS = 200
+
+/**
+ * The window in which an empty, unproductive first attempt is read as a start-up hiccup
+ * rather than a real attempt: minutes after a machine restart, a handful of model calls
+ * ended `status: "error"` with nothing to show, and the same brief ran normally later.
+ */
+const EARLY_RETRY_MAX_MS = 180_000
+const EARLY_RETRY_MAX_MODEL_CALLS = 12
+
+/** How long the service waits before retrying such an attempt; injectable for tests. */
+const DEFAULT_EARLY_RETRY_DELAY_MS = 10_000
+
 /** Marker the workflow tool renders immediately before the script's JSON value. */
 const WORKFLOW_VALUE_MARKER = 'Return value:'
 
@@ -182,6 +212,8 @@ export class FlashTaskService {
    * @param {number} [options.maxTasks] - ceiling on tasks in one fleet call.
    * @param {number} [options.perItemChars] - returned per-worker budget inside a fleet.
    * @param {number} [options.progressIntervalMs] - how often a running call reports progress.
+   * @param {number} [options.earlyRetryDelayMs] - how long to wait before retrying an early,
+   *   empty first attempt (default 10 s; injectable so a test need not wait).
    * @param {number} [options.initTimeoutMs] - cold-start handshake budget for one runtime.
    * @param {Record<string, string | undefined>} [options.env] - runtime environment.
    * @param {(message: string) => void} [options.log] - diagnostic sink (stderr).
@@ -206,6 +238,7 @@ export class FlashTaskService {
     maxTasks = DEFAULT_MAX_TASKS,
     perItemChars = DEFAULT_PER_ITEM_CHARS,
     progressIntervalMs = DEFAULT_PROGRESS_INTERVAL_MS,
+    earlyRetryDelayMs = DEFAULT_EARLY_RETRY_DELAY_MS,
     initTimeoutMs = DEFAULT_INITIALIZE_TIMEOUT_MS,
     env = process.env,
     log = () => {},
@@ -253,6 +286,7 @@ export class FlashTaskService {
     this.maxTasks = maxTasks
     this.perItemChars = perItemChars
     this.progressIntervalMs = progressIntervalMs
+    this.earlyRetryDelayMs = earlyRetryDelayMs
     this.initTimeoutMs = initTimeoutMs
     this.env = env
     this.log = log
@@ -300,6 +334,9 @@ export class FlashTaskService {
             // A setup step is repository code run on the host, outside the sandbox the worker
             // is confined to, so the pool only runs it after an explicit opt-in.
             ...(isolate.allowSlotSetup === undefined ? {} : { allowSlotSetup: isolate.allowSlotSetup }),
+            // The stdio server defers the dead-owner sweep until the client has finished the
+            // handshake; every other caller leaves this out and gets the constructor's sweep.
+            ...(isolate.deferStartupSweep === undefined ? {} : { deferStartupSweep: isolate.deferStartupSweep }),
             log,
           })
     this.stateDir = this.isolation?.stateDir ?? resolve(isolate.stateDir ?? join(canonicalTmpdir(), 'flash-mcp'))
@@ -487,17 +524,37 @@ export class FlashTaskService {
    * check — a queued call looked hung. The counts are stored too, so a render can fall
    * back to them if the pool is no longer at hand.
    *
+   * A foreground wait is the one case where the caller's whole turn is held by the queue,
+   * so the wait says so in the progress line and in the log: a caller that sent a writing
+   * call without `background: true` cannot see what it is waiting for otherwise.
+   *
    * @param {WorkspaceIsolation} pool - the pool the call is about to lease from.
    * @param {object} activity - the call's activity record.
+   * @param {boolean} [foreground] - whether this call holds the caller's turn while it waits.
    * @returns {number | undefined} when the wait began, or undefined when a tree was free.
    */
-  #noteQueue(pool, activity) {
+  #noteQueue(pool, activity, foreground = false) {
+    // A deferred start-up sweep (the stdio server's) may still be reclaiming the previous
+    // server's trees when the first call arrives. That wait has no session event behind it,
+    // so without this the heartbeat reads "starting" and the call looks hung; `undefined`
+    // on a pool that never deferred the sweep is simply false.
+    if (pool.startupSweepPending === true) {
+      activity.what = 'waiting for the start-up sweep to finish'
+      activity.at = Date.now()
+    }
     if (pool.inUse < pool.size) return undefined
     const since = Date.now()
     activity.what = `queued: waiting for a free tree (${String(pool.inUse)} of ${String(pool.size)} in use)`
     activity.queuedSince = since
     activity.queuedInUse = pool.inUse
     activity.queuedSize = pool.size
+    if (foreground) {
+      activity.queuedForeground = true
+      this.log(
+        `queued in the foreground: waiting for a free tree (${String(pool.inUse)} of ${String(pool.size)} in use); ` +
+          'send writing calls with background: true when trees may be busy',
+      )
+    }
     // Read through at render time: another waiting call may take the freeing tree first.
     activity.pool = pool
     return since
@@ -529,11 +586,12 @@ export class FlashTaskService {
    * @param {object | undefined} slot - the leased tree, when the call is isolated.
    * @param {string} rootCwd - the resolved directory inside the caller's root.
    * @returns {{promptCwd: string, runtimeCwd: string, extraEnv: object | undefined,
-   *   slotPorts: string[]}} where to run, and which of `extraEnv`'s names are port ranges.
+   *   slotPorts: string[], slotValues: string[]}} where to run, and which of `extraEnv`'s
+   *   names are port ranges and which are plain values the project's settings set.
    */
   #runLocation(slot, rootCwd, pool) {
     if (slot === undefined || pool === undefined) {
-      return { promptCwd: rootCwd, runtimeCwd: rootCwd, extraEnv: undefined, slotPorts: [] }
+      return { promptCwd: rootCwd, runtimeCwd: rootCwd, extraEnv: undefined, slotPorts: [], slotValues: [] }
     }
     // The runtime's environment is deliberately left alone apart from the per-slot paths
     // the repository's settings ask for. Pointing TMPDIR into the tree looked tidy, but the
@@ -543,10 +601,13 @@ export class FlashTaskService {
     // the same directory succeeded. The tree's own scratch directory still exists and the
     // worker is told about it in its prompt.
     const slotEnv = pool.slotEnvFor(slot)
-    // A `port:` entry resolves to a bare number, which the worker must not read as a path:
-    // the prompt names those variables in their own sentence.
+    // A `port:` entry resolves to a bare number and a `value:` entry to plain text, which the
+    // worker must not read as a path: the prompt names each kind in its own sentence.
     const slotPorts = Object.entries(pool.slotEnv)
       .filter(([, spec]) => spec.kind === 'port')
+      .map(([name]) => name)
+    const slotValues = Object.entries(pool.slotEnv)
+      .filter(([, spec]) => spec.kind === 'value')
       .map(([name]) => name)
     return {
       promptCwd: pool.slotCwd(slot, rootCwd),
@@ -556,6 +617,7 @@ export class FlashTaskService {
       // exactly as before: the runtime's environment is then untouched.
       extraEnv: Object.keys(slotEnv).length === 0 ? undefined : slotEnv,
       slotPorts,
+      slotValues,
     }
   }
 
@@ -612,10 +674,18 @@ export class FlashTaskService {
    * @param {AbortSignal} [options.signal] - client cancellation.
    * @param {(report: object) => void} [options.progress] - MCP progress sender.
    * @param {unknown} [options.progressToken] - the request's progress token, when it had one.
+   * @param {boolean} [options.background] - whether the call runs as a background job. A
+   *   foreground call that has to wait for a tree holds the caller's whole turn, so it says
+   *   so while it waits and in its result; a background one has no turn to hold.
+   * @param {string} [options.jobId] - the background job serving the call, recorded on the
+   *   patch's task so a stored change can be traced back to it.
    * @returns {Promise<object>} the compact structured result.
    */
-  async flashTask(args, { signal, progress, progressToken } = {}) {
+  async flashTask(args, { signal, progress, progressToken, background = false, jobId } = {}) {
     const task = this.#resolveTask(args)
+    // The path the caller gave, not the resolved one: a stored patch names the brief the
+    // call named, so it can be found again from the record alone.
+    const taskFile = typeof args?.taskFile === 'string' ? args.taskFile : undefined
     const rootCwd = this.#resolveCwd(args?.cwd)
     const acceptance = optionalText(args?.acceptance)
     const apply = this.#resolveApply(args?.apply)
@@ -657,6 +727,9 @@ export class FlashTaskService {
     // itself work the client must not mistake for a dead server. The interval is
     // stopped on every path out of this method.
     const activity = createActivity()
+    // The heartbeat names the session the call is waiting on. A retry replaces that session,
+    // so the id lives on the activity record instead of in this closure.
+    activity.sessionId = sessionId
     const stopProgress = startProgress({
       activity,
       progress,
@@ -673,15 +746,34 @@ export class FlashTaskService {
     let setup
     let queuedMs = 0
     try {
+      /** The wait for a tree, when there was one: its length, the pool's counts, nothing else. */
+      let queued
       if (pool !== undefined) {
-        const queuedSince = this.#noteQueue(pool, activity)
+        const queuedSince = this.#noteQueue(pool, activity, background !== true)
         slot = await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal)
         queuedMs = this.#noteLeased(activity, queuedSince)
+        if (queuedSince !== undefined) {
+          // Snapshotted now: the counts a result reports are the ones the caller waited
+          // behind, not whatever the pool looks like once the call is over.
+          queued = { ms: queuedMs, inUse: activity.queuedInUse, size: activity.queuedSize }
+        }
       }
-      const { promptCwd, runtimeCwd, extraEnv, slotPorts } = this.#runLocation(slot, rootCwd, pool)
+      const { promptCwd, runtimeCwd, extraEnv, slotPorts, slotValues } = this.#runLocation(slot, rootCwd, pool)
       if (slot !== undefined) {
         try {
-          pool.prepare(slot, { cwd: rootCwd, source })
+          pool.prepare(slot, {
+            cwd: rootCwd,
+            source,
+            // The task travels with the copy, so the patch this call stores can name the
+            // work it belongs to even after a crash or a restart.
+            task: {
+              kind: 'flash_task',
+              label: taskLabel(task, TASK_LABEL_CHARS),
+              sessionId,
+              ...(jobId === undefined ? {} : { jobId }),
+              ...(taskFile === undefined ? {} : { taskFile }),
+            },
+          })
         } catch (error) {
           // `prepare` reports "head needs a git repository" as an IsolationError so the pool
           // can raise it where the scope is known; a caller of the tool must read a
@@ -717,6 +809,7 @@ export class FlashTaskService {
               uncommitted: slot.uncommitted,
               slotEnv: extraEnv,
               slotPorts,
+              slotValues,
               slotSetup: promptSlotSetup(pool, setup),
               discard: apply === 'discard',
               ...(baseApplied === undefined ? {} : { basePatch: promptBasePatch(baseApplied) }),
@@ -725,32 +818,68 @@ export class FlashTaskService {
       // Measured before the worker runs, in the tree it is about to see: a worker that writes
       // or deletes an instruction file must not change what this call reports it was given.
       const instructions = this.#instructionsFor(promptCwd)
-      const { state, started } = await this.#runSession({
-        sessionId,
-        activity,
-        prompt: buildOrchestrationPrompt(childPrompt),
-        timeoutMs: this.taskTimeoutMs,
-        label: 'flash_task',
-        note: `${String(childPrompt.length)} chars of task text`,
+      const prompt = buildOrchestrationPrompt(childPrompt)
+      const runAttempt = (attemptSessionId) =>
+        this.#runSession({
+          sessionId: attemptSessionId,
+          activity,
+          prompt,
+          timeoutMs: this.taskTimeoutMs,
+          label: 'flash_task',
+          note: `${String(childPrompt.length)} chars of task text`,
+          signal,
+          profile: profileName,
+          cwd: runtimeCwd,
+          extraEnv,
+          model,
+        })
+      let attempt = await runAttempt(sessionId)
+      let attemptSessionId = sessionId
+      let retried
+      const early = this.#earlyFailureReason({
+        state: attempt.state,
+        started: attempt.started,
+        slot,
+        pool,
         signal,
-        profile: profileName,
-        cwd: runtimeCwd,
-        extraEnv,
-        model,
+        // Today's NOT_DELEGATED: the orchestrator finished without one child.
+        delegated: attempt.state.children.length > 0,
       })
+      if (early !== undefined) {
+        const firstUsage = usageTotal(attempt.state)
+        retried = {
+          reason: early,
+          firstSessionId: sessionId,
+          firstDurationMs: Date.now() - attempt.started,
+          ...(firstUsage === undefined ? {} : { firstUsage }),
+        }
+        this.log(
+          `the first attempt ${sessionId} ended early with no result (${early}); retrying once in the same working ` +
+            `directory after ${String(this.earlyRetryDelayMs)}ms`,
+        )
+        await this.#waitBeforeRetry(signal, 'flash_task')
+        attemptSessionId = `flash-task-${randomUUID()}`
+        activity.sessionId = attemptSessionId
+        attempt = await runAttempt(attemptSessionId)
+        // There is never a third attempt, and `retried` stays whatever the second attempt
+        // did: the caller paid for two, so the first attempt's session and usage belong in
+        // the answer even when the same failure ended both. The failure itself is reported
+        // unchanged below — a result, or the NOT_DELEGATED message, which names the retry.
+      }
+      const { state, started } = attempt
 
       if (state.children.length === 0) {
         throw new FlashTaskError(
-          `the orchestrator finished without delegating${describeParent(state)}`,
+          `the orchestrator finished without delegating${describeParent(state)}${retryNote(retried)}`,
           'NOT_DELEGATED',
         )
       }
       this.#logToolTrace(state)
       change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars, store: apply !== 'discard' })
       const applied = change?.available === true && apply === 'auto' ? this.#applyChange(change) : undefined
-      return this.#buildResult({
+      const result = this.#buildResult({
         state,
-        sessionId,
+        sessionId: attemptSessionId,
         started,
         profile: profileName,
         cwd: runtimeCwd,
@@ -763,7 +892,18 @@ export class FlashTaskService {
         basePatch: baseApplied,
         setup,
         queuedMs,
+        queued,
+        background,
+        retried,
+        activity,
       })
+      // After the result is built, because the report it carries is the primary child's full
+      // text (before the result's own clipping), and before the copy is emptied: the patch is
+      // the record from here on.
+      if (change?.patchId !== undefined && apply !== 'discard') {
+        this.#annotatePatch(pool, change.patchId, state.children.at(-1)?.result ?? '')
+      }
+      return result
     } catch (error) {
       if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'IDLE' || error?.code === 'CANCELLED')) {
         await this.#salvageOrphaned(pool, slot, error, profileName)
@@ -887,9 +1027,13 @@ export class FlashTaskService {
    * @param {AbortSignal} [options.signal] - client cancellation.
    * @param {(report: object) => void} [options.progress] - MCP progress sender.
    * @param {unknown} [options.progressToken] - the request's progress token, when it had one.
+   * @param {boolean} [options.background] - whether the call runs as a background job; see
+   *   `flashTask`.
+   * @param {string} [options.jobId] - the background job serving the call, recorded on the
+   *   fleet's patch task.
    * @returns {Promise<object>} the compact per-task fleet result.
    */
-  async flashBatch(args, { signal, progress, progressToken } = {}) {
+  async flashBatch(args, { signal, progress, progressToken, background = false, jobId } = {}) {
     const tasks = normalizeTasks(args?.tasks, this.maxTasks, {
       readTaskFile: (value, field) => this.#readTaskFile(value, field),
     })
@@ -926,6 +1070,9 @@ export class FlashTaskService {
     }
     // As with flash_task, progress spans the whole call, a wait for a free tree included.
     const activity = createActivity()
+    // As in flashTask: the heartbeat reads the session id from the activity record, so a
+    // retry's new session is named without restarting the timer.
+    activity.sessionId = sessionId
     const stopProgress = startProgress({
       activity,
       progress,
@@ -942,15 +1089,31 @@ export class FlashTaskService {
     let setup
     let queuedMs = 0
     try {
+      /** The wait for a tree, when there was one; see flashTask. */
+      let queued
       if (pool !== undefined) {
-        const queuedSince = this.#noteQueue(pool, activity)
+        const queuedSince = this.#noteQueue(pool, activity, background !== true)
         slot = await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal)
         queuedMs = this.#noteLeased(activity, queuedSince)
+        if (queuedSince !== undefined) {
+          queued = { ms: queuedMs, inUse: activity.queuedInUse, size: activity.queuedSize }
+        }
       }
-      const { promptCwd, runtimeCwd, extraEnv, slotPorts } = this.#runLocation(slot, rootCwd, pool)
+      const { promptCwd, runtimeCwd, extraEnv, slotPorts, slotValues } = this.#runLocation(slot, rootCwd, pool)
       if (slot !== undefined) {
         try {
-          pool.prepare(slot, { cwd: rootCwd, source })
+          pool.prepare(slot, {
+            cwd: rootCwd,
+            source,
+            // The fleet is one call, so one task identity: the member's first lines, in
+            // order, so the patch says what the fleet was asked to do.
+            task: {
+              kind: 'flash_batch',
+              label: batchTaskLabel(tasks),
+              sessionId,
+              ...(jobId === undefined ? {} : { jobId }),
+            },
+          })
         } catch (error) {
           if (error instanceof IsolationError) throw new FlashTaskError(error.message, error.code)
           throw error
@@ -975,6 +1138,7 @@ export class FlashTaskService {
               uncommitted: slot.uncommitted,
               slotEnv: extraEnv,
               slotPorts,
+              slotValues,
               slotSetup: promptSlotSetup(pool, setup),
               discard: apply === 'discard',
               ...(baseApplied === undefined ? {} : { basePatch: promptBasePatch(baseApplied) }),
@@ -989,37 +1153,71 @@ export class FlashTaskService {
       }))
       // As in flashTask: measured before the fleet runs, in the copy its members see.
       const instructions = this.#instructionsFor(promptCwd)
-      const { state, started } = await this.#runSession({
-        sessionId,
-        activity,
-        prompt: buildBatchPrompt({
-          count: items.length,
-          script: BATCH_SCRIPT,
-          args: { items, perItemChars: this.perItemChars },
-        }),
-        timeoutMs: this.batchTimeoutMs,
-        label: 'flash_batch',
-        note: `${String(items.length)} delegated tasks`,
-        signal,
-        profile: profileName,
-        cwd: runtimeCwd,
-        extraEnv,
-        model,
+      const prompt = buildBatchPrompt({
+        count: items.length,
+        script: BATCH_SCRIPT,
+        args: { items, perItemChars: this.perItemChars },
       })
+      const runAttempt = (attemptSessionId) =>
+        this.#runSession({
+          sessionId: attemptSessionId,
+          activity,
+          prompt,
+          timeoutMs: this.batchTimeoutMs,
+          label: 'flash_batch',
+          note: `${String(items.length)} delegated tasks`,
+          signal,
+          profile: profileName,
+          cwd: runtimeCwd,
+          extraEnv,
+          model,
+        })
+      let attempt = await runAttempt(sessionId)
+      let attemptSessionId = sessionId
+      let retried
+      const early = this.#earlyFailureReason({
+        state: attempt.state,
+        started: attempt.started,
+        slot,
+        pool,
+        signal,
+        // Today's NOT_DELEGATED for a fleet: the orchestrator never started one worker.
+        delegated: attempt.state.subagentStarts > 0,
+      })
+      if (early !== undefined) {
+        const firstUsage = usageTotal(attempt.state)
+        retried = {
+          reason: early,
+          firstSessionId: sessionId,
+          firstDurationMs: Date.now() - attempt.started,
+          ...(firstUsage === undefined ? {} : { firstUsage }),
+        }
+        this.log(
+          `the first attempt ${sessionId} ended early with no result (${early}); retrying once in the same working ` +
+            `directory after ${String(this.earlyRetryDelayMs)}ms`,
+        )
+        await this.#waitBeforeRetry(signal, 'flash_batch')
+        attemptSessionId = `flash-batch-${randomUUID()}`
+        activity.sessionId = attemptSessionId
+        attempt = await runAttempt(attemptSessionId)
+        // As in flashTask: never a third attempt, and the retry stays in the record even when
+        // the second attempt failed the same way.
+      }
+      const { state, started } = attempt
 
       if (state.subagentStarts === 0) {
         throw new FlashTaskError(
-          `the orchestrator finished without starting the fleet${describeParent(state)}`,
+          `the orchestrator finished without starting the fleet${describeParent(state)}${retryNote(retried)}`,
           'NOT_DELEGATED',
         )
       }
       this.#logToolTrace(state)
       change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars, store: apply !== 'discard' })
       const applied = change?.available === true && apply === 'auto' ? this.#applyChange(change) : undefined
-      return this.#buildBatchResult({
+      const result = this.#buildBatchResult({
         state,
         tasks,
-        sessionId,
+        sessionId: attemptSessionId,
         started,
         profile: profileName,
         cwd: runtimeCwd,
@@ -1031,7 +1229,17 @@ export class FlashTaskService {
         basePatch: baseApplied,
         setup,
         queuedMs,
+        queued,
+        background,
+        retried,
+        activity,
       })
+      // The fleet's record carries one paragraph per member: the patch outlives the call,
+      // and the workers' own accounts are the only explanation of it.
+      if (change?.patchId !== undefined && apply !== 'discard') {
+        this.#annotatePatch(pool, change.patchId, batchFinalMessage(result))
+      }
+      return result
     } catch (error) {
       if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'IDLE' || error?.code === 'CANCELLED')) {
         await this.#salvageOrphaned(pool, slot, error, profileName)
@@ -1040,6 +1248,110 @@ export class FlashTaskService {
     } finally {
       stopProgress()
       if (slot !== undefined) this.#settleSlot(pool, slot, change)
+    }
+  }
+
+  /**
+   * Why an attempt is an early, empty failure worth one retry — or undefined when it is not.
+   *
+   * Right after a machine restart, some of the first calls ended within a minute or two with
+   * `status: "error"` and an empty message, and the same briefs ran normally minutes later.
+   * The shape of such an attempt is specific: nothing delegated (or every worker said
+   * nothing), a handful of model calls, a short session, and — the part that matters most —
+   * no change in the copy. A copy holding a change is real work whatever the worker said, so
+   * it is never retried; the check is `collect(..., { store: false })`, which stages the
+   * copy's index exactly as the real collect does, so a later collect still sees the same
+   * change (a test pins that). "No change" means every part of what `collect` reports is
+   * empty — tracked files, newly ignored paths, and rewritten ignored ones — and that the
+   * diff could be computed at all: ignored build output alone is work a retry would claim.
+   *
+   * @param {object} input - the finished attempt.
+   * @param {object} input.state - the observation state `#runSession` accumulated.
+   * @param {number} input.started - when the attempt began, in ms.
+   * @param {object} [input.slot] - the call's tree, when it had one.
+   * @param {WorkspaceIsolation} [input.pool] - the call's pool.
+   * @param {AbortSignal} [input.signal] - the call's cancellation.
+   * @param {boolean} input.delegated - whether the attempt delegated anything at all.
+   * @returns {'NOT_DELEGATED' | 'EMPTY_RESULT' | undefined} the reason, or undefined.
+   */
+  #earlyFailureReason({ state, started, slot, pool, signal, delegated }) {
+    if (signal?.aborted === true) return undefined
+    if (Date.now() - started >= EARLY_RETRY_MAX_MS) return undefined
+    // Unknown usage counts as qualifying: nothing reported it, so nothing says the attempt
+    // was a real one.
+    const usage = usageTotal(state)
+    if (usage !== undefined && usage.modelCalls > EARLY_RETRY_MAX_MODEL_CALLS) return undefined
+    let reason
+    if (!delegated) reason = 'NOT_DELEGATED'
+    else if (state.children.length > 0 && state.children.every((child) => child.result.trim().length === 0)) {
+      reason = 'EMPTY_RESULT'
+    } else return undefined
+    if (slot !== undefined && pool !== undefined) {
+      // A call without a slot has no copy to check, and a read-only call cannot have changed
+      // anything in the first place.
+      const change = pool.collect(slot, { store: false, diffChars: this.diffChars })
+      // Only a copy that can be compared and holds nothing at all is "unchanged". An
+      // unreadable diff (`available: false`) says nothing either way, and git-ignored output
+      // is real work the patch cannot carry: retrying in the same tree would then let the
+      // second attempt report the first one's ignored files as its own.
+      if (change?.available !== true) return undefined
+      if ((change.filesChanged ?? []).length > 0) return undefined
+      if ((change.ignored ?? []).length > 0) return undefined
+      if ((change.ignoredChanged ?? []).length > 0) return undefined
+    }
+    return reason
+  }
+
+  /**
+   * Wait before retrying an early, empty attempt, or refuse when the call is cancelled.
+   *
+   * The wait is the point: a runtime that has just come up is still cold, and the report
+   * that motivated this said the same brief sent minutes later ran normally. It is
+   * abortable, because a caller that has already given up must not be held for it, and the
+   * timer is unref'd so it never keeps the process alive on its own.
+   *
+   * @param {AbortSignal} [signal] - the call's cancellation.
+   * @param {string} label - `flash_task` or `flash_batch`, for the error message.
+   * @returns {Promise<void>} resolves after the delay.
+   * @throws {FlashTaskCancelled} when the call is cancelled first.
+   */
+  #waitBeforeRetry(signal, label) {
+    if (signal?.aborted === true) {
+      return Promise.reject(new FlashTaskCancelled(`${label} was cancelled before its first attempt was retried`))
+    }
+    const delayMs = this.earlyRetryDelayMs
+    if (delayMs <= 0) return Promise.resolve()
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer)
+        reject(new FlashTaskCancelled(`${label} was cancelled before its first attempt was retried`))
+      }
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }, delayMs)
+      timer.unref?.()
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  /**
+   * Attach a worker's report to a stored patch, and never let that fail the call.
+   *
+   * The annotation is traceability, not the result: the patch is already on disk and the
+   * caller already holds the answer. A record that cannot be rewritten is worth one log line.
+   *
+   * @param {WorkspaceIsolation | undefined} pool - the pool that stored the patch.
+   * @param {string} patchId - the patch to annotate.
+   * @param {string} finalMessage - the worker's own account; an empty one is not written.
+   * @returns {void}
+   */
+  #annotatePatch(pool, patchId, finalMessage) {
+    if (pool === undefined || typeof finalMessage !== 'string' || finalMessage.length === 0) return
+    try {
+      pool.annotatePatch(patchId, { finalMessage })
+    } catch (error) {
+      this.log(`could not attach the worker's report to patch ${patchId}: ${messageOf(error)}`)
     }
   }
 
@@ -1382,40 +1694,7 @@ export class FlashTaskService {
    * @throws {FlashTaskError} when the path is unreadable, outside the root, or not a usable file.
    */
   #readTaskFile(requested, field = 'taskFile') {
-    const text = requireText(requested, field)
-    const absolute = isAbsolute(text) ? resolve(text) : resolve(this.root, text)
-    let real
-    try {
-      // realpathSync both proves the file exists and resolves a symlink, so a link that
-      // points out of the root is fenced by the same comparison a literal path gets.
-      real = realpathSync(absolute)
-    } catch (error) {
-      throw new FlashTaskError(`${field} "${text}" could not be read: ${messageOf(error)}`, 'INVALID_ARGUMENT')
-    }
-    const relation = relative(this.root, real)
-    if (relation === '..' || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
-      throw new FlashTaskError(
-        `${field} "${text}" is outside the service root ${this.root}; this service is confined to that root`,
-        'TASK_FILE_OUTSIDE_ROOT',
-      )
-    }
-    const stats = statSync(real)
-    if (!stats.isFile()) {
-      throw new FlashTaskError(`${field} "${text}" is not a regular file`, 'INVALID_ARGUMENT')
-    }
-    if (stats.size > MAX_TASK_FILE_BYTES) {
-      throw new FlashTaskError(
-        `${field} "${text}" is ${String(stats.size)} bytes; the most this service reads is ` +
-          `${String(MAX_TASK_FILE_BYTES)} (256 KB)`,
-        'INVALID_ARGUMENT',
-      )
-    }
-    const content = readFileSync(real, 'utf8')
-    if (content.trim().length === 0) {
-      throw new FlashTaskError(`${field} "${text}" is empty`, 'INVALID_ARGUMENT')
-    }
-    this.log(`task read from ${real} (${String(content.length)} chars)`)
-    return content
+    return readTaskFile(this.root, requested, { field, log: this.log })
   }
 
   /** Resolve and fence the worker working directory. */
@@ -1511,7 +1790,26 @@ export class FlashTaskService {
   }
 
   /** Assemble the compact per-task fleet result. */
-  #buildBatchResult({ state, tasks, sessionId, started, profile, cwd, model, instructions, slot, change, applied, basePatch, setup, queuedMs = 0 }) {
+  #buildBatchResult({
+    state,
+    tasks,
+    sessionId,
+    started,
+    profile,
+    cwd,
+    model,
+    instructions,
+    slot,
+    change,
+    applied,
+    basePatch,
+    setup,
+    queuedMs = 0,
+    queued,
+    background = false,
+    retried,
+    activity,
+  }) {
     const envelope = extractWorkflowValue(state.workflowText)
     const payload = envelope.value
     const warnings = []
@@ -1663,6 +1961,11 @@ export class FlashTaskService {
     if (slot !== undefined && this.isolation?.slotSetupWarning !== undefined) {
       warnings.push(this.isolation.slotSetupWarning)
     }
+    // The fleet's shared activity record: one warning per command that keeps failing,
+    // whichever member of the fleet was running it.
+    warnings.push(...activityWarnings(activity))
+    if (queued !== undefined && background !== true) warnings.push(foregroundQueueWarning(queued))
+    if (retried !== undefined) warnings.push(earlyRetryWarning(retried.reason))
     const routes = []
     for (const route of state.childRoutes.values()) {
       if (!routes.some((known) => known.provider === route.provider && known.model === route.model)) routes.push(route)
@@ -1698,6 +2001,7 @@ export class FlashTaskService {
       ...(usage === undefined ? {} : { usage }),
       instructions,
       ...(setup === undefined || setup.length === 0 ? {} : { setup }),
+      ...(retried === undefined ? {} : { retried }),
       runtime: this.#runtimeInfo(profile, cwd, model),
       ...this.#changeFields({ profileName: profile, slot, change, applied, basePatch }),
       ...(warnings.length === 0 ? {} : { warnings }),
@@ -1705,7 +2009,25 @@ export class FlashTaskService {
   }
 
   /** Assemble the compact result the MCP client receives. */
-  #buildResult({ state, sessionId, started, profile, cwd, model, instructions, slot, change, applied, basePatch, setup, queuedMs = 0 }) {
+  #buildResult({
+    state,
+    sessionId,
+    started,
+    profile,
+    cwd,
+    model,
+    instructions,
+    slot,
+    change,
+    applied,
+    basePatch,
+    setup,
+    queuedMs = 0,
+    queued,
+    background = false,
+    retried,
+    activity,
+  }) {
     const children = state.children.map((child) => {
       const clipped = truncate(child.result, this.maxResultChars)
       return {
@@ -1757,6 +2079,12 @@ export class FlashTaskService {
     if (primary.route?.model !== undefined && primary.route.model !== model) {
       warnings.push(`the worker ran on ${primary.route.model}, not the requested ${model}`)
     }
+    // A worker that keeps repeating a step its sandbox cannot finish holds its tree for
+    // hours while its progress keeps changing; the result says so even to a caller that
+    // never watched a heartbeat.
+    warnings.push(...activityWarnings(activity))
+    if (queued !== undefined && background !== true) warnings.push(foregroundQueueWarning(queued))
+    if (retried !== undefined) warnings.push(earlyRetryWarning(retried.reason))
 
     return {
       status: primary.status,
@@ -1775,6 +2103,7 @@ export class FlashTaskService {
       ...(usage === undefined ? {} : { usage }),
       instructions,
       ...(setup === undefined || setup.length === 0 ? {} : { setup }),
+      ...(retried === undefined ? {} : { retried }),
       runtime: this.#runtimeInfo(profile, cwd, model),
       ...this.#changeFields({ profileName: profile, slot, change, applied, basePatch }),
       ...(warnings.length === 0 ? {} : { warnings }),
@@ -1832,30 +2161,517 @@ function ignoredChangedWarning(change) {
     'regenerate or copy them after applying'
   )
 }
+
+/**
+ * The warning a foreground call carries when it had to wait for a free tree.
+ *
+ * A writing call without `background: true` holds the caller's whole turn while it queues,
+ * and the caller cannot see why: the wait itself is the answer, with the counts it waited
+ * behind and the one thing that would have avoided it.
+ *
+ * @param {{ms: number, inUse: number, size: number}} queued - the wait and its pool counts.
+ * @returns {string} one sentence naming the wait and the remedy.
+ */
+function foregroundQueueWarning(queued) {
+  return (
+    `this call waited ${formatElapsed(queued.ms)} in the foreground for a free tree ` +
+    `(${String(queued.inUse)} of ${String(queued.size)} in use), holding your turn; ` +
+    'send writing calls with background: true when trees may be busy'
+  )
+}
+
+/**
+ * The warning a retried call carries about the attempt that produced nothing.
+ *
+ * @param {'NOT_DELEGATED' | 'EMPTY_RESULT'} reason - why the first attempt ended early.
+ * @returns {string} one sentence naming the reason and that one retry happened.
+ */
+function earlyRetryWarning(reason) {
+  return `the first attempt ended early with no result (${reason}) and was retried once`
+}
+
+/**
+ * The retry the NOT_DELEGATED error names, when the call had already made one.
+ *
+ * A flash_task that never delegated has no result object to carry `retried`, so the error is
+ * the only place the first attempt can survive. Without this the caller reads the same
+ * message it would have read had no retry happened, while having paid for two attempts.
+ *
+ * @param {object | undefined} retried - the retry record, when there was one.
+ * @returns {string} one parenthetical, or `''` when no retry happened.
+ */
+function retryNote(retried) {
+  if (retried === undefined) return ''
+  return ` (after one automatic retry; the first attempt ${retried.firstSessionId} ended the same way)`
+}
+
+/**
+ * The first non-empty line of a task text, trimmed, or `''` when it has none.
+ *
+ * Exported because a background job's label and a stored patch's task label must read the
+ * same line: the job is what the caller watches, and the patch is what outlives it.
+ *
+ * @param {unknown} text - the task text.
+ * @returns {string} its first non-empty line, trimmed.
+ */
+export function firstTaskLine(text) {
+  if (typeof text !== 'string') return ''
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (trimmed.length > 0) return trimmed
+  }
+  return ''
+}
+
+/**
+ * The label a stored patch's task record keeps for one task text.
+ *
+ * A brief is usually a Markdown heading followed by prose; the heading is the label, and
+ * its `#` markers are noise on a one-line status, so they are stripped. Exported because a
+ * background job's label and a stored patch's task label must be the same words: the job is
+ * what the caller watches, and the patch is what outlives it.
+ *
+ * @param {string} text - the task text actually sent.
+ * @param {number} maxChars - how much of the line the record keeps.
+ * @returns {string} the label, possibly empty.
+ */
+export function taskLabel(text, maxChars) {
+  return clipText(firstTaskLine(text).replace(/^#+/, '').trim(), maxChars)
+}
+
+/**
+ * The label a fleet's patch record keeps: its size, then every member's first line.
+ *
+ * @param {{task: string}[]} tasks - the normalized fleet.
+ * @returns {string} the label, at most `BATCH_TASK_LABEL_CHARS` characters.
+ */
+function batchTaskLabel(tasks) {
+  const lines = tasks.map((entry) => taskLabel(entry.task, BATCH_TASK_LABEL_CHARS))
+  return clipText(`${String(tasks.length)} tasks: ${lines.join(' | ')}`, BATCH_TASK_LABEL_CHARS)
+}
+
+/**
+ * The report a fleet's patch keeps: one paragraph per member, in task order.
+ *
+ * @param {object} result - the fleet result that was just built.
+ * @returns {string} the paragraphs, or `''` when no member's entry could be paired.
+ */
+function batchFinalMessage(result) {
+  const entries = Array.isArray(result?.results) ? result.results : []
+  return entries
+    .map((entry) => `task ${String(entry.index + 1)} (${String(entry.status)}): ${String(entry.result ?? '')}`)
+    .join('\n\n')
+}
+
+/** Bound a line to a width, without leaving a cut marker behind (unlike `truncateText`). */
+function clipText(text, maxChars) {
+  return text.length <= maxChars ? text : text.slice(0, maxChars)
+}
+
 /** The observation state for one session. */
 /**
  * The last sign of life a call has seen: when, which step, and what it was doing.
  * Shared by the observer (which writes it), the progress heartbeat and the idle
  * check (which read it), so all three agree on one clock.
+ *
+ * Two maps live here as well, because "what is it doing right now" is a question about the
+ * call as a whole and not about one event: `openCalls` holds the worker's open tool calls —
+ * one per call id, because one session can have two running at once — so a worker stuck in a
+ * two-hour build is visible while it is stuck, and `failures` counts failed commands by what
+ * was being run, so a command repeated without success is named.
  */
 export function createActivity(now = Date.now()) {
-  return { at: now, step: undefined, what: 'starting', events: 0 }
+  return {
+    at: now,
+    step: undefined,
+    what: 'starting',
+    events: 0,
+    /**
+     * Every open tool call of every worker, keyed by session and call id (see
+     * `openCallKey`). A value keeps the session too, so a result without an id can still
+     * be matched to the oldest call of its own worker.
+     *
+     * @type {Map<string, {session: string, id?: string, tool: string, command: string, since: number}>}
+     */
+    openCalls: new Map(),
+    /** How many calls this record has seen, so an id-less call still gets a unique key. */
+    callSeq: 0,
+    /** @type {Map<string, {count: number, lastAt: number, lastExitCode?: number, lastName?: string}>} */
+    failures: new Map(),
+  }
 }
 
-/** Record one event as activity. */
-function touchActivity(activity, event) {
+/**
+ * Record one event as activity.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {object} event - the session event.
+ * @param {string} [workerSession] - the worker session the event came from, so open calls
+ *   can be tracked per worker. Omitted for the call's own (dispatcher) session: its one
+ *   `flash`/`workflow` call stays open for the whole delegation and must never be reported
+ *   as the command the worker is running, nor count as a failure.
+ * @param {(message: string) => void} [log] - diagnostic sink, for the repeated-failure line.
+ * @returns {void}
+ */
+function touchActivity(activity, event, workerSession, log = () => {}) {
   if (activity === undefined) return
   activity.at = Date.now()
   activity.events += 1
   const step = event?.data?.step
   if (typeof step === 'number') activity.step = step
   const type = String(event?.type ?? '')
-  if (type === 'tool/call') activity.what = `tool ${String(event.data?.name ?? '?')}`
-  else if (type === 'tool/result') activity.what = 'reading a tool result'
-  else if (type.startsWith('assistant/') || type.startsWith('llm/')) activity.what = 'model responding'
+  if (type === 'tool/call') {
+    const tool = String(event.data?.name ?? '?')
+    activity.what = `tool ${tool}`
+    noteToolCall(activity, workerSession, tool, event.data?.arguments, toolCallIdOf(event))
+  } else if (type === 'tool/result') {
+    activity.what = 'reading a tool result'
+    noteToolResult(activity, workerSession, event, log)
+  } else if (type.startsWith('assistant/') || type.startsWith('llm/')) activity.what = 'model responding'
 }
 
-/** One line describing the last activity, for heartbeats and stop reasons. */
+/**
+ * The key one open tool call is held under: its worker session and its own call id.
+ *
+ * A session can have two calls open at once (two `bash` invocations, or `bash` and `read`),
+ * so a per-session key let the second overwrite the first and then made the first result
+ * delete the second's entry. The session is part of the key rather than the map's value
+ * alone so an exact lookup needs no scan.
+ *
+ * @param {string} session - the worker session.
+ * @param {string} id - the tool call id, or the synthetic id a call without one got.
+ * @returns {string} the map key.
+ */
+function openCallKey(session, id) {
+  // A NUL cannot appear in either part, so no two pairs can collide.
+  return `${session}\u0000${id}`
+}
+
+/**
+ * The id a tool event carries for the call it opens or closes.
+ *
+ * Harness names a call in one of a few fields depending on the event: `data.id`,
+ * `data.callId` or `data.toolCallId` on `tool/call`, the same on `tool/result` or in the
+ * `source`/`tool-result` content blocks (a call id there looks like `call_y7k0qyl9`). Any of
+ * them is a stable match; none means the result falls back to the per-session FIFO.
+ *
+ * @param {object} event - a `tool/call` or `tool/result` event.
+ * @returns {string | undefined} the id, when the event carries one.
+ */
+function toolCallIdOf(event) {
+  const data = event?.data
+  for (const candidate of [data?.id, data?.callId, data?.toolCallId, data?.call?.id, data?.message?.source?.callId]) {
+    if (typeof candidate === 'string' && candidate.length > 0) return candidate
+  }
+  return toolCallIdInBlocks(data?.message?.content)
+}
+
+/** The call id a tool-result (or tool-call) content block names, walking nested blocks. */
+function toolCallIdInBlocks(blocks) {
+  if (!Array.isArray(blocks)) return undefined
+  for (const block of blocks) {
+    if (block === null || typeof block !== 'object') continue
+    for (const candidate of [block.toolCallId, block.callId]) {
+      if (typeof candidate === 'string' && candidate.length > 0) return candidate
+    }
+    const nested = toolCallIdInBlocks(block.content)
+    if (nested !== undefined) return nested
+  }
+  return undefined
+}
+
+/**
+ * Remember one open tool call of one worker, from its `tool/call` event.
+ *
+ * A shell call's command line is what a stalled worker is stuck in, so it is kept nearly
+ * whole; any other tool is named with the head of its arguments. The call stays open until
+ * the result that answers *that call id* arrives, which is what makes "since when"
+ * answerable even while the same worker runs a second call beside it.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {string} [session] - the worker session the call came from.
+ * @param {string} tool - the tool name.
+ * @param {unknown} args - the tool call's arguments, a JSON string in practice.
+ * @param {string} [id] - the call's own id, when the event carried one.
+ * @returns {void}
+ */
+function noteToolCall(activity, session, tool, args, id) {
+  if (typeof session !== 'string' || activity?.openCalls === undefined) return
+  // A call without an id still needs its own entry: the second anonymous call of a worker
+  // must not overwrite the first, and its result must close exactly one of them.
+  const callId = id ?? `#${String((activity.callSeq ?? 0) + 1)}`
+  activity.callSeq = (activity.callSeq ?? 0) + 1
+  activity.openCalls.set(openCallKey(session, callId), {
+    session,
+    ...(id === undefined ? {} : { id }),
+    tool,
+    command: describeToolCall(tool, args),
+    since: Date.now(),
+  })
+}
+
+/**
+ * Forget every open tool call of a worker that has ended.
+ *
+ * A worker cut off mid-call (cancelled, out of budget, its runtime gone) never sends the
+ * result that would close its call, and the entry would otherwise stay in `current` for the
+ * rest of the job as a command that is still running.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {unknown} session - the worker session that ended.
+ * @returns {void}
+ */
+function closeSessionCalls(activity, session) {
+  if (typeof session !== 'string' || activity?.openCalls === undefined) return
+  for (const [key, call] of activity.openCalls) {
+    if (call.session === session) activity.openCalls.delete(key)
+  }
+}
+
+/**
+ * Close the open tool call one result answers, and count a failure.
+ *
+ * The result is matched by its call id when it carries one; without an id (or with an id
+ * this record never saw start) the oldest open call of that worker answers it, by tool name
+ * when the result names one. Either way exactly one entry is closed: a second open call of
+ * the same worker is left alone for its own result, so its failure is counted rather than
+ * silently dropped.
+ *
+ * A shell result is marked with `[exit code: N]`; a non-zero one, or any result carrying
+ * `data.error`, is a failed run of that command. Failures are counted per command key (see
+ * `failureKey`), and the warning is logged when one key reaches the threshold and at every
+ * threshold further failure after that — the log is where a night of unattended work is
+ * read afterwards.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {string} [session] - the worker session the result came from.
+ * @param {object} event - the `tool/result` event.
+ * @param {(message: string) => void} log - diagnostic sink.
+ * @returns {void}
+ */
+function noteToolResult(activity, session, event, log) {
+  if (typeof session !== 'string' || activity?.openCalls === undefined) return
+  const call = closeOpenCall(activity, session, toolCallIdOf(event), event.data?.name ?? event.data?.tool)
+  // A result nobody saw start says nothing about which command failed.
+  if (call === undefined) return
+  const text = toolResultText(event.data?.message)
+  const exitCode = exitCodeOf(text)
+  const failure = event.data?.error
+  const failed = (failure !== undefined && failure !== null) || (exitCode !== undefined && exitCode !== 0)
+  if (!failed) return
+  const key = failureKey(call.command)
+  if (key.length === 0) return
+  const record = activity.failures.get(key) ?? { count: 0 }
+  record.count += 1
+  record.lastAt = Date.now()
+  record.lastExitCode = exitCode
+  record.lastName = typeof failure?.name === 'string' ? failure.name : undefined
+  activity.failures.set(key, record)
+  if (record.count < REPEATED_FAILURE_THRESHOLD) return
+  if (record.count % REPEATED_FAILURE_THRESHOLD !== 0) return
+  log(repeatedFailureWarning(key, record, record.lastAt))
+}
+
+/**
+ * Remove and return the one open call a result answers.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {string} session - the worker session the result came from.
+ * @param {string | undefined} id - the call id the result carries, if any.
+ * @param {string | undefined} tool - the tool name the result names, if any.
+ * @returns {object | undefined} the closed call, or undefined when none was open.
+ */
+function closeOpenCall(activity, session, id, tool) {
+  if (id !== undefined) {
+    const key = openCallKey(session, id)
+    const exact = activity.openCalls.get(key)
+    if (exact !== undefined) {
+      activity.openCalls.delete(key)
+      return exact
+    }
+  }
+  // FIFO, restricted to this worker: the oldest call still open is the one that has been
+  // running longest, which is the one a result arriving without an id most plausibly answers.
+  const first = takeOpenCall(activity, session, tool)
+  if (first !== undefined) return first
+  // A result that names a tool no open call of this worker has (a rename between the call
+  // and its result, say) still closes exactly one call rather than being dropped: the
+  // oldest one left is the only candidate.
+  return typeof tool === 'string' && tool.length > 0 ? takeOpenCall(activity, session, undefined) : undefined
+}
+
+/**
+ * Remove and return the oldest open call of one worker, optionally only of one tool.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {string} session - the worker session.
+ * @param {string | undefined} tool - the tool name to match, when one is known.
+ * @returns {object | undefined} the closed call, or undefined when none matched.
+ */
+function takeOpenCall(activity, session, tool) {
+  for (const [key, call] of activity.openCalls) {
+    if (call.session !== session) continue
+    if (typeof tool === 'string' && tool.length > 0 && call.tool !== tool) continue
+    activity.openCalls.delete(key)
+    return call
+  }
+  return undefined
+}
+
+/**
+ * The command line of a shell tool call, read out of its JSON arguments.
+ *
+ * @param {string} raw - the event's `arguments` field.
+ * @returns {string | undefined} the command, or undefined when the arguments are not a
+ *   JSON object with a string `command`.
+ */
+function shellCommandOf(raw) {
+  if (typeof raw !== 'string' || raw.length === 0) return undefined
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+  return typeof parsed?.command === 'string' ? parsed.command : undefined
+}
+
+/**
+ * The one-line description of a tool call an activity record keeps.
+ *
+ * @param {string} tool - the tool name.
+ * @param {unknown} args - the event's `arguments` field.
+ * @returns {string} a command line for a shell tool, or the tool name plus its arguments.
+ */
+function describeToolCall(tool, args) {
+  const raw = typeof args === 'string' ? args : args === undefined || args === null ? '' : JSON.stringify(args)
+  if (tool === 'bash' || tool === 'pwsh') {
+    const command = shellCommandOf(raw)
+    if (command !== undefined && command.length > 0) return clipText(command, ACTIVITY_COMMAND_CHARS)
+  }
+  return clipText(raw.length === 0 ? tool : `${tool} ${raw}`, ACTIVITY_TOOL_CHARS)
+}
+
+/**
+ * The command key failures are counted under.
+ *
+ * `cd repo && cargo build --release` and `CARGO_X=1 cargo build -p app` are the same step
+ * being retried: a leading `cd` only sets the directory and a leading assignment only sets
+ * an environment variable, so both are removed, whitespace is collapsed, and the first two
+ * words are what is left (`cargo build`, `npm run`).
+ *
+ * @param {string} command - the command line.
+ * @returns {string} the key, or `''` when nothing but setup segments was there.
+ */
+function failureKey(command) {
+  let text = String(command ?? '')
+  for (;;) {
+    const match = /^\s*cd\s+(?:"[^"]*"|'[^']*'|[^\s&;]+)\s*(?:&&|;)\s*/.exec(text)
+    if (match === null) break
+    text = text.slice(match[0].length)
+  }
+  for (;;) {
+    const match = /^\s*[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+/.exec(text)
+    if (match === null) break
+    text = text.slice(match[0].length)
+  }
+  return text
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter((word) => word.length > 0)
+    .slice(0, 2)
+    .join(' ')
+}
+
+/** The exit code a shell result is marked with, or undefined when it carries none. */
+function exitCodeOf(text) {
+  if (typeof text !== 'string') return undefined
+  let code
+  for (const match of text.matchAll(/\[exit code:\s*(-?\d+)\]/g)) code = Number(match[1])
+  return code
+}
+
+/**
+ * How one failing command is described inside a warning.
+ *
+ * @param {{lastExitCode?: number, lastName?: string}} record - the failure record.
+ * @param {number} now - the clock the "ago" is measured against.
+ * @returns {string} `exit code 101, 40s ago`, or the tool error's name.
+ */
+function failureSummary(record, now) {
+  const reason =
+    record.lastExitCode !== undefined
+      ? `exit code ${String(record.lastExitCode)}`
+      : `tool error${record.lastName === undefined ? '' : ` ${record.lastName}`}`
+  return `${reason}, ${formatElapsed(now - record.lastAt)} ago`
+}
+
+/**
+ * The warning that one command keeps failing in this call.
+ *
+ * The count, the last failure and how long ago it was are all read at render time, so the
+ * same record produces a current line in every heartbeat and in the result — the count in
+ * the warning never speaks about an earlier moment than the call itself.
+ *
+ * @param {string} key - the command key.
+ * @param {object} record - its failure record.
+ * @param {number} now - the clock to measure against.
+ * @returns {string} the warning.
+ */
+function repeatedFailureWarning(key, record, now) {
+  return (
+    `"${key}" failed ${String(record.count)} times in this call (last: ${failureSummary(record, now)}); ` +
+    'a worker repeating a step its sandbox cannot finish keeps its tree busy — check its report or cancel the call'
+  )
+}
+
+/**
+ * Every repeated-failure warning of a call, current as of `now`.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @param {number} [now] - the clock to measure against.
+ * @returns {string[]} the warnings, in the order the commands first failed.
+ */
+function activityWarnings(activity, now = Date.now()) {
+  const warnings = []
+  for (const [key, record] of activity?.failures ?? []) {
+    if (record.count < REPEATED_FAILURE_THRESHOLD) continue
+    warnings.push(repeatedFailureWarning(key, record, now))
+  }
+  return warnings
+}
+
+/**
+ * The open tool calls of a call, longest-running first.
+ *
+ * `since` is an ISO timestamp for a status reader; `runningMs` is what a render needs, and
+ * keeping both means no reader has to trust this process's clock twice.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @param {number} [now] - the clock to measure against.
+ * @returns {{tool: string, command: string, since: string, runningMs: number}[]} the calls.
+ */
+function openCommands(activity, now = Date.now()) {
+  const current = []
+  for (const call of activity?.openCalls?.values() ?? []) {
+    current.push({
+      tool: call.tool,
+      command: call.command,
+      since: new Date(call.since).toISOString(),
+      runningMs: Math.max(0, now - call.since),
+    })
+  }
+  return current.sort((a, b) => b.runningMs - a.runningMs)
+}
+
+/**
+ * One line describing the last activity, for heartbeats and stop reasons.
+ *
+ * The longest-running open command is appended when there is one: a worker that has been
+ * inside the same build for four minutes is doing something, and a caller reading "tool
+ * bash · last event 2s ago" cannot tell that from a worker making progress.
+ */
 export function describeActivity(activity, now = Date.now()) {
   if (activity === undefined) return 'no activity recorded'
   // A call waiting for a tree has no session event to report, and saying so is the point:
@@ -1864,11 +2680,21 @@ export function describeActivity(activity, now = Date.now()) {
   if (activity.queuedSince !== undefined) {
     const inUse = activity.pool?.inUse ?? activity.queuedInUse ?? 0
     const size = activity.pool?.size ?? activity.queuedSize ?? 0
-    return `queued ${formatElapsed(now - activity.queuedSince)}: waiting for a free tree (${String(inUse)} of ${String(size)} in use)`
+    const counts = `waiting for a free tree (${String(inUse)} of ${String(size)} in use)`
+    // A foreground call is holding the caller's whole turn while it waits, and the line is
+    // read by that caller: say so, and say how long, instead of leaving it as an ordinary
+    // queue line whose only clock is the last-event age.
+    if (activity.queuedForeground === true) {
+      return `queued in the foreground ${formatElapsed(now - activity.queuedSince)}: ${counts}`
+    }
+    return `queued ${formatElapsed(now - activity.queuedSince)}: ${counts}`
   }
   const ago = formatElapsed(now - activity.at)
   const step = activity.step === undefined ? '' : `step ${String(activity.step)} · `
-  return `${step}${activity.what} · last event ${ago} ago`
+  const running = openCommands(activity, now)[0]
+  const suffix =
+    running === undefined ? '' : `; running "${running.command}" for ${formatElapsed(running.runningMs)}`
+  return `${step}${activity.what} · last event ${ago} ago${suffix}`
 }
 
 export function createObserveState() {
@@ -2097,7 +2923,7 @@ function descendsFrom(state, session, root) {
 }
 
 /** Collect one session's progress from runtime notifications. */
-function observe(state, method, params, sessionId, completion, log) {
+export function observe(state, method, params, sessionId, completion, log) {
   if (method === 'session.status') {
     if (params?.sessionId !== sessionId) return
     state.status = String(params.status)
@@ -2120,7 +2946,7 @@ function observe(state, method, params, sessionId, completion, log) {
       state.sessionParents.set(params.childSessionId, params.parentSessionId)
     }
     if (params?.parentSessionId !== sessionId) return
-    touchActivity(state.activity, { type: 'subagent/started' })
+    touchActivity(state.activity, { type: 'subagent/started' }, String(params.childSessionId ?? ''), log)
     state.subagentStarts += 1
     // Overlap is counted in notification order, not from timestamps: the runtime
     // can report several starts inside one millisecond, and concurrent workers
@@ -2143,6 +2969,7 @@ function observe(state, method, params, sessionId, completion, log) {
       (entry) => entry.childSessionId === params.childSessionId && entry.finishedAt === undefined,
     )
     if (open !== undefined) open.finishedAt = finishedAt
+    closeSessionCalls(state.activity, params.childSessionId)
     if (typeof params.childSessionId === 'string') state.childIds.add(params.childSessionId)
     state.children.push({
       status: String(params.status),
@@ -2158,11 +2985,20 @@ function observe(state, method, params, sessionId, completion, log) {
   if (method !== 'session.event') return
   const session = params?.sessionId
   const event = params?.event
-  // Any event from this session or one of its workers is a sign of life.
-  if (session === sessionId || state.childIds.has(session)) touchActivity(state.activity, event)
+  // Any event from this session or one of its workers is a sign of life, and a worker's
+  // tool calls are tracked per session so the call can say what each one is running.
+  //
+  // The call's own session is the dispatcher: it calls `flash` (or `workflow` for a fleet)
+  // exactly once, and that call stays open for the whole delegation. Counting it would make
+  // the dispatch itself the longest-running "command" of every call, so its events still
+  // move `at`/`step`/`what` but never own an open call or a failure. Workers are found with
+  // `sessionInCall`, not `childIds`: a fleet member may be known only through its
+  // `tool-workflow/agent-start`, and that member's commands belong to the call too.
+  const inCall = sessionInCall(state, session, sessionId)
+  if (inCall) touchActivity(state.activity, event, session === sessionId ? undefined : session, log)
   // Usage can ride on any event of the call; the ledger keeps it per session so a
   // fleet can later attribute it to the task whose worker reported it.
-  if (sessionInCall(state, session, sessionId)) recordUsage(state, session, event)
+  if (inCall) recordUsage(state, session, event)
   if (event?.type === 'request/header' && state.childIds.has(session)) {
     // Harness logs the exact call configuration of every request; this is the
     // child's real route, observed rather than assumed.
@@ -2218,8 +3054,9 @@ function observe(state, method, params, sessionId, completion, log) {
   // members arrive here too. Only a session this call owns — its own, a worker's, or a
   // worker's child — may contribute: accepting another call's agent-start would put its child
   // in this call's `workflowChildIds`, and `sessionInCall` would then count that call's tokens
-  // as this one's.
-  const mine = sessionInCall(state, session, sessionId)
+  // as this one's. `inCall` is the same answer computed above; nothing since then changed
+  // which sessions belong to the call.
+  const mine = inCall
   if (mine && event?.type === 'tool-workflow/agent-start') {
     // The engine reports the label this service generated for each member, which
     // is what makes a per-task pairing possible without guessing; the child session
@@ -2235,6 +3072,8 @@ function observe(state, method, params, sessionId, completion, log) {
     const agent = [...state.workflowAgents.values()].find((entry) => entry.seq === seq)
     if (agent !== undefined) agent.outcome = event.data?.outcome
     else state.workflowAgents.set(`seq-${String(seq)}`, { childId: undefined, outcome: event.data?.outcome, seq })
+    // A fleet member that ended mid-call leaves no result behind to close it.
+    closeSessionCalls(state.activity, agent?.childId)
   }
   if (event?.type === 'tool-workflow/run-start' || event?.type === 'tool-workflow/run-end') {
     if (typeof event.data?.runId === 'string') state.workflowRunId = event.data.runId
@@ -2309,11 +3148,19 @@ function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs
   const startedAt = Date.now()
   const timer = setInterval(() => {
     try {
-      const elapsedMs = Date.now() - startedAt
+      const now = Date.now()
+      const elapsedMs = now - startedAt
+      // The session id comes from the activity record, not this closure: a retried first
+      // attempt runs under a new session, and the heartbeat must name the live one.
+      const current = activity?.sessionId ?? sessionId
       progress({
         progress: Math.round(elapsedMs) / 1000,
         ...(budgetMs === undefined || budgetMs === null ? {} : { total: Math.round(budgetMs / 1000) }),
-        message: `${label} running ${formatElapsed(elapsedMs)}; ${describeActivity(activity)} (session ${sessionId})`,
+        message: `${label} running ${formatElapsed(elapsedMs)}; ${describeActivity(activity, now)} (session ${current})`,
+        // Structured, for a status reader rather than a client: which commands are open and
+        // which keep failing. `mcp.js` forwards only progress/total/message, so this never
+        // reaches the MCP wire (a test pins that).
+        detail: { current: openCommands(activity, now), warnings: activityWarnings(activity, now) },
       })
     } catch (error) {
       // A client that has gone away must not turn a heartbeat into a task failure.
@@ -2598,6 +3445,9 @@ export const WORKER_INSTRUCTIONS = [
   'If you build a different interface or structure than the task names (another signature, the logic split across several places instead of one, a different data shape), say so first in your final report, with the reason.',
   "If the task's contract or design looks wrong, report it rather than quietly working around it.",
   'If you stop before the task is done, start your final report with why you stopped (for example: the context is full, a blocker, a test you could not make pass) and what is left.',
+  'If a check the task asks for cannot run here (an end-to-end run, a service, a step the sandbox blocks), still write the code and the tests the task asks for, and name each check you could not run and why, so the caller can run it.',
+  'If the same build or command fails the same way twice, do not keep retrying it: report the error and what it would need.',
+  'Before adding a name with global reach (a global CSS class, a global variable, a route, an environment variable, a config key), search the code for it; if it already means something else, choose another and say so.',
 ]
 
 /** How many of the copy's uncommitted paths are worth naming in the prompt. */
@@ -2630,14 +3480,16 @@ function promptBasePatch(basePatch) {
 }
 
 /** The worker-facing task text. */
-export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slotEnv, slotPorts, slotSetup, discard, basePatch }) {
+export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slotEnv, slotPorts, slotValues, slotSetup, discard, basePatch }) {
   const started = Number(uncommitted?.count) > 0
   const startedFiles = started ? (uncommitted.files ?? []).slice(0, PROMPT_UNCOMMITTED_LIMIT) : []
   const allEnvNames = slotEnv === undefined || slotEnv === null ? [] : Object.keys(slotEnv)
-  // A `port:` entry holds a number, not a directory, and the worker would look for a path
-  // if it were named in the same sentence. Only the names this call actually set count.
+  // A `port:` entry holds a number and a `value:` entry holds plain text, not a directory:
+  // the worker would look for a path if either were named in the directories' sentence.
+  // Only the names this call actually set count.
   const portNames = (Array.isArray(slotPorts) ? slotPorts : []).filter((name) => allEnvNames.includes(name))
-  const envNames = allEnvNames.filter((name) => !portNames.includes(name))
+  const valueNames = (Array.isArray(slotValues) ? slotValues : []).filter((name) => allEnvNames.includes(name))
+  const envNames = allEnvNames.filter((name) => !portNames.includes(name) && !valueNames.includes(name))
   const setupSteps = Array.isArray(slotSetup) ? slotSetup : []
   // A call that continues from an earlier patch starts on top of that change: the worker must
   // not redo it, and must resolve it first when the copy holds conflict markers instead.
@@ -2675,7 +3527,7 @@ export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slo
           `The copy already contains the change from an earlier call (patch ${basePatch.patchId}), applied before you started: ${baseFiles.join(', ')}. Continue from it; do not redo it.`,
           ...(baseConflicts.length === 0 ? [] : [`It did not apply cleanly: ${baseConflicts.join(', ')} hold conflict markers. Resolve them first.`]),
         ]),
-    ...(envNames.length === 0 && portNames.length === 0
+    ...(envNames.length === 0 && portNames.length === 0 && valueNames.length === 0
       ? []
       : [
           '',
@@ -2685,6 +3537,9 @@ export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slo
           ...(portNames.length === 0
             ? []
             : [`${portNames.join(', ')} hold a port base reserved for this slot; use ports from there instead of fixed ones.`]),
+          ...(valueNames.length === 0
+            ? []
+            : [`The project's settings set ${valueNames.join(', ')} for every worker; leave them as they are.`]),
         ]),
     ...(setupSteps.length === 0
       ? []
@@ -2804,6 +3659,64 @@ function stderrHint(diagnostics) {
 function isTimeoutError(error) {
   if (error?.code === 'TIMEOUT') return true
   return error instanceof Error && /timed out after \d+ms/.test(error.message)
+}
+
+/**
+ * Read a task brief from a file, fenced to the service root exactly like `cwd`.
+ *
+ * Callers write 4-8 KB briefs to a file and used to paste `$(cat brief)` into the task
+ * text, which the worker then started on literally. A path — relative to the root — is
+ * sent as written, once. Reading is confined for the same reason every other path is:
+ * the file is about to be put into a prompt, so a path outside the root (or a symlink
+ * pointing out of it) is refused rather than read.
+ *
+ * Exported so a background job's label reads a brief through exactly this fence and these
+ * limits: a label derived by a second, weaker reader would name a file the call refuses.
+ *
+ * @param {string} root - the service root every path is fenced to.
+ * @param {unknown} requested - the `taskFile` argument.
+ * @param {object} [options] - how to read it.
+ * @param {string} [options.field] - the argument's name, for errors
+ *   (`tasks[1].taskFile` in a fleet).
+ * @param {(message: string) => void} [options.log] - diagnostic sink.
+ * @returns {string} the file's text, exactly as written.
+ * @throws {FlashTaskError} when the path is unreadable, outside the root, or not a usable file.
+ */
+export function readTaskFile(root, requested, { field = 'taskFile', log = () => {} } = {}) {
+  const text = requireText(requested, field)
+  const absolute = isAbsolute(text) ? resolve(text) : resolve(root, text)
+  let real
+  try {
+    // realpathSync both proves the file exists and resolves a symlink, so a link that
+    // points out of the root is fenced by the same comparison a literal path gets.
+    real = realpathSync(absolute)
+  } catch (error) {
+    throw new FlashTaskError(`${field} "${text}" could not be read: ${messageOf(error)}`, 'INVALID_ARGUMENT')
+  }
+  const relation = relative(root, real)
+  if (relation === '..' || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
+    throw new FlashTaskError(
+      `${field} "${text}" is outside the service root ${root}; this service is confined to that root`,
+      'TASK_FILE_OUTSIDE_ROOT',
+    )
+  }
+  const stats = statSync(real)
+  if (!stats.isFile()) {
+    throw new FlashTaskError(`${field} "${text}" is not a regular file`, 'INVALID_ARGUMENT')
+  }
+  if (stats.size > MAX_TASK_FILE_BYTES) {
+    throw new FlashTaskError(
+      `${field} "${text}" is ${String(stats.size)} bytes; the most this service reads is ` +
+        `${String(MAX_TASK_FILE_BYTES)} (256 KB)`,
+      'INVALID_ARGUMENT',
+    )
+  }
+  const content = readFileSync(real, 'utf8')
+  if (content.trim().length === 0) {
+    throw new FlashTaskError(`${field} "${text}" is empty`, 'INVALID_ARGUMENT')
+  }
+  log(`task read from ${real} (${String(content.length)} chars)`)
+  return content
 }
 
 function requireText(value, field) {

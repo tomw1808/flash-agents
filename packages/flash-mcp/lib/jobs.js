@@ -47,6 +47,10 @@ export const JOB_TOOLS = [
       'running, how many have ended, and how many ended ones were left out. Pass `state: "running"`',
       'or `state: "ended"` to see only one group, and a larger `limit` (up to 50) to see more.',
       '',
+      'A running job also shows what its workers are doing as of the last heartbeat: `current` lists',
+      'each open tool call (tool, command, since, runningMs), and `warnings` names a command that',
+      'failed three or more times in the call — a worker repeating a step its sandbox cannot finish.',
+      '',
       'This reports status only: it never returns a job\'s result — use flash_result for that. A job',
       'id is meaningful only to the server process that created it, and jobs do not survive a restart.',
       'After a restart, a finished writing call\'s work is still salvaged as a patch by the next server,',
@@ -395,6 +399,11 @@ export class JobRegistry {
    * own interval; only the latest one is kept, which is all `flash_status` shows. A report
    * without a message is not worth showing and is ignored.
    *
+   * The report's structured `detail` is kept too, because it is the part a status reader can
+   * act on: the commands a running call currently has open, and the ones that keep failing.
+   * It is bounded like the message — only the latest report is held — and it is a fresh
+   * object per heartbeat, so keeping the reference cannot let a later report mutate it.
+   *
    * @param {object} job - the running job.
    * @param {object} report - the service's progress report.
    */
@@ -402,10 +411,12 @@ export class JobRegistry {
     if (job.state !== 'running') return
     if (report === null || typeof report !== 'object') return
     if (typeof report.message !== 'string' || report.message.length === 0) return
+    const detail = report.detail
     job.lastProgress = {
       message: report.message,
       ...(typeof report.progress === 'number' ? { progress: report.progress } : {}),
       ...(typeof report.total === 'number' ? { total: report.total } : {}),
+      ...(detail === null || typeof detail !== 'object' || Array.isArray(detail) ? {} : { detail }),
       at: new Date(this.now()).toISOString(),
     }
   }
@@ -428,8 +439,18 @@ export class JobRegistry {
     this.log(`job ${job.jobId} ${job.kind} ended ${job.state} in ${formatMinutes(endedMs - job.startedMs)} min`)
   }
 
-  /** The status projection: identity, state, timing, latest progress — never the result. */
+  /**
+   * The status projection: identity, state, timing, latest progress — never the result.
+   *
+   * A running job also reports what its call is doing right now: the open commands and the
+   * repeated-failure warnings the last heartbeat carried. Both are dropped once the job has
+   * ended — an ended job's answer is its result, and a stale snapshot of a command that was
+   * running an hour ago would read as if it were still running.
+   */
   #project(job) {
+    const detail = job.state === 'running' ? job.lastProgress?.detail : undefined
+    const current = detail?.current
+    const warnings = detail?.warnings
     return {
       jobId: job.jobId,
       kind: job.kind,
@@ -441,6 +462,8 @@ export class JobRegistry {
       ...(job.lastProgress === undefined
         ? {}
         : { lastProgress: { message: job.lastProgress.message, at: job.lastProgress.at } }),
+      ...(Array.isArray(current) && current.length > 0 ? { current } : {}),
+      ...(Array.isArray(warnings) && warnings.length > 0 ? { warnings } : {}),
       resultReady: job.state === 'ok',
     }
   }

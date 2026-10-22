@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
@@ -19,13 +20,17 @@ import {
   buildBatchPrompt,
   buildChildPrompt,
   buildOrchestrationPrompt,
+  createActivity,
+  createObserveState,
   describeActivity,
   extractWorkflowValue,
   looksLikeWorkflowResult,
   normalizeTasks,
+  observe,
   parseWorkflowHeader,
   toolResultText,
 } from '../lib/service.js'
+import { jobLabel } from '../lib/index.js'
 
 /** Read the fleet payload back out of the dispatch prompt. */
 function promptArgs(text) {
@@ -46,8 +51,27 @@ class FakeSdkClient {
     /** Every cwd a runtime was booted with, and every shutdown it received. */
     this.shutdowns = 0
     this.shutdownCwds = []
-    /** When set, the "worker" writes this file into whatever tree it was given. */
+    /**
+     * When set, the "worker" writes this file into whatever tree it was given; a function
+     * decides per prompt (its index), which is how a test models a first attempt that left
+     * no change and a retry that did.
+     */
     this.writes = undefined
+    /**
+     * Session events the "worker" emits, in order, as `{name, command, text, error, open,
+     * holdMs, id}`: a `tool/call` for `name` and, unless `open` is set, its `tool/result`
+     * after `holdMs`. This is the shape Harness reports a worker's shell command in.
+     */
+    this.toolEvents = undefined
+    /**
+     * When set, the call's own (dispatcher) session emits one `tool/call` that stays open
+     * for the whole delegation, exactly as the real `flash`/`workflow` call does.
+     */
+    this.dispatcherCall = false
+    /** The tool name that dispatcher call uses; a fleet's dispatcher calls `workflow`. */
+    this.dispatcherTool = 'flash'
+    /** Called from `prompt`, before the replay runs (tests that need the clock or a hook). */
+    this.onPrompt = undefined
     /** When set, the canned replay runs after this many milliseconds instead of a microtask. */
     this.delayMs = 0
     this.cwd = undefined
@@ -88,7 +112,8 @@ class FakeSdkClient {
 
   async prompt({ sessionId, text }) {
     this.prompts.push({ sessionId, text })
-    const replay = () => this.#replay(sessionId, text)
+    this.onPrompt?.(this.prompts.length - 1)
+    const replay = () => this.#replay(sessionId, text, this.prompts.length - 1)
     if (this.delayMs > 0) setTimeout(replay, this.delayMs)
     else queueMicrotask(replay)
     return { messageId: `msg-${String(this.prompts.length)}` }
@@ -116,11 +141,32 @@ class FakeSdkClient {
     for (const handler of this.notificationHandlers) handler(method, params)
   }
 
-  #replay(sessionId, text) {
-    const script = this.script
+  async #replay(sessionId, text, index) {
+    const script = typeof this.script === 'function' ? this.script(text, index) : this.script
     const childSessionId = `child-${sessionId}`
-    if (this.writes !== undefined && this.cwd !== undefined) {
-      writeFileSync(join(this.cwd, this.writes), 'written by the worker\n')
+    const writes = typeof this.writes === 'function' ? this.writes(index) : this.writes
+    if (writes !== undefined && this.cwd !== undefined) {
+      writeFileSync(join(this.cwd, writes), 'written by the worker\n')
+    }
+    if (this.dispatcherCall === true) {
+      // The dispatcher's own call, open until the session ends: the activity record must
+      // never mistake it for the command the worker is running.
+      this.emit('session.event', {
+        sessionId,
+        event: {
+          type: 'tool/call',
+          data: {
+            turn: 1,
+            step: 1,
+            id: `call-dispatch-${sessionId}`,
+            name: this.dispatcherTool,
+            arguments: JSON.stringify({
+              description: 'build the app',
+              prompt: 'Working directory: /tmp/app\n\nTask:\nbuild it',
+            }),
+          },
+        },
+      })
     }
     if (script === 'no-delegation') {
       this.emit('session.status', { sessionId, status: 'running' })
@@ -186,6 +232,29 @@ class FakeSdkClient {
           event: {
             type: 'request/header',
             data: { header: { config: { provider: 'ollama', model: this.routeModel } } },
+          },
+        })
+      }
+      // A fleet's first worker runs the same shell commands a single worker would; the
+      // activity record is the call's, so its failures are the fleet's too.
+      for (const entry of this.toolEvents ?? []) {
+        this.emit('session.event', {
+          sessionId: childId(0),
+          event: {
+            type: 'tool/call',
+            data: { turn: 1, step: 1, name: entry.name ?? 'bash', arguments: JSON.stringify({ command: entry.command }) },
+          },
+        })
+        this.emit('session.event', {
+          sessionId: childId(0),
+          event: {
+            type: 'tool/result',
+            data: {
+              turn: 1,
+              step: 1,
+              message: { content: [{ type: 'tool-result', toolCallId: 'call-1', content: [{ type: 'text', text: entry.text ?? '' }] }] },
+              ...(entry.error === undefined ? {} : { error: entry.error }),
+            },
           },
         })
       }
@@ -260,6 +329,182 @@ class FakeSdkClient {
       this.emit('session.status', { sessionId, status: 'idle' })
       return
     }
+    if (script === 'busy-empty') {
+      // The shape of the reported start-up failure at its worst: several model calls, no
+      // delegation, no message — but more calls than an early hiccup has.
+      this.emit('session.status', { sessionId, status: 'running' })
+      for (let call = 1; call <= 13; call += 1) {
+        this.emit('session.event', {
+          sessionId,
+          event: {
+            type: 'assistant/message',
+            data: {
+              message: { id: `msg-${String(call)}`, content: [{ type: 'text', text: 'working' }] },
+              usage: { inputTokens: 10, outputTokens: 2 },
+            },
+          },
+        })
+      }
+      this.emit('session.status', { sessionId, status: 'idle' })
+      return
+    }
+    if (script === 'overlapping-calls') {
+      // One worker with two calls open at the same time: `bash` runs a build while a second
+      // `bash` runs the tests. Both must be visible, and both results must count.
+      this.emit('session.status', { sessionId, status: 'running' })
+      const worker = childSessionId
+      this.emit('subagent.started', { parentSessionId: sessionId, childSessionId: worker })
+      const call = (id, command) =>
+        this.emit('session.event', {
+          sessionId: worker,
+          event: {
+            type: 'tool/call',
+            data: { turn: 1, step: 1, id, name: 'bash', arguments: JSON.stringify({ command }) },
+          },
+        })
+      const done = (id, text) =>
+        this.emit('session.event', {
+          sessionId: worker,
+          event: {
+            type: 'tool/result',
+            data: {
+              turn: 1,
+              step: 1,
+              id,
+              message: { content: [{ type: 'tool-result', toolCallId: id, content: [{ type: 'text', text }] }] },
+            },
+          },
+        })
+      for (let round = 0; round < 3; round += 1) {
+        call(`call-build-${String(round)}`, 'cargo build -p app')
+        call(`call-test-${String(round)}`, 'cargo test -p app')
+        // Long enough for a heartbeat to see both open at once.
+        if (round === 0) await new Promise((resolve) => setTimeout(resolve, 60))
+        // The later call finishes first, which used to leave the first result with no entry.
+        done(`call-test-${String(round)}`, '[exit code: 101]')
+        done(`call-build-${String(round)}`, '[exit code: 101]')
+      }
+      // Both results closed their own call.
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      this.emit('subagent.finished', {
+        provider: 'flash',
+        agentId: 'agent-0',
+        parentSessionId: sessionId,
+        childSessionId: worker,
+        status: 'ok',
+        stopReason: 'completed',
+        lastAssistantMessage: [{ type: 'text', text: 'both commands failed' }],
+      })
+      this.emit('session.status', { sessionId, status: 'idle' })
+      return
+    }
+    if (script === 'workflow-member-fleet') {
+      // A fleet whose second member exists only as the workflow tool's own child: the engine
+      // reports it through `tool-workflow/agent-start`, and no `subagent.started` ever names
+      // it. Its commands still belong to this call.
+      this.emit('session.status', { sessionId, status: 'running' })
+      const items = promptArgs(text).items
+      const first = `child-${sessionId}-0`
+      const member = `wf-${sessionId}-1`
+      this.emit('subagent.started', { parentSessionId: sessionId, childSessionId: first })
+      this.emit('session.event', {
+        sessionId: first,
+        event: { type: 'request/header', data: { header: { config: { provider: 'ollama', model: this.routeModel } } } },
+      })
+      this.emit('session.event', {
+        sessionId,
+        event: {
+          type: 'tool-workflow/agent-start',
+          data: { runId: 'run-wf', seq: 2, label: 'task-2', childId: member },
+        },
+      })
+      for (let round = 0; round < 3; round += 1) {
+        this.emit('session.event', {
+          sessionId: member,
+          event: {
+            type: 'tool/call',
+            data: {
+              turn: 1,
+              step: 1,
+              id: `call-wf-${String(round)}`,
+              name: 'bash',
+              arguments: JSON.stringify({ command: 'cargo build -p app' }),
+            },
+          },
+        })
+        if (round === 0) await new Promise((resolve) => setTimeout(resolve, 60))
+        this.emit('session.event', {
+          sessionId: member,
+          event: {
+            type: 'tool/result',
+            data: {
+              turn: 1,
+              step: 1,
+              id: `call-wf-${String(round)}`,
+              message: {
+                content: [
+                  {
+                    type: 'tool-result',
+                    toolCallId: `call-wf-${String(round)}`,
+                    content: [{ type: 'text', text: '[exit code: 101]' }],
+                  },
+                ],
+              },
+            },
+          },
+        })
+      }
+      // Leave the failure warning time to reach a heartbeat.
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      this.emit('subagent.finished', {
+        provider: 'flash',
+        agentId: 'agent-0',
+        parentSessionId: sessionId,
+        childSessionId: first,
+        status: 'ok',
+        stopReason: 'completed',
+        lastAssistantMessage: [{ type: 'text', text: 'worker 0' }],
+      })
+      this.emit('session.event', {
+        sessionId,
+        event: { type: 'tool-workflow/agent-end', data: { runId: 'run-wf', seq: 2, outcome: 'completed' } },
+      })
+      this.emit('session.event', {
+        sessionId,
+        event: { type: 'tool-workflow/run-start', data: { runId: 'run-wf', name: 'flash-batch' } },
+      })
+      this.emit('session.event', {
+        sessionId,
+        event: { type: 'tool-workflow/run-end', data: { runId: 'run-wf', stopReason: 'completed' } },
+      })
+      const entries = items.map((item, position) => ({ index: position, ok: true, result: `member ${String(position)}` }))
+      this.emit('session.event', {
+        sessionId,
+        event: {
+          type: 'tool/result',
+          data: {
+            turn: 1,
+            step: 1,
+            message: {
+              content: [
+                {
+                  type: 'tool-result',
+                  toolCallId: 'call-workflow',
+                  content: [
+                    {
+                      type: 'text',
+                      text: `workflow "flash-batch" completed (${String(items.length)} agents).\nReturn value:\n${JSON.stringify(entries)}`,
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+      })
+      this.emit('session.status', { sessionId, status: 'idle' })
+      return
+    }
     if (script === 'runtime-exit') {
       this.emit('session.status', { sessionId, status: 'running' })
       for (const handler of this.exitHandlers) handler({ code: 1, signal: null })
@@ -284,6 +529,43 @@ class FakeSdkClient {
       sessionId: 'someone-elses-session',
       event: { type: 'request/header', data: { header: { config: { provider: 'deepseek-official', model: 'other' } } } },
     })
+    // A worker's own shell commands, in the shape Harness reports them: one `tool/call`
+    // and the `tool/result` that closes it.
+    for (const entry of this.toolEvents ?? []) {
+      const session = childId(0)
+      this.emit('session.event', {
+        sessionId: session,
+        event: {
+          type: 'tool/call',
+          data: {
+            turn: 1,
+            step: 1,
+            ...(entry.id === undefined ? {} : { id: entry.id }),
+            name: entry.name ?? 'bash',
+            arguments: JSON.stringify({ command: entry.command }),
+          },
+        },
+      })
+      if (entry.holdMs !== undefined) await new Promise((resolve) => setTimeout(resolve, entry.holdMs))
+      if (entry.open === true) continue
+      this.emit('session.event', {
+        sessionId: session,
+        event: {
+          type: 'tool/result',
+          data: {
+            turn: 1,
+            step: 1,
+            message: {
+              content: [
+                { type: 'tool-result', toolCallId: entry.id ?? 'call-1', content: [{ type: 'text', text: entry.text ?? '' }] },
+              ],
+            },
+            ...(entry.error === undefined ? {} : { error: entry.error }),
+          },
+        },
+      })
+      if (entry.afterMs !== undefined) await new Promise((resolve) => setTimeout(resolve, entry.afterMs))
+    }
     for (let index = 0; index < count; index += 1) {
       this.emit('subagent.finished', {
         provider: 'flash',
@@ -347,13 +629,16 @@ function makeService({ script, ...overrides } = {}) {
     // The installed profile is never read from this machine's home: the tests that
     // choose another model decide what the fake profile reports.
     honoursModelEnv: () => true,
+    // A retried first attempt waits ten seconds in production; no test waits for that
+    // unless it is the wait itself under test.
+    earlyRetryDelayMs: 0,
     ...overrides,
   })
   return { root, client, service }
 }
 
 /** A git-backed root, and a worker that writes one file into whatever tree it gets. */
-function makeIsolatedService({ slots = 2, file = 'worker-output.txt', script, ...overrides } = {}) {
+function makeIsolatedService({ slots = 2, file = 'worker-output.txt', script, slotEnv, ...overrides } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-iso-')))
   execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root })
   writeFileSync(join(root, 'README.md'), '# project\n')
@@ -369,8 +654,9 @@ function makeIsolatedService({ slots = 2, file = 'worker-output.txt', script, ..
       return client
     },
     log: () => {},
-    isolate: { slots, stateDir },
+    isolate: { slots, stateDir, ...(slotEnv === undefined ? {} : { slotEnv }) },
     honoursModelEnv: () => true,
+    earlyRetryDelayMs: 0,
     ...overrides,
   })
   return { root, client, service, stateDir }
@@ -399,6 +685,7 @@ function makeModelService({ script, routeModel, models, ...overrides } = {}) {
     log: (line) => logs.push(line),
     isolate: { mode: 'none' },
     honoursModelEnv: () => true,
+    earlyRetryDelayMs: 0,
     ...overrides,
   })
   return { root, clients, logs, service }
@@ -1252,8 +1539,12 @@ test('reports progress while a queued call waits for a free tree', async () => {
   assert.match(cancelled.message, /cancelled while waiting/)
   assert.ok(reports.length >= 2, `expected progress while waiting, saw ${String(reports.length)}`)
   // A call queued for a tree has no session event to report, so the heartbeat says what it
-  // is waiting for instead of "last event … ago", which read as a hang.
-  assert.match(reports[0].message, /^flash_task running \d+m?\d*s; queued \d+m?\d*s: waiting for a free tree \(1 of 1 in use\) \(session flash-task-.*\)$/)
+  // is waiting for instead of "last event … ago", which read as a hang. This one carries no
+  // `background: true`, so it is holding the caller's turn and says that too.
+  assert.match(
+    reports[0].message,
+    /^flash_task running \d+m?\d*s; queued in the foreground \d+m?\d*s: waiting for a free tree \(1 of 1 in use\) \(session flash-task-.*\)$/,
+  )
   // A call that never got a tree is still a call the client must see living; but its
   // interval stops when it is cancelled, and nothing is salvaged because nothing ran.
   const settled = reports.length
@@ -1276,8 +1567,56 @@ test('describeActivity renders a queued call as a wait, never as silence', () =>
   // Without a pool the counts recorded when the wait began are used.
   const detached = { ...activity, pool: undefined, queuedInUse: 2, queuedSize: 2 }
   assert.equal(describeActivity(detached, 2_000), 'queued 1s: waiting for a free tree (2 of 2 in use)')
+  // A foreground wait holds the caller's whole turn, so its line names the wait's own length:
+  // the caller cannot see a status call while it waits, and "queued" alone said nothing about
+  // how long it had already been.
+  const foreground = { ...detached, queuedForeground: true }
+  assert.equal(
+    describeActivity(foreground, 1_000 + 60_000),
+    'queued in the foreground 1m0s: waiting for a free tree (2 of 2 in use)',
+  )
   // The ordinary line is unchanged.
   assert.equal(describeActivity({ at: 1_000, events: 0, what: 'starting' }, 4_000), 'starting · last event 3s ago')
+})
+
+test('a call waiting for the start-up sweep says so instead of looking hung', async () => {
+  const { root, service } = makeIsolatedService({ progressIntervalMs: 5 })
+  const pool = service.isolation
+  // The pool's pending flag arrives with its deferred-sweep change; a pool without it must
+  // read as "no sweep pending" (the service only accepts `true`). A pending sweep is
+  // simulated here so the wait can be observed without depending on how long a real one takes.
+  Object.defineProperty(pool, 'startupSweepPending', { configurable: true, get: () => true })
+  const lease = pool.lease.bind(pool)
+  let releaseSweep
+  const sweepGate = new Promise((resolve) => {
+    releaseSweep = resolve
+  })
+  pool.lease = async (options) => {
+    await sweepGate
+    return lease(options)
+  }
+
+  const reports = []
+  const pending = service.flashTask(
+    { task: 'write one file', cwd: root },
+    { progress: (report) => reports.push(report), progressToken: 'tok-sweep' },
+  )
+  await waitFor(
+    () => reports.some((report) => report.message.includes('waiting for the start-up sweep to finish')),
+    'the sweep-wait line',
+  )
+  releaseSweep()
+  await pending
+
+  // The line names the wait and still carries the last-event clock, so it reads as work in
+  // progress rather than as a call that stopped emitting anything.
+  assert.ok(
+    reports.some((report) =>
+      /; waiting for the start-up sweep to finish · last event \d+m?\d*s ago \(session flash-task-/.test(report.message),
+    ),
+    `expected the sweep wait in a heartbeat, saw ${JSON.stringify(reports.map((report) => report.message))}`,
+  )
+  await service.close()
 })
 
 test('a call that waited for a tree reports queuedMs, separately from its run time', async () => {
@@ -1310,7 +1649,7 @@ test('truncates an oversized child message and warns about a failed child', asyn
 })
 
 test('an ok call with an empty message and no change is reported as failed', async () => {
-  const { root, service } = makeService({ script: 'empty-result' })
+  const { root, client, service } = makeService({ script: 'empty-result' })
   const result = await service.flashTask({ task: 'x', cwd: root })
 
   // "ok"/"completed" alone is not evidence of work: nothing was said and nothing changed.
@@ -1318,8 +1657,15 @@ test('an ok call with an empty message and no change is reported as failed', asy
   assert.equal(result.stopReason, 'completed')
   assert.equal(result.result, '')
   assert.equal(result.emptyResult, true)
+  // The second attempt failed the same way, but the retry still happened and stays in the
+  // record: the caller paid for two attempts, and the first one's session is named nowhere
+  // else in the result.
+  assert.equal(client.prompts.length, 2)
+  assert.equal(result.retried.reason, 'EMPTY_RESULT')
+  assert.equal(result.retried.firstSessionId, client.prompts[0].sessionId)
   assert.deepEqual(result.warnings, [
     'the worker ended with an empty final message and changed nothing; treat the call as failed and send the task again',
+    'the first attempt ended early with no result (EMPTY_RESULT) and was retried once',
   ])
 })
 
@@ -1358,7 +1704,7 @@ test('prompt builders keep the dispatcher on a single delegation', () => {
 test('every child prompt carries the standing worker instructions, in order', () => {
   // The first two are the originals; the other three exist so a caller reading the report
   // (never the transcript) learns about a deviation, a wrong contract, or an unfinished task.
-  assert.equal(WORKER_INSTRUCTIONS.length, 5)
+  assert.equal(WORKER_INSTRUCTIONS.length, 8)
   assert.match(WORKER_INSTRUCTIONS[0], /^Do not commit unless the task explicitly asks/)
   assert.match(WORKER_INSTRUCTIONS[1], /^If the work reaches for an escape hatch/)
   assert.equal(
@@ -1372,6 +1718,18 @@ test('every child prompt carries the standing worker instructions, in order', ()
   assert.equal(
     WORKER_INSTRUCTIONS[4],
     'If you stop before the task is done, start your final report with why you stopped (for example: the context is full, a blocker, a test you could not make pass) and what is left.',
+  )
+  assert.equal(
+    WORKER_INSTRUCTIONS[5],
+    'If a check the task asks for cannot run here (an end-to-end run, a service, a step the sandbox blocks), still write the code and the tests the task asks for, and name each check you could not run and why, so the caller can run it.',
+  )
+  assert.equal(
+    WORKER_INSTRUCTIONS[6],
+    'If the same build or command fails the same way twice, do not keep retrying it: report the error and what it would need.',
+  )
+  assert.equal(
+    WORKER_INSTRUCTIONS[7],
+    'Before adding a name with global reach (a global CSS class, a global variable, a route, an environment variable, a config key), search the code for it; if it already means something else, choose another and say so.',
   )
   for (const prompt of [
     buildChildPrompt({ cwd: '/w', task: 'x' }),
@@ -2001,4 +2359,613 @@ test('a finished call empties its tree once the patch is stored, and keeps one i
   assert.equal(existsSync(join(other.service.isolation.slots[0].dir, other.client.writes)), true)
   assert.ok(logs.some((line) => /kept .* could not be collected/.test(line)), 'the kept tree is named in the log')
   await other.service.close()
+})
+
+// ── what each worker is running right now, and what keeps failing ───────────
+
+/**
+ * A command line in the shape the field report had: a vendored build configured and run
+ * from another directory, long enough that the 300-character cut is real.
+ */
+const LONG_BUILD_COMMAND =
+  'cd /tmp/openssl-src && ./Configure darwin64-x86_64-cc no-shared no-tests ' +
+  '--prefix=$PWD/build --openssldir=$PWD/build/ssl enable-ec_nistp_64_gcc_128 ' +
+  '-DOPENSSL_NO_SECOND_ORDER_MUL -DOPENSSL_SMALL_FOOTPRINT -DOPENSSL_SUPPRESS_DEPRECATED ' +
+  '-DOPENSSL_NO_DEPRECATED_3_0 -DOPENSSL_NO_TESTS -DOPENSSL_NO_APPS ' +
+  '&& make -j8 build_libs && make -j8 build_programs && make -j8 install_sw'
+
+test('a worker’s open command is visible while it runs, and gone once its result arrives', async () => {
+  const { root, client, service } = makeService({ progressIntervalMs: 5 })
+  assert.ok(LONG_BUILD_COMMAND.length > 300, 'the command must be longer than the cut')
+  client.toolEvents = [
+    { command: LONG_BUILD_COMMAND, holdMs: 60, text: 'cl.exe failed\n[exit code: 0]', afterMs: 60 },
+  ]
+  const reports = []
+  const result = await service.flashTask(
+    { task: 'build the vendored openssl', cwd: root },
+    { progress: (report) => reports.push(report), progressToken: 'tok-1' },
+  )
+  assert.equal(result.status, 'ok')
+
+  const during = reports.filter((report) => report.detail.current.length > 0)
+  assert.ok(during.length > 0, `expected an open command in a heartbeat, saw ${JSON.stringify(reports)}`)
+  const shown = during[0].detail.current[0]
+  assert.equal(shown.tool, 'bash')
+  // Cut to 300 characters, not carried whole and not annotated with a marker.
+  assert.equal(shown.command.length, 300)
+  assert.equal(shown.command, LONG_BUILD_COMMAND.slice(0, 300))
+  assert.equal(typeof shown.runningMs, 'number')
+  assert.equal(Number.isNaN(Date.parse(shown.since)), false)
+
+  // A `tool/result` for that session closes the call: a later heartbeat shows nothing open.
+  const after = reports.slice(reports.indexOf(during.at(-1)) + 1)
+  assert.ok(after.length > 0, 'expected a heartbeat after the tool result')
+  for (const report of after) assert.deepEqual(report.detail.current, [])
+  // A clean exit with a failed-looking message is still a success: exit code 0 is 0.
+  assert.deepEqual(result.warnings, undefined)
+})
+
+test('any other tool is named with the head of its arguments', async () => {
+  const { root, client, service } = makeService({ progressIntervalMs: 5 })
+  client.toolEvents = [
+    { name: 'edit', command: undefined, holdMs: 40, text: 'ok' },
+  ]
+  // A non-shell call's arguments are not a command; the fake sends `{command: undefined}`,
+  // which serializes to `{}` — the description is then the tool name plus that blob.
+  const reports = []
+  await service.flashTask(
+    { task: 'edit one file', cwd: root },
+    { progress: (report) => reports.push(report), progressToken: 'tok-2' },
+  )
+  const shown = reports.find((report) => report.detail.current.length > 0)?.detail.current[0]
+  assert.equal(shown.tool, 'edit')
+  assert.match(shown.command, /^edit /)
+  assert.ok(shown.command.length <= 120)
+})
+
+test('the dispatcher’s own open call is never reported as the worker’s command', async () => {
+  const { root, client, service } = makeService({ progressIntervalMs: 5 })
+  // The dispatcher calls `flash` once and that call stays open for the whole delegation: it
+  // is always the longest-running call of the call, and must never be the one reported.
+  client.dispatcherCall = true
+  client.toolEvents = [{ command: 'cargo build -p app', holdMs: 80, text: '[exit code: 0]', open: true }]
+  const reports = []
+  const result = await service.flashTask(
+    { task: 'build the app', cwd: root },
+    { progress: (report) => reports.push(report), progressToken: 'tok-dispatch' },
+  )
+  assert.equal(result.status, 'ok')
+
+  const during = reports.filter((report) => report.detail.current.length > 0)
+  assert.ok(during.length > 0, 'expected the worker’s open command in a heartbeat')
+  for (const report of during) {
+    // Exactly the worker's call: the dispatcher's `flash` call is not a worker command at all.
+    assert.deepEqual(
+      report.detail.current.map((call) => `${call.tool}:${call.command}`),
+      ['bash:cargo build -p app'],
+    )
+  }
+  // The status suffix names the worker's stuck build, not the dispatcher's dispatch.
+  const withSuffix = reports.filter((report) => report.message.includes('; running "'))
+  assert.ok(withSuffix.length > 0, 'expected the open command in the status line')
+  for (const report of withSuffix) {
+    assert.match(report.message, /; running "cargo build -p app" for \d+m?\d*s/)
+    assert.equal(report.message.includes('"flash '), false)
+  }
+})
+
+test('two overlapping calls of one worker are both visible and both failures count', async () => {
+  const { root, service } = makeService({ script: 'overlapping-calls', progressIntervalMs: 5 })
+  const reports = []
+  const result = await service.flashTask(
+    { task: 'build and test', cwd: root },
+    { progress: (report) => reports.push(report), progressToken: 'tok-overlap' },
+  )
+
+  const both = reports.find((report) => report.detail.current.length === 2)
+  assert.ok(
+    both !== undefined,
+    `expected both open calls in one heartbeat, saw ${JSON.stringify(reports.map((report) => report.detail.current))}`,
+  )
+  assert.deepEqual(
+    both.detail.current.map((call) => call.command).sort(),
+    ['cargo build -p app', 'cargo test -p app'],
+  )
+  // Every result closed its own call: the last heartbeat (after both results) shows nothing open.
+  assert.deepEqual(reports.at(-1).detail.current, [])
+  // Each result was counted under the command it answered, so both reach the threshold.
+  const warned = result.warnings.filter((line) => /^"cargo (build|test)" failed 3 times/.test(line))
+  assert.equal(warned.length, 2, `expected both commands warned about, saw ${JSON.stringify(result.warnings)}`)
+  assert.ok(warned.some((line) => line.startsWith('"cargo build"')))
+  assert.ok(warned.some((line) => line.startsWith('"cargo test"')))
+})
+
+test('describeActivity names the longest-running open command', () => {
+  const activity = createActivity(1_000)
+  activity.openCalls.set('child-1', { tool: 'bash', command: 'cargo build -p app', since: 1_000 })
+  activity.openCalls.set('child-2', { tool: 'bash', command: 'npm test', since: 1_000 + 60_000 })
+  assert.equal(
+    describeActivity(activity, 1_000 + 250_000),
+    'starting · last event 4m10s ago; running "cargo build -p app" for 4m10s',
+  )
+  activity.openCalls.clear()
+  assert.equal(describeActivity(activity, 1_000 + 250_000), 'starting · last event 4m10s ago')
+})
+
+test('a worker that ends with a call still open no longer reports it as running', () => {
+  const sessionId = `flash-task-${randomUUID()}`
+  const child = randomUUID()
+  const state = createObserveState()
+  state.activity = createActivity()
+  const completion = { resolve: () => {}, reject: () => {} }
+  const send = (method, params) => observe(state, method, params, sessionId, completion, () => {})
+  send('subagent.started', { parentSessionId: sessionId, childSessionId: child })
+  send('session.event', {
+    sessionId: child,
+    event: { type: 'tool/call', data: { id: 'call_k2b9x1q7', name: 'bash', arguments: '{"command":"cargo build -p app"}' } },
+  })
+  assert.match(describeActivity(state.activity), /running "cargo build -p app"/)
+  // Cancelled mid-build: the result that would close the call never arrives.
+  send('subagent.finished', {
+    parentSessionId: sessionId,
+    childSessionId: child,
+    status: 'cancelled',
+    stopReason: 'cancelled',
+    provider: 'flash',
+    lastAssistantMessage: [],
+  })
+  assert.doesNotMatch(describeActivity(state.activity), /running/)
+  assert.equal(state.activity.openCalls.size, 0)
+})
+
+test('a command that keeps failing is warned about at three failures, by folded key', async () => {
+  const logs = []
+  const { root, client, service } = makeService({ log: (line) => logs.push(line) })
+  // `cd` only sets the directory, `NAME=value` only sets a variable: all three are the same
+  // step being retried, which is what a worker stuck in a build its sandbox refuses looks like.
+  client.toolEvents = [
+    { command: 'cd openssl && cargo build --release', text: 'error: linker failed\n[exit code: 101]' },
+    { command: 'CARGO_X=1 cargo build -p a', text: 'error: linker failed\n[exit code: 101]' },
+    { command: 'cd "openssl dir" && cargo   build   -p b', text: 'error: linker failed\n[exit code: 101]' },
+  ]
+  const result = await service.flashTask({ task: 'build the vendored openssl', cwd: root })
+
+  assert.equal(result.warnings.length, 1)
+  assert.match(
+    result.warnings[0],
+    /^"cargo build" failed 3 times in this call \(last: exit code 101, \d+m?\d?s ago\); a worker repeating a step its sandbox cannot finish keeps its tree busy — check its report or cancel the call$/,
+  )
+  // The log gets the same line when the key reaches three.
+  assert.equal(logs.filter((line) => line.includes('"cargo build" failed 3 times')).length, 1)
+})
+
+test('two failures of a command are not a warning, and other commands keep their own count', async () => {
+  const { root, client, service } = makeService()
+  client.toolEvents = [
+    { command: 'cargo build', text: '[exit code: 101]' },
+    { command: 'cargo build', text: '[exit code: 101]' },
+    { command: 'npm test', text: '[exit code: 1]' },
+    { command: 'npm test', text: '[exit code: 1]' },
+  ]
+  const result = await service.flashTask({ task: 'build', cwd: root })
+  assert.deepEqual(result.warnings, undefined)
+})
+
+test('a failing command is also named in the running job’s progress detail', async () => {
+  const { root, client, service } = makeService({ progressIntervalMs: 5 })
+  client.toolEvents = [
+    { command: 'cargo build', text: '[exit code: 101]' },
+    { command: 'cargo build', text: '[exit code: 101]' },
+    { command: 'cargo build', text: '[exit code: 101]', afterMs: 60 },
+  ]
+  const reports = []
+  const result = await service.flashTask(
+    { task: 'build', cwd: root },
+    { progress: (report) => reports.push(report), progressToken: 'tok-3' },
+  )
+  const warned = reports.filter((report) => report.detail.warnings.length > 0)
+  assert.ok(warned.length > 0, 'the heartbeat must carry the warning once three have failed')
+  assert.match(warned[0].detail.warnings[0], /^"cargo build" failed 3 times in this call/)
+  // "The count in the warning stays current": six failures say six, not the three it first said.
+  assert.equal(result.warnings.length, 1)
+})
+
+test('the failure count in the warning stays current and is logged at every third failure', async () => {
+  const logs = []
+  const { root, client, service } = makeService({ log: (line) => logs.push(line), progressIntervalMs: 5 })
+  client.toolEvents = [
+    ...Array.from({ length: 6 }, () => ({ command: 'cargo build', text: '[exit code: 101]' })),
+    { command: 'true', text: 'ok', afterMs: 40 },
+  ]
+  const reports = []
+  const result = await service.flashTask(
+    { task: 'build', cwd: root },
+    { progress: (report) => reports.push(report), progressToken: 'tok-4' },
+  )
+  assert.match(result.warnings[0], /^"cargo build" failed 6 times in this call/)
+  assert.equal(logs.filter((line) => line.includes('"cargo build" failed 3 times')).length, 1)
+  assert.equal(logs.filter((line) => line.includes('"cargo build" failed 6 times')).length, 1)
+  assert.equal(logs.filter((line) => line.includes('"cargo build" failed ')).length, 2)
+  const warned = reports.filter((report) => report.detail.warnings.length > 0)
+  assert.match(warned.at(-1).detail.warnings[0], /^"cargo build" failed 6 times in this call/)
+})
+
+test('a tool result carrying an error counts as a failure without a shell exit code', async () => {
+  const { root, client, service } = makeService()
+  client.toolEvents = [
+    { command: 'npm run build', error: { name: 'ToolError', code: 'TOOL_ERROR' }, text: 'the tool refused' },
+    { command: 'npm run build', error: { name: 'ToolError', code: 'TOOL_ERROR' }, text: 'the tool refused' },
+    { command: 'npm run build', error: { name: 'ToolError', code: 'TOOL_ERROR' }, text: 'the tool refused' },
+  ]
+  const result = await service.flashTask({ task: 'build', cwd: root })
+  assert.match(result.warnings[0], /^"npm run" failed 3 times in this call \(last: tool error ToolError, \d+m?\d?s ago\)/)
+})
+
+// ── retrying an early, empty failure ───────────────────────────────────────
+
+test('retries a first attempt that never delegated, and reports the retry', async () => {
+  const logs = []
+  const { root, client, service } = makeService({
+    script: (text, index) => (index === 0 ? 'no-delegation' : 'ok'),
+    log: (line) => logs.push(line),
+  })
+  const result = await service.flashTask({ task: 'read the README', cwd: root })
+
+  assert.equal(result.status, 'ok')
+  assert.equal(client.prompts.length, 2, 'exactly one retry')
+  assert.notEqual(client.prompts[0].sessionId, client.prompts[1].sessionId)
+  assert.match(client.prompts[1].sessionId, /^flash-task-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+  // The same prompt, run again: a start-up hiccup, not a different call.
+  assert.equal(client.prompts[1].text, client.prompts[0].text)
+  assert.equal(result.sessionId, client.prompts[1].sessionId)
+  assert.deepEqual(result.retried, {
+    reason: 'NOT_DELEGATED',
+    firstSessionId: client.prompts[0].sessionId,
+    firstDurationMs: result.retried.firstDurationMs,
+  })
+  assert.equal(typeof result.retried.firstDurationMs, 'number')
+  assert.deepEqual(result.warnings, [
+    'the first attempt ended early with no result (NOT_DELEGATED) and was retried once',
+  ])
+  assert.ok(
+    logs.some((line) => line.includes(`the first attempt ${result.retried.firstSessionId} ended early with no result (NOT_DELEGATED)`)),
+    `expected the retry line in the log, saw:\n${logs.join('\n')}`,
+  )
+})
+
+test('retries a first attempt whose only worker said nothing, in the same tree', async () => {
+  const { root, client, service } = makeIsolatedService({ script: (text, index) => (index === 0 ? 'empty-result' : 'ok') })
+  // The first attempt left no change; the retry writes the file.
+  client.writes = (index) => (index === 0 ? undefined : 'second-try.txt')
+  const result = await service.flashTask({ task: 'write one file', cwd: root })
+
+  assert.equal(client.prompts.length, 2)
+  assert.equal(result.retried.reason, 'EMPTY_RESULT')
+  assert.equal(result.status, 'ok')
+  assert.deepEqual(result.change.filesChanged, ['second-try.txt'])
+  // The eligibility check collected with `store: false` before the retry; the real collect
+  // afterwards still finds the same tree and stores the change as a usable patch.
+  assert.equal(typeof result.change.patchId, 'string')
+  const applied = service.flashApply({ patchId: result.change.patchId })
+  assert.equal(applied.applied, true)
+  assert.equal(readFileSync(join(root, 'second-try.txt'), 'utf8'), 'written by the worker\n')
+  await service.close()
+})
+
+test('does not retry an attempt that produced a non-empty result', async () => {
+  const { root, client, service } = makeService()
+  const result = await service.flashTask({ task: 'x', cwd: root })
+  assert.equal(result.retried, undefined)
+  assert.equal(client.prompts.length, 1)
+  assert.equal(result.warnings, undefined)
+})
+
+test('does not retry an attempt that already ran longer than three minutes', async () => {
+  const { root, client, service } = makeService({ script: 'no-delegation' })
+  const realNow = Date.now
+  let offset = 0
+  // The clock is the only way to model an attempt that ran for minutes without waiting for
+  // one; `Date.now` is what the eligibility window and the result's timings read.
+  Date.now = () => realNow() + offset
+  client.onPrompt = () => {
+    offset = 181_000
+  }
+  try {
+    await assert.rejects(
+      service.flashTask({ task: 'x', cwd: root }),
+      (error) => error.code === 'NOT_DELEGATED',
+    )
+  } finally {
+    Date.now = realNow
+  }
+  assert.equal(client.prompts.length, 1, 'a slow attempt is a verdict, not a hiccup')
+})
+
+test('does not retry an attempt whose copy holds a change', async () => {
+  const { root, client, service } = makeIsolatedService({ script: 'empty-result', file: 'quiet.txt' })
+  const result = await service.flashTask({ task: 'write one file', cwd: root })
+  assert.equal(client.prompts.length, 1)
+  assert.equal(result.retried, undefined)
+  assert.deepEqual(result.change.filesChanged, ['quiet.txt'])
+  await service.close()
+})
+
+test('does not retry an attempt that wrote only git-ignored output', async () => {
+  const { root, client, service } = makeIsolatedService({ script: 'empty-result' })
+  // The copy starts with the ignore rule, so the worker's only output is invisible to the patch.
+  writeFileSync(join(root, '.gitignore'), '*.log\n')
+  execFileSync('git', ['add', '.gitignore'], { cwd: root })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'ignore logs'], { cwd: root })
+  client.writes = 'build.log'
+  const result = await service.flashTask({ task: 'write a log', cwd: root })
+
+  // Ignored output is still this attempt's work: retrying in the same tree would let the
+  // second attempt report the first one's file as its own.
+  assert.equal(client.prompts.length, 1, 'an ignored build log is not an untouched copy')
+  assert.equal(result.retried, undefined)
+  assert.deepEqual(result.change.ignored, ['build.log'])
+  await service.close()
+})
+
+test('does not retry an attempt that used more than twelve model calls', async () => {
+  const { root, client, service } = makeService({ script: 'busy-empty' })
+  await assert.rejects(
+    service.flashTask({ task: 'x', cwd: root }),
+    (error) => error.code === 'NOT_DELEGATED',
+  )
+  assert.equal(client.prompts.length, 1, 'a spent attempt is not a start-up hiccup')
+})
+
+test('a second early failure is never a third attempt, and still names the retry', async () => {
+  const { root, client, service } = makeService({ script: 'no-delegation' })
+  const error = await service.flashTask({ task: 'x', cwd: root }).catch((caught) => caught)
+  // The orchestrator finished without delegating, so there is no result object to carry
+  // `retried`: the error itself has to say that a retry happened and which attempt came first.
+  assert.equal(error.code, 'NOT_DELEGATED')
+  assert.match(error.message, /I cannot do that\./)
+  const firstSessionId = client.prompts[0].sessionId
+  assert.ok(
+    error.message.endsWith(` (after one automatic retry; the first attempt ${firstSessionId} ended the same way)`),
+    `expected the retry named in the error, saw: ${error.message}`,
+  )
+  assert.equal(client.prompts.length, 2)
+
+  // A second attempt that does build a result keeps `retried` beside the same failure.
+  const empty = makeService({ script: 'empty-result' })
+  const result = await empty.service.flashTask({ task: 'x', cwd: empty.root })
+  assert.equal(empty.client.prompts.length, 2)
+  assert.equal(result.retried.reason, 'EMPTY_RESULT')
+  assert.equal(result.retried.firstSessionId, empty.client.prompts[0].sessionId)
+  assert.equal(result.status, 'error')
+  assert.deepEqual(result.warnings, [
+    'the worker ended with an empty final message and changed nothing; treat the call as failed and send the task again',
+    'the first attempt ended early with no result (EMPTY_RESULT) and was retried once',
+  ])
+})
+
+test('cancelling during the wait before the retry stops the call', async () => {
+  const { root, client, service } = makeService({ script: 'no-delegation', earlyRetryDelayMs: 400 })
+  const controller = new AbortController()
+  const pending = service.flashTask({ task: 'x', cwd: root }, { signal: controller.signal })
+  // Wait until the first attempt has ended and the retry wait has begun.
+  await waitFor(() => client.prompts.length === 1, 'the first attempt to run')
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  controller.abort()
+  const error = await pending.catch((caught) => caught)
+  assert.equal(error.code, 'CANCELLED')
+  assert.match(error.message, /cancelled before its first attempt was retried/)
+  assert.equal(client.prompts.length, 1, 'the retry must not run after the cancellation')
+})
+
+test('a fleet retries a first attempt that never started a worker', async () => {
+  const { root, client, service } = makeService({
+    script: (text, index) => (index === 0 ? 'batch-no-fleet' : 'batch'),
+  })
+  const result = await service.flashBatch({ tasks: ['a', 'b'], cwd: root })
+  assert.equal(result.status, 'ok')
+  assert.equal(client.prompts.length, 2)
+  assert.equal(result.retried.reason, 'NOT_DELEGATED')
+  assert.match(client.prompts[1].sessionId, /^flash-batch-/)
+  assert.deepEqual(result.warnings, [
+    'the first attempt ended early with no result (NOT_DELEGATED) and was retried once',
+  ])
+})
+
+// ── a foreground call that has to queue ────────────────────────────────────
+
+test('a foreground call that waited for a tree says so, in the log and the result', async () => {
+  const logs = []
+  const { root, client, service } = makeIsolatedService({ slots: 1, log: (line) => logs.push(line) })
+  client.delayMs = 250
+  const holding = service.flashTask({ task: 'hold the only tree', cwd: root })
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const queued = await service.flashTask({ task: 'second', cwd: root })
+  const held = await holding
+
+  assert.ok(queued.queuedMs > 0, 'the second call must have waited')
+  const warning = queued.warnings.find((line) => line.startsWith('this call waited '))
+  assert.match(
+    warning,
+    /^this call waited \d+m?\d?s in the foreground for a free tree \(1 of 1 in use\), holding your turn; send writing calls with background: true when trees may be busy$/,
+  )
+  assert.ok(
+    logs.some((line) => line.startsWith('queued in the foreground: waiting for a free tree (1 of 1 in use)')),
+    `expected the foreground wait in the log, saw:\n${logs.join('\n')}`,
+  )
+  // The call that did not wait carries no such warning.
+  assert.equal((held.warnings ?? []).some((line) => line.startsWith('this call waited ')), false)
+  await service.close()
+})
+
+test('a background call that queued gets no foreground warning', async () => {
+  const logs = []
+  const { root, client, service } = makeIsolatedService({ slots: 1, log: (line) => logs.push(line) })
+  client.delayMs = 250
+  const holding = service.flashTask({ task: 'hold the only tree', cwd: root })
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const queued = await service.flashTask({ task: 'second', cwd: root }, { background: true, jobId: 'job-abc12345' })
+
+  assert.ok(queued.queuedMs > 0, 'the background call must have waited too')
+  assert.equal(queued.warnings, undefined)
+  assert.equal(
+    logs.some((line) => line.startsWith('queued in the foreground')),
+    false,
+    'a background call holds no turn, so there is nothing to warn about',
+  )
+  await holding
+  await service.close()
+})
+
+// ── the task a patch belongs to, and the worker’s report beside it ─────────
+
+test('prepare receives the task of a flash_task call, labelled from its text', async () => {
+  const { root, service } = makeIsolatedService()
+  const task = ['# Fix the parser', '', ...Array.from({ length: 28 }, (_, index) => `line ${String(index)}`)].join('\n')
+  const result = await service.flashTask({ task, cwd: root })
+  const record = service.flashPatch({ patchId: result.change.patchId })
+  assert.deepEqual(record.task, {
+    kind: 'flash_task',
+    label: 'Fix the parser',
+    sessionId: result.sessionId,
+  })
+  await service.close()
+})
+
+test('a brief starting with a Markdown heading labels both its job and its patch without the #', async () => {
+  const { root, service } = makeIsolatedService()
+  writeFileSync(join(root, 'brief.md'), '# Fix the sweep\n\nThe body of the brief.\n')
+
+  // One helper reads the brief for the job the caller watches and for the patch that
+  // outlives it: the two labels cannot drift.
+  const label = jobLabel('flash_task', { taskFile: 'brief.md', cwd: root }, undefined, root)
+  const result = await service.flashTask({ taskFile: 'brief.md', cwd: root })
+  const record = service.flashPatch({ patchId: result.change.patchId })
+  assert.equal(label, 'Fix the sweep')
+  assert.equal(record.task.label, 'Fix the sweep')
+  await service.close()
+})
+
+test('prepare receives the task file a flash_task call used, and the job it ran as', async () => {
+  const { root, service } = makeIsolatedService()
+  writeFileSync(join(root, 'brief.txt'), '# Port the parser\n\nA long brief.\n')
+  const result = await service.flashTask(
+    { taskFile: 'brief.txt', cwd: root },
+    { background: true, jobId: 'job-0badf00d' },
+  )
+  const record = service.flashPatch({ patchId: result.change.patchId })
+  assert.deepEqual(record.task, {
+    kind: 'flash_task',
+    label: 'Port the parser',
+    sessionId: result.sessionId,
+    jobId: 'job-0badf00d',
+    taskFile: 'brief.txt',
+  })
+  await service.close()
+})
+
+test('prepare receives a fleet’s task with every member’s first line', async () => {
+  const { root, service } = makeIsolatedService({ script: 'batch' })
+  const first = ['# First task', '', ...Array.from({ length: 28 }, (_, index) => `line ${String(index)}`)].join('\n')
+  const result = await service.flashBatch({ tasks: [first, 'Second task\nwith a body'], cwd: root })
+  const record = service.flashPatch({ patchId: result.change.patchId })
+  assert.equal(record.task.kind, 'flash_batch')
+  assert.equal(record.task.label, '2 tasks: First task | Second task')
+  assert.equal(record.task.sessionId, result.sessionId)
+  assert.equal(record.task.taskFile, undefined)
+  await service.close()
+})
+
+test('the stored patch keeps the worker’s full report, not the clipped result', async () => {
+  const { root, service } = makeIsolatedService({ maxResultChars: 10 })
+  const result = await service.flashTask({ task: 'write one file', cwd: root })
+  assert.equal(result.resultTruncated, true)
+
+  // The result is clipped for the caller; the patch keeps the report the worker wrote.
+  assert.match(result.result, /\[truncated \d+ of \d+ characters\]/)
+  const record = service.flashPatch({ patchId: result.change.patchId })
+  // The stub's worker answers "worker result 0" plus the first ten characters of the
+  // dispatch prompt; the patch keeps all of it, where the caller's result kept eleven.
+  assert.equal(record.finalMessage, 'worker result 0\nYou are a')
+  assert.equal(/truncated/.test(record.finalMessage), false)
+  await service.close()
+})
+
+test('a fleet’s stored patch keeps one paragraph per member', async () => {
+  const { root, service } = makeIsolatedService({ script: 'batch' })
+  const result = await service.flashBatch({ tasks: ['first', 'second'], cwd: root })
+  const record = service.flashPatch({ patchId: result.change.patchId })
+  assert.equal(
+    record.finalMessage,
+    'task 1 (ok): fleet result 0 from task-1\n\ntask 2 (ok): fleet result 1 from task-2',
+  )
+  await service.close()
+})
+
+test('a slot value entry is named as a setting, not as a directory or a port', async () => {
+  const { root, client, service } = makeIsolatedService({
+    slotEnv: { FLASH_API_BASE: 'value:https://api.example.test', FLASH_HOME: 'home:tool', FLASH_PORT: 'port:4100' },
+  })
+  await service.flashTask({ task: 'write one file', cwd: root })
+  const prompt = client.prompts[0].text
+  assert.ok(
+    prompt.includes(
+      "The project's settings set FLASH_API_BASE for every worker; leave them as they are.",
+    ),
+    prompt,
+  )
+  assert.match(prompt, /The environment sets FLASH_HOME to writable per-slot directories/)
+  assert.match(prompt, /FLASH_PORT hold a port base reserved for this slot/)
+  // The value is not described as a path or a port.
+  assert.equal(/sets FLASH_API_BASE to writable/.test(prompt), false)
+  assert.equal(/FLASH_API_BASE hold a port/.test(prompt), false)
+  await service.close()
+})
+
+test('a value entry with no copy is not described to a read-only worker', () => {
+  const prompt = buildChildPrompt({
+    cwd: '/w',
+    task: 'review',
+    copy: true,
+    uncommitted: { count: 0, files: [] },
+    slotEnv: { FLASH_API_BASE: 'https://api.example.test' },
+    slotPorts: [],
+    slotValues: ['FLASH_API_BASE'],
+  })
+  assert.ok(prompt.includes("The project's settings set FLASH_API_BASE for every worker; leave them as they are."))
+  assert.doesNotMatch(prompt, /writable per-slot directories/)
+})
+
+test('a fleet’s result carries the repeated-failure warnings of its workers', async () => {
+  const { root, client, service } = makeService({ script: 'batch' })
+  client.toolEvents = [
+    { command: 'cd openssl && cargo build --release', text: '[exit code: 101]' },
+    { command: 'CARGO_X=1 cargo build -p a', text: '[exit code: 101]' },
+    { command: 'cargo build -p b', text: '[exit code: 101]' },
+  ]
+  const result = await service.flashBatch({ tasks: ['a', 'b'], cwd: root })
+  assert.match(
+    result.warnings[0],
+    /^"cargo build" failed 3 times in this call \(last: exit code 101, \d+m?\d?s ago\); a worker repeating a step its sandbox cannot finish keeps its tree busy — check its report or cancel the call$/,
+  )
+})
+
+test('a fleet member known only through the engine’s agent-start still shows its command and failures', async () => {
+  // The second member never appears in a `subagent.started`; only the workflow tool's
+  // `agent-start` names it, as the engine's own child. Its commands are still this call's.
+  const { root, service } = makeService({ script: 'workflow-member-fleet', progressIntervalMs: 5 })
+  const reports = []
+  const result = await service.flashBatch(
+    { tasks: ['first', 'second'], cwd: root },
+    { progress: (report) => reports.push(report), progressToken: 'tok-wf-member' },
+  )
+
+  assert.equal(result.status, 'ok')
+  const shown = reports.flatMap((report) => report.detail.current).filter((call) => call.command === 'cargo build -p app')
+  assert.ok(shown.length > 0, `expected the member’s command in a heartbeat, saw ${JSON.stringify(reports.map((report) => report.detail.current))}`)
+  // Its three failures reached the heartbeat and the result, not only the log.
+  assert.ok(
+    reports.some((report) => report.detail.warnings.some((line) => /^"cargo build" failed 3 times/.test(line))),
+    'expected the member’s repeated failure in a heartbeat',
+  )
+  assert.ok(result.warnings.some((line) => /^"cargo build" failed 3 times/.test(line)))
 })

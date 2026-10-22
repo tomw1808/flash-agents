@@ -12,7 +12,7 @@
 
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -49,6 +49,21 @@ function writePatch(patchDir, root, { createdAt, ...extra }) {
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
+/**
+ * The `trash-*` entries of a digest directory: a removal that was renamed but whose
+ * deletion did not finish. `clean` must leave none behind when it returns.
+ *
+ * @param {string} dir - a root's digest directory under the injected base.
+ * @returns {string[]} the trash directory names.
+ */
+function trashDirsIn(dir) {
+  try {
+    return readdirSync(dir).filter((name) => name.startsWith('trash-'))
+  } catch {
+    return []
+  }
+}
+
 test('clean reports each root digest and reclaims this root’s dead trees and expired patches', async () => {
   const base = makeBase()
   const root = makeRoot()
@@ -56,8 +71,10 @@ test('clean reports each root digest and reclaims this root’s dead trees and e
   const ownParent = join(base, own)
   const deadPid = '4194303'
 
-  // This root: a dead owner with a 1.5 MB slot tree, one expired and one fresh patch.
-  const ownSlot = join(ownParent, deadPid, 'slots', 'slot-0')
+  // This root: a dead owner in the real layout — `<pid>/<instance>/slots/<name>` — with a
+  // 1.5 MB slot tree, one expired and one fresh patch. The older `<pid>/slots` layout is
+  // exercised by the foreign live root below, and must be counted too.
+  const ownSlot = join(ownParent, deadPid, 'ca5ca5ca', 'slots', 'slot-0')
   mkdirSync(ownSlot, { recursive: true })
   writeFileSync(join(ownSlot, 'work.txt'), 'x'.repeat(Math.floor(1.5 * 1024 * 1024)))
   const patches = join(ownParent, 'patches')
@@ -89,14 +106,47 @@ test('clean reports each root digest and reclaims this root’s dead trees and e
   assert.match(text, /slot trees: 1 \(1\.5 MB\)/)
   assert.match(text, /slot trees: 1 \(2\.0 MB\)/)
   assert.match(text, /patches: 2 \(0\.0 MB\)/)
-  assert.match(text, /removed: 1 dead owner\(s\), 1 expired patch\(es\), 1 empty digest\(s\)/)
+  assert.match(
+    text,
+    /removed: 1 dead owner\(s\), 1 expired patch\(es\), 1 empty digest\(s\), 0 trash director/,
+    'the summary names the trash count even when there was none',
+  )
 
   // Startup-equivalent cleanup, for this root only.
   assert.equal(existsSync(join(ownParent, deadPid)), false, 'this root’s dead owner is removed')
+  // Removal is synchronous: the process exits as soon as the summary is printed, so a
+  // renamed `trash-*` tree would otherwise be abandoned with it while the summary claimed
+  // the space was reclaimed.
+  assert.deepEqual(trashDirsIn(ownParent), [], 'no trash is left when clean returns')
   assert.equal(existsSync(join(patches, `${expired}.patch`)), false, 'the expired patch is pruned')
   assert.equal(existsSync(join(patches, `${fresh}.patch`)), true, 'the fresh patch is kept')
   assert.equal(existsSync(join(base, emptyDigest)), false, 'the empty foreign digest is removed')
   assert.equal(existsSync(foreignLiveSlot), true, 'a foreign root with a live server is untouched')
+})
+
+test('clean removes and reports the trash an interrupted removal left behind', async () => {
+  // A removal is a rename to `trash-<pid>-<ms>` plus a background delete. A process killed
+  // in between leaves the trash; only `clean` (and the next server's sweep) can reclaim it,
+  // and the operator must see that it happened rather than wonder where the space went.
+  const base = makeBase()
+  const root = makeRoot()
+  const own = rootDigest(root)
+  const trash = join(base, own, 'trash-4242-1700000000000')
+  mkdirSync(join(trash, 'slots', 'slot-0'), { recursive: true })
+  writeFileSync(join(trash, 'slots', 'slot-0', 'left.txt'), 'x'.repeat(1024))
+
+  const lines = []
+  const code = await runClean([], { env: { FLASH_SERVICE_ROOT: root }, write: (text) => lines.push(text), baseDir: base })
+  assert.equal(code, 0)
+  const text = lines.join('')
+  assert.match(text, /trash-4242-1700000000000/, 'the removed trash is named')
+  assert.match(
+    text,
+    /removed: 0 dead owner\(s\), 0 expired patch\(es\), 0 empty digest\(s\), 1 trash directory/,
+    'the summary counts the trash it removed',
+  )
+  assert.equal(existsSync(trash), false, 'the trash of an interrupted removal is removed')
+  assert.deepEqual(trashDirsIn(join(base, own)), [], 'and nothing is left to a background removal')
 })
 
 test('clean prunes the durable store and a legacy temp store, and reports both locations', async () => {

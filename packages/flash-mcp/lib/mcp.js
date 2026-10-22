@@ -53,6 +53,12 @@ const SERVER_NOT_INITIALIZED = -32002
  * @param {NodeJS.ReadableStream} [options.input] - protocol input (default stdin).
  * @param {NodeJS.WritableStream} [options.output] - protocol output (default stdout).
  * @param {(message: string) => void} [options.log] - diagnostic sink; MUST NOT be stdout.
+ * @param {() => void} [options.onInitialized] - called once, when the client's
+ *   `notifications/initialized` arrives. It runs after the `initialize` result was
+ *   written, which is the first moment the client is ready to talk: a server uses it to
+ *   start work that must not delay the handshake. The return value is ignored, and a
+ *   throw is logged rather than answered — there is no request to answer. A second
+ *   `initialized` notification does not call it again.
  * @returns {{close: () => void, handled: () => number}} a handle for shutdown and tests.
  */
 export function serveStdio({
@@ -63,9 +69,11 @@ export function serveStdio({
   input = process.stdin,
   output = process.stdout,
   log = () => {},
+  onInitialized,
 }) {
   let buffer = ''
   let initialized = false
+  let notifiedInitialized = false
   let closed = false
   let handled = 0
   /** In-flight tool calls by JSON-RPC id, so `notifications/cancelled` can abort them. */
@@ -190,6 +198,17 @@ export function serveStdio({
   const handleNotification = (method, params) => {
     if (method === 'notifications/initialized') {
       log('client initialized')
+      // Once, and only once: a client may resend the notification (a reconnect, a
+      // retrying bridge), and starting a start-up sweep twice would undo its idempotence.
+      if (notifiedInitialized) return
+      notifiedInitialized = true
+      if (onInitialized === undefined) return
+      try {
+        onInitialized()
+      } catch (error) {
+        // A notification has no request to answer, so a failure here can only be logged.
+        log(`onInitialized failed: ${describeError(error)}`)
+      }
       return
     }
     if (method === 'notifications/cancelled') {

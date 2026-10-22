@@ -9,7 +9,7 @@ import { PassThrough } from 'node:stream'
 import { serveStdio } from '../lib/mcp.js'
 
 /** Drive one connection and collect the frames it writes. */
-function connect({ callTool } = {}) {
+function connect({ callTool, onInitialized, log } = {}) {
   const input = new PassThrough()
   const output = new PassThrough()
   output.setEncoding('utf8')
@@ -34,7 +34,8 @@ function connect({ callTool } = {}) {
     callTool: callTool ?? (async () => ({ content: [{ type: 'text', text: 'ok' }] })),
     input,
     output,
-    log: () => {},
+    log: log ?? (() => {}),
+    ...(onInitialized === undefined ? {} : { onInitialized }),
   })
   return { input, frames, connection, send: (message) => input.write(`${JSON.stringify(message)}\n`) }
 }
@@ -103,6 +104,49 @@ test('reports an unknown tool as a tool error, not a protocol error', async () =
   await settle(frames, 2)
   assert.equal(frames[1].result.isError, true)
   assert.match(frames[1].result.content[0].text, /unknown tool "nope"/)
+  connection.close()
+})
+
+/** Wait, with a bound, until a notification that writes no frame has been handled. */
+async function settleHook(predicate) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.fail('the notification was not handled in time')
+}
+
+test('reports notifications/initialized once, and never as part of the handshake answer', async () => {
+  const calls = []
+  const { frames, send, connection } = connect({ onInitialized: () => calls.push('initialized') })
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
+  await settle(frames, 1)
+  assert.deepEqual(calls, [], 'the hook is not what answers initialize')
+
+  send({ jsonrpc: '2.0', method: 'notifications/initialized' })
+  await settleHook(() => calls.length === 1)
+  // A client reconnecting, or a bridge retrying, may send it again; a start-up sweep must
+  // not be started twice by that.
+  send({ jsonrpc: '2.0', method: 'notifications/initialized' })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.deepEqual(calls, ['initialized'])
+  connection.close()
+})
+
+test('a failing onInitialized hook is logged, not answered or thrown into the connection', async () => {
+  const logs = []
+  const { frames, send, connection } = connect({
+    log: (message) => logs.push(message),
+    onInitialized: () => {
+      throw new Error('the sweep would not start')
+    },
+  })
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
+  send({ jsonrpc: '2.0', method: 'notifications/initialized' })
+  send({ jsonrpc: '2.0', id: 2, method: 'ping' })
+  await settle(frames, 2)
+  assert.equal(frames[1].id, 2, 'the connection still answers after the hook threw')
+  assert.ok(logs.some((line) => line.includes('onInitialized failed')), `expected a log line in ${JSON.stringify(logs)}`)
   connection.close()
 })
 
@@ -188,6 +232,39 @@ test('sends progress notifications carrying the request token, and none without 
   assert.equal(withoutToken.frames.length, 2)
   assert.equal(withoutToken.frames.some((frame) => frame.method === 'notifications/progress'), false)
   withoutToken.connection.close()
+})
+
+test('a progress report’s structured detail never reaches the MCP wire', async () => {
+  // The service puts the open commands and the repeated-failure warnings on the report so a
+  // status reader can see them; MCP has no room for them, and a client that received an
+  // unexpected field could only be confused. Only the four documented fields are forwarded.
+  const withDetail = connect({
+    async callTool(name, args, ctx) {
+      ctx.sendProgress({
+        progress: 61,
+        total: 300,
+        message: 'flash_task running 1m1s; running "make -j8" for 1m1s',
+        detail: {
+          current: [{ tool: 'bash', command: 'make -j8 build_libs', since: '2026-01-02T03:04:05.000Z', runningMs: 61_000 }],
+          warnings: ['"cargo build" failed 3 times in this call'],
+        },
+      })
+      return { content: [{ type: 'text', text: 'ok' }] }
+    },
+  })
+  withDetail.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
+  withDetail.send({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/call',
+    params: { name: 'flash_task', arguments: {}, _meta: { progressToken: 'tok-detail' } },
+  })
+  await settle(withDetail.frames, 3)
+  const notification = withDetail.frames.find((frame) => frame.method === 'notifications/progress')
+  assert.deepEqual(Object.keys(notification.params).sort(), ['message', 'progress', 'progressToken', 'total'])
+  assert.equal('detail' in notification.params, false)
+  assert.equal(JSON.stringify(withDetail.frames).includes('make -j8 build_libs'), false)
+  withDetail.connection.close()
 })
 
 test('closes on input end without answering', async () => {

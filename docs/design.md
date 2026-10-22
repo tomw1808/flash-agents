@@ -170,6 +170,14 @@ task text carries the decisions (signatures, contracts, mapping rules) and the w
 them. One coherent goal with up to about six sub-goals per task; 800–1,500 words of task text.
 The `delegate` skill has the working loop and the task template.
 
+Every worker prompt also carries three standing rules. A check the task asks for that cannot run in
+the sandbox (an end-to-end run, a service, a step the sandbox blocks) does not excuse skipping the
+code: the worker still writes the code and tests the task asks for and names each check it could not
+run, so the caller can. A command that fails the same way twice is not retried a third and fourth
+time — the worker reports the error and what it would need. And a new name with global reach (a
+global CSS class or variable, a route, an environment variable, a config key) is checked against the
+code first: if it already means something else, the worker chooses another name and says so.
+
 ### The pipeline
 
 ```
@@ -209,9 +217,9 @@ Two doors that start work, and five that only look at, land, or stop work alread
 |---|---|---|
 | `flash_task` | `task` or `taskFile`, `cwd` | one self-contained task on one worker |
 | `flash_batch` | `tasks` | a fleet the caller has already split, one worker per task |
-| `flash_apply` | `patchId` | put the change an earlier call produced into the workspace (`dryRun?`, `force?`, `threeWay?`) |
-| `flash_patch` | `patchId` | read a stored patch whole, by file (`files?`), or by page (`offset?`, `maxChars?`) |
-| `flash_status` | — | the state of one background job (`jobId?`), or a listing: running jobs first, then up to `limit?` (default 10) ended ones; `state?` filters |
+| `flash_apply` | `patchId` | put the change an earlier call produced into the workspace (`dryRun?`, `force?`, `threeWay?`); the result names the task that made the patch |
+| `flash_patch` | `patchId` | read a stored patch whole, by file (`files?`), or by page (`offset?`, `maxChars?`); `task` on every page, the worker's report on the first |
+| `flash_status` | — | the state of one background job (`jobId?`), or a listing: running jobs first, then up to `limit?` (default 10) ended ones; `state?` filters. A running job also reports `current` (its workers' open tool calls) and `warnings` (commands failing repeatedly) |
 | `flash_result` | `jobId` | a background job's result, waiting up to `waitSeconds?` (≤ 600) for it; `wait.endedBy` says what ended the wait |
 | `flash_cancel` | `jobId` | stop a background job; its tree is retired as on a timeout |
 
@@ -229,6 +237,12 @@ salvaged as a patch by the next server. The provider, the reasoning effort, and 
 caller capabilities; `provider`, `reasoningEffort` and `agentOptions` are logged and ignored. A
 `flash_batch` takes one `model` for the whole fleet — a `model` inside a task is refused with
 `INVALID_ARGUMENT`. Unknown arguments are ignored rather than forwarded.
+
+`basePatch`, `flash_apply` and `flash_patch` all take a patch id from a result, or a unique prefix of it:
+at least eight hex digits, with or without the `flash-` prefix (`1a2b3c4d`,
+`flash-1a2b3c4d-5e6f`). A prefix that matches more than one stored patch is refused, naming up to
+five of the full ids and how many there were; the prefix is still checked against the id shape
+before any path is built from it.
 
 A writing call does not run in your repository. It runs in a **disposable copy** of it and returns the
 change it made; `apply: "auto"` applies that change before returning, and `flash_apply { patchId }`
@@ -292,7 +306,21 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
   and no change comes back as `error` with `emptyResult: true`. An empty message with a change keeps
   its status, sets `emptyResult`, and warns that the account of the change is missing.
 - `durationMs` is the session's own run time. A call that waited for a free copy reports the wait
-  as `queuedMs`; while it waits, its progress line reads `queued …: waiting for a free tree`.
+  as `queuedMs` and the pool counts it waited behind as `queued` (`{ ms, inUse, size }`); while it
+  waits, its progress line reads `queued …: waiting for a free tree`. A writing call sent without
+  `background: true` holds the caller's whole turn while it queues, so its line says
+  `queued in the foreground …` and its `warnings` carry the same fact plus the remedy (send writing
+  calls with `background: true` when trees may be busy). `background` stays opt-in.
+- `retried` (`{ reason, firstSessionId, firstDurationMs, firstUsage? }`) appears when a call's first
+  attempt was retried. The retry covers one specific failure shape: the attempt ended within 180 s
+  and at most 12 model calls, delegated nothing (`NOT_DELEGATED`) or started only workers whose
+  reports were empty (`EMPTY_RESULT`), and left the copy untouched — no tracked change, no new or
+  rewritten ignored path, and a diff that could actually be read. Such an attempt is usually a cold
+  runtime rather than a real answer, so the same prompt is sent again in a fresh session, in the same
+  copy, after ten seconds; `warnings` carries the retry, and a `NOT_DELEGATED` error names it too,
+  because the caller paid for two attempts. Nothing else is retried: a slow failure is a verdict,
+  and so is one that changed files, because a copy holding a change is real work whatever the
+  worker said. A read-only call has no copy to check, so the delegation shape alone decides there.
 - `instructions` (`{ files, bytes, budgetBytes, overBudget, approxTokens }`) is the service's
   estimate of the project instruction files the harness injected into the worker (`AGENTS.md`,
   `CLAUDE.md`, their `.local` overlays and `$DSH_HOME/AGENTS.md`, root to cwd). The harness renders
@@ -304,6 +332,14 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
   made and that the worker rewrote or deleted, compared by size and mtime. Neither can be in the
   patch, and both come with a warning. Ignored directories are not walked, so a change inside
   `node_modules/` is not reported.
+- `warnings` gathers what the call can say about itself: a worker that ran on another model than the
+  one asked for, the ignored files above, instruction files over budget, a skipped `slotSetup` step,
+  the foreground queue wait, the automatic retry — and a command that failed three or more times in
+  the call. Failures are counted by a command's first two words after any leading `cd … &&` and
+  `NAME=value` segments, so `cd repo && cargo build --release` and `CARGO_X=1 cargo build -p app` are
+  the one step `cargo build`. A shell result carries `[exit code: N]`; a non-zero one, or a tool
+  error, is a failure. A command piped into `tee` reports `tee`'s exit code, so a failure on the left
+  of a pipe cannot be seen there.
 
 `flash_batch { tasks, cwd?, acceptance?, mode? }` returns one entry per task, **in task order**, so
 `results[i]` always answers `tasks[i]`:
@@ -491,6 +527,28 @@ processes that no longer exist are swept at startup, before every `prepare`, and
 minutes; a live service's trees never are. Sweeping only at startup let a dead server's 35 GB
 wait for some later server, because the one still running never looked.
 
+A dead owner's directory is renamed to `trash-<pid>-<epochMs>` and then deleted in the background.
+The rename is instant on the same filesystem and takes the tree out of every later sweep's path at
+once; the deletion itself is what takes minutes on NTFS for a slot holding a multi-gigabyte `cargo
+target`. The stdio server also answers MCP `initialize` before any of this runs and starts the
+sweep when the client reports it is initialized (or after 5 s, for a client that never sends the
+notification): a sweep inside the constructor outlasted Claude Code's 30 s connect timeout on such
+a machine, and the client killed the server mid-sweep.
+
+A dead owner whose work could not be salvaged is kept rather than deleted: the next sweep tries
+again, at most once every ten minutes and up to three attempts, after which the trees are removed
+and the loss is named in the log. Two facts make that retry safe: the failed attempt is recorded in
+the owner's directory (`salvage-attempts`, including which slots already produced a patch, so a
+retry cannot store the same change twice), and `prepare` sweeps before every call, so three calls
+in a row cannot burn all three attempts within seconds.
+
+**Before 0.1.7 the sweep looked for a dead server's trees one directory too high.** A current
+server keeps a slot at `<pid>/<instance>/slots/<name>`; the sweep looked at `<pid>/slots/<name>`,
+found nothing, judged the dead owner clean, and removed the whole directory with the uncommitted
+work still inside it. A crash after a worker had written files therefore lost that work, and the
+salvage `flash_apply` advertises could only find trees left by an older layout. 0.1.7 enumerates
+both layouts, which is what makes a crash survivable.
+
 A tree is emptied as soon as its change is stored as a patch, rather than at the start of the next
 call in its slot: an idle server used to hold a full copy plus the worker's build output per slot,
 indefinitely. A tree whose change could not be collected (no git, or a failed diff) is the only copy
@@ -512,18 +570,36 @@ directories that hold no files and no live server. `flash-agents clean` reports 
 digest — live server pids, and the number and MB of slot trees and patches — and reclaims what a
 startup would; `clean --all` also removes the trees of roots with no live server. Patches are never
 removed by `--all`, because a root without a live server is exactly where a caller might still want
-one.
+one. `clean` also removes this root's `trash-*` directories — a removal a crash left unfinished —
+and reports how many. Unlike a server's sweep, every removal it reports is synchronous: `clean`
+prints its summary and exits, so a deletion left in the background would be abandoned half done
+while the summary claimed the disk back.
 
 A patch is more than a file. Each one is stored with a record — the root it was computed for, the
-base commit, the files it touches, and whether it has been applied — and `flash_apply` refuses:
+base commit, the files it touches, whether it has been applied, and the task that made it — and
+`flash_apply` refuses:
 
-- an id that is not the shape this service issues (`flash-<uuid>`), because the id is used to
-  build a path and `../` used to reach any `.patch` on disk;
+- an id that is neither `flash-<uuid>` nor a unique prefix of one (at least eight hex digits, with
+  or without the `flash-` prefix), because the id is used to build a path and `../` used to reach
+  any `.patch` on disk;
+- a prefix that matches more than one stored patch, naming up to five of the full ids and how many
+  there were: choosing one would be a guess, and the caller could not tell which change it got, so
+  the error asks for more of the id instead;
 - a patch computed for a **different root**, because that is not a merge, it is a different edit
   to different files, landing one caller's work in another caller's tree;
 - a patch whose record says it was **already applied**, unless the caller passes `force: true`.
   Recording the apply is what makes this a rule instead of a coincidence: `git apply` can find a
   second place to put the same change when the surrounding lines repeat elsewhere in the file.
+
+The record's `task` is a bounded `{ kind, label, sessionId?, jobId?, taskFile? }`. The label is the
+brief's first line with any Markdown heading markers stripped (a fleet's is its size and every
+member's first line), and a `flash_task` sent with `taskFile` keeps that path. While the call runs the same
+value sits in the copy's own `.git/flash-task.json`: git never reports a file there, so it cannot
+reach a patch, and it is how a copy salvaged after a crash still names the task it was working on.
+When the call finishes, the worker's final report is attached to the record — a fleet's is one
+paragraph per member — and the first 8,000 characters are kept, with `finalMessageTruncated` when
+it was cut. `flash_patch` returns `task` on every page and `finalMessage` on the page that starts at
+offset 0; `flash_apply` returns `task`.
 
 Honest limits of this design:
 
@@ -577,10 +653,20 @@ Honest limits of this design:
   environment variables to folders inside the slot: `home:<name>` under `.flash-home/`, emptied every
   call, and `cache:<name>` under `.flash-cache/`, which `prepare` keeps between calls in the same slot
   and retire, sweep and close remove with the slot. Both folders are excluded from the diff like
-  `.flash-tmp/`. `TMPDIR`, `TMP`, `TEMP` and `HOME` are refused: the sandbox derives its writable roots
+  `.flash-tmp/`. A fourth form, `value:<text>`, sets a plain value in every slot — for the worker and
+  for the `slotSetup` steps — so a project-wide setting does not have to be repeated in every brief:
+  `"OPENSSL_NO_VENDOR": "value:1"`, `"OPENSSL_DIR": "value:C:\\openssl"` or
+  `"RUSTC_WRAPPER": "value:sccache"`. Everything after the first `value:` is the text verbatim, a
+  `:`-bearing Windows path included, up to the 32,767-character limit for one variable; a NUL is
+  refused. `TMPDIR`, `TMP`, `TEMP` and `HOME` are refused: the sandbox derives its writable roots
   from the runtime's temp dir (see above), and every toolchain reads `HOME`. So are `DSH_HOME`, since a
   `cache:` folder outlives the call and a worker could plant a profile there for the next runtime on
-  that slot, and `FLASH_ROUTE_MODEL`, which only the server sets.
+  that slot, and `FLASH_ROUTE_MODEL`, which only the server sets. And so are `PATH`, `PATHEXT`,
+  `NODE_OPTIONS`, `NODE_PATH` and every `LD_*`/`DYLD_*` name, for every kind of entry: the slot
+  environment is also the environment of the `dsh` runtime process, which runs outside the worker's
+  sandbox, so a `NODE_OPTIONS=--require …` would run worker-supplied code inside that runtime and a
+  `PATH` would decide which programs it starts. A `read-only` call has no slot, so none of this
+  reaches it.
 - **The index mirrors yours.** The base is recorded through a private index (`GIT_INDEX_FILE`, seeded
   from the copy's own), so `git status` in the copy shows your staged, unstaged and untracked work
   exactly as you left it. Recording it on the real index used to make every uncommitted edit look
@@ -743,6 +829,19 @@ tail -f /tmp/flash.log
 Each line carries an ISO timestamp: runtime boot, session per call, child started, the observed route,
 each tool call and result, every guard denial, and the collected change.
 
+**From Claude Code** — `flash_status` answers the same question for a background job without a log
+file. A running job carries `current`, the call's open tool calls as of the last heartbeat (every
+20 s), longest-running first, each with `tool`, `command`, `since` and `runningMs`; and `warnings`,
+the repeated-failure lines a finished result carries too. The heartbeat's progress line ends with
+the longest-running command, so `tool bash · last event 2s ago; running "cargo build" for 4m20s`
+is what a working worker looks like. Both fields are dropped once the job ends: an ended job's
+answer is its result, and a snapshot of a command that ran an hour ago would read as if it were
+still running. The dispatcher's own `flash`/`workflow` call is never one of them — it stays open for
+the whole delegation and would otherwise always be the longest-running "command". A job sent with
+`taskFile` is labelled with the brief's first line, heading markers stripped, read through the same
+fence and size limit the call itself uses; a brief that cannot be read leaves `taskFile <path>` as
+the label, which is at least the one fact a reader can act on.
+
 **Afterwards** — worker sessions are durable, in the same store the interactive surfaces use
 (`$DSH_HOME/sessions/<workspace-key>/<sessionId>/session.v3.jsonl.zstd`, one JSON event per line).
 `scripts/flash-sessions.mjs` lists them without guessing at the key:
@@ -794,7 +893,7 @@ implementation of the protocol the target agent speaks — and prints one line p
 `dsh --profile flash-service` and `flash-service-readonly` runtimes, and prints one line per
 check. The counts below are for the shipped three-model allowlist; the `models` stage expands with
 the allowlist and needs those models available in Ollama. `--models` narrows it, and with no
-non-default model the stage prints a skip note instead of failing. For 0.1.6 that is **116/116
+non-default model the stage prints a skip note instead of failing. For 0.1.7 that is **116/116
 checks** passed live.
 
 | Stage | Checks | What it establishes |
@@ -1017,6 +1116,20 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
   than a rule. Structurally it cannot be fixed by a profile flag: `tools.restrict()` refuses a
   context-global filter on purpose, so the fix is to remove the dispatcher, not to police it. That is
   the next slice.
+- **Only an early, empty failure is retried.** The one automatic retry covers an attempt that ended
+  within 180 s and at most 12 model calls, delegated nothing or only empty reports, and left the copy
+  untouched. A failure that took longer is a verdict, and so is one that changed files: a copy
+  holding a change is real work, and retrying in it would let a second attempt report the first
+  one's ignored build output as its own.
+- **Jobs are one server process's, and only it can list them.** `flash_status` and `flash_result`
+  know only the jobs the running server started: another session's server, or the one after a
+  restart, lists none of them. A finished writing call's work survives as a stored patch, but a job
+  id does not.
+- **The repeated-failure warning cannot see through a pipe, and counts two words.** A shell result
+  carries the exit code of the pipeline's last command, so a build piped into `tee` reports `tee`'s
+  status and its failure never reaches `warnings`; the worker's own output is the only place it
+  shows. The key is the command's first two words, so every `npm run …` script counts as one
+  command, and a command whose first two words differ from an earlier one is counted separately.
 - **A cancelled call that is mid-flight is not interrupted.** Cancellation now stops a call that is
   *waiting for a tree* (and it never copies the repository), but once a worker is running, the SDK has
   no cancel method — the session finishes inside Harness and its notifications are ignored.
