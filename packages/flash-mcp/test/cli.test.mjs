@@ -12,13 +12,22 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 
 import { createService, instructionsFor, jobLabel, listTools, parseOptions, runDoctor, startServer } from '../lib/index.js'
 import { DEFAULT_CONFIG, mergeConfig } from '../lib/config.js'
+import { rootDigest } from '../lib/isolation.js'
+import { resolveDshCommand } from '../lib/sdk.js'
+
+/**
+ * A service built with `--state-base` keeps the default patch store, which lives in the
+ * durable data directory. Point it at a throwaway directory so no test reads or prunes
+ * the real one.
+ */
+process.env.FLASH_DATA_DIR = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-data-')))
 
 /** The route the tests configure; recognisable so a value can be traced to it. */
 const TEST_MODEL = 'test-model:cloud'
@@ -316,6 +325,21 @@ test('doctor --copy takes its root from CLAUDE_PROJECT_DIR, as the plugin starts
   })
   assert.equal(code, 0)
   assert.match(lines.join(''), new RegExp(`ok\\s+copy\\s+copied ${repo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+})
+
+test('doctor refuses a relative state base instead of measuring the repository', async () => {
+  const lines = []
+  const code = await runDoctor(['--state-base', 'rel'], {
+    env: doctorEnv(),
+    write: (text) => lines.push(text),
+  })
+  assert.equal(code, 2)
+  assert.match(
+    lines.join(''),
+    /flash-agents: --state-base must be an absolute path \(got "rel"\)/,
+    'the same invalid-option report as the other bad options',
+  )
+  assert.match(lines.join(''), /Usage:/)
 })
 
 test('doctor --e2e skips the run when a check failed', async () => {
@@ -659,5 +683,174 @@ test('createService only defers the sweep when the serve wiring asks for it', as
     assert.equal(deferred.isolation.startupSweepPending, true)
   } finally {
     await deferred.close()
+  }
+})
+
+// ── --state-base / FLASH_STATE_BASE and the start-up launcher probe ──
+
+test('FLASH_STATE_BASE and --state-base select the default layout’s base', () => {
+  assert.equal(parseOptions([], { FLASH_STATE_BASE: '/tmp/flash-base' }, config).stateBase, '/tmp/flash-base')
+  assert.equal(
+    parseOptions(['--state-base', '/tmp/flag-base'], { FLASH_STATE_BASE: '/tmp/env-base' }, config).stateBase,
+    '/tmp/flag-base',
+    'the flag wins over the environment',
+  )
+  assert.equal(parseOptions([], { FLASH_STATE_BASE: '' }, config).stateBase, undefined, 'empty means unset')
+  // `--state-dir` keeps its own meaning; the two are separate settings.
+  const both = parseOptions(['--state-base', '/tmp/base', '--state-dir', '/tmp/dir'], {}, config)
+  assert.equal(both.stateBase, '/tmp/base')
+  assert.equal(both.stateDir, '/tmp/dir')
+  // A leading ~ expands the way DSH_HOME does; the injected home keeps the test off the
+  // real one.
+  assert.equal(
+    parseOptions([], { FLASH_STATE_BASE: ' ~/flash-base ' }, config, { home: '/home/u' }).stateBase,
+    join('/home/u', 'flash-base'),
+  )
+  assert.equal(parseOptions(['--state-base', '~'], {}, config, { home: '/home/u' }).stateBase, '/home/u')
+})
+
+test('a relative state base is refused rather than landing inside the repository', () => {
+  const refusal = '--state-base must be an absolute path (got "rel")'
+  assert.throws(() => parseOptions(['--state-base', 'rel'], {}, config), (error) => error.message === refusal)
+  assert.throws(() => parseOptions([], { FLASH_STATE_BASE: 'rel' }, config), (error) => error.message === refusal)
+  // `~user` is not a home-relative path this expands, so it stays relative and is refused.
+  assert.throws(
+    () => parseOptions(['--state-base', '~someone/x'], {}, config),
+    /--state-base must be an absolute path \(got "~someone\/x"\)/,
+  )
+})
+
+test('the plugin exposes a state_base option and passes it as FLASH_STATE_BASE', () => {
+  const plugin = JSON.parse(readFileSync(new URL('../../../.claude-plugin/plugin.json', import.meta.url), 'utf8'))
+  const flash = plugin.mcpServers.flash
+  // The same wiring as state_dir, so an unset option expands to "" and parseOptions reads
+  // that as "not set" (`textFrom`); a configured one reaches the server's option parsing.
+  assert.equal(flash.env.FLASH_STATE_BASE, '${user_config.state_base}')
+  assert.equal(flash.env.FLASH_STATE_DIR, '${user_config.state_dir}')
+  const config = plugin.userConfig.state_base
+  assert.equal(config.type, 'directory')
+  assert.equal(config.title, 'Base folder for worker copies')
+  assert.equal(config.default, plugin.userConfig.state_dir.default)
+  assert.equal(config.required, false)
+  assert.match(config.description, /base folder for the default per-repository copy layout/i)
+  assert.match(config.description, /must be an absolute path/)
+})
+
+test('FLASH_STATE_BASE places the slots under <base>/<digest>/<pid>/<instance>', async () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-base-')))
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-base-root-')))
+  const service = createService({
+    ...parseOptions([], { FLASH_STATE_BASE: base }, config),
+    root,
+    isolate: 'copy',
+    slots: 1,
+    env: doctorEnv(),
+  })
+  try {
+    assert.ok(
+      service.isolation.stateDir.startsWith(join(base, rootDigest(root), String(process.pid))),
+      `the state directory ${service.isolation.stateDir} must sit under ${base}`,
+    )
+    assert.equal(service.isolation.slots[0].dir, join(service.isolation.stateDir, 'slots', 'slot-0'))
+  } finally {
+    await service.close()
+    rmSync(base, { recursive: true, force: true })
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('--state-dir wins over FLASH_STATE_BASE', async () => {
+  const base = '/tmp/flash-cli-base-never-created'
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-dir-root-')))
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-dir-state-')))
+  const service = createService({
+    ...parseOptions([], { FLASH_STATE_BASE: base }, config),
+    root,
+    isolate: 'copy',
+    slots: 1,
+    stateDir,
+    env: doctorEnv(),
+  })
+  try {
+    assert.equal(service.isolation.stateDir, stateDir)
+    assert.equal(existsSync(base), false, 'the losing base is never created')
+  } finally {
+    await service.close()
+    rmSync(root, { recursive: true, force: true })
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
+
+test('startServer logs a missing dsh and names a sibling Node launcher at start', async () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-nvm-')))
+  const current = join(base, 'versions', 'node', 'v22.19.0', 'bin', 'node')
+  const sibling = join(base, 'versions', 'node', 'v20.19.0', 'bin', 'dsh')
+  mkdirSync(join(base, 'versions', 'node', 'v20.19.0', 'bin'), { recursive: true })
+  writeFileSync(sibling, '#!/bin/sh\nexit 0\n')
+  chmodSync(sibling, 0o755)
+  const logs = []
+  const options = serveOptions()
+  const { server, input, send, waitForFrame } = startTestServer(options, {
+    startupSweepDelayMs: 60_000,
+    env: { PATH: '', DSH_HOME: ABSENT_DSH_HOME },
+    platform: 'linux',
+    execPath: current,
+    listDir: (directory) => {
+      assert.equal(directory, join(base, 'versions', 'node'))
+      return ['v22.19.0', 'v20.19.0']
+    },
+    log: (line) => logs.push(line),
+  })
+  try {
+    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
+    await waitForFrame(1)
+    send({ jsonrpc: '2.0', method: 'notifications/initialized' })
+    await waitUntil(() => logs.some((line) => line.startsWith('cannot find the dsh launcher')))
+    const line = logs.find((candidate) => candidate.startsWith('cannot find the dsh launcher'))
+    assert.match(line, /cannot find the dsh launcher for this Node \(v\d+\.\d+\.\d+\)/)
+    assert.ok(line.includes(`found one under Node 20.19.0 at ${sibling}`), line)
+  } finally {
+    input.end()
+    await server.done
+    rmSync(base, { recursive: true, force: true })
+    rmSync(options.root, { recursive: true, force: true })
+    rmSync(options.stateDir, { recursive: true, force: true })
+  }
+})
+
+test('a call without dsh carries the same sibling launcher sentence as the start log', async () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-nvm-call-')))
+  const current = join(base, 'versions', 'node', 'v22.19.0', 'bin', 'node')
+  const sibling = join(base, 'versions', 'node', 'v20.19.0', 'bin', 'dsh')
+  mkdirSync(join(base, 'versions', 'node', 'v20.19.0', 'bin'), { recursive: true })
+  writeFileSync(sibling, '#!/bin/sh\nexit 0\n')
+  chmodSync(sibling, 0o755)
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-nvm-root-')))
+  const service = createService(
+    {
+      ...parseOptions([], {}, config),
+      root,
+      isolate: 'none',
+      env: { PATH: '', DSH_HOME: ABSENT_DSH_HOME },
+      resolveDshCommand: (env) =>
+        resolveDshCommand(env, 'linux', {
+          execPath: current,
+          listDir: () => ['v22.19.0', 'v20.19.0'],
+          nodeVersion: 'v22.19.0',
+        }),
+    },
+    () => {},
+  )
+  try {
+    await assert.rejects(service.flashTask({ task: 'say hello', cwd: root }), (error) => {
+      assert.match(error.message, /cannot find the dsh launcher for this Node \(v22\.19\.0\)/)
+      assert.ok(error.message.includes(`found one under Node 20.19.0 at ${sibling}`), error.message)
+      assert.match(error.message, /FLASH_DSH_BIN/)
+      return true
+    })
+  } finally {
+    await service.close()
+    rmSync(base, { recursive: true, force: true })
+    rmSync(root, { recursive: true, force: true })
   }
 })

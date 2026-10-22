@@ -21,8 +21,12 @@ node "${CLAUDE_PLUGIN_ROOT}/packages/flash-mcp/lib/index.js" doctor
 Every line is a check; every failure prints the command that repairs it. The doctor checks the
 default model and every model on the allowlist: the default's absence fails, while another one's
 absence only warns. A `profile-models` warning means the installed profile predates model choice
-and needs the installer rerun (step 4). If all checks pass and `profile-models` is not warning,
-skip to step 5. Otherwise fix them in the order below — later checks depend on earlier ones.
+and needs the installer rerun (step 4), and a `profile-version` warning means the profile is not
+installed or came from another release than this server, with `node install.mjs` as the fix. On
+Windows, `slot-path-length` warns when the first copy's path is long enough that MSVC's `cl.exe`
+and other tools without long-path support may fail; step 5 says what to set. If all checks pass
+and none of those warns, skip to step 5. Otherwise fix them in the order below — later checks
+depend on earlier ones.
 
 ## 2. The harness
 
@@ -67,10 +71,12 @@ node "${CLAUDE_PLUGIN_ROOT}/install.mjs"
 ```
 
 This renders two profiles into `$DSH_HOME/profiles` — the writing service and its
-read-only twin — from `flash.config.json`. Re-run it after changing that file, and once after
-upgrading from 0.1.5 or older: a profile installed before 0.1.6 pins one literal model and cannot
-run a per-call choice. Then confirm with the doctor again; the `profile` check must pass, and
-`profile-models` must not warn.
+read-only twin — from `flash.config.json`. Re-run it after changing that file and after every
+plugin update: an update replaces the server but not the guard or the profiles the server runs
+with, so the old guard stays in place until the installer rewrites it. Run it once after upgrading
+from 0.1.5 or older too: a profile installed before 0.1.6 pins one literal model and cannot run a
+per-call choice. Then confirm with the doctor again; `profile` must pass, and `profile-models` and
+`profile-version` must not warn.
 
 ## 5. Prove it end to end
 
@@ -103,7 +109,10 @@ If it is large or slow, point at the largest entries it lists and at a `.flash-a
 the project root (`copyExclude`, `slotEnv`; see the README's "Per-repository settings"). `.env`,
 `.env.*` and `.mcp.json` are already left out by default. `slotEnv` takes `"NAME": "value:<text>"`
 for a plain value set in every copy — a prebuilt OpenSSL, `RUSTC_WRAPPER` — so briefs need not
-repeat it.
+repeat it. On Windows, if `slot-path-length` warns, the copy's root is already long before the
+project's own build folders are added: point the plugin's **Base folder for worker copies** setting
+(`state_base`, or `FLASH_STATE_BASE` / `--state-base` for a manual install) at a short absolute
+folder such as `C:\fm`. It moves the default copy layout only, and a leading `~` expands.
 
 ## 6. Tell them what they have
 

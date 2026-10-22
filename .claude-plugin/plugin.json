@@ -1,7 +1,7 @@
 {
   "name": "flash-agents",
   "displayName": "Flash Agents",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "author": {
     "name": "Thomas Wiesner",
     "url": "https://github.com/tomw1808"
@@ -28,6 +28,7 @@
         "FLASH_SLOTS": "${user_config.slots}",
         "FLASH_ISOLATE": "${user_config.isolate}",
         "FLASH_STATE_DIR": "${user_config.state_dir}",
+        "FLASH_STATE_BASE": "${user_config.state_base}",
         "FLASH_ALLOW_SLOT_SETUP": "${user_config.allow_slot_setup}"
       }
     }
@@ -71,6 +72,12 @@
       "type": "directory",
       "title": "State directory",
       "description": "Where worker copies and returned patches live. Leave empty for the defaults: copies in a private directory under the system temp area, patches in your user data directory, where a reboot cannot remove them. Set a fixed path to make worker session history browsable.",
+      "required": false
+    },
+    "state_base": {
+      "type": "directory",
+      "title": "Base folder for worker copies",
+      "description": "The base folder for the default per-repository copy layout, used when no state directory is set. Leave empty for the system temp area. It must be an absolute path; a short one such as C:\\fm leaves room for Windows tools that ignore long-path support.",
       "required": false
     }
   }

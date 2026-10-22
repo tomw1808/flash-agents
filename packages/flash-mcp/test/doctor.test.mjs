@@ -14,7 +14,16 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
 
-import { CHECK_IDS, formatChecks, profileHonoursModelEnv, resolveDshHome, runChecks } from '../lib/doctor.js'
+import {
+  CHECK_IDS,
+  FLASH_MCP_VERSION,
+  formatChecks,
+  profileHonoursModelEnv,
+  profileVersionWarning,
+  readProfileStamp,
+  resolveDshHome,
+  runChecks,
+} from '../lib/doctor.js'
 
 /** Look up one check in a report by id. @param {object} result @param {string} id */
 function find(result, id) {
@@ -31,7 +40,16 @@ const NODE_PTY_MANIFEST = `${NODE_PTY_DIR}/package.json`
 /** A fake harness home whose installed service profile honours FLASH_ROUTE_MODEL. */
 const FAKE_DSH_HOME = '/fake/home/.dsh'
 const FAKE_PROFILE_PATCH = `${FAKE_DSH_HOME}/profiles/flash-service/cordis.patch.yml`
+const FAKE_PROFILE_DIR = `${FAKE_DSH_HOME}/profiles/flash-service`
+const FAKE_READONLY_DIR = `${FAKE_DSH_HOME}/profiles/flash-service-readonly`
+const FAKE_STAMP = `${FAKE_PROFILE_DIR}/plugins/package.json`
+const FAKE_READONLY_STAMP = `${FAKE_READONLY_DIR}/plugins/package.json`
 const HONOURING_PATCH = 'agent-default-model:\n  config:\n    model: !!js process.env.FLASH_ROUTE_MODEL || "deepseek-v4.1-flash:cloud"\n'
+
+/** A release stamp as `install.mjs` writes it beside a profile's plugins. */
+function stampText(version) {
+  return JSON.stringify({ private: true, type: 'module', flashAgents: { version } })
+}
 
 /**
  * A filesystem probe over an in-memory tree, so the native-module check can run
@@ -98,7 +116,15 @@ function nativeInstall(spec = {}) {
   const prebuildDir = `${NODE_PTY_DIR}/prebuilds/${platform}-${arch}`
   const buildDir = `${NODE_PTY_DIR}/build/Release`
   const loadedDir = pty === 'build' ? buildDir : prebuildDir
-  const files = { [FAKE_PROFILE_PATCH]: HONOURING_PATCH }
+  const files = {
+    [FAKE_PROFILE_PATCH]: HONOURING_PATCH,
+    // A working install has both profile directories and both release stamps, the read-only
+    // profile included: a call with mode "read-only" boots that one.
+    [FAKE_PROFILE_DIR]: null,
+    [FAKE_READONLY_DIR]: null,
+    [FAKE_STAMP]: stampText(FLASH_MCP_VERSION),
+    [FAKE_READONLY_STAMP]: stampText(FLASH_MCP_VERSION),
+  }
   const executables = []
   if (locateDsh) files[DSH_MANIFEST] = JSON.stringify({ name: '@deepseek-ai/dsh' })
   if (pty === 'prebuild') files[`${prebuildDir}/${binary}`] = null
@@ -156,11 +182,15 @@ function fakeOptions(behaviors = {}, options = {}) {
   return { options: { run, probe: async () => daemon, generate, nodePath, nodeVersion: '22.19.0', dshHome: FAKE_DSH_HOME, ...native, ...options }, calls }
 }
 
-test('reports ten ok checks for a fully working environment', async () => {
+test('reports eleven ok checks for a fully working environment', async () => {
   const { options } = fakeOptions()
   const result = await runChecks(options)
-  assert.equal(result.checks.length, 10)
-  assert.deepEqual(result.checks.map((check) => check.id), [...CHECK_IDS])
+  // The slot-path row is Windows-only, so a Unix run reports every other id.
+  assert.equal(result.checks.length, CHECK_IDS.length - 1)
+  assert.deepEqual(
+    result.checks.map((check) => check.id),
+    CHECK_IDS.filter((id) => id !== 'slot-path-length'),
+  )
   assert.ok(result.checks.every((check) => check.status === 'ok'))
   assert.equal(result.ok, true)
   assert.equal(result.failures, 0)
@@ -748,6 +778,147 @@ test('profile-models is ok when the installed profile reads FLASH_ROUTE_MODEL', 
   assert.match(check.detail, /every allowed model can run/)
 })
 
+test('profile-version is ok when the stamp matches this server', async () => {
+  const result = await runChecks(fakeOptions().options)
+  const check = find(result, 'profile-version')
+  assert.equal(check.status, 'ok')
+  assert.match(check.detail, new RegExp(`installed by flash-agents ${FLASH_MCP_VERSION.replace(/\./g, '\\.')}`))
+  assert.equal(result.ok, true)
+})
+
+test('profile-version warns for a missing stamp and for another release', async () => {
+  // The profile directory exists, so the only thing missing is the stamp: that is the
+  // "older release" case, not an uninstalled profile.
+  const missing = fakeFs({
+    files: { [FAKE_PROFILE_PATCH]: HONOURING_PATCH, [FAKE_PROFILE_DIR]: null, [FAKE_READONLY_STAMP]: stampText(FLASH_MCP_VERSION), [FAKE_READONLY_DIR]: null },
+  })
+  const missingResult = await runChecks(fakeOptions({}, { fs: missing.probe }).options)
+  const missingRow = find(missingResult, 'profile-version')
+  assert.equal(missingRow.status, 'warn')
+  assert.match(missingRow.detail, /installed by an older release, not \d+\.\d+\.\d+/)
+  assert.match(missingRow.detail, /run node install\.mjs in the plugin folder/)
+  assert.match(missingRow.detail, /then reconnect/)
+  assert.equal(missingRow.fix, 'node install.mjs')
+  assert.equal(missingResult.ok, true)
+
+  const older = fakeFs({
+    files: {
+      [FAKE_PROFILE_PATCH]: HONOURING_PATCH,
+      [FAKE_PROFILE_DIR]: null,
+      [FAKE_READONLY_DIR]: null,
+      [FAKE_STAMP]: stampText('0.0.9'),
+      [FAKE_READONLY_STAMP]: stampText(FLASH_MCP_VERSION),
+    },
+  })
+  const olderResult = await runChecks(fakeOptions({}, { fs: older.probe }).options)
+  const olderRow = find(olderResult, 'profile-version')
+  assert.equal(olderRow.status, 'warn')
+  assert.match(olderRow.detail, /installed by 0\.0\.9, not /)
+})
+
+test('an absent profile directory is called not installed, not an older release', async () => {
+  const { probe: fs } = fakeFs({ files: {} })
+  const result = await runChecks(fakeOptions({}, { fs }).options)
+  const row = find(result, 'profile-version')
+  assert.equal(row.status, 'warn')
+  assert.ok(
+    row.detail.includes(
+      `the worker profile ${FAKE_PROFILE_DIR} is not installed: run node install.mjs in the plugin folder (`,
+    ),
+    row.detail,
+  )
+  assert.doesNotMatch(row.detail, /older release/)
+})
+
+test('a stale read-only profile gets its own warning naming its directory', async () => {
+  const files = {
+    [FAKE_PROFILE_PATCH]: HONOURING_PATCH,
+    [FAKE_PROFILE_DIR]: null,
+    [FAKE_READONLY_DIR]: null,
+    [FAKE_STAMP]: stampText(FLASH_MCP_VERSION),
+    [FAKE_READONLY_STAMP]: stampText('0.0.8'),
+  }
+  const { probe: fs } = fakeFs({ files })
+  const result = await runChecks(fakeOptions({}, { fs }).options)
+  const row = find(result, 'profile-version')
+  assert.equal(row.status, 'warn')
+  assert.ok(row.detail.includes(`the worker profile in ${FAKE_READONLY_DIR} was installed by 0.0.8, not`), row.detail)
+  assert.equal(row.detail.includes(`the worker profile in ${FAKE_PROFILE_DIR} was installed`), false, 'the current writing profile is not named')
+
+  // Two stale profiles are two warnings, both on the one row.
+  const both = fakeFs({
+    files: { ...files, [FAKE_STAMP]: stampText('0.0.9') },
+  })
+  const bothResult = await runChecks(fakeOptions({}, { fs: both.probe }).options)
+  const bothRow = find(bothResult, 'profile-version')
+  assert.ok(bothRow.detail.includes(FAKE_PROFILE_DIR), bothRow.detail)
+  assert.ok(bothRow.detail.includes(FAKE_READONLY_DIR), bothRow.detail)
+  assert.match(bothRow.detail, /installed by 0\.0\.9, not .* the worker profile in .*flash-service-readonly was installed by 0\.0\.8/)
+})
+
+test('readProfileStamp and profileVersionWarning read the generated plugins manifest', () => {
+  const home = mkdtempSync(join(tmpdir(), 'flash-doctor-stamp-'))
+  try {
+    assert.equal(readProfileStamp(home), undefined)
+    const plugins = join(home, 'profiles', 'flash-service', 'plugins')
+    mkdirSync(plugins, { recursive: true })
+    writeFileSync(join(plugins, 'package.json'), '{ not json')
+    assert.equal(readProfileStamp(home), undefined, 'an unreadable stamp is an older release')
+    writeFileSync(
+      join(plugins, 'package.json'),
+      JSON.stringify({ private: true, type: 'module', flashAgents: { version: '9.9.9' } }),
+    )
+    assert.equal(readProfileStamp(home), '9.9.9')
+    const warning = profileVersionWarning({
+      dshHome: home,
+      version: '1.2.3',
+      pluginFolder: '/repo',
+    })
+    assert.equal(
+      warning,
+      `the worker profile in ${join(home, 'profiles', 'flash-service')} was installed by 9.9.9, not 1.2.3: ` +
+        'run node install.mjs in the plugin folder (/repo), then reconnect',
+    )
+    // The read-only profile is a separate stamp; once it matches too, nothing is stale.
+    const readOnlyPlugins = join(home, 'profiles', 'flash-service-readonly', 'plugins')
+    mkdirSync(readOnlyPlugins, { recursive: true })
+    writeFileSync(join(readOnlyPlugins, 'package.json'), stampText('9.9.9'))
+    assert.equal(profileVersionWarning({ dshHome: home, version: '9.9.9' }), undefined)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('slot-path-length warns on Windows with a long base and is absent elsewhere', async () => {
+  const win32 = nativeInstall({ platform: 'win32' })
+  const longBase = 'C:\\Users\\a-long-user-name\\AppData\\Local\\Temp\\flash-mcp-for-a-deep-project'
+  const long = await runChecks(fakeOptions({}, { ...win32, root: '/repo', stateBase: longBase }).options)
+  const row = find(long, 'slot-path-length')
+  assert.equal(row.status, 'warn')
+  assert.match(row.detail, /^slot copies live at .*slot-0[\\/] \(\d+ characters\); Windows tools without long-path support/)
+  assert.match(row.detail, /MSVC cl\.exe/)
+  assert.match(row.detail, /A short base leaves more room: set the plugin option "state_base" \(or FLASH_STATE_BASE\) to a folder such as C:\\fm/)
+  assert.match(row.fix, /"state_base".*FLASH_STATE_BASE/)
+
+  const short = await runChecks(fakeOptions({}, { ...win32, root: '/repo', stateBase: 'C:\\fm' }).options)
+  const shortRow = find(short, 'slot-path-length')
+  assert.equal(shortRow.status, 'ok')
+  assert.match(shortRow.detail, /slot copies live at C:\\fm\//)
+
+  // A `~` base is measured where the server would expand it, not as a literal `~`
+  // directory; the injected home keeps the row off this machine's real home, and a short
+  // one keeps the measured path under the advisory.
+  const tilde = await runChecks(
+    fakeOptions({}, { ...win32, root: '/repo', stateBase: '~/fm', home: '/h' }).options,
+  )
+  const tildeRow = find(tilde, 'slot-path-length')
+  assert.equal(tildeRow.status, 'ok')
+  assert.match(tildeRow.detail, /slot copies live at \/h\/fm\//)
+
+  const linux = await runChecks(fakeOptions().options)
+  assert.equal(find(linux, 'slot-path-length'), undefined, 'the row exists only on Windows')
+})
+
 test('profileHonoursModelEnv reads the installed patch and fails closed', () => {
   const home = mkdtempSync(join(tmpdir(), 'flash-profile-home-'))
   try {
@@ -830,9 +1001,12 @@ test('formats one line per check and a Fix line per broken one', async () => {
   const text = formatChecks(result)
   const lines = text.split('\n')
   const checkLines = lines.filter((line) => /^(ok|warn|fail)\s/.test(line))
-  assert.equal(checkLines.length, 9)
+  // dsh-native is skipped without a running dsh, and slot-path-length is Windows-only.
+  assert.equal(checkLines.length, CHECK_IDS.length - 2)
   // dsh did not start here, so its native-module check is not run at all.
-  for (const id of CHECK_IDS.filter((id) => id !== 'dsh-native')) assert.ok(text.includes(id), `missing ${id}`)
+  for (const id of CHECK_IDS.filter((id) => id !== 'dsh-native' && id !== 'slot-path-length')) {
+    assert.ok(text.includes(id), `missing ${id}`)
+  }
   const fixLines = lines.filter((line) => line.startsWith('Fix:'))
   const broken = result.checks.filter((check) => check.status !== 'ok')
   assert.equal(fixLines.length, broken.length)

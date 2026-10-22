@@ -28,20 +28,23 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { serveStdio, describeError } from './mcp.js'
 import { DEFAULT_MODEL, FlashTaskService, readTaskFile, taskLabel } from './service.js'
-import { DEFAULT_INITIALIZE_TIMEOUT_MS } from './sdk.js'
+import { DEFAULT_INITIALIZE_TIMEOUT_MS, resolveDshCommand } from './sdk.js'
 import { JobRegistry, JOB_TOOLS } from './jobs.js'
 import { allowedModels, loadConfig } from './config.js'
-import { formatChecks, resolveDshHome, runChecks } from './doctor.js'
-import { WorkspaceIsolation, cleanLayout } from './isolation.js'
+import { FLASH_MCP_VERSION, formatChecks, profileVersionWarnings, resolveDshHome, runChecks } from './doctor.js'
+import { WorkspaceIsolation, cleanLayout, requireAbsoluteStateBase } from './isolation.js'
+
+/** The repository root this server runs from, named in the profile-stamp warning. */
+const REPO_ROOT = resolve(fileURLToPath(new URL('../../../', import.meta.url)))
 
 /** Server identity reported to the MCP client. */
-export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: '0.1.7' })
+export const SERVER_INFO = Object.freeze({ name: 'flash-mcp', version: FLASH_MCP_VERSION })
 
 /**
  * How often a `flash_result` call that is waiting tells the MCP client it is alive. The
@@ -323,6 +326,10 @@ export function listTools(models = [DEFAULT_MODEL]) {
         'started from, which the service keeps with the patch. Your index is never touched; a',
         'conflict leaves conflict markers in the named files and is listed in `conflicts`.',
         '`dryRun` with `threeWay` predicts the conflicts without writing anything.',
+        '',
+        'The result\'s `drift` says how far your tree moved since the patch\'s base (`commitsBehind`)',
+        'and which of the patch\'s own files you changed in the meantime (`filesChangedSince`); a',
+        'non-empty file list also comes back as a warning before you apply.',
       ].join('\n'),
       inputSchema: {
         type: 'object',
@@ -366,6 +373,10 @@ export function listTools(models = [DEFAULT_MODEL]) {
         'id, the session and any taskFile path) is on every page, and the worker\'s final report',
         '(`finalMessage`, the first 8,000 characters; `finalMessageTruncated` says when it was cut)',
         'is on the page that starts at offset 0.',
+        '',
+        'The result\'s `drift` says how far your tree has moved since the patch\'s base: `commitsBehind`',
+        'and the patch\'s own files you changed since the worker\'s copy was made (`filesChangedSince`).',
+        'It is on the page that starts at offset 0, and is `null` once the patch was applied.',
       ].join('\n'),
       inputSchema: {
         type: 'object',
@@ -410,9 +421,12 @@ export function listTools(models = [DEFAULT_MODEL]) {
  * @param {string[]} [argv] - arguments after the command name.
  * @param {Record<string, string | undefined>} [env] - environment to read.
  * @param {object} [config] - resolved configuration; loaded from disk by default.
+ * @param {object} [options] - effects a test can inject.
+ * @param {string} [options.home] - the home directory a `~` in `--state-base` expands
+ *   against (default the process's; injectable so a test needs no real home).
  * @returns {object} the service options.
  */
-export function parseOptions(argv = process.argv.slice(2), env = process.env, config = loadConfig({ env })) {
+export function parseOptions(argv = process.argv.slice(2), env = process.env, config = loadConfig({ env }), { home = homedir() } = {}) {
   const options = {
     root: textFrom(env.FLASH_SERVICE_ROOT) ?? process.cwd(),
     profile: textFrom(env.FLASH_SERVICE_PROFILE) ?? 'flash-service',
@@ -439,6 +453,9 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
     isolate: textFrom(env.FLASH_ISOLATE) ?? 'copy',
     slots: numberFrom(env.FLASH_SLOTS, config.limits.slots),
     stateDir: textFrom(env.FLASH_STATE_DIR),
+    // The base of the default per-root/per-process layout. `--state-dir` replaces that
+    // layout entirely and wins over this; a base only moves where the default lives.
+    stateBase: textFrom(env.FLASH_STATE_BASE),
     copyExclude: listFrom(env.FLASH_COPY_EXCLUDE),
     // Running a repository's `slotSetup` steps is host code outside the worker's sandbox,
     // so it is off unless the operator explicitly says yes.
@@ -488,6 +505,9 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
       case '--state-dir':
         options.stateDir = next()
         break
+      case '--state-base':
+        options.stateBase = next()
+        break
       case '--copy-exclude':
         options.copyExclude = listFrom(next())
         break
@@ -526,6 +546,10 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
   if (options.isolate !== 'copy' && options.isolate !== 'none') {
     throw new Error(`--isolate ${JSON.stringify(options.isolate)} is not available; use "copy" (default) or "none"`)
   }
+  // A relative base is resolved against the service root, which puts the copies inside the
+  // caller's repository; `~` is expanded first, exactly as `DSH_HOME` is. Refusing here
+  // means `serve`, `clean` and `doctor` report the same sentence before anything exists.
+  options.stateBase = requireAbsoluteStateBase(options.stateBase, home)
   return options
 }
 
@@ -551,7 +575,7 @@ function usage() {
 Usage: flash-agents [serve] [options]           serve the MCP stdio protocol (the default)
        flash-agents doctor [--profile <id>] [--e2e] [--copy [--root <path>]]
                                                 check the prerequisites and print the fixes
-       flash-agents clean [--all] [--root <path>]
+       flash-agents clean [--all] [--root <path>] [--state-base <path>]
                                                 report the state directory per root and
                                                 remove dead trees and expired patches
 
@@ -581,7 +605,13 @@ Options:
   --state-dir <path>        where slot trees and returned patches live (default: trees in a
                             directory private to this root and this process under TMPDIR,
                             patches in FLASH_DATA_DIR or the platform data directory); a
-                            configured directory is shared, so one service per directory
+                            configured directory is shared, so one service per directory;
+                            wins over --state-base
+  --state-base <path>       base directory under which the default
+                            <base>/<digest>/<pid>/<instance>/ layout is created (default:
+                            $TMPDIR/flash-mcp); it must be absolute, and a leading ~ is
+                            expanded; on Windows a short base such as C:\\fm leaves room
+                            for tools that ignore long-path support
   --copy-exclude <a,b,c>    names left out of a disposable copy: a bare name matches at any
                             depth, one with a slash is a path relative to the root; a match
                             is left out only where git ignores it and tracks nothing under it
@@ -603,7 +633,7 @@ Options:
 Environment: FLASH_SERVICE_ROOT, FLASH_SERVICE_PROFILE, FLASH_SERVICE_PROVIDER,
 FLASH_SERVICE_MODEL, FLASH_MODELS, FLASH_TASK_TIMEOUT_MS, FLASH_INIT_TIMEOUT_MS, FLASH_IDLE_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS,
 FLASH_MAX_TASKS, FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
-FLASH_STATE_DIR, FLASH_COPY_EXCLUDE, FLASH_ALLOW_SLOT_SETUP, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_MAX_STATE_BYTES, FLASH_LOG_FILE,
+FLASH_STATE_DIR, FLASH_STATE_BASE, FLASH_COPY_EXCLUDE, FLASH_ALLOW_SLOT_SETUP, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_MAX_STATE_BYTES, FLASH_LOG_FILE,
 FLASH_DSH_BIN.
 
 The route and the numeric limits default to flash.config.json, the one file that owns
@@ -1004,8 +1034,30 @@ function modelChoices(model, models) {
  * @returns {FlashTaskService} the service.
  */
 export function createService(options, log = () => {}, { deferStartupSweep = false } = {}) {
+  // The profile stamps are read only when the caller asks for it. This is the server's
+  // start, where naming a stale profile is worth one log line and a warning on every
+  // flash_task and flash_batch result. `doctor --e2e` builds the same service but must
+  // read no real harness home, so it does not set the flag: handing in an environment is
+  // not the same request as asking to inspect the profiles installed in it.
+  const startupWarnings = []
+  // Without an environment there is no `DSH_HOME` to resolve, and falling back to the
+  // process's own home would read the real `~/.dsh` on a caller that never named one.
+  if (options?.checkProfileStamp === true && options.env !== undefined) {
+    const warnings = profileVersionWarnings({
+      dshHome: resolveDshHome(options.env?.DSH_HOME, options?.home ?? homedir()),
+      profile: options?.profile ?? 'flash-service',
+      pluginFolder: REPO_ROOT,
+    })
+    for (const warning of warnings) {
+      // One line per stale profile at start: the operator sees the drift before the first
+      // call, and the same sentence comes back in flash_task/flash_batch results while it holds.
+      log(warning)
+      startupWarnings.push(warning)
+    }
+  }
   return new FlashTaskService({
     ...options,
+    startupWarnings,
     // The service's allowlist always holds its own default first, whichever door named it
     // (`route.models`, FLASH_MODELS, or --model).
     models: modelChoices(options?.model, options?.models),
@@ -1013,6 +1065,9 @@ export function createService(options, log = () => {}, { deferStartupSweep = fal
       mode: options.isolate,
       ...(options.slots === undefined ? {} : { slots: options.slots }),
       ...(options.stateDir === undefined ? {} : { stateDir: options.stateDir }),
+      // `--state-dir` replaces the default layout outright, so its base is irrelevant then;
+      // `WorkspaceIsolation` already prefers `stateDir` when both are present.
+      ...(options.stateBase === undefined ? {} : { baseDir: options.stateBase }),
       ...(options.copyExclude === undefined ? {} : { copyExclude: options.copyExclude }),
       ...(options.allowSlotSetup === true ? { allowSlotSetup: true } : {}),
       ...(options.diffChars === undefined ? {} : { diffChars: options.diffChars }),
@@ -1046,15 +1101,31 @@ const STARTUP_SWEEP_FALLBACK_MS = 5_000
  * @param {object} [options] - parsed options.
  * @param {NodeJS.ReadableStream} [input] - protocol input.
  * @param {NodeJS.WritableStream} [output] - protocol output.
- * @param {object} [timing] - timings a test can shorten.
+ * @param {object} [timing] - timings and effects a test can shorten or inject.
  * @param {number} [timing.startupSweepDelayMs] - fallback delay before the start-up sweep.
+ * @param {Record<string, string | undefined>} [timing.env] - environment for the service and
+ *   the start probes (default `options.env`, then process.env).
+ * @param {string} [timing.platform] - platform the start probes resolve for (default process.platform).
+ * @param {string} [timing.execPath] - the running Node binary the launcher probe searches
+ *   version-manager siblings of (default process.execPath).
+ * @param {(directory: string) => string[]} [timing.listDir] - directory listing for that
+ *   sibling lookup; injectable so a start-log test needs no real nvm layout.
+ * @param {(message: string) => void} [timing.log] - extra diagnostic sink, so a test can
+ *   read the start log without capturing the process's stderr.
  * @returns {{service: FlashTaskService, connection: {close: () => void}, done: Promise<void>}}
  */
 export function startServer(
   options,
   input = process.stdin,
   output = process.stdout,
-  { startupSweepDelayMs = STARTUP_SWEEP_FALLBACK_MS } = {},
+  {
+    startupSweepDelayMs = STARTUP_SWEEP_FALLBACK_MS,
+    env,
+    platform = process.platform,
+    execPath = process.execPath,
+    listDir,
+    log: extraLog,
+  } = {},
 ) {
   const logFile =
     typeof options.logFile === 'string' && options.logFile.length > 0 ? options.logFile : undefined
@@ -1077,6 +1148,7 @@ export function startServer(
   const log = (message) => {
     const line = `[flash-mcp] ${message}`
     process.stderr.write(`${line}\n`)
+    extraLog?.(message)
     if (logFd === undefined) return
     try {
       appendFileSync(logFd, `${new Date().toISOString()} ${line}\n`)
@@ -1085,7 +1157,12 @@ export function startServer(
       reportLogFileFailure(error)
     }
   }
-  const service = createService(options, log, { deferStartupSweep: true })
+  const environment = env ?? options.env ?? process.env
+  // Only the server checks the installed profile stamps: it is the long-lived process whose
+  // results carry the warning, and the operator starts it against their real harness home.
+  const service = createService({ ...options, env: environment, platform, checkProfileStamp: true }, log, {
+    deferStartupSweep: true,
+  })
   log(`root ${service.root}; profile ${service.profile}; route ${service.provider}/${service.model}`)
   if (service.isolation === undefined) {
     log(
@@ -1106,6 +1183,32 @@ export function startServer(
     void service.isolation?.startupSweep()
   }
 
+  // The launcher is resolved once, after the handshake, so a missing `dsh` is one log
+  // line at start instead of every call failing seconds later. Resolution is only a few
+  // file lookups, but it is queued so it can never sit between `initialize` and its answer.
+  let probeStarted = false
+  const startLauncherProbe = () => {
+    if (probeStarted) return
+    probeStarted = true
+    setImmediate(() => {
+      try {
+        resolveDshCommand(environment, platform, {
+          execPath,
+          ...(listDir === undefined ? {} : { listDir }),
+        })
+      } catch (error) {
+        // The per-call path resolves the same launcher and throws the same sentence, so
+        // the start log and a failed call cannot disagree about what is wrong.
+        log(describeError(error))
+      }
+    })
+  }
+
+  const startStartupWork = (trigger) => {
+    startSweep(trigger)
+    startLauncherProbe()
+  }
+
   const models = modelChoices(service.model, service.models)
   const connection = serveStdio({
     serverInfo: SERVER_INFO,
@@ -1115,10 +1218,10 @@ export function startServer(
     input,
     output,
     callTool: createToolCaller({ service, jobs: new JobRegistry({ log }), log }),
-    onInitialized: () => startSweep('after initialize'),
+    onInitialized: () => startStartupWork('after initialize'),
   })
   // Unref'd: the fallback must never be the reason a finished process stays alive.
-  const sweepTimer = setTimeout(() => startSweep('after 5s without initialized'), startupSweepDelayMs)
+  const sweepTimer = setTimeout(() => startStartupWork('after 5s without initialized'), startupSweepDelayMs)
   sweepTimer.unref?.()
 
   const done = new Promise((resolveDone) => {
@@ -1277,6 +1380,9 @@ export async function runDoctor(
       dshVersion: config.dsh.version,
       profile: options.profile,
       dshHome: resolveDshHome(textFrom(env.DSH_HOME)),
+      root: options.root,
+      ...(options.stateDir === undefined ? {} : { stateDir: options.stateDir }),
+      ...(options.stateBase === undefined ? {} : { stateBase: options.stateBase }),
       ...(run === undefined ? {} : { run }),
       ...(probe === undefined ? {} : { probe }),
       ...(generate === undefined ? {} : { generate }),
@@ -1407,6 +1513,8 @@ async function runE2eSteps({ options, emit, makeService, env, model, cleanup }) 
         stateDir: join(stateRoot, 'state'),
         taskTimeoutMs: E2E_TIMEOUT_MS,
         // The doctor's environment, so the run reads (and writes) no real harness home.
+        // No `checkProfileStamp`: this run must not inspect the profiles installed in that
+        // environment, only prove the runtime the server would start.
         env,
       },
       (message) => serviceLog.push(message),
@@ -1746,10 +1854,13 @@ function canonicalRoot(root) {
 
 const CLEAN_USAGE = `flash-agents clean — report and reclaim the flash-mcp state directory
 
-Usage: flash-agents clean [--all] [--root <path>] [--patch-retention-days <n>]
+Usage: flash-agents clean [--all] [--root <path>] [--state-base <path>] [--patch-retention-days <n>]
 
   --all                      also remove the slot trees of roots with no live server
   --root <path>              service root whose digest is swept (default: cwd)
+  --state-base <path>        base directory of the default layout (default: $TMPDIR/flash-mcp,
+                             or FLASH_STATE_BASE); it must be absolute and a leading ~ is
+                             expanded; pass the same base the server runs with
   --patch-retention-days <n> days an unapplied patch is kept (default: flash.config.json)
 
 The default removes what a server startup removes for --root: dead owners (salvaging
@@ -1774,13 +1885,19 @@ directories. Patches are never removed by --all.
  * @param {Record<string, string | undefined>} [options.env] - environment to read.
  * @param {(text: string) => void} [options.write] - output sink.
  * @param {string} [options.baseDir] - the state base directory, for tests.
+ * @param {string} [options.home] - the home directory a `~` base expands against (default
+ *   the process's; injectable so a test needs no real home).
  * @param {number} [options.now] - the current time, for tests.
  * @returns {Promise<number>} the exit code: 0 unless an argument is unknown.
  */
-export async function runClean(argv = [], { env = process.env, write, baseDir, now } = {}) {
+export async function runClean(argv = [], { env = process.env, write, baseDir, home = homedir(), now } = {}) {
   const emit = write ?? ((text) => process.stdout.write(text))
   let all = false
   let root = textFrom(env.FLASH_SERVICE_ROOT) ?? process.cwd()
+  // The base the server's default layout sits under: `--state-base` overrides the
+  // environment, and an injected base (tests) is the starting point so a flag can still
+  // move it. Without any, `cleanLayout` uses the platform temp base.
+  let base = baseDir ?? textFrom(env.FLASH_STATE_BASE)
   /** @type {number | undefined} */
   let retentionDays
   for (let index = 0; index < argv.length; index += 1) {
@@ -1792,6 +1909,7 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, n
     }
     if (flag === '--all') all = true
     else if (flag === '--root') root = next()
+    else if (flag === '--state-base') base = next()
     else if (flag === '--patch-retention-days') retentionDays = numberFrom(next(), undefined)
     else if (flag === '--help' || flag === '-h') {
       emit(CLEAN_USAGE)
@@ -1799,9 +1917,13 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, n
     } else throw new Error(`unknown argument "${flag}"`)
   }
   const config = loadConfig({ env })
+  // The base `clean` sweeps is the base the server would create: `~` expanded, and a
+  // relative path refused, because a relative base resolves against the service root and
+  // would make `clean` work inside the caller's repository instead of under the state base.
+  base = requireAbsoluteStateBase(base, home)
   const dataDir = textFrom(env.FLASH_DATA_DIR)
   const report = cleanLayout({
-    ...(baseDir === undefined ? {} : { baseDir }),
+    ...(base === undefined ? {} : { baseDir: base }),
     ...(dataDir === undefined ? {} : { dataDir }),
     root: canonicalRoot(root),
     all,

@@ -32,6 +32,7 @@ import { dirname, join } from 'node:path'
 
 import { WorkspaceIsolation, prunePatches, rootDigest } from '../lib/isolation.js'
 import { FlashTaskError, FlashTaskService } from '../lib/service.js'
+import { listTools } from '../lib/index.js'
 
 const GIT_ID = ['-c', 'user.email=t@t', '-c', 'user.name=t']
 
@@ -279,7 +280,423 @@ test('a stored change reports patchPath and the files its clipped diff omitted',
   await service.close()
 })
 
+// ── drift from the patch's base ─────────────────────────────────────────────
+
+/** A file long enough that a worker hunk and a caller edit elsewhere do not share context. */
+const TWELVE_LINES = 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n'
+
+test('apply and readPatch report a tree that moved by an unrelated commit', async () => {
+  const repo = makeRepo({ 'f.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, 'f.txt'), TWELVE_LINES.replace('l2\n', 'l2 WORKER\n'))
+  })
+  // Another session commits something else: HEAD moves, the patch's file does not.
+  writeFileSync(join(repo, 'unrelated.txt'), 'other work\n')
+  commit(repo, 'unrelated work')
+
+  const page = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+  assert.deepEqual(dry.drift, { commitsBehind: 1, filesChangedSince: [] })
+  assert.deepEqual(page.drift, dry.drift, 'readPatch carries the same drift')
+  assert.equal(dry.warnings, undefined, 'an unrelated commit is not a warning')
+  assert.equal(page.applied, false)
+  isolation.close()
+})
+
+test('apply warns when a commit touched one of the patch’s own files', async () => {
+  const repo = makeRepo({ 'f.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, 'f.txt'), TWELVE_LINES.replace('l2\n', 'l2 WORKER\n'))
+  })
+  // Far enough from the worker's hunk that the plain apply still fits, which is the case
+  // the field report hit: nothing failed, and nothing said the file had moved.
+  writeFileSync(join(repo, 'f.txt'), TWELVE_LINES.replace('l11\n', 'l11 ROOT\n'))
+  commit(repo, 'root touches the patch file')
+
+  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+  assert.equal(dry.drift.commitsBehind, 1)
+  assert.deepEqual(dry.drift.filesChangedSince, ['f.txt'])
+  assert.deepEqual(dry.warnings, [
+    "1 of this patch's files changed in your tree since the worker's copy was made (f.txt); review the result, or use threeWay: true if the plain apply fails",
+  ])
+  isolation.close()
+})
+
+test('apply lists a patch file edited but not committed since the copy was made', async () => {
+  const repo = makeRepo({ 'f.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, 'f.txt'), TWELVE_LINES.replace('l2\n', 'l2 WORKER\n'))
+  })
+  writeFileSync(join(repo, 'f.txt'), TWELVE_LINES.replace('l11\n', 'l11 UNCOMMITTED\n'))
+
+  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+  assert.equal(dry.drift.commitsBehind, 0, 'an uncommitted edit moves no commit')
+  assert.deepEqual(dry.drift.filesChangedSince, ['f.txt'])
+  isolation.close()
+})
+
+test('drift lists a patch file the tree deleted since the copy was made', async () => {
+  const repo = makeRepo({ 'f.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, 'f.txt'), TWELVE_LINES.replace('l2\n', 'l2 WORKER\n'))
+  })
+  rmSync(join(repo, 'f.txt'))
+
+  const page = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.deepEqual(page.drift.filesChangedSince, ['f.txt'], 'a deletion is a change from the base')
+  // A dry-run merge still reports the drift and the warning without writing the deletion away.
+  const predicted = isolation.apply({ patchId: change.patchId, dryRun: true, threeWay: true })
+  assert.deepEqual(predicted.drift.filesChangedSince, ['f.txt'])
+  assert.match(predicted.warnings[0], /^1 of this patch's files changed .*\(f\.txt\);/)
+  assert.equal(existsSync(join(repo, 'f.txt')), false, 'a dry run writes nothing')
+  isolation.close()
+})
+
+test('a base whose parent is unknown reports commitsBehind null', async () => {
+  const repo = makeRepo({ 'f.txt': 'one\n' })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, 'f.txt'), 'two\n')
+  })
+  // A record from an object store that does not hold this base: its parent cannot be read.
+  const record = isolation.patches.get(change.patchId)
+  record.base = 'f'.repeat(40)
+  delete record.baseParent
+
+  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+  assert.equal(dry.drift.commitsBehind, null)
+  assert.deepEqual(dry.drift.filesChangedSince, [])
+  isolation.close()
+})
+
+test('a patch with no recorded base gets drift null', async () => {
+  const repo = makeRepo({ 'f.txt': 'one\n' })
+  const { isolation } = makePool(repo)
+  const patchId = `flash-${randomUUID()}`
+  storeRawPatch(
+    isolation,
+    patchId,
+    'diff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0000000..ce01363\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n',
+    ['new.txt'],
+  )
+  const dry = isolation.apply({ patchId, dryRun: true })
+  assert.equal(dry.drift, null)
+  assert.equal(dry.warnings, undefined)
+  isolation.close()
+})
+
+test('drift is computed on the first page only, not on every page', async () => {
+  const repo = makeRepo({ 'f.txt': 'one\n' })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, 'f.txt'), `${'line\n'.repeat(300)}worker\n`)
+  })
+
+  const first = isolation.readPatch({ patchId: change.patchId, maxChars: 400 })
+  assert.notEqual(first.nextOffset, null, 'the patch must need a second page')
+  assert.equal(first.offset, 0)
+  assert.deepEqual(first.drift, { commitsBehind: 0, filesChangedSince: [] })
+  const second = isolation.readPatch({ patchId: change.patchId, offset: first.nextOffset, maxChars: 400 })
+  assert.ok(second.offset > 0)
+  assert.equal('drift' in second, false, 'a later page costs no git spawn for drift')
+  isolation.close()
+})
+
+test('readPatch reports drift before an apply and null after it', async () => {
+  const repo = makeRepo({ 'f.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, 'f.txt'), TWELVE_LINES.replace('l2\n', 'l2 WORKER\n'))
+  })
+
+  const before = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.equal(before.applied, false)
+  assert.deepEqual(before.drift, { commitsBehind: 0, filesChangedSince: [] })
+
+  isolation.apply({ patchId: change.patchId })
+  const after = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.equal(after.applied, true)
+  assert.equal(after.drift, null, 'an applied patch no longer has a tree to compare against its base')
+  isolation.close()
+})
+
+test('a 300-file patch is hashed in one batch, so its dry-run apply stays fast', async () => {
+  // Drift used to spawn `git hash-object` once per patch file, so a 300-file patch cost
+  // 3.7 s per apply and 3.6 s for the first `flash_patch` page. The whole patch is now
+  // hashed in a single `git hash-object --stdin-paths` call, and this pins the result:
+  // an apply of a 300-file patch must not fall back to a process per file again.
+  const files = {}
+  for (let index = 0; index < 300; index += 1) files[`f${String(index).padStart(3, '0')}.txt`] = TWELVE_LINES
+  const repo = makeRepo(files)
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    for (const name of Object.keys(files)) writeFileSync(join(dir, name), TWELVE_LINES.replace('l2\n', 'l2 WORKER\n'))
+  })
+  assert.equal(change.filesChanged.length, 300)
+
+  const startedAt = process.hrtime.bigint()
+  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+  const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6
+  assert.deepEqual(dry.drift, { commitsBehind: 0, filesChangedSince: [] })
+  assert.equal(dry.applied, false)
+  assert.ok(elapsedMs < 1000, `a 300-file dry run took ${elapsedMs.toFixed(1)} ms, expected under 1000 ms`)
+  isolation.close()
+})
+
+test('a batched drift still names edited, unedited, deleted and renamed files', async () => {
+  // The same four answers the per-file hashing gave, now read out of one batch: a file
+  // the caller edited is drift, an untouched one is not, a file the caller deleted is
+  // drift, and a rename's old path is drift (and is the destructive edit the apply warns
+  // about).
+  const repo = makeRepo({
+    'clean.txt': TWELVE_LINES,
+    'edited.txt': TWELVE_LINES,
+    'gone.txt': TWELVE_LINES,
+    'old.txt': TWELVE_LINES,
+  })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, 'clean.txt'), TWELVE_LINES.replace('l2\n', 'l2 WORKER\n'))
+    writeFileSync(join(dir, 'edited.txt'), TWELVE_LINES.replace('l2\n', 'l2 WORKER\n'))
+    rmSync(join(dir, 'gone.txt'))
+    execFileSync('git', ['mv', 'old.txt', 'new.txt'], { cwd: dir })
+  })
+  writeFileSync(join(repo, 'edited.txt'), TWELVE_LINES.replace('l9\n', 'l9 CALLER\n'))
+  rmSync(join(repo, 'gone.txt'))
+  writeFileSync(join(repo, 'old.txt'), TWELVE_LINES.replace('l6\n', 'l6 CALLER\n'))
+
+  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+  assert.equal(dry.drift.commitsBehind, 0)
+  assert.deepEqual([...dry.drift.filesChangedSince].sort(), ['edited.txt', 'gone.txt', 'old.txt'])
+  // `clean.txt` and the rename's new path are not caller edits.
+  assert.equal(dry.drift.filesChangedSince.includes('clean.txt'), false)
+  assert.equal(dry.drift.filesChangedSince.includes('new.txt'), false)
+  assert.ok(
+    dry.warnings.some((line) => line.includes('it deletes or renames old.txt, which you changed')),
+    `the destructive edit is still reported, saw ${JSON.stringify(dry.warnings)}`,
+  )
+  isolation.close()
+})
+
+test('the batched hash applies the checkout filters exactly as the per-file hash did', async () => {
+  // `--stdin-paths` applies the same path-based filters as `--path`: with `text eol=lf`
+  // committed and a CRLF working copy, the blob is the committed one, so a line-ending
+  // difference alone is not drift. Hashing the bytes without the path filter would have
+  // reported every such file, which is why this stays pinned.
+  const lf = TWELVE_LINES
+  const crlf = TWELVE_LINES.replace(/\n/g, '\r\n')
+  const repo = makeRepo({ '.gitattributes': '*.txt text eol=lf\n', 'f.txt': lf, 'g.txt': lf })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, 'f.txt'), lf.replace('l2\n', 'l2 WORKER\n'))
+    writeFileSync(join(dir, 'g.txt'), lf.replace('l2\n', 'l2 WORKER\n'))
+  })
+  // Both files are rewritten CRLF on disk; only `g.txt` also holds a caller edit.
+  writeFileSync(join(repo, 'f.txt'), crlf)
+  writeFileSync(join(repo, 'g.txt'), crlf.replace('l9\r\n', 'l9 CALLER\r\n'))
+
+  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+  assert.deepEqual(dry.drift.filesChangedSince, ['g.txt'])
+  isolation.close()
+})
+
+// ── a rename or deletion must not take the caller's edit with it ────────────
+
+test('a rename over a caller-edited old path is refused, and the edit stays', async () => {
+  const repo = makeRepo({ 'old.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    // Identical content, so git records a pure rename: the hunk carries no content for
+    // `git apply` to compare, which is what used to delete the caller's edit silently.
+    execFileSync('git', ['mv', 'old.txt', 'new.txt'], { cwd: dir })
+  })
+  const edited = TWELVE_LINES.replace('l6\n', 'l6 CALLER EDIT\n')
+  writeFileSync(join(repo, 'old.txt'), edited)
+
+  const page = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.deepEqual(page.drift.filesChangedSince, ['old.txt'], 'the old path is the one the apply removes')
+
+  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+  assert.deepEqual(dry.drift.filesChangedSince, ['old.txt'])
+  assert.ok(
+    dry.warnings.some((line) => line.includes('it deletes or renames old.txt, which you changed')),
+    `a dry run reports the condition as a warning, saw ${JSON.stringify(dry.warnings)}`,
+  )
+  assert.equal(readFileSync(join(repo, 'old.txt'), 'utf8'), edited, 'a dry run writes nothing')
+  assert.equal(existsSync(join(repo, 'new.txt')), false)
+
+  const refusal =
+    `refusing to apply ${change.patchId}: it deletes or renames old.txt, which you changed since the worker's ` +
+    'copy was made; your edit would be lost. Pass threeWay: true to merge it (conflicts are marked in the file), ' +
+    'or save it first and pass force: true'
+  assert.throws(() => isolation.apply({ patchId: change.patchId }), (error) => error.message === refusal)
+  assert.equal(readFileSync(join(repo, 'old.txt'), 'utf8'), edited, 'the refusal happens before anything is written')
+  assert.equal(existsSync(join(repo, 'new.txt')), false)
+
+  // force: true is the caller saying the edit may go; the rename then lands as before.
+  const forced = isolation.apply({ patchId: change.patchId, force: true })
+  assert.equal(forced.applied, true)
+  assert.equal(existsSync(join(repo, 'new.txt')), true)
+  assert.equal(existsSync(join(repo, 'old.txt')), false)
+  isolation.close()
+})
+
+test('a threeWay rename over a caller-edited old path merges the edit instead of refusing it', async () => {
+  const repo = makeRepo({ 'old.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    // A rename that also edits the same line the caller edits, so the merge has a real
+    // conflict to mark. The old path is still removed by a plain apply without comparing
+    // its content, which is what makes it destructive.
+    execFileSync('git', ['mv', 'old.txt', 'new.txt'], { cwd: dir })
+    writeFileSync(join(dir, 'new.txt'), TWELVE_LINES.replace('l6\n', 'l6 WORKER\n'))
+  })
+  const edited = TWELVE_LINES.replace('l6\n', 'l6 CALLER EDIT\n')
+  writeFileSync(join(repo, 'old.txt'), edited)
+
+  // A dry run with threeWay predicts the merge instead of reporting the refusal and
+  // skipping git: it is the mode that keeps the edit.
+  const predicted = isolation.apply({ patchId: change.patchId, dryRun: true, threeWay: true })
+  assert.equal(predicted.threeWay, true)
+  assert.ok(predicted.conflicts.length > 0, `expected a predicted conflict, saw ${JSON.stringify(predicted.conflicts)}`)
+  assert.equal(predicted.applied, false)
+  assert.equal(readFileSync(join(repo, 'old.txt'), 'utf8'), edited, 'a dry run writes nothing')
+  assert.equal(existsSync(join(repo, 'new.txt')), false)
+
+  // The plain attempt is skipped: it would succeed for a pure rename and discard the edit
+  // before the merge ever ran. The merge leaves markers and the caller's text in the tree.
+  const applied = isolation.apply({ patchId: change.patchId, threeWay: true })
+  assert.equal(applied.threeWay, true)
+  assert.ok(applied.conflicts.length > 0)
+  assert.equal(applied.indexTouched, false)
+  const merged = ['old.txt', 'new.txt']
+    .filter((name) => existsSync(join(repo, name)))
+    .map((name) => readFileSync(join(repo, name), 'utf8'))
+    .join('\n')
+  assert.match(merged, /<<<<<<< /, 'the conflict is marked in the file')
+  assert.match(merged, /CALLER EDIT/, 'the caller’s edit is still in the tree')
+  isolation.close()
+})
+
+test('a rename whose old path is untouched applies as before', async () => {
+  const repo = makeRepo({ 'old.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    execFileSync('git', ['mv', 'old.txt', 'new.txt'], { cwd: dir })
+  })
+
+  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+  assert.deepEqual(dry.drift.filesChangedSince, [])
+  assert.equal(dry.warnings, undefined)
+  const applied = isolation.apply({ patchId: change.patchId })
+  assert.equal(applied.applied, true)
+  assert.equal(existsSync(join(repo, 'new.txt')), true)
+  assert.equal(existsSync(join(repo, 'old.txt')), false)
+  isolation.close()
+})
+
+test('a deletion of a file the caller edited is refused, and the edit stays', async () => {
+  const repo = makeRepo({ 'f.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    rmSync(join(dir, 'f.txt'))
+  })
+  const edited = TWELVE_LINES.replace('l8\n', 'l8 CALLER EDIT\n')
+  writeFileSync(join(repo, 'f.txt'), edited)
+
+  const page = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.deepEqual(page.drift.filesChangedSince, ['f.txt'])
+  // A dry run reports the condition instead of failing on the content check git would do.
+  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+  assert.equal(dry.applied, false)
+  assert.match(dry.warnings[0], /it deletes or renames f\.txt, which you changed/)
+  assert.equal(readFileSync(join(repo, 'f.txt'), 'utf8'), edited, 'a dry run writes nothing')
+  // A real (non-dry) apply is the one that would remove the file; it must refuse first.
+  assert.throws(
+    () => isolation.apply({ patchId: change.patchId }),
+    /refusing to apply .*: it deletes or renames f\.txt, which you changed since the worker's copy was made/,
+  )
+  assert.equal(readFileSync(join(repo, 'f.txt'), 'utf8'), edited, 'the file and its edit are intact')
+  isolation.close()
+})
+
+test('a record without a preimage warns before removing a path it cannot check', async () => {
+  const repo = makeRepo({ 'old.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { change } = await collectInCopy(isolation, (dir) => {
+    execFileSync('git', ['mv', 'old.txt', 'new.txt'], { cwd: dir })
+  })
+  writeFileSync(join(repo, 'old.txt'), TWELVE_LINES.replace('l6\n', 'l6 CALLER EDIT\n'))
+  // A record from before blob saving: no base content, so nothing can be compared.
+  delete isolation.patches.get(change.patchId).preimage
+  const warning =
+    'this patch was stored by an older release, so whether you changed old.txt since cannot be checked; ' +
+    'a plain apply removes them'
+
+  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+  assert.deepEqual(dry.warnings, [warning], 'the apply is not refused, but says what it cannot check')
+  assert.equal(dry.applied, false)
+  assert.equal(readFileSync(join(repo, 'old.txt'), 'utf8'), TWELVE_LINES.replace('l6\n', 'l6 CALLER EDIT\n'))
+
+  const applied = isolation.apply({ patchId: change.patchId })
+  assert.equal(applied.applied, true)
+  assert.equal(applied.threeWay, false)
+  assert.deepEqual(applied.warnings, [warning])
+  assert.equal(existsSync(join(repo, 'new.txt')), true)
+  assert.equal(existsSync(join(repo, 'old.txt')), false)
+  isolation.close()
+})
+
+test('a patch from a nested repository names its paths from the service root', async () => {
+  const repo = makeRepo({ 'README.md': '# project\n' })
+  const sub = join(repo, 'sub')
+  mkdirSync(sub)
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: sub })
+  writeFileSync(join(sub, 'n.txt'), TWELVE_LINES)
+  commit(sub, 'inner')
+  commit(repo, 'add sub')
+  const { isolation } = makePool(repo)
+  const slot = await isolation.lease()
+  isolation.prepare(slot, { cwd: sub })
+  // The record's paths are relative to `sub`; every path the caller sees is not.
+  execFileSync('git', ['mv', 'n.txt', 'm.txt'], { cwd: join(slot.dir, 'sub') })
+  const change = isolation.collect(slot)
+  isolation.release(slot)
+  assert.equal(change.scope, 'sub')
+
+  writeFileSync(join(sub, 'n.txt'), TWELVE_LINES.replace('l6\n', 'l6 CALLER EDIT\n'))
+  const page = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  // `filesChanged` keeps the record's spelling, the one `flash_patch`'s `files` accepts.
+  assert.deepEqual(page.filesChanged, ['m.txt'], 'filesChanged keeps the record spelling')
+  assert.deepEqual(page.drift.filesChangedSince, ['sub/n.txt'], 'drift names the file the caller has')
+
+  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+  assert.ok(
+    dry.warnings.some((line) => line.includes('it deletes or renames sub/n.txt, which you changed')),
+    `a dry run names the service-root path, saw ${JSON.stringify(dry.warnings)}`,
+  )
+  assert.throws(
+    () => isolation.apply({ patchId: change.patchId }),
+    /it deletes or renames sub\/n\.txt, which you changed since the worker's copy was made/,
+  )
+  isolation.close()
+})
+
 // ── flash_patch: reading the stored patch ───────────────────────────────────
+
+test('flash_patch says drift is on the first page and null once the patch was applied', () => {
+  const tool = listTools().find((entry) => entry.name === 'flash_patch')
+  assert.ok(tool !== undefined)
+  assert.match(
+    tool.description,
+    /It is on the page that starts at offset 0, and is `null` once the patch was applied\./,
+    'the description must say where drift is, and that it is null after the apply',
+  )
+})
 
 test('flash_patch reads the whole stored patch and says it is not applied', async () => {
   const root = makeRepo({ 'README.md': '# project\n' })

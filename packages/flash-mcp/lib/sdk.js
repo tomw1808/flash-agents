@@ -14,8 +14,8 @@
  */
 
 import { spawn } from 'node:child_process'
-import { accessSync, constants, existsSync, readFileSync } from 'node:fs'
-import { delimiter, dirname, join } from 'node:path'
+import { accessSync, constants, existsSync, readFileSync, readdirSync } from 'node:fs'
+import { basename, delimiter, dirname, join } from 'node:path'
 
 /** Identity the SDK runtime reports at handshake. */
 export const SDK_SERVER_NAME = 'deepseek-harness-sdk-runtime'
@@ -37,7 +37,17 @@ const DEFAULT_STDERR_TAIL_BYTES = 4_096
  * Resolve the `dsh` launcher.
  *
  * Order: `FLASH_DSH_BIN` (a launcher path, or a JavaScript entry run with the
- * current Node binary), then the first executable `dsh` on `PATH`.
+ * current Node binary), then the first executable `dsh` on `PATH`, then — only to
+ * *report* it — a launcher beside another Node version of the same version manager.
+ * The sibling is never started: after an nvm switch, the `dsh` under the previous
+ * Node is the one that still works, but running it would run the harness on a Node
+ * the caller did not choose. It is named in the error so the fix (reinstall under
+ * this Node) is one command away.
+ *
+ * The version-manager layouts recognised are only the ones that are exactly the
+ * same shape: nvm's `<…>/versions/node/<v>/bin/dsh`, nvm-windows's
+ * `<NVM_HOME>/<v>/dsh.cmd`, and volta's `<…>/node/<v>/bin/dsh`. fnm's
+ * `<v>/installation/bin/dsh` has an extra level and is deliberately not guessed at.
  *
  * On Windows, npm installs `dsh` as a `dsh.cmd` shim, and Node refuses to spawn a
  * `.cmd` or `.bat` without a shell (CVE-2024-27980). The shim is therefore resolved
@@ -46,9 +56,16 @@ const DEFAULT_STDERR_TAIL_BYTES = 4_096
  *
  * @param {Record<string, string | undefined>} [env] - environment to read.
  * @param {string} [platform] - platform to resolve for (tests).
+ * @param {object} [options] - lookup details a test can inject.
+ * @param {string} [options.execPath] - the running Node binary, whose version-manager
+ *   siblings are searched when nothing is on PATH (default process.execPath).
+ * @param {(directory: string) => string[]} [options.listDir] - lists a directory's
+ *   entry names; injectable so a test needs no real version-manager layout.
+ * @param {string} [options.nodeVersion] - the running Node version, as named in the error
+ *   (default process.version, which includes its leading `v`).
  * @returns {{command: string, prefix: string[]}} spawn command and leading args.
  */
-export function resolveDshCommand(env = process.env, platform = process.platform) {
+export function resolveDshCommand(env = process.env, platform = process.platform, options = {}) {
   const override = env.FLASH_DSH_BIN
   if (typeof override === 'string' && override.trim().length > 0) {
     return commandFor(override.trim(), platform)
@@ -57,9 +74,120 @@ export function resolveDshCommand(env = process.env, platform = process.platform
   const pathValue = env.PATH ?? (platform === 'win32' ? env.Path : undefined) ?? ''
   const found = findOnPath('dsh', pathValue, platform)
   if (found !== undefined) return commandFor(found, platform)
+  const sibling = findSiblingLauncher(platform, options)
+  if (sibling !== undefined) {
+    const nodeVersion = options.nodeVersion ?? process.version
+    throw new Error(
+      `cannot find the dsh launcher for this Node (${nodeVersion}); found one under Node ${sibling.version} ` +
+        `at ${sibling.path}: reinstall dsh under this Node (npm install -g @deepseek-ai/dsh, as the README's ` +
+        'install step says) or set FLASH_DSH_BIN to that path',
+    )
+  }
   throw new Error(
     'cannot find the dsh launcher: set FLASH_DSH_BIN to the dsh executable (or to lib/bin.js inside the harness install), or put dsh on PATH',
   )
+}
+
+/** A Node version directory name, as nvm, nvm-windows and volta spell it. */
+const NODE_VERSION_DIR = /^v?(\d+)\.(\d+)\.(\d+)$/
+
+/** List a directory's subdirectory names; an unreadable directory has none. */
+function listDirectories(directory) {
+  try {
+    return readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * The version directory the running Node lives in, when its layout says it was
+ * installed by a version manager.
+ *
+ * nvm puts the binary in `<version>/bin/node`, nvm-windows in `<version>/node.exe` and
+ * volta in `<version>/bin/node`, so both spellings are checked against the same
+ * version-name pattern. A normal system install (`/usr/local/bin/node`) names no
+ * version directory, and then nothing is searched at all.
+ *
+ * @param {string} execPath - the running Node binary.
+ * @returns {string | undefined} the version directory, or undefined outside one.
+ */
+function nodeVersionDirectory(execPath) {
+  for (const candidate of [dirname(execPath), dirname(dirname(execPath))]) {
+    if (NODE_VERSION_DIR.test(basename(candidate))) return candidate
+  }
+  return undefined
+}
+
+/** Compare two version-name matches, newest first. */
+function newestFirst(left, right) {
+  for (let index = 1; index <= 3; index += 1) {
+    if (Number(left[index]) !== Number(right[index])) return Number(right[index]) - Number(left[index])
+  }
+  return 0
+}
+
+/**
+ * The `dsh` launcher of another Node version of the same version manager.
+ *
+ * Only siblings of the current Node's version directory are considered, and only the
+ * layouts named in `resolveDshCommand`'s doc. The newest sibling wins, because after
+ * an nvm switch the newest other version is normally the one the user just left.
+ *
+ * @param {string} platform - platform whose launcher suffix to look for.
+ * @param {object} options - injected `execPath` and `listDir`.
+ * @returns {{version: string, path: string} | undefined} the sibling, when one exists.
+ */
+function findSiblingLauncher(platform, options = {}) {
+  const current = nodeVersionDirectory(options.execPath ?? process.execPath)
+  if (current === undefined) return undefined
+  const parent = dirname(current)
+  const listDir = options.listDir ?? listDirectories
+  let entries
+  try {
+    entries = listDir(parent)
+  } catch {
+    return undefined
+  }
+  const siblings = entries
+    .map((name) => ({ name, version: NODE_VERSION_DIR.exec(name) }))
+    .filter((entry) => entry.version !== null && entry.name !== basename(current))
+    .sort((left, right) => newestFirst(left.version, right.version))
+  for (const sibling of siblings) {
+    const candidates =
+      platform === 'win32'
+        ? [join(parent, sibling.name, 'dsh.cmd'), join(parent, sibling.name, 'dsh.exe')]
+        : [join(parent, sibling.name, 'bin', 'dsh')]
+    for (const candidate of candidates) {
+      if (isLauncher(candidate, platform)) {
+        return { version: sibling.name.replace(/^v/, ''), path: candidate }
+      }
+    }
+  }
+  return undefined
+}
+
+/**
+ * Whether a path is a launcher a caller could start.
+ *
+ * Windows has no execute bit, so there a file with the right name is a launcher; on a
+ * Unix host the execute bit is what distinguishes a launcher from a data file.
+ *
+ * @param {string} candidate - the path to test.
+ * @param {string} platform - platform whose rule to apply.
+ * @returns {boolean} true when the file exists and is executable.
+ */
+function isLauncher(candidate, platform) {
+  if (!existsSync(candidate)) return false
+  if (platform === 'win32') return true
+  try {
+    accessSync(candidate, constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** Turn a launcher path into a spawn command, running JavaScript entries with Node. */
@@ -138,6 +266,9 @@ export class HarnessSdkClient {
    * @param {number} [options.initializeTimeoutMs] - cold-start handshake timeout.
    * @param {number} [options.stderrTailBytes] - retained stderr bytes.
    * @param {{command: string, prefix: string[]}} [options.command] - launcher override (tests).
+   * @param {(env: Record<string, string | undefined>) => {command: string, prefix: string[]}} [options.resolveCommand]
+   *   how the launcher is resolved when `command` is not given; injectable so a test can
+   *   supply a sibling-version lookup without a real version-manager layout.
    */
   constructor({
     profile,
@@ -148,6 +279,7 @@ export class HarnessSdkClient {
     initializeTimeoutMs = DEFAULT_INITIALIZE_TIMEOUT_MS,
     stderrTailBytes = DEFAULT_STDERR_TAIL_BYTES,
     command,
+    resolveCommand,
   }) {
     this.profile = profile
     this.cwd = cwd
@@ -156,7 +288,7 @@ export class HarnessSdkClient {
     this.requestTimeoutMs = requestTimeoutMs
     this.initializeTimeoutMs = initializeTimeoutMs
     this.stderrTailBytes = stderrTailBytes
-    this.launcher = command ?? resolveDshCommand(env)
+    this.launcher = command ?? (resolveCommand ?? resolveDshCommand)(env)
 
     /** @type {import('node:child_process').ChildProcess | undefined} */
     this.child = undefined

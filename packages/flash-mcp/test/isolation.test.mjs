@@ -22,6 +22,7 @@ import { dirname, join, sep } from 'node:path'
 import { test } from 'node:test'
 
 import {
+  SETTINGS_CHANGED_WARNING,
   SWEEP_INTERVAL_MS,
   WorkspaceIsolation,
   canonicalTmpdir,
@@ -29,6 +30,8 @@ import {
   durableBaseDir,
   migrateLegacyPatches,
   rootDigest,
+  slotPathWarning,
+  slotRootPath,
 } from '../lib/isolation.js'
 
 /**
@@ -2130,4 +2133,90 @@ test('scratch inside a scoped repository never reaches the patch', async () => {
   const change = isolation.collect(slot)
   assert.deepEqual(change.filesChanged.map((line) => line.split('\t').at(-1)), ['app.txt'])
   isolation.close()
+})
+
+// ── an injected state base and the Windows slot-path advisory ──
+
+test('an injected base keeps the slot layout under it and sweeps a dead owner there', () => {
+  const repo = makeRepo()
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-base-option-')))
+  try {
+    const { owner, slotDir } = makeDeadOwner(repo, { baseDir: base })
+    makeFlashBaseTree(slotDir)
+    writeFileSync(join(slotDir, 'keep.txt'), 'the lost fix\n')
+
+    const pool = new WorkspaceIsolation({ root: repo, baseDir: base, slots: 1 })
+    try {
+      // The layout is exactly `defaultStateDir` under the injected base, not under $TMPDIR.
+      assert.ok(
+        pool.stateDir.startsWith(join(base, rootDigest(repo), String(process.pid)) + sep),
+        `the pool's state ${pool.stateDir} must sit under ${base}`,
+      )
+      assert.equal(pool.slots[0].dir, join(pool.stateDir, 'slots', 'slot-0'))
+      assert.equal(existsSync(owner), false, 'the dead owner under the injected base is removed')
+      assert.ok(salvagedPatch(pool), 'its unfinished work is salvaged as a patch')
+    } finally {
+      pool.close()
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
+
+test('repoSettingsChanged sees a replacement that keeps the mtime', () => {
+  const repo = makeRepo()
+  const { isolation } = makePool(repo, 1)
+  try {
+    assert.equal(isolation.repoSettingsChanged(), false, 'a repository without the file has not changed')
+    const path = join(repo, '.flash-agents.json')
+    writeFileSync(path, JSON.stringify({ copyExclude: ['dist'] }))
+    assert.equal(isolation.repoSettingsChanged(), true, 'a file created after start is a change')
+
+    const started = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
+    assert.equal(started.repoSettingsChanged(), false)
+    const future = new Date(Date.now() + 2_000)
+    utimesSync(path, future, future)
+    assert.equal(started.repoSettingsChanged(), true, 'a touched file is a change')
+
+    // A different file renamed over the settings, with the original mtime put back: an
+    // implementation comparing only mtimeMs calls this unchanged, and the server would
+    // never tell the caller their new settings were ignored. The mtime is a whole second
+    // so restoring it is exact, which makes the mtime-only failure deterministic.
+    const fixed = new Date(Math.floor(Date.now() / 1000) * 1000)
+    utimesSync(path, fixed, fixed)
+    const stable = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
+    assert.equal(stable.repoSettingsChanged(), false)
+    const replacement = join(repo, '.flash-agents.next')
+    writeFileSync(replacement, JSON.stringify({ copyExclude: ['build'] }))
+    renameSync(replacement, path)
+    utimesSync(path, fixed, fixed)
+    assert.equal(stable.repoSettingsChanged(), true, 'a replaced file is a change even with its mtime restored')
+
+    rmSync(path, { force: true })
+    assert.equal(stable.repoSettingsChanged(), true, 'a removed file is a change')
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
+
+test('slotPathWarning names a long path with a trailing separator, only on Windows', () => {
+  const long = 'C:\\Users\\a-long-user-name\\AppData\\Local\\Temp\\flash-mcp\\0123456789ab\\1234\\abcdefgh\\slots\\slot-0'
+  assert.equal(slotPathWarning(long, { platform: 'linux' }), undefined)
+  assert.equal(slotPathWarning('C:\\fm\\0123456789ab\\1234\\abcdefgh\\slots\\slot-0', { platform: 'win32' }), undefined)
+  const warning = slotPathWarning(long, { platform: 'win32' })
+  // The injected platform is Windows, but the host separator is still this test's `sep`.
+  assert.ok(warning.startsWith(`slot copies live at ${long}${sep} (`), warning)
+  assert.match(warning, /\(\d+ characters\); Windows tools without long-path support/)
+  assert.match(warning, /\(MSVC cl\.exe among them\) fail past 260 characters/)
+  assert.match(warning, /A short base leaves more room: set the plugin option "state_base" \(or FLASH_STATE_BASE\) to a folder such as C:\\fm/)
+  // slotRootPath always adds the separator the advisory counts.
+  assert.equal(slotRootPath('/tmp/fm/digest/1/nonce', 0), join('/tmp/fm/digest/1/nonce', 'slots', 'slot-0') + sep)
+})
+
+test('the settings warning sentence is the one the service returns', () => {
+  assert.equal(
+    SETTINGS_CHANGED_WARNING,
+    '.flash-agents.json changed after this server started; its new settings take effect after a reconnect (/mcp reconnect plugin:flash-agents:flash)',
+  )
 })

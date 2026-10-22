@@ -20,9 +20,16 @@ import { homedir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
-import { IsolationError, WorkspaceIsolation, canonicalTmpdir } from './isolation.js'
+import {
+  IsolationError,
+  SETTINGS_CHANGED_WARNING,
+  WorkspaceIsolation,
+  canonicalTmpdir,
+  slotPathWarning,
+  slotRootPath,
+} from './isolation.js'
 import { estimateInstructions } from './instructions.js'
-import { HarnessSdkClient, DEFAULT_INITIALIZE_TIMEOUT_MS } from './sdk.js'
+import { HarnessSdkClient, DEFAULT_INITIALIZE_TIMEOUT_MS, resolveDshCommand } from './sdk.js'
 import { profileHonoursModelEnv, resolveDshHome } from './doctor.js'
 
 /** Route the service pins; callers can never change the provider. */
@@ -216,6 +223,14 @@ export class FlashTaskService {
    *   empty first attempt (default 10 s; injectable so a test need not wait).
    * @param {number} [options.initTimeoutMs] - cold-start handshake budget for one runtime.
    * @param {Record<string, string | undefined>} [options.env] - runtime environment.
+   * @param {string} [options.platform] - platform the slot-path advisory is decided for
+   *   (default process.platform; injectable so a Windows warning can be tested anywhere).
+   * @param {(env: Record<string, string | undefined>) => {command: string, prefix: string[]}} [options.resolveDshCommand]
+   *   how a runtime finds its launcher (default `resolveDshCommand` on `platform`); injectable
+   *   so a test can model a version-manager sibling without a real nvm layout.
+   * @param {string[]} [options.startupWarnings] - warnings the server established at start
+   *   (the profile release stamps), carried by every `flash_task` and `flash_batch` result
+   *   while they hold.
    * @param {(message: string) => void} [options.log] - diagnostic sink (stderr).
    * @param {(profile: string, cwd: string, extraEnv?: object) => HarnessSdkClient} [options.clientFactory]
    *   runtime factory (tests).
@@ -241,6 +256,9 @@ export class FlashTaskService {
     earlyRetryDelayMs = DEFAULT_EARLY_RETRY_DELAY_MS,
     initTimeoutMs = DEFAULT_INITIALIZE_TIMEOUT_MS,
     env = process.env,
+    platform = process.platform,
+    resolveDshCommand: resolveLauncher = (environment) => resolveDshCommand(environment, platform),
+    startupWarnings = [],
     log = () => {},
     clientFactory,
     isolate = {},
@@ -305,6 +323,7 @@ export class FlashTaskService {
           env: extraEnv === undefined ? env : { ...env, ...extraEnv },
           log,
           initializeTimeoutMs: initTimeoutMs,
+          resolveCommand: resolveLauncher,
         }))
     this.diffChars = isolate.diffChars ?? DEFAULT_DIFF_CHARS
     /**
@@ -324,6 +343,9 @@ export class FlashTaskService {
             // and this process. A shared default was a data-loss bug: one instance
             // cleared another's in-flight tree and reused its path.
             ...(isolate.stateDir === undefined ? {} : { stateDir: isolate.stateDir }),
+            // The base of the default layout (`--state-base` / FLASH_STATE_BASE); ignored
+            // by the pool when a state directory was configured, as the flag's docs say.
+            ...(isolate.baseDir === undefined ? {} : { baseDir: isolate.baseDir }),
             ...(isolate.patchRetentionDays === undefined ? {} : { patchRetentionDays: isolate.patchRetentionDays }),
             ...(isolate.maxStateBytes === undefined ? {} : { maxStateBytes: isolate.maxStateBytes }),
             // The copy's exclusions and the worker's per-slot environment belong to the
@@ -340,6 +362,22 @@ export class FlashTaskService {
             log,
           })
     this.stateDir = this.isolation?.stateDir ?? resolve(isolate.stateDir ?? join(canonicalTmpdir(), 'flash-mcp'))
+    /**
+     * Warnings established at start that every `flash_task` and `flash_batch` result
+     * carries while they hold. The profile release stamps arrive from `createService`; the
+     * Windows slot-path advisory is measured here, from the path the pool really leased.
+     *
+     * @type {string[]}
+     */
+    this.startupWarnings = Array.isArray(startupWarnings) ? [...startupWarnings] : []
+    const lengthWarning =
+      this.isolation === undefined
+        ? undefined
+        : slotPathWarning(slotRootPath(this.isolation.stateDir, 0), { platform })
+    if (lengthWarning !== undefined) {
+      this.startupWarnings.push(lengthWarning)
+      this.log(lengthWarning)
+    }
 
     /**
      * One persistent runtime per profile *and working directory*, keyed by both. A
@@ -1966,6 +2004,9 @@ export class FlashTaskService {
     warnings.push(...activityWarnings(activity))
     if (queued !== undefined && background !== true) warnings.push(foregroundQueueWarning(queued))
     if (retried !== undefined) warnings.push(earlyRetryWarning(retried.reason))
+    // Installation drift: a profile from another release, a Settings edit after start, or a
+    // Windows slot root too long for tools without long-path support.
+    warnings.push(...this.#installationWarnings())
     const routes = []
     for (const route of state.childRoutes.values()) {
       if (!routes.some((known) => known.provider === route.provider && known.model === route.model)) routes.push(route)
@@ -2006,6 +2047,21 @@ export class FlashTaskService {
       ...this.#changeFields({ profileName: profile, slot, change, applied, basePatch }),
       ...(warnings.length === 0 ? {} : { warnings }),
     }
+  }
+
+  /**
+   * The installation warnings this call's result must carry.
+   *
+   * The start-up ones were established once and do not change; the settings check is one
+   * `stat` per call, because a file edited after the pool read it is silently ignored until
+   * a reconnect and the caller has to be told (see `WorkspaceIsolation.repoSettingsChanged`).
+   *
+   * @returns {string[]} the warnings, each at most once.
+   */
+  #installationWarnings() {
+    const warnings = [...this.startupWarnings]
+    if (this.isolation?.repoSettingsChanged() === true) warnings.push(SETTINGS_CHANGED_WARNING)
+    return warnings
   }
 
   /** Assemble the compact result the MCP client receives. */
@@ -2085,6 +2141,8 @@ export class FlashTaskService {
     warnings.push(...activityWarnings(activity))
     if (queued !== undefined && background !== true) warnings.push(foregroundQueueWarning(queued))
     if (retried !== undefined) warnings.push(earlyRetryWarning(retried.reason))
+    // Same installation drift the fleet's members were started under.
+    warnings.push(...this.#installationWarnings())
 
     return {
       status: primary.status,
@@ -2291,9 +2349,18 @@ export function createActivity(now = Date.now()) {
      * `openCallKey`). A value keeps the session too, so a result without an id can still
      * be matched to the oldest call of its own worker.
      *
-     * @type {Map<string, {session: string, id?: string, tool: string, command: string, since: number}>}
+     * @type {Map<string, {session: string, id?: string, tool: string, command: string, jobId?: string, background?: boolean, since: number}>}
      */
     openCalls: new Map(),
+    /**
+     * The background jobs a worker started and has not finished waiting on, keyed by its
+     * session and the job id (see `backgroundJobKey`). A job outlives the shell call that
+     * started it, so it cannot live in `openCalls`; this is what lets a later `job_output`
+     * wait name the command instead of the wait itself.
+     *
+     * @type {Map<string, {session: string, jobId: string, tool: string, command: string, since: number}>}
+     */
+    backgroundJobs: new Map(),
     /** How many calls this record has seen, so an id-less call still gets a unique key. */
     callSeq: 0,
     /** @type {Map<string, {count: number, lastAt: number, lastExitCode?: number, lastName?: string}>} */
@@ -2345,6 +2412,67 @@ function touchActivity(activity, event, workerSession, log = () => {}) {
 function openCallKey(session, id) {
   // A NUL cannot appear in either part, so no two pairs can collide.
   return `${session}\u0000${id}`
+}
+
+/**
+ * The key one background job is held under: its worker session and its job id.
+ *
+ * The `job` segment keeps a job id from colliding with a tool call id in `openCallKey`'s
+ * namespace; a job belongs to the worker that started it, so two workers may both have
+ * `bash-2` and must not share an entry.
+ *
+ * @param {string} session - the worker session.
+ * @param {string} jobId - the harness job id, such as `bash-2`.
+ * @returns {string} the map key.
+ */
+function backgroundJobKey(session, jobId) {
+  return `${session}\u0000job\u0000${jobId}`
+}
+
+/**
+ * The job id a `job_output` call names in its arguments.
+ *
+ * @param {unknown} args - the tool call's arguments, a JSON string in practice.
+ * @returns {string | undefined} the job id, or undefined when the call names none.
+ */
+function jobIdOf(args) {
+  const raw = typeof args === 'string' ? args : args === undefined || args === null ? '' : JSON.stringify(args)
+  if (raw.length === 0) return undefined
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+  return typeof parsed?.job_id === 'string' && parsed.job_id.length > 0 ? parsed.job_id : undefined
+}
+
+/**
+ * Whether a shell call's arguments asked for it to run in the background.
+ *
+ * Only a call made with `run_in_background: true` can legitimately answer
+ * `started background job <id>`. Reading that sentence from any shell result made a
+ * foreground `cat` of a log containing the phrase relabel a worker's job with the `cat`
+ * command and restart its clock, so the flag has to come from the call itself.
+ *
+ * The harness has sent the flag as `"true"` (and `1`) as well as the boolean, so a strict
+ * `=== true` check would drop a real background start. The spellings are folded here,
+ * before the result is read; `"false"` and `0` are still the foreground case.
+ *
+ * @param {unknown} args - the tool call's arguments, a JSON string in practice.
+ * @returns {boolean} true when the call asked to run in the background.
+ */
+function shellRunsInBackground(args) {
+  const raw = typeof args === 'string' ? args : args === undefined || args === null ? '' : JSON.stringify(args)
+  if (raw.length === 0) return false
+  let flag
+  try {
+    flag = JSON.parse(raw)?.run_in_background
+  } catch {
+    return false
+  }
+  if (flag === true || flag === 1) return true
+  return typeof flag === 'string' && flag.trim().toLowerCase() === 'true'
 }
 
 /**
@@ -2401,11 +2529,19 @@ function noteToolCall(activity, session, tool, args, id) {
   // must not overwrite the first, and its result must close exactly one of them.
   const callId = id ?? `#${String((activity.callSeq ?? 0) + 1)}`
   activity.callSeq = (activity.callSeq ?? 0) + 1
+  // The wait's own arguments are kept on the call so its result can be tied to the job it
+  // names — a `job_output` result may not repeat the id anywhere the result reader sees.
+  const jobId = tool === 'job_output' ? jobIdOf(args) : undefined
+  // A shell result can only announce a background job when its own call asked for one; the
+  // flag is kept here so the result reader never has to trust the result text alone.
+  const background = (tool === 'bash' || tool === 'pwsh') && shellRunsInBackground(args)
   activity.openCalls.set(openCallKey(session, callId), {
     session,
     ...(id === undefined ? {} : { id }),
     tool,
     command: describeToolCall(tool, args),
+    ...(jobId === undefined ? {} : { jobId }),
+    ...(background ? { background: true } : {}),
     since: Date.now(),
   })
 }
@@ -2415,7 +2551,9 @@ function noteToolCall(activity, session, tool, args, id) {
  *
  * A worker cut off mid-call (cancelled, out of budget, its runtime gone) never sends the
  * result that would close its call, and the entry would otherwise stay in `current` for the
- * rest of the job as a command that is still running.
+ * rest of the job as a command that is still running. Its background jobs are dropped for
+ * the same reason: nobody will read their `job_output` status, so a later call must not
+ * inherit them as waits in progress.
  *
  * @param {object} activity - the call's activity record.
  * @param {unknown} session - the worker session that ended.
@@ -2425,6 +2563,9 @@ function closeSessionCalls(activity, session) {
   if (typeof session !== 'string' || activity?.openCalls === undefined) return
   for (const [key, call] of activity.openCalls) {
     if (call.session === session) activity.openCalls.delete(key)
+  }
+  for (const [key, job] of activity.backgroundJobs ?? []) {
+    if (job.session === session) activity.backgroundJobs.delete(key)
   }
 }
 
@@ -2443,6 +2584,15 @@ function closeSessionCalls(activity, session) {
  * threshold further failure after that — the log is where a night of unattended work is
  * read afterwards.
  *
+ * A shell result may instead say that the command is still going in the background; that
+ * job is remembered so a later `job_output` wait can name the command it belongs to. The
+ * sentence is only trusted in the two shapes the harness really emits — the whole trimmed
+ * first line of a call made with `run_in_background: true`, or a whole
+ * `[still running after …ms; moved to background job …]` line — because a foreground
+ * `cat` of a log that quotes the phrase must not rewrite the job being read. The wait's
+ * own result is then read for a terminal status and for the exit code of the background
+ * command, which counts as a failure exactly like a foreground one.
+ *
  * @param {object} activity - the call's activity record.
  * @param {string} [session] - the worker session the result came from.
  * @param {object} event - the `tool/result` event.
@@ -2455,17 +2605,170 @@ function noteToolResult(activity, session, event, log) {
   // A result nobody saw start says nothing about which command failed.
   if (call === undefined) return
   const text = toolResultText(event.data?.message)
+  // Only a shell result announces a background job; a job's own output could quote the
+  // phrase back at us, and must not overwrite the entry it is being read through.
+  if (call.tool === 'bash' || call.tool === 'pwsh') noteBackgroundStart(activity, call, text)
+  if (call.jobId !== undefined) {
+    noteJobOutputResult(activity, call, event, text, log)
+    return
+  }
   const exitCode = exitCodeOf(text)
   const failure = event.data?.error
   const failed = (failure !== undefined && failure !== null) || (exitCode !== undefined && exitCode !== 0)
   if (!failed) return
-  const key = failureKey(call.command)
+  countFailure(activity, call.command, {
+    exitCode,
+    name: typeof failure?.name === 'string' ? failure.name : undefined,
+    log,
+  })
+}
+
+/**
+ * Remember the background job a shell result just announced.
+ *
+ * The harness says either `started background job <id>` for a call made in the background
+ * or `[still running after <ms>ms; moved to background job <id>]` for a foreground call
+ * that outlived its timeout. Only those two exact shapes are trusted: the first must be the
+ * whole trimmed first line *and* the call must have asked for `run_in_background: true`,
+ * the second must be a whole line. A foreground `cat` of a log that happens to contain the
+ * phrase therefore cannot relabel the job with the `cat` command. In both cases the command
+ * is the one the shell call opened with, and the time it started is that call's own `since`
+ * — the job's clock does not restart when a later wait begins.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {object} call - the shell call the result just closed.
+ * @param {string} text - the result's text.
+ * @returns {void}
+ */
+function noteBackgroundStart(activity, call, text) {
+  if (typeof text !== 'string' || text.length === 0) return
+  if (activity?.backgroundJobs === undefined) return
+  const lines = text.split(/\r?\n/)
+  let jobId
+  if (call.background === true) {
+    const match = /^started background job (\S+)$/.exec((lines[0] ?? '').trim())
+    if (match !== null) jobId = match[1]
+  }
+  if (jobId === undefined) {
+    for (const line of lines) {
+      const match = /^\[still running after \d+ms; moved to background job ([^\]]+)\]$/.exec(line.trim())
+      if (match !== null) {
+        jobId = match[1].trim()
+        break
+      }
+    }
+  }
+  if (jobId === undefined || jobId.length === 0) return
+  activity.backgroundJobs.set(backgroundJobKey(call.session, jobId), {
+    session: call.session,
+    jobId,
+    tool: call.tool,
+    command: call.command,
+    since: call.since,
+  })
+}
+
+/**
+ * Read one `job_output` result: forget a finished job, and count a failed exit.
+ *
+ * The read's text ends with `[status: <status>]`; anything but `running` means the job is
+ * over and will never be waited on again, so its entry is dropped. A status naming a
+ * non-zero exit code is a failed run of the command that job started, counted under the
+ * same folded key a foreground failure uses — a worker that backgrounds a failing build and
+ * then polls it is retrying the same step. The job's own output is not searched for an exit
+ * code: a successful command may quote one, and only the harness's status line says how
+ * the job itself ended. A result with no status at all that is an error, or that says the
+ * job is unknown (a job id from another server, say), also forgets the job: it will never
+ * produce a status this record can read.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {object} call - the `job_output` call the result just closed.
+ * @param {object} event - the `tool/result` event.
+ * @param {string} text - the result's text.
+ * @param {(message: string) => void} log - diagnostic sink.
+ * @returns {void}
+ */
+function noteJobOutputResult(activity, call, event, text, log) {
+  if (activity?.backgroundJobs === undefined) return
+  const key = backgroundJobKey(call.session, call.jobId)
+  const status = lastStatusOf(text)
+  if (status === undefined) {
+    const failure = event.data?.error
+    if ((failure !== undefined && failure !== null) || jobLooksUnknown(text)) activity.backgroundJobs.delete(key)
+    return
+  }
+  if (status.trim() === 'running') return
+  const job = activity.backgroundJobs.get(key)
+  activity.backgroundJobs.delete(key)
+  if (job === undefined) return
+  // Only the status line speaks for the job. Its output may quote any `exit code: N` —
+  // a passing test run that prints the exit code of a deliberately failing child, say —
+  // and counting that as the job's own failure warned about a command that succeeded.
+  const exitCode = exitCodeInStatus(status)
+  if (exitCode === undefined || exitCode === 0) return
+  countFailure(activity, job.command, { exitCode, log })
+}
+
+/**
+ * Whether a `job_output` result without a status says the job does not exist.
+ *
+ * The server's own unknown-job error says `unknown job "<id>"`; the other shapes are the
+ * ways a harness can phrase the same fact. Only read when there is no status, so a real
+ * status sentence is never overridden by a word in a job's output.
+ *
+ * @param {string} text - the result's text.
+ * @returns {boolean} true when the text names an unknown job.
+ */
+function jobLooksUnknown(text) {
+  return typeof text === 'string' && /unknown job|no such job|job .* (?:not found|does not exist)/i.test(text)
+}
+
+/**
+ * The last `[status: …]` a job read carries, which is its current status.
+ *
+ * @param {string} text - the result's text.
+ * @returns {string | undefined} the status, or undefined when the text names none.
+ */
+function lastStatusOf(text) {
+  if (typeof text !== 'string') return undefined
+  let status
+  for (const match of text.matchAll(/\[status:\s*([^\]]*)\]/g)) status = match[1]
+  return status
+}
+
+/**
+ * The exit code a status line names, when it names one.
+ *
+ * @param {string} text - the text inside `[status: …]`, never the whole job read.
+ * @returns {number | undefined} the code, or undefined when the text carries none.
+ */
+function exitCodeInStatus(text) {
+  const match = /exit code:\s*(-?\d+)/.exec(text)
+  return match === null ? undefined : Number(match[1])
+}
+
+/**
+ * Count one failure of one command, and log the warning at each threshold.
+ *
+ * Both a foreground result and a background job's terminal read come through here, so a
+ * command is warned about the same way whichever way it failed.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {string} command - the command line that failed.
+ * @param {object} options - what the failure was.
+ * @param {number | undefined} options.exitCode - the exit code, when there was one.
+ * @param {string | undefined} [options.name] - the tool error's name, when there was one.
+ * @param {(message: string) => void} options.log - diagnostic sink.
+ * @returns {void}
+ */
+function countFailure(activity, command, { exitCode, name, log }) {
+  const key = failureKey(command)
   if (key.length === 0) return
   const record = activity.failures.get(key) ?? { count: 0 }
   record.count += 1
   record.lastAt = Date.now()
   record.lastExitCode = exitCode
-  record.lastName = typeof failure?.name === 'string' ? failure.name : undefined
+  record.lastName = name
   activity.failures.set(key, record)
   if (record.count < REPEATED_FAILURE_THRESHOLD) return
   if (record.count % REPEATED_FAILURE_THRESHOLD !== 0) return
@@ -2648,13 +2951,30 @@ function activityWarnings(activity, now = Date.now()) {
  * `since` is an ISO timestamp for a status reader; `runningMs` is what a render needs, and
  * keeping both means no reader has to trust this process's clock twice.
  *
+ * A `job_output` call waiting on a job this call started is shown as the command that job
+ * is running, from that command's start, with `background` naming the job. Without it the
+ * status would say `job_output {…}` for the whole wait and restart its clock at every poll.
+ * An unknown job id has no command to show and keeps the ordinary rendering.
+ *
  * @param {object} [activity] - the call's activity record.
  * @param {number} [now] - the clock to measure against.
- * @returns {{tool: string, command: string, since: string, runningMs: number}[]} the calls.
+ * @returns {{tool: string, command: string, since: string, runningMs: number, background?: string}[]} the calls.
  */
-function openCommands(activity, now = Date.now()) {
+export function openCommands(activity, now = Date.now()) {
   const current = []
   for (const call of activity?.openCalls?.values() ?? []) {
+    const job =
+      call.jobId === undefined ? undefined : activity?.backgroundJobs?.get(backgroundJobKey(call.session, call.jobId))
+    if (job !== undefined) {
+      current.push({
+        tool: job.tool,
+        command: job.command,
+        since: new Date(job.since).toISOString(),
+        runningMs: Math.max(0, now - job.since),
+        background: job.jobId,
+      })
+      continue
+    }
     current.push({
       tool: call.tool,
       command: call.command,
@@ -3437,7 +3757,9 @@ function warnAboutIgnoredArguments(args, toolName, log) {
  * it survives. Three more exist because the caller reads the report, not the transcript: a
  * deviation from the named interface is invisible unless it is said first, a contract that
  * looks wrong is the caller's decision rather than something to route around, and a task
- * abandoned halfway must say so before its partial result is mistaken for a whole one.
+ * abandoned halfway must say so before its partial result is mistaken for a whole one. The
+ * last three cover what a diff cannot show either: a command whose exit code was hidden, a
+ * feature removed without a word, and a file changed outside the task's list.
  */
 export const WORKER_INSTRUCTIONS = [
   'Do not commit unless the task explicitly asks: the service reads the change from the working tree, and a commit only confuses the report.',
@@ -3448,6 +3770,9 @@ export const WORKER_INSTRUCTIONS = [
   'If a check the task asks for cannot run here (an end-to-end run, a service, a step the sandbox blocks), still write the code and the tests the task asks for, and name each check you could not run and why, so the caller can run it.',
   'If the same build or command fails the same way twice, do not keep retrying it: report the error and what it would need.',
   'Before adding a name with global reach (a global CSS class, a global variable, a route, an environment variable, a config key), search the code for it; if it already means something else, choose another and say so.',
+  'Run a command bare so its exit code shows; do not hide it behind `; echo` or `|| true`, which makes a failing command look like a success.',
+  'In the report, list anything you removed or left out that existed before (a menu item, an option, a test, a check), each with why.',
+  'In the report, name every file you changed outside the files the task named, and why.',
 ]
 
 /** How many of the copy's uncommitted paths are worth naming in the prompt. */

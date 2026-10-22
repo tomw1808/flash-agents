@@ -102,6 +102,10 @@ worker profiles into `~/.dsh/profiles` (plus a `flash-orchestrator` preset for d
 proves the pipeline end to end with one real task. Every failing check
 prints the exact command that fixes it.
 
+Run it again after every plugin update, and reconnect: the update replaces the server but not the
+worker profile or the guard it runs with, so the installer has to rewrite both (see
+[Configuration](#configuration)).
+
 **4. Use it**
 
 ```
@@ -135,8 +139,11 @@ review an earlier patch while workers run; `flash_result` collects the result (a
 it), `flash_cancel` stops it. `flash_status` lists running jobs first, then the last few that
 ended, and for a running one says what its workers are doing: `current` holds each open tool call
 (`tool`, `command`, `since`, `runningMs`, as of the last heartbeat) and `warnings` names a command
-that failed three or more times in the call. A job sent with `taskFile` is labelled with the brief's
-first line rather than `(untitled task)`, so a long brief's job is recognisable in the listing. A
+that failed three or more times in the call. A worker waiting on a backgrounded command shows that
+command instead, with `background: <job id>` and the time since the shell call that started it; a
+background command that ends non-zero counts toward `warnings` like a foreground one. A job sent
+with `taskFile` is labelled with the brief's first line rather than `(untitled task)`, so a long
+brief's job is recognisable in the listing. A
 call still waiting for a free copy says so — `queued 1m10s: waiting for a free tree (2 of 2 in use)`,
 and `queued in the foreground …` for a writing call sent without `background: true`, which holds
 your turn while it waits; that call's result carries the same warning.
@@ -162,6 +169,15 @@ the `taskFile` path — and, once the call finished, the worker's final report (
 characters). `flash_patch` returns the task on every page and the report on the first; `flash_apply`
 returns the task. A patch salvaged after a crash still names its task.
 
+`flash_apply` and `flash_patch` report `drift`: `commitsBehind` (how many commits your `HEAD` has
+since the patch's base; `null` when that cannot be answered) and `filesChangedSince` (the patch's
+own files whose content in your tree differs from the base the copy was made from; `flash_patch`
+computes it on the page at offset 0 only, and it is `null` once the patch was applied). A
+non-empty file list comes back as a warning on the apply. An apply that would delete or rename away
+a file you changed since the copy was made is refused instead: `threeWay: true` merges it and keeps
+your edit (conflicts are marked in the file), and `force: true` applies it anyway and discards the
+edit. Before 0.1.8 such an apply removed the file without a word.
+
 Every result reports the tokens the call used (`usage`), and lists any uncommitted files the copy
 started with (`isolation.uncommittedAtStart`). If another session has uncommitted work in the same
 tree, `source: "head"` starts the copy from the last commit instead.
@@ -178,8 +194,9 @@ Three layers stand between a cheap model and your machine. **The copy**: writing
 in your tree. **The sandbox**: workers are confined to their workspace by DeepSeek Harness, with
 no approval prompts — anything outside fails closed. **The wall**: a deterministic, model-free
 filter refuses reads of secrets (`.env`, `~/.ssh`, `~/.aws`, …), writes to `.git`, destructive git
-(`reset --hard`, `push --force`, …), catastrophic deletions, and any write outside the workspace.
-Each refusal comes back to Claude with a code and a reason. Details, and the live test that proves
+(`reset --hard`, `push --force`, …), catastrophic deletions, and any write outside the workspace,
+with every path placed in the directory its own command runs in after a `cd`. Each refusal comes
+back to Claude with a code and a reason. Details, and the live test that proves
 each rule, are in [docs/design.md](docs/design.md#permissions).
 
 ## Configuration
@@ -200,13 +217,24 @@ Both `flash_task` and `flash_batch` take a `model` from that list: one task, or 
 run on a different allowed model, and the result's `route` reports the model that actually ran.
 Omit `model` for the default.
 
+The settings also cover how many copies may be in flight (each is a process, so this is a memory
+decision; default 2), where copies and patches live, and **Base folder for worker copies**
+(`state_base`; `FLASH_STATE_BASE` or `--state-base` for a manual install). That base moves the
+default copy layout only — a configured state directory replaces it — and it must be an absolute
+path, with a leading `~` expanded. On Windows a short one such as `C:\fm` leaves room for build
+tools that ignore long-path support; see [Honest limits](#honest-limits).
+
+**After updating the plugin, run `node install.mjs` again in the plugin folder, then reconnect**
+(`/flash-agents:setup` does the same from the plugin). An update replaces the server but not the
+worker profile or the guard the server runs with, so the old guard stays in place until the
+installer rewrites it. 0.1.8 names that drift: the server logs it at start, every `flash_task` and
+`flash_batch` result carries the warning, and `doctor`'s `profile-version` row warns until the installed profile matches the
+server.
+
 **After upgrading from 0.1.5 or older, run the setup once more** (`/flash-agents:setup`, or
 `node install.mjs` in a manual install). Before 0.1.6 the installed worker profile pinned one
 literal model: setting the plugin's model alone did not switch the worker, and a profile from an
 older release refuses a per-call choice until it is regenerated.
-
-The settings also cover how many copies may be in flight (each is a process, so this is a memory
-decision; default 2) and where patches live.
 
 Limits live in [`flash.config.json`](flash.config.json). The defaults: a call is stopped after
 **10 minutes without any activity** (stuck), or 3 hours in total (a ceiling for honest work);
@@ -215,7 +243,9 @@ either way, the change so far is salvaged as a patch.
 ### Per-repository settings
 
 A `.flash-agents.json` at the repository root tunes the disposable copy for that repository. It
-is read when the server starts, so restart Claude Code after changing it.
+is read when the server starts; a change made after that is not applied, and every task result warns
+about it (`… changed after this server started; its new settings take effect after a reconnect`)
+until you reconnect.
 
 ```json
 {
@@ -317,6 +347,12 @@ To watch workers live, set a log file and `tail -f` it — see
   jobs the running server process started: another session's jobs, or one from before a restart, are
   not listed. A finished writing call's work survives that as a patch, which `flash_apply` can still
   apply by id.
+- **The guard follows the shell, and an update no longer leaves it behind.** The wall now places
+  every path in the directory its own command runs in, so `cd .. && echo x > ../elsewhere` is refused
+  and `cd server && … > ../log` is allowed; a deletion after a `cd` it cannot follow is refused
+  rather than guessed at. And a plugin update no longer leaves the old guard and worker profile behind silently: the
+  server names the drift in its log and in every task result, and `node install.mjs` in the plugin folder
+  is the fix.
 - **A crash used to lose the unfinished work; 0.1.7 fixes that.** Before 0.1.7 the start-up sweep
   looked for a dead server's copies one directory too high, found nothing to salvage, and deleted
   them. It now finds them and salvages a copy that holds work as a patch named in the log, and keeps a copy it
@@ -324,6 +360,11 @@ To watch workers live, set a log file and `tail -f` it — see
   it. The dead server's directory is renamed out of the way and deleted in the background, and the
   handshake is answered before any of it runs, so a large clean-up cannot outlast Claude Code's
   connect timeout.
+- **On Windows, a long slot path can break tools that ignore long-path support.** MSVC's `cl.exe`
+  and others still fail past 260 characters, and a slot root is about 85 before a project's own
+  build folders are added. A slot root over 64 characters logs a warning at start and on every call,
+  and `doctor` reports a `slot-path-length` row; set **Base folder for worker copies** (`state_base`,
+  `FLASH_STATE_BASE` or `--state-base`) to a short absolute folder such as `C:\fm`.
 - macOS and Linux are what we test on. Windows 11 works in daily use by at least one user; directory
   junctions are recreated as junctions inside the copy.
 

@@ -77,7 +77,12 @@ non-default model while the installed profile predates 0.1.6; the error says to 
    semantic core twice (§1). When `change.diffTruncated` is true, read the rest with `flash_patch`
    (by file or by page) before applying. A patch that no longer applies because a file moved
    meanwhile takes `flash_apply` with `threeWay: true`; it merges without touching the index and
-   names any conflicts. A worker that reports green has still only tested its copy, and
+   names any conflicts. `flash_apply` and `flash_patch` report `drift` (`commitsBehind`, and
+   `filesChangedSince`: the patch's own files you changed in the tree since the copy was made), and
+   an apply that would delete or rename away one of those files is refused unless you pass
+   `threeWay: true` (merges and keeps the edit, marking conflicts) or `force: true` (discards it).
+   A worker that reports
+   green has still only tested its copy, and
    "no warnings in the files I created" says nothing about the files it changed.
 5. **Review independently.** Send the diff to a **read-only** worker with the review template
    (§5). A read-only worker cannot build or run tests — both write. When the review must, send it

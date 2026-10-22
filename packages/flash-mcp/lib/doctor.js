@@ -15,8 +15,10 @@ import { spawnSync } from 'node:child_process'
 import { accessSync, constants, existsSync, readFileSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
+import { canonicalTmpdir, defaultStateDir, resolveStateBase, slotPathWarning } from './isolation.js'
 import { resolveDshCommand } from './sdk.js'
 
 /** The check ids in the order they run. Model rows expand to `model:<id>` per allowed model. */
@@ -27,11 +29,31 @@ export const CHECK_IDS = Object.freeze([
   'dsh-native',
   'profile',
   'profile-models',
+  'profile-version',
+  'slot-path-length',
   'ollama',
   'model',
   'git',
   'zstd',
 ])
+
+/**
+ * The release of this server, read from its own package manifest.
+ *
+ * The installer stamps this same value into `plugins/package.json`, which is how a
+ * profile can name the release that wrote it; comparing the two is what tells a
+ * worker profile that a plugin update left behind from one this release installed.
+ */
+export const FLASH_MCP_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version ?? 'unknown'
+  } catch {
+    return 'unknown'
+  }
+})()
+
+/** The repository root a plugin install runs from: this module's `packages/flash-mcp/lib`. */
+const REPO_ROOT = resolve(fileURLToPath(new URL('../../../', import.meta.url)))
 
 /** The DeepSeek Harness version the profiles are written for and tested against. */
 const DEFAULT_DSH_VERSION = '0.2.0-rc.2'
@@ -178,6 +200,120 @@ export function profileHonoursModelEnv(dshHome, profile = 'flash-service', fs = 
   } catch {
     return false
   }
+}
+
+/**
+ * The file `install.mjs` writes beside an installed profile's plugins.
+ *
+ * It is deliberately its own `package.json`, not the profile's seeded one: the seed is
+ * the user's to edit and `install.mjs` never replaces it, while this one is generated on
+ * every install so it can say which release wrote the plugins beside it. Its `type`
+ * is what stops Node printing `MODULE_TYPELESS_PACKAGE_JSON` on every runtime start.
+ *
+ * @param {string} dshHome - the harness home holding `profiles/`.
+ * @param {string} [profile] - the installed profile (default 'flash-service').
+ * @returns {string} the stamp file's path.
+ */
+export function profileStampPath(dshHome, profile = 'flash-service') {
+  return join(dshHome, 'profiles', profile, 'plugins', 'package.json')
+}
+
+/**
+ * The release that installed a profile, read from the stamp beside its plugins.
+ *
+ * A missing file, one that cannot be read, and one whose `flashAgents.version` is absent
+ * all answer `undefined`: all three mean the profile was written by a release from before
+ * the stamp existed, which is exactly what the caller has to say.
+ *
+ * @param {string} dshHome - the harness home holding `profiles/`.
+ * @param {string} [profile] - the installed profile (default 'flash-service').
+ * @param {object} [fs] - filesystem probe with exists/readText (default the node:fs calls).
+ * @returns {string | undefined} the stamped version, or undefined when there is none.
+ */
+export function readProfileStamp(dshHome, profile = 'flash-service', fs = REAL_FS) {
+  if (typeof dshHome !== 'string' || dshHome === '') return undefined
+  const stamp = profileStampPath(dshHome, profile)
+  try {
+    if (fs.exists(stamp) !== true) return undefined
+    const parsed = JSON.parse(fs.readText(stamp))
+    const version = parsed?.flashAgents?.version
+    return typeof version === 'string' && version.length > 0 ? version : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The warning one profile's release stamp produces, or undefined when it is current.
+ *
+ * A profile directory that does not exist at all is a different state from one written by
+ * a release from before the stamp existed: the doctor runs before installing too, and
+ * telling a user their not-yet-installed profile "was installed by an older release" is
+ * simply false. The absent case therefore says it is not installed and names the installer.
+ *
+ * @param {object} options - what to compare.
+ * @param {string} options.dshHome - the harness home holding `profiles/`.
+ * @param {string} [options.profile] - the installed profile (default 'flash-service').
+ * @param {string} [options.version] - this server's release (default FLASH_MCP_VERSION).
+ * @param {string} [options.pluginFolder] - the repository root `install.mjs` runs from,
+ *   named in the message when the code knows it.
+ * @param {object} [options.fs] - filesystem probe with exists/readText.
+ * @returns {string | undefined} the warning, or undefined when the stamp matches.
+ */
+export function profileVersionWarning({
+  dshHome,
+  profile = 'flash-service',
+  version = FLASH_MCP_VERSION,
+  pluginFolder,
+  fs = REAL_FS,
+} = {}) {
+  if (typeof dshHome !== 'string' || dshHome === '') return undefined
+  const dir = join(dshHome, 'profiles', profile)
+  const folder = typeof pluginFolder === 'string' && pluginFolder.length > 0 ? ` (${pluginFolder})` : ''
+  let present = false
+  try {
+    present = fs.exists(dir) === true
+  } catch {
+    present = false
+  }
+  if (!present) {
+    return `the worker profile ${dir} is not installed: run node install.mjs in the plugin folder${folder}`
+  }
+  const installed = readProfileStamp(dshHome, profile, fs)
+  if (installed === version) return undefined
+  return (
+    `the worker profile in ${dir} was installed by ${installed ?? 'an older release'}, not ${version}: ` +
+    `run node install.mjs in the plugin folder${folder}, then reconnect`
+  )
+}
+
+/**
+ * One warning per stale worker profile: the service profile and its read-only sibling.
+ *
+ * A call with `mode: "read-only"` boots `<profile>-readonly`, and `install.mjs` stamps that
+ * profile too. Checking only the writing profile let a plugin update leave the read-only
+ * one a release behind with no warning anywhere. The read-only name is derived the same
+ * way `FlashTaskService` derives it, so the profiles named here are exactly the ones a
+ * call can boot.
+ *
+ * @param {object} options - what to compare; see `profileVersionWarning`.
+ * @param {string} [options.profile] - the writing profile (default 'flash-service').
+ * @returns {string[]} one warning per profile whose stamp is missing, absent or different.
+ */
+export function profileVersionWarnings({
+  dshHome,
+  profile = 'flash-service',
+  version = FLASH_MCP_VERSION,
+  pluginFolder,
+  fs = REAL_FS,
+} = {}) {
+  const names = profile.endsWith('-readonly') ? [profile] : [profile, `${profile}-readonly`]
+  const warnings = []
+  for (const name of names) {
+    const warning = profileVersionWarning({ dshHome, profile: name, version, pluginFolder, fs })
+    if (warning !== undefined) warnings.push(warning)
+  }
+  return warnings
 }
 
 /**
@@ -540,9 +676,19 @@ function checkNativeModules(entry, platform, arch, fs, install, { run, nodePath 
  * @param {string} [options.home] - home directory a `~` in `dshHome` expands against
  *        (default the process's; injectable so a check needs no real home).
  * @param {string} [options.dshVersion] - the dsh version the profiles are written for (default '0.2.0-rc.2').
+ * @param {string} [options.root] - the service root whose default slot layout is measured
+ *        (default the current directory).
+ * @param {string} [options.stateDir] - a configured state directory, which replaces the
+ *        default slot layout in the Windows path-length row.
+ * @param {string} [options.stateBase] - the base of the default slot layout
+ *        (default `$TMPDIR/flash-mcp`), so the row measures the base a server would use.
  * @param {string} [options.platform] - platform whose node-pty prebuild to inspect (default process.platform).
  * @param {string} [options.arch] - architecture whose node-pty prebuild to inspect (default process.arch).
  * @param {string} [options.nodePath] - Node executable that runs the pty probe (default process.execPath).
+ * @param {string} [options.execPath] - the running Node binary, whose version-manager siblings
+ *        the launcher check names when dsh is missing (default process.execPath).
+ * @param {(directory: string) => string[]} [options.listDir] - directory listing used by the
+ *        launcher check's sibling lookup; injectable so a check needs no real nvm layout.
  * @param {object} [options.fs] - filesystem probe with realpath/exists/executable/readText/resolvePackage;
  *        defaults to the node:fs calls, and is injectable so the check needs no real harness install.
  * @param {{command: string, prefix: string[]}} [options.launcher] - how to start dsh; defaults to the
@@ -614,7 +760,10 @@ export async function runChecks(options = {}) {
   let notFound = ''
   if (launcher === undefined) {
     try {
-      launcher = resolveDshCommand(env)
+      launcher = resolveDshCommand(env, platform, {
+        execPath: config.execPath ?? process.execPath,
+        ...(config.listDir === undefined ? {} : { listDir: config.listDir }),
+      })
     } catch (error) {
       notFound = error instanceof Error ? error.message : String(error)
     }
@@ -697,6 +846,55 @@ export async function runChecks(options = {}) {
       `the installed ${profile} profile does not read FLASH_ROUTE_MODEL, so only the default model can run until it is regenerated (${join(dshHome, 'profiles', profile)})`,
       'node install.mjs',
     )
+  }
+
+  // The installed profiles' stamps name the release that wrote their plugins. A plugin
+  // update replaces the server without running install.mjs, so the guard and the profiles
+  // can be a release behind while every call still runs; the row says which release wrote
+  // each one, including the read-only profile a `mode: "read-only"` call boots.
+  const stampWarnings = profileVersionWarnings({
+    dshHome,
+    profile,
+    version: FLASH_MCP_VERSION,
+    pluginFolder: REPO_ROOT,
+    fs,
+  })
+  if (stampWarnings.length === 0) {
+    record(
+      'profile-version',
+      'profile release',
+      'ok',
+      `the ${profile} profile was installed by flash-agents ${FLASH_MCP_VERSION}`,
+      '',
+    )
+  } else {
+    // One sentence per stale profile, on one row: the report has one line per check, and
+    // the caller needs both directories when both are behind.
+    record('profile-version', 'profile release', 'warn', stampWarnings.join(' '), 'node install.mjs')
+  }
+
+  // Only Windows pays the 260-character limit: a tool that ignores long-path support
+  // (`cl.exe` among them) fails in a slot whose own root is already long before the
+  // project's deep build folders are added. Other platforms have no such limit.
+  if (platform === 'win32') {
+    const serviceRoot = resolve(config.root ?? process.cwd())
+    // The same expansion the server's option parsing applies, so a `~` base is measured
+    // where the copies would really land instead of as a literal `~` directory.
+    const defaultBase = resolveStateBase(config.stateBase, config.home ?? homedir()) ?? join(canonicalTmpdir(), 'flash-mcp')
+    const slotRoot = join(config.stateDir ?? defaultStateDir(serviceRoot, { baseDir: defaultBase }), 'slots', 'slot-0')
+    const lengthWarning = slotPathWarning(slotRoot, { platform })
+    if (lengthWarning === undefined) {
+      const trailing = /[\\/]$/.test(slotRoot) ? slotRoot : `${slotRoot}\\`
+      record('slot-path-length', 'slot copy path length', 'ok', `slot copies live at ${trailing} (${String(trailing.length)} characters)`, '')
+    } else {
+      record(
+        'slot-path-length',
+        'slot copy path length',
+        'warn',
+        lengthWarning,
+        'set the plugin option "state_base" (or FLASH_STATE_BASE) to a short absolute folder such as C:\\fm',
+      )
+    }
   }
 
   const daemonUp = await safeProbe(OLLAMA_TAGS_URL)

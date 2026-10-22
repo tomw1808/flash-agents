@@ -7,7 +7,17 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
@@ -27,10 +37,19 @@ import {
   looksLikeWorkflowResult,
   normalizeTasks,
   observe,
+  openCommands,
   parseWorkflowHeader,
   toolResultText,
 } from '../lib/service.js'
-import { jobLabel } from '../lib/index.js'
+import { SETTINGS_CHANGED_WARNING } from '../lib/isolation.js'
+import { createService, jobLabel, SERVER_INFO } from '../lib/index.js'
+
+/**
+ * Pools without an explicit state directory (the `--state-base` case) store patches in
+ * the durable data directory. Point it at a throwaway directory so no test can read,
+ * prune or write the real one.
+ */
+process.env.FLASH_DATA_DIR = realpathSync(mkdtempSync(join(tmpdir(), 'flash-service-data-')))
 
 /** Read the fleet payload back out of the dispatch prompt. */
 function promptArgs(text) {
@@ -637,11 +656,17 @@ function makeService({ script, ...overrides } = {}) {
   return { root, client, service }
 }
 
-/** A git-backed root, and a worker that writes one file into whatever tree it gets. */
-function makeIsolatedService({ slots = 2, file = 'worker-output.txt', script, slotEnv, ...overrides } = {}) {
+/**
+ * A git-backed root, and a worker that writes one file into whatever tree it gets.
+ *
+ * `settings` is written as `.flash-agents.json` before the pool is constructed, so a test
+ * can tell the file the server read at start from one edited afterwards.
+ */
+function makeIsolatedService({ slots = 2, file = 'worker-output.txt', script, slotEnv, settings, ...overrides } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-iso-')))
   execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root })
   writeFileSync(join(root, 'README.md'), '# project\n')
+  if (settings !== undefined) writeFileSync(join(root, '.flash-agents.json'), settings)
   execFileSync('git', ['add', '-A'], { cwd: root })
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: root })
   const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-iso-state-')))
@@ -1702,9 +1727,9 @@ test('prompt builders keep the dispatcher on a single delegation', () => {
 })
 
 test('every child prompt carries the standing worker instructions, in order', () => {
-  // The first two are the originals; the other three exist so a caller reading the report
+  // The first two are the originals; the next three exist so a caller reading the report
   // (never the transcript) learns about a deviation, a wrong contract, or an unfinished task.
-  assert.equal(WORKER_INSTRUCTIONS.length, 8)
+  assert.equal(WORKER_INSTRUCTIONS.length, 11)
   assert.match(WORKER_INSTRUCTIONS[0], /^Do not commit unless the task explicitly asks/)
   assert.match(WORKER_INSTRUCTIONS[1], /^If the work reaches for an escape hatch/)
   assert.equal(
@@ -1730,6 +1755,18 @@ test('every child prompt carries the standing worker instructions, in order', ()
   assert.equal(
     WORKER_INSTRUCTIONS[7],
     'Before adding a name with global reach (a global CSS class, a global variable, a route, an environment variable, a config key), search the code for it; if it already means something else, choose another and say so.',
+  )
+  assert.equal(
+    WORKER_INSTRUCTIONS[8],
+    'Run a command bare so its exit code shows; do not hide it behind `; echo` or `|| true`, which makes a failing command look like a success.',
+  )
+  assert.equal(
+    WORKER_INSTRUCTIONS[9],
+    'In the report, list anything you removed or left out that existed before (a menu item, an option, a test, a check), each with why.',
+  )
+  assert.equal(
+    WORKER_INSTRUCTIONS[10],
+    'In the report, name every file you changed outside the files the task named, and why.',
   )
   for (const prompt of [
     buildChildPrompt({ cwd: '/w', task: 'x' }),
@@ -2518,6 +2555,433 @@ test('a worker that ends with a call still open no longer reports it as running'
   assert.equal(state.activity.openCalls.size, 0)
 })
 
+test('a waited-on background job names the command it started, from the command’s own start', async () => {
+  const sessionId = `flash-task-${randomUUID()}`
+  const child = randomUUID()
+  const state = createObserveState()
+  state.activity = createActivity()
+  const completion = { resolve: () => {}, reject: () => {} }
+  const send = (method, params) => observe(state, method, params, sessionId, completion, () => {})
+  const event = (type, data) => send('session.event', { sessionId: child, event: { type, data } })
+  send('subagent.started', { parentSessionId: sessionId, childSessionId: child })
+
+  const startedAt = Date.now()
+  event('tool/call', {
+    id: 'call_bg',
+    name: 'bash',
+    arguments: JSON.stringify({ command: 'sleep 300', run_in_background: true }),
+  })
+  event('tool/result', {
+    id: 'call_bg',
+    name: 'bash',
+    message: { content: [{ type: 'text', text: 'started background job bash-2' }] },
+  })
+  const wait = (id) =>
+    event('tool/call', { id, name: 'job_output', arguments: JSON.stringify({ job_id: 'bash-2', wait: true }) })
+  wait('call_wait_1')
+  const [first] = openCommands(state.activity)
+  assert.equal(first.tool, 'bash', 'the background command is named, not the wait')
+  assert.equal(first.command, 'sleep 300')
+  assert.equal(first.background, 'bash-2')
+  assert.equal(state.activity.backgroundJobs.size, 1)
+  // The clock belongs to the shell call that started the job, not to this wait.
+  assert.ok(
+    Math.abs(Date.parse(first.since) - startedAt) < 1000,
+    `expected the background start near ${String(startedAt)}, saw ${first.since}`,
+  )
+
+  // A read that still says running closes this wait without forgetting the job.
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  event('tool/result', {
+    id: 'call_wait_1',
+    name: 'job_output',
+    message: { content: [{ type: 'text', text: 'still working\n[status: running]' }] },
+  })
+  assert.deepEqual(openCommands(state.activity), [], 'a wait that returned is no longer open')
+  wait('call_wait_2')
+  const [second] = openCommands(state.activity)
+  assert.equal(second.command, 'sleep 300')
+  assert.equal(second.background, 'bash-2')
+  assert.ok(
+    second.runningMs >= first.runningMs + 30,
+    `the second wait must not restart the clock (${String(first.runningMs)} -> ${String(second.runningMs)})`,
+  )
+
+  // A terminal read ends the job: no later wait can name it.
+  event('tool/result', {
+    id: 'call_wait_2',
+    name: 'job_output',
+    message: { content: [{ type: 'text', text: 'done\n[status: succeeded]' }] },
+  })
+  assert.equal(state.activity.backgroundJobs.size, 0)
+})
+
+test('a background command that kept failing reaches the repeated-failure warning', () => {
+  const sessionId = `flash-task-${randomUUID()}`
+  const child = randomUUID()
+  const state = createObserveState()
+  state.activity = createActivity()
+  const logs = []
+  const completion = { resolve: () => {}, reject: () => {} }
+  const send = (method, params) => observe(state, method, params, sessionId, completion, (line) => logs.push(line))
+  const event = (type, data) => send('session.event', { sessionId: child, event: { type, data } })
+  send('subagent.started', { parentSessionId: sessionId, childSessionId: child })
+
+  // Three background runs of one command, each polled once to a failed terminal status.
+  for (let run = 1; run <= 3; run += 1) {
+    const jobId = `bash-${String(run + 1)}`
+    event('tool/call', {
+      id: `call_bg_${String(run)}`,
+      name: 'bash',
+      arguments: JSON.stringify({ command: 'cargo test --release', run_in_background: true }),
+    })
+    event('tool/result', {
+      id: `call_bg_${String(run)}`,
+      name: 'bash',
+      message: { content: [{ type: 'text', text: `started background job ${jobId}` }] },
+    })
+    event('tool/call', {
+      id: `call_wait_${String(run)}`,
+      name: 'job_output',
+      arguments: JSON.stringify({ job_id: jobId, wait: true }),
+    })
+    event('tool/result', {
+      id: `call_wait_${String(run)}`,
+      name: 'job_output',
+      // The code is in the status line, which is the only place a job's own exit is read.
+      message: { content: [{ type: 'text', text: '[status: failed (exit code: 1)]' }] },
+    })
+  }
+
+  // The job read's exit code is counted under the command the job started, folded like a
+  // foreground failure (`cargo test --release` -> `cargo test`).
+  assert.equal(state.activity.failures.get('cargo test').count, 3)
+  assert.equal(logs.filter((line) => line.startsWith('"cargo test" failed 3 times')).length, 1)
+  assert.equal(state.activity.backgroundJobs.size, 0, 'every terminal read forgot its job')
+})
+
+test('a background flag spelled “true” or 1 starts a job, and “false” or 0 does not', () => {
+  const sessionId = `flash-task-${randomUUID()}`
+  const child = randomUUID()
+  const state = createObserveState()
+  state.activity = createActivity()
+  const completion = { resolve: () => {}, reject: () => {} }
+  const send = (method, params) => observe(state, method, params, sessionId, completion, () => {})
+  const event = (type, data) => send('session.event', { sessionId: child, event: { type, data } })
+  send('subagent.started', { parentSessionId: sessionId, childSessionId: child })
+
+  const cases = [
+    ['true', true],
+    ['TRUE', true],
+    [1, true],
+    ['false', false],
+    [0, false],
+  ]
+  for (const [index, [flag, expected]] of cases.entries()) {
+    const run = index + 1
+    const jobId = `bash-flag-${String(run)}`
+    event('tool/call', {
+      id: `call_flag_${String(run)}`,
+      name: 'bash',
+      arguments: JSON.stringify({ command: `sleep ${String(run)}`, run_in_background: flag }),
+    })
+    event('tool/result', {
+      id: `call_flag_${String(run)}`,
+      name: 'bash',
+      message: { content: [{ type: 'text', text: `started background job ${jobId}` }] },
+    })
+    assert.equal(
+      state.activity.backgroundJobs.size,
+      expected ? 1 : 0,
+      `run_in_background: ${JSON.stringify(flag)} must ${expected ? 'start' : 'not start'} a tracked job`,
+    )
+    if (!expected) continue
+    // Finish the job so the next case starts from an empty map.
+    event('tool/call', {
+      id: `call_flag_wait_${String(run)}`,
+      name: 'job_output',
+      arguments: JSON.stringify({ job_id: jobId, wait: true }),
+    })
+    event('tool/result', {
+      id: `call_flag_wait_${String(run)}`,
+      name: 'job_output',
+      message: { content: [{ type: 'text', text: '[status: succeeded]' }] },
+    })
+    assert.equal(state.activity.backgroundJobs.size, 0)
+  }
+})
+
+test('a successful job whose output quotes an exit code counts no failure', () => {
+  const sessionId = `flash-task-${randomUUID()}`
+  const child = randomUUID()
+  const state = createObserveState()
+  state.activity = createActivity()
+  const logs = []
+  const completion = { resolve: () => {}, reject: () => {} }
+  const send = (method, params) => observe(state, method, params, sessionId, completion, (line) => logs.push(line))
+  const event = (type, data) => send('session.event', { sessionId: child, event: { type, data } })
+  send('subagent.started', { parentSessionId: sessionId, childSessionId: child })
+
+  // Three successful `npm test` runs whose output quotes the exit code of a child process.
+  // The quote is not the job's own exit status and must not be counted as one.
+  for (let run = 1; run <= 3; run += 1) {
+    const jobId = `bash-quote-${String(run)}`
+    event('tool/call', {
+      id: `call_quote_${String(run)}`,
+      name: 'bash',
+      arguments: JSON.stringify({ command: 'npm test', run_in_background: true }),
+    })
+    event('tool/result', {
+      id: `call_quote_${String(run)}`,
+      name: 'bash',
+      message: { content: [{ type: 'text', text: `started background job ${jobId}` }] },
+    })
+    event('tool/call', {
+      id: `call_quote_wait_${String(run)}`,
+      name: 'job_output',
+      arguments: JSON.stringify({ job_id: jobId, wait: true }),
+    })
+    event('tool/result', {
+      id: `call_quote_wait_${String(run)}`,
+      name: 'job_output',
+      message: {
+        content: [{ type: 'text', text: 'all tests passed\na deliberately failing child said exit code: 7\n[status: succeeded]' }],
+      },
+    })
+  }
+
+  assert.equal(state.activity.failures.size, 0, 'a quoted exit code is not the job’s exit code')
+  assert.equal(logs.filter((line) => line.includes('failed 3 times')).length, 0)
+  assert.equal(state.activity.backgroundJobs.size, 0, 'every terminal read still forgets its job')
+})
+
+test('a job status naming an exit code counts one failure', () => {
+  const sessionId = `flash-task-${randomUUID()}`
+  const child = randomUUID()
+  const state = createObserveState()
+  state.activity = createActivity()
+  const completion = { resolve: () => {}, reject: () => {} }
+  const send = (method, params) => observe(state, method, params, sessionId, completion, () => {})
+  const event = (type, data) => send('session.event', { sessionId: child, event: { type, data } })
+  send('subagent.started', { parentSessionId: sessionId, childSessionId: child })
+
+  event('tool/call', {
+    id: 'call_failed',
+    name: 'bash',
+    arguments: JSON.stringify({ command: 'cargo test --release', run_in_background: true }),
+  })
+  event('tool/result', {
+    id: 'call_failed',
+    name: 'bash',
+    message: { content: [{ type: 'text', text: 'started background job bash-failed' }] },
+  })
+  event('tool/call', {
+    id: 'call_failed_wait',
+    name: 'job_output',
+    arguments: JSON.stringify({ job_id: 'bash-failed', wait: true }),
+  })
+  event('tool/result', {
+    id: 'call_failed_wait',
+    name: 'job_output',
+    message: { content: [{ type: 'text', text: 'test failed\n[status: failed (exit code: 2)]' }] },
+  })
+
+  const record = state.activity.failures.get('cargo test')
+  assert.equal(record.count, 1)
+  assert.equal(record.lastExitCode, 2, 'the status line is where the job’s exit code is read')
+  assert.equal(state.activity.backgroundJobs.size, 0)
+})
+
+test('a foreground command moved to a background job is named while its job is waited on', () => {
+  const sessionId = `flash-task-${randomUUID()}`
+  const child = randomUUID()
+  const state = createObserveState()
+  state.activity = createActivity()
+  const completion = { resolve: () => {}, reject: () => {} }
+  const send = (method, params) => observe(state, method, params, sessionId, completion, () => {})
+  const event = (type, data) => send('session.event', { sessionId: child, event: { type, data } })
+  send('subagent.started', { parentSessionId: sessionId, childSessionId: child })
+
+  event('tool/call', { id: 'call_long', name: 'bash', arguments: JSON.stringify({ command: 'npm run build' }) })
+  event('tool/result', {
+    id: 'call_long',
+    name: 'bash',
+    message: { content: [{ type: 'text', text: '[still running after 120000ms; moved to background job bash-3]' }] },
+  })
+  event('tool/call', {
+    id: 'call_wait',
+    name: 'job_output',
+    arguments: JSON.stringify({ job_id: 'bash-3', wait: true }),
+  })
+  const [shown] = openCommands(state.activity)
+  assert.equal(shown.tool, 'bash')
+  assert.equal(shown.command, 'npm run build')
+  assert.equal(shown.background, 'bash-3')
+})
+
+test('a job_output wait for an unknown job id keeps the ordinary rendering', () => {
+  const sessionId = `flash-task-${randomUUID()}`
+  const child = randomUUID()
+  const state = createObserveState()
+  state.activity = createActivity()
+  const completion = { resolve: () => {}, reject: () => {} }
+  const send = (method, params) => observe(state, method, params, sessionId, completion, () => {})
+  send('subagent.started', { parentSessionId: sessionId, childSessionId: child })
+  send('session.event', {
+    sessionId: child,
+    event: {
+      type: 'tool/call',
+      data: {
+        id: 'call_unknown',
+        name: 'job_output',
+        arguments: JSON.stringify({ job_id: 'bash-9', wait: true }),
+      },
+    },
+  })
+  const [shown] = openCommands(state.activity)
+  assert.equal(shown.tool, 'job_output')
+  assert.match(shown.command, /^job_output /)
+  assert.equal(shown.background, undefined)
+  assert.equal(state.activity.backgroundJobs.size, 0)
+})
+
+test('a foreground cat of a log that says “started background job” starts no job', () => {
+  const sessionId = `flash-task-${randomUUID()}`
+  const child = randomUUID()
+  const state = createObserveState()
+  state.activity = createActivity()
+  const completion = { resolve: () => {}, reject: () => {} }
+  const send = (method, params) => observe(state, method, params, sessionId, completion, () => {})
+  const event = (type, data) => send('session.event', { sessionId: child, event: { type, data } })
+  send('subagent.started', { parentSessionId: sessionId, childSessionId: child })
+
+  // The log the worker cats contains a previous run's start line, with an id that would
+  // otherwise label this `cat` as a background job and restart its clock.
+  event('tool/call', { id: 'call_cat', name: 'bash', arguments: JSON.stringify({ command: 'cat build.log' }) })
+  event('tool/result', {
+    id: 'call_cat',
+    name: 'bash',
+    message: { content: [{ type: 'text', text: 'started background job bash-2\nbuild failed\n[exit code: 1]' }] },
+  })
+  assert.equal(state.activity.backgroundJobs.size, 0, 'a foreground shell result cannot start a job')
+  assert.equal(state.activity.failures.get('cat build.log').count, 1, 'the cat result is still the failure it was')
+
+  // A shell call whose output starts with the phrase but that did not ask for the
+  // background is the same case, even with the flag spelled out as false.
+  event('tool/call', {
+    id: 'call_print',
+    name: 'bash',
+    arguments: JSON.stringify({ command: 'printf …', run_in_background: false }),
+  })
+  event('tool/result', {
+    id: 'call_print',
+    name: 'bash',
+    message: { content: [{ type: 'text', text: 'started background job bash-3' }] },
+  })
+  assert.equal(state.activity.backgroundJobs.size, 0)
+
+  // A background call is recognised only when the phrase is the whole trimmed first line;
+  // a log line before it is output, not the harness's own sentence.
+  event('tool/call', {
+    id: 'call_bg_odd',
+    name: 'bash',
+    arguments: JSON.stringify({ command: 'sleep 1', run_in_background: true }),
+  })
+  event('tool/result', {
+    id: 'call_bg_odd',
+    name: 'bash',
+    message: { content: [{ type: 'text', text: 'warming up\nstarted background job bash-4' }] },
+  })
+  assert.equal(state.activity.backgroundJobs.size, 0)
+})
+
+test('a job_output result with no status that is an error or names an unknown job forgets the job', () => {
+  const sessionId = `flash-task-${randomUUID()}`
+  const child = randomUUID()
+  const state = createObserveState()
+  state.activity = createActivity()
+  const completion = { resolve: () => {}, reject: () => {} }
+  const send = (method, params) => observe(state, method, params, sessionId, completion, () => {})
+  const event = (type, data) => send('session.event', { sessionId: child, event: { type, data } })
+  send('subagent.started', { parentSessionId: sessionId, childSessionId: child })
+
+  // A call that reached a background job, then a wait whose result carries an error and no
+  // `[status: …]`: nobody will ever read a status for this job, so it must be forgotten.
+  const startJob = (callId, jobId) => {
+    event('tool/call', {
+      id: callId,
+      name: 'bash',
+      arguments: JSON.stringify({ command: 'sleep 300', run_in_background: true }),
+    })
+    event('tool/result', {
+      id: callId,
+      name: 'bash',
+      message: { content: [{ type: 'text', text: `started background job ${jobId}` }] },
+    })
+    event('tool/call', {
+      id: `${callId}_wait`,
+      name: 'job_output',
+      arguments: JSON.stringify({ job_id: jobId, wait: true }),
+    })
+  }
+
+  startJob('call_err', 'bash-2')
+  assert.equal(state.activity.backgroundJobs.size, 1)
+  event('tool/result', {
+    id: 'call_err_wait',
+    name: 'job_output',
+    error: { name: 'Error', message: 'the harness closed the job pipe' },
+    message: { content: [{ type: 'text', text: 'job_output failed' }] },
+  })
+  assert.equal(state.activity.backgroundJobs.size, 0, 'an error without a status forgets the job')
+
+  startJob('call_gone', 'bash-3')
+  assert.equal(state.activity.backgroundJobs.size, 1)
+  event('tool/result', {
+    id: 'call_gone_wait',
+    name: 'job_output',
+    message: { content: [{ type: 'text', text: 'job_output failed: unknown job "bash-3". Job ids live only in the server process that made them.' }] },
+  })
+  assert.equal(state.activity.backgroundJobs.size, 0, 'an unknown job is forgotten rather than waited on forever')
+})
+
+test('a worker that finishes forgets the background jobs it started', () => {
+  const sessionId = `flash-task-${randomUUID()}`
+  const child = randomUUID()
+  const state = createObserveState()
+  state.activity = createActivity()
+  const completion = { resolve: () => {}, reject: () => {} }
+  const send = (method, params) => observe(state, method, params, sessionId, completion, () => {})
+  const event = (type, data) => send('session.event', { sessionId: child, event: { type, data } })
+  send('subagent.started', { parentSessionId: sessionId, childSessionId: child })
+  event('tool/call', {
+    id: 'call_bg',
+    name: 'bash',
+    arguments: JSON.stringify({ command: 'sleep 300', run_in_background: true }),
+  })
+  event('tool/result', {
+    id: 'call_bg',
+    name: 'bash',
+    message: { content: [{ type: 'text', text: 'started background job bash-2' }] },
+  })
+  event('tool/call', {
+    id: 'call_wait',
+    name: 'job_output',
+    arguments: JSON.stringify({ job_id: 'bash-2', wait: true }),
+  })
+  assert.equal(state.activity.backgroundJobs.size, 1)
+  send('subagent.finished', {
+    parentSessionId: sessionId,
+    childSessionId: child,
+    status: 'ok',
+    stopReason: 'done',
+    provider: 'flash',
+    lastAssistantMessage: [],
+  })
+  assert.equal(state.activity.backgroundJobs.size, 0)
+  assert.deepEqual(openCommands(state.activity), [])
+})
+
 test('a command that keeps failing is warned about at three failures, by folded key', async () => {
   const logs = []
   const { root, client, service } = makeService({ log: (line) => logs.push(line) })
@@ -2968,4 +3432,247 @@ test('a fleet member known only through the engine’s agent-start still shows i
     'expected the member’s repeated failure in a heartbeat',
   )
   assert.ok(result.warnings.some((line) => /^"cargo build" failed 3 times/.test(line)))
+})
+
+// ── installation drift: profile release, settings edits, Windows slot paths ──
+
+/**
+ * A throwaway harness home whose service profile carries a release stamp, or none.
+ *
+ * Both profiles `install.mjs` writes are created: the writing one with `version`, the
+ * read-only sibling with `readOnlyVersion`. A test that is about one profile leaves the
+ * other current, so the warnings it counts are the ones it meant.
+ *
+ * @param {string} [version] - the writing profile's stamped release; omit for a profile from
+ *   before the stamp (the directory exists, the stamp does not).
+ * @param {object} [options] - which release the read-only profile was stamped with.
+ * @param {string} [options.readOnlyVersion] - defaults to this server's release.
+ * @returns {string} the harness home.
+ */
+function profileHome(version, { readOnlyVersion = SERVER_INFO.version } = {}) {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-profile-home-')))
+  const writeStamp = (profile, release) => {
+    const plugins = join(home, 'profiles', profile, 'plugins')
+    mkdirSync(plugins, { recursive: true })
+    if (release === undefined) return
+    writeFileSync(
+      join(plugins, 'package.json'),
+      `${JSON.stringify({ private: true, type: 'module', flashAgents: { version: release } }, null, 2)}\n`,
+    )
+  }
+  writeStamp('flash-service', version)
+  writeStamp('flash-service-readonly', readOnlyVersion)
+  return home
+}
+
+/** A service created through the factory the server uses, with one fake runtime per call. */
+function makeDriftService({ env, log = () => {}, ...overrides } = {}) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-drift-')))
+  const client = new FakeSdkClient()
+  const service = createService(
+    {
+      root,
+      model: 'deepseek-v4.1-flash:cloud',
+      env,
+      isolate: 'none',
+      clientFactory: () => client,
+      honoursModelEnv: () => true,
+      earlyRetryDelayMs: 0,
+      ...overrides,
+    },
+    log,
+  )
+  return { root, client, service }
+}
+
+test('a profile stamped by this release adds no warning to a call', async () => {
+  const home = profileHome(SERVER_INFO.version)
+  const logs = []
+  const { root, service } = makeDriftService({
+    env: { DSH_HOME: home },
+    checkProfileStamp: true,
+    log: (line) => logs.push(line),
+  })
+  try {
+    const result = await service.flashTask({ task: 'read the README', cwd: root })
+    assert.equal(result.status, 'ok')
+    assert.equal(result.warnings, undefined)
+    assert.deepEqual(logs.filter((line) => line.startsWith('the worker profile')), [], 'a matching stamp says nothing at start')
+  } finally {
+    await service.close()
+    rmSync(home, { recursive: true, force: true })
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('the profile stamps are read only when the caller asks for it', async () => {
+  const home = profileHome('0.0.9')
+  const logs = []
+  const { root, service } = makeDriftService({ env: { DSH_HOME: home }, log: (line) => logs.push(line) })
+  try {
+    const result = await service.flashTask({ task: 'read the README', cwd: root })
+    assert.equal(result.warnings, undefined, 'an environment alone is not a request to inspect the profiles')
+    assert.deepEqual(logs.filter((line) => line.startsWith('the worker profile')), [])
+  } finally {
+    await service.close()
+    rmSync(home, { recursive: true, force: true })
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a missing or older profile stamp logs once and warns once in every call result', async () => {
+  for (const version of [undefined, '0.0.9']) {
+    const home = profileHome(version)
+    const logs = []
+    const { root, service } = makeDriftService({
+      env: { DSH_HOME: home },
+      checkProfileStamp: true,
+      log: (line) => logs.push(line),
+    })
+    try {
+      for (let call = 0; call < 2; call += 1) {
+        const result = await service.flashTask({ task: 'read the README', cwd: root })
+        const warnings = result.warnings.filter((line) => line.startsWith('the worker profile'))
+        assert.equal(warnings.length, 1, `call ${String(call + 1)} must carry exactly one profile warning`)
+        assert.ok(
+          warnings[0].includes(`the worker profile in ${join(home, 'profiles', 'flash-service')} was installed by `),
+          warnings[0],
+        )
+        assert.ok(warnings[0].includes(`installed by ${version ?? 'an older release'}, not ${SERVER_INFO.version}`), warnings[0])
+        assert.match(warnings[0], /run node install\.mjs in the plugin folder \(.*\), then reconnect/)
+      }
+      assert.equal(logs.filter((line) => line.startsWith('the worker profile')).length, 1, 'the start log says it once')
+    } finally {
+      await service.close()
+      rmSync(home, { recursive: true, force: true })
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+})
+
+test('a stale read-only profile gets its own warning naming its directory', async () => {
+  const home = profileHome(SERVER_INFO.version, { readOnlyVersion: '0.0.8' })
+  const { root, service } = makeDriftService({ env: { DSH_HOME: home }, checkProfileStamp: true })
+  try {
+    const result = await service.flashTask({ task: 'read the README', cwd: root })
+    const warnings = result.warnings.filter((line) => line.startsWith('the worker profile'))
+    assert.equal(warnings.length, 1, `expected one read-only warning, saw ${JSON.stringify(result.warnings)}`)
+    assert.ok(warnings[0].includes(join(home, 'profiles', 'flash-service-readonly')), warnings[0])
+    assert.ok(warnings[0].includes(`installed by 0.0.8, not ${SERVER_INFO.version}`), warnings[0])
+  } finally {
+    await service.close()
+    rmSync(home, { recursive: true, force: true })
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('two stale profiles are two warnings, one per directory', async () => {
+  const home = profileHome('0.0.9', { readOnlyVersion: '0.0.8' })
+  const { root, service } = makeDriftService({ env: { DSH_HOME: home }, checkProfileStamp: true })
+  try {
+    const result = await service.flashTask({ task: 'read the README', cwd: root })
+    const warnings = result.warnings.filter((line) => line.startsWith('the worker profile'))
+    assert.equal(warnings.length, 2, JSON.stringify(result.warnings))
+    assert.ok(warnings.some((line) => line.includes(join(home, 'profiles', 'flash-service')) && line.includes('0.0.9')))
+    assert.ok(warnings.some((line) => line.includes(join(home, 'profiles', 'flash-service-readonly')) && line.includes('0.0.8')))
+  } finally {
+    await service.close()
+    rmSync(home, { recursive: true, force: true })
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a profile that is not installed is called not installed, not an older release', async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-profile-absent-')))
+  const { root, service } = makeDriftService({ env: { DSH_HOME: home }, checkProfileStamp: true })
+  try {
+    const result = await service.flashTask({ task: 'read the README', cwd: root })
+    const warning = result.warnings.find((line) => line.startsWith('the worker profile'))
+    assert.ok(
+      warning.includes(
+        `the worker profile ${join(home, 'profiles', 'flash-service')} is not installed: run node install.mjs in the plugin folder (`,
+      ),
+      warning,
+    )
+    assert.doesNotMatch(warning, /older release/)
+  } finally {
+    await service.close()
+    rmSync(home, { recursive: true, force: true })
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('an untouched .flash-agents.json adds no warning', async () => {
+  const { service } = makeIsolatedService({ settings: JSON.stringify({ copyExclude: ['dist'] }) })
+  try {
+    const result = await service.flashTask({ task: 'build it', cwd: service.root })
+    assert.equal(result.status, 'ok')
+    assert.equal(result.warnings, undefined)
+  } finally {
+    await service.close()
+  }
+})
+
+test('.flash-agents.json touched after start adds one warning to the next call', async () => {
+  const { root, service } = makeIsolatedService({ settings: JSON.stringify({ copyExclude: ['dist'] }) })
+  try {
+    const path = join(root, '.flash-agents.json')
+    writeFileSync(path, JSON.stringify({ copyExclude: ['build'], slotEnv: { CARGO_HOME: 'home:cargo' } }))
+    // Filesystem timestamps can be coarse; the server compares mtimeMs, so move it forward.
+    const future = new Date(Date.now() + 2_000)
+    utimesSync(path, future, future)
+    const result = await service.flashTask({ task: 'build it', cwd: service.root })
+    const warnings = result.warnings.filter((line) => line === SETTINGS_CHANGED_WARNING)
+    assert.equal(warnings.length, 1, `expected exactly the settings warning, saw ${JSON.stringify(result.warnings)}`)
+    assert.match(warnings[0], /take effect after a reconnect \(\/mcp reconnect plugin:flash-agents:flash\)/)
+  } finally {
+    await service.close()
+  }
+})
+
+test('.flash-agents.json created after start adds one warning to the next call', async () => {
+  const { root, service } = makeIsolatedService()
+  try {
+    assert.equal(existsSync(join(root, '.flash-agents.json')), false)
+    writeFileSync(join(root, '.flash-agents.json'), JSON.stringify({ copyExcludeDefaults: false }))
+    const result = await service.flashTask({ task: 'build it', cwd: service.root })
+    assert.equal(result.warnings.filter((line) => line === SETTINGS_CHANGED_WARNING).length, 1)
+  } finally {
+    await service.close()
+  }
+})
+
+test('a long Windows slot root warns once in every call result, and only on win32', async () => {
+  // A base long enough that the slot root is over the 64-character advisory on any host.
+  const base = join(realpathSync(tmpdir()), `flash-mcp-win-long-${'x'.repeat(20)}`)
+  const logs = []
+  const { root, service } = makeIsolatedService({
+    platform: 'win32',
+    isolate: { slots: 2, baseDir: base },
+    log: (line) => logs.push(line),
+  })
+  try {
+    assert.equal(logs.filter((line) => line.startsWith('slot copies live at ')).length, 1, 'the start log says it once')
+    const result = await service.flashTask({ task: 'build it', cwd: service.root })
+    const warnings = result.warnings.filter((line) => line.startsWith('slot copies live at '))
+    assert.equal(warnings.length, 1, `expected one path warning, saw ${JSON.stringify(result.warnings)}`)
+    assert.ok(warnings[0].includes(base), warnings[0])
+    assert.ok(warnings[0].includes('slot-0'), warnings[0])
+    assert.match(warnings[0], /Windows tools without long-path support \(MSVC cl\.exe among them\) fail past 260 characters/)
+    assert.match(warnings[0], /A short base leaves more room: set the plugin option "state_base" \(or FLASH_STATE_BASE\) to a folder such as C:\\fm/)
+  } finally {
+    await service.close()
+    rmSync(base, { recursive: true, force: true })
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('the Windows slot path warning does not appear on another platform', async () => {
+  const { root, service } = makeIsolatedService({ platform: 'linux' })
+  try {
+    const result = await service.flashTask({ task: 'build it', cwd: service.root })
+    assert.equal(result.warnings, undefined)
+  } finally {
+    await service.close()
+  }
 })

@@ -12,7 +12,7 @@
 
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -257,4 +257,64 @@ test('clean refuses an unknown argument and answers --help', async () => {
   const code = await runClean(['--help'], { env: {}, write: (text) => lines.push(text), baseDir: base })
   assert.equal(code, 0)
   assert.match(lines.join(''), /flash-agents clean/)
+})
+
+test('clean refuses a relative state base and expands a leading ~', async () => {
+  const refusal = '--state-base must be an absolute path (got "rel")'
+  await assert.rejects(
+    () => runClean(['--state-base', 'rel'], { env: {}, write: () => {} }),
+    (error) => error.message === refusal,
+  )
+  await assert.rejects(
+    () => runClean([], { env: { FLASH_STATE_BASE: 'rel' }, write: () => {} }),
+    (error) => error.message === refusal,
+  )
+
+  // A `~` base is expanded against the injected home, not left as a literal `~` directory.
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'flash-clean-home-')))
+  try {
+    const lines = []
+    const code = await runClean(['--root', home], {
+      env: { FLASH_STATE_BASE: '~/flash-base' },
+      home,
+      write: (text) => lines.push(text),
+    })
+    assert.equal(code, 0)
+    assert.ok(lines.join('').includes(`${join(home, 'flash-base')}`), lines.join(''))
+    assert.ok(lines.join('').includes('flash-mcp state: '))
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('FLASH_STATE_BASE and --state-base make clean read that base', async () => {
+  const fromEnv = makeBase()
+  const fromFlag = makeBase()
+  const root = makeRoot()
+  /** Plant one dead owner's slot tree under a base. */
+  function plant(base) {
+    const slot = join(base, rootDigest(root), '4194303', 'dead0001', 'slots', 'slot-0')
+    mkdirSync(slot, { recursive: true })
+    writeFileSync(join(slot, 'leftover.txt'), 'a crashed worker left this\n')
+    return join(base, rootDigest(root), '4194303')
+  }
+  try {
+    const envOwner = plant(fromEnv)
+    const flagOwner = plant(fromFlag)
+
+    const envLines = []
+    // The environment base is the one the server was started with, so clean defaults to it.
+    await runClean(['--root', root], { env: { FLASH_STATE_BASE: fromEnv }, write: (text) => envLines.push(text) })
+    assert.ok(envLines.join('').includes(fromEnv), 'the report names the base from FLASH_STATE_BASE')
+    assert.equal(existsSync(envOwner), false)
+    assert.equal(existsSync(flagOwner), true, 'another base is not touched')
+
+    const flagLines = []
+    await runClean(['--root', root, '--state-base', fromFlag], { env: {}, write: (text) => flagLines.push(text) })
+    assert.ok(flagLines.join('').includes(fromFlag))
+    assert.equal(existsSync(flagOwner), false)
+  } finally {
+    for (const base of [fromEnv, fromFlag]) rmSync(base, { recursive: true, force: true })
+    rmSync(root, { recursive: true, force: true })
+  }
 })

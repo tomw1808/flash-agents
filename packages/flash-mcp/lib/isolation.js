@@ -125,6 +125,26 @@ const SLOT_CACHE = '.flash-cache'
 const SETTINGS_FILE = '.flash-agents.json'
 
 /**
+ * The warning a call carries when `.flash-agents.json` changed after this server read it.
+ *
+ * The file is read once, when the pool is constructed, because its settings describe the
+ * repository rather than the call and every copy would otherwise pay for a re-read. A file
+ * edited afterwards is therefore not applied by the running server; saying so on every call
+ * is the only way the edit is not simply ignored until someone happens to reconnect.
+ */
+export const SETTINGS_CHANGED_WARNING =
+  '.flash-agents.json changed after this server started; its new settings take effect after a reconnect (/mcp reconnect plugin:flash-agents:flash)'
+
+/**
+ * How long a Windows slot root may be before tools without long-path support can fail.
+ *
+ * MSVC's `cl.exe` and friends still count against 260 characters. A slot root of about 85
+ * characters leaves almost no room for a project's own deep build folders, and a user's
+ * OpenSSL build hit 264; past this advisory the server and the doctor say so early.
+ */
+export const WINDOWS_SLOT_PATH_ADVISORY = 64
+
+/**
  * Names left out of every copy unless a repository opts out with
  * `"copyExcludeDefaults": false`. They are the usual homes of secrets: a worker has no use
  * for an access token, and every copy of one is another file holding it on disk. The
@@ -549,6 +569,51 @@ export class IsolationError extends Error {
  */
 function stateBaseDir() {
   return join(canonicalTmpdir(), 'flash-mcp')
+}
+
+/**
+ * The state base a `--state-base` value or `FLASH_STATE_BASE` names, with `~` expanded.
+ *
+ * A relative base used to be passed straight to `resolve()`, which resolved it against the
+ * process's working directory — the service root — so `--state-base rel` put every worker
+ * copy inside the caller's own repository, where the sweep could later delete parts of it.
+ * `~` is the other shape people write; it used to become a literal directory named `~`.
+ * Expansion follows `resolveDshHome`, because that is the spelling dsh itself accepts.
+ * Whether what is left is absolute is the caller's decision (see `requireAbsoluteStateBase`),
+ * so the measurement path can report on an odd base without refusing to run.
+ *
+ * @param {unknown} value - the raw flag argument or environment value.
+ * @param {string} [home] - the user's home directory (default the process's).
+ * @returns {string | undefined} the expanded path, or undefined when the value is empty.
+ */
+export function resolveStateBase(value, home = homedir()) {
+  const text = typeof value === 'string' ? value.trim() : ''
+  if (text === '') return undefined
+  if (text === '~') return home
+  if (text.startsWith('~/') || text.startsWith('~\\')) return join(home, text.slice(2))
+  return text
+}
+
+/**
+ * The state base an option names, refusing one that is still relative after `~` expansion.
+ *
+ * A relative base is resolved against the process cwd, which is the service root, so it
+ * would land the disposable copies inside the caller's repository. Refusing it at option
+ * parsing means every door — the server, `clean` and `doctor` — reports the same sentence
+ * before anything is created.
+ *
+ * @param {unknown} value - the raw flag argument or environment value.
+ * @param {string} [home] - the user's home directory (default the process's).
+ * @returns {string | undefined} the absolute path, or undefined when the value is empty.
+ * @throws {Error} when the expanded value is still relative.
+ */
+export function requireAbsoluteStateBase(value, home = homedir()) {
+  const resolved = resolveStateBase(value, home)
+  if (resolved === undefined) return undefined
+  if (!isAbsolute(resolved)) {
+    throw new Error(`--state-base must be an absolute path (got ${JSON.stringify(String(value))})`)
+  }
+  return resolved
 }
 
 /**
@@ -1630,6 +1695,9 @@ function salvageSlot(slotDir, { root, patchDir, pid, sweptAt, log = () => {} }) 
     root,
     scope,
     base,
+    // The dead copy still has the base commit, so the caller's HEAD it started from can be
+    // recorded here too; after the tree is removed it is no longer readable anywhere.
+    baseParent: resolveBaseParent(base, repoDir) ?? null,
     filesChanged,
     diffstat,
     createdAt: Date.now(),
@@ -3023,6 +3091,47 @@ function slotDirectory(stateDir, id, index) {
 }
 
 /**
+ * The root path of one slot's disposable tree, as a warning and the doctor name it.
+ *
+ * The trailing separator is part of a directory's own path for a Windows tool counting
+ * characters: `C:\…\slot-0\` is one longer than the path without it, and that one
+ * character is what a build near the limit runs out of first.
+ *
+ * @param {string} stateDir - the pool's state directory.
+ * @param {number} [id] - slot number (default 0, the first slot).
+ * @returns {string} the slot root, with a trailing separator.
+ */
+export function slotRootPath(stateDir, id = 0) {
+  const root = slotDirectory(stateDir, id, 0)
+  return /[\\/]$/.test(root) ? root : `${root}${sep}`
+}
+
+/**
+ * The warning to emit when slot trees are copied under a path Windows tools may outgrow.
+ *
+ * Deliberately advisory, not a refusal: the default layout is shared by the sweep, `clean`
+ * and salvage, so changing it silently would strand existing trees. The operator can move
+ * the base with `--state-base` / `FLASH_STATE_BASE` and keep every other behaviour.
+ *
+ * @param {string} slotRoot - the first slot's root path (a trailing separator is added).
+ * @param {object} [options] - platform and the advisory length, injected by tests.
+ * @param {string} [options.platform] - platform the warning applies to (default process.platform).
+ * @param {number} [options.limit] - the advisory length in characters (default 64).
+ * @returns {string | undefined} the warning, or undefined when it does not apply.
+ */
+export function slotPathWarning(slotRoot, { platform = process.platform, limit = WINDOWS_SLOT_PATH_ADVISORY } = {}) {
+  if (platform !== 'win32') return undefined
+  const path = /[\\/]$/.test(slotRoot) ? slotRoot : `${slotRoot}${sep}`
+  if (path.length <= limit) return undefined
+  return (
+    `slot copies live at ${path} (${String(path.length)} characters); Windows tools without ` +
+    'long-path support (MSVC cl.exe among them) fail past 260 characters, so deep build folders ' +
+    'inside the copy can break. A short base leaves more room: set the plugin option "state_base" ' +
+    '(or FLASH_STATE_BASE) to a folder such as C:\\fm'
+  )
+}
+
+/**
  * Report and reclaim the default state base: one line of facts per root digest.
  *
  * This is what the `clean` CLI command runs. The default reclaims exactly what a
@@ -3666,6 +3775,466 @@ function filePathsUnder(dir, top) {
   return files
 }
 
+/**
+ * One path from a patch record, named relative to the service root.
+ *
+ * A record computed inside a nested repository stores paths as that repository's git names
+ * them (`n.txt`), while the caller's tree is the service root and the same file is
+ * `sub/n.txt` there. Every path the caller is shown is named the way the caller names it,
+ * so a refusal or a drift warning can be acted on without translating it first.
+ *
+ * @param {object} record - the patch record; `scope` is the nested repository, when there is one.
+ * @param {string} path - a path relative to the record's repository.
+ * @returns {string} the path relative to the service root, with `/` separators.
+ */
+function serviceRootPath(record, path) {
+  return record.scope ? join(record.scope, path).split(sep).join('/') : path
+}
+
+/**
+ * How far the caller's tree has moved since a patch's base, and whether it touched the
+ * patch's own files.
+ *
+ * A patch computed against a copy that has since fallen behind is exactly the case that
+ * needed a three-way apply with no warning beforehand. The count is about commits between
+ * the caller's HEAD then and now; the file list narrows that to the patch's files, because
+ * an unrelated commit elsewhere in a large tree says nothing about this patch.
+ *
+ * `flash_patch` asks this of the first page of every patch, so the whole patch is hashed
+ * once rather than once per file: see `workingTreeBlobs`.
+ *
+ * @param {object} record - a patch record, with `base` and `preimage` when it has them.
+ * @param {string} root - the service root the record was computed for.
+ * @param {Map<string, string | null | undefined>} [blobs] - a batch the caller already
+ *   made for this record and tree; when omitted, one is made here.
+ * @returns {{commitsBehind: number | null, filesChangedSince: string[]} | null} the drift,
+ *   or null for a patch salvaged without a recorded base, or for one already applied.
+ */
+function patchDrift(record, root, blobs) {
+  // An applied patch is no longer ahead of the tree: its own writes are what the tree now
+  // holds, so every patch file would be reported as a caller edit. The question the drift
+  // answers — "will this apply over what changed since its base?" — has already been
+  // answered by the apply, so there is nothing to report.
+  if (record?.appliedAt !== null && record?.appliedAt !== undefined) return null
+  const base = record?.base
+  if (typeof base !== 'string' || base.length === 0) return null
+  const target = record.scope ? join(root, record.scope) : root
+  const batch = blobs ?? workingTreeBlobs(target, patchBlobPaths(record))
+  return {
+    commitsBehind: commitsBehindBase(record, base, target),
+    // The record's paths are inside its scope; a caller reading `filesChangedSince` works
+    // from the service root, exactly as `filesChanged` in the same result does.
+    filesChangedSince: filesChangedSinceBase(record, target, batch).map((path) => serviceRootPath(record, path)),
+  }
+}
+
+/**
+ * The commit id the base was committed on top of: the caller's HEAD at copy time.
+ *
+ * New records carry it directly. A record written before the field existed can still name
+ * it when the base commit happens to be in this repository's object store, which is why
+ * the fallback is attempted rather than giving up at once.
+ *
+ * @param {string} base - the patch's base commit id.
+ * @param {string} target - the repository to ask.
+ * @returns {string | undefined} the parent id, or undefined when it cannot be resolved.
+ */
+function resolveBaseParent(base, target) {
+  try {
+    const parent = git(['rev-parse', '--verify', '-q', `${base}^`], target).trim()
+    return parent === '' ? undefined : parent
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * How many commits the caller's HEAD has that the patch's base did not start from.
+ *
+ * `null` is the honest answer when the question cannot be answered: no HEAD, a base whose
+ * parent is gone from this object store, or a tree that is no longer a repository. A wrong
+ * zero would read as "nothing moved" and is worse than saying so.
+ *
+ * @param {object} record - the patch record.
+ * @param {string} base - the patch's base commit id.
+ * @param {string} target - the repository whose HEAD is counted.
+ * @returns {number | null} the commit count, or null.
+ */
+function commitsBehindBase(record, base, target) {
+  const recorded = record.baseParent
+  const parent = typeof recorded === 'string' && recorded.length > 0 ? recorded : resolveBaseParent(base, target)
+  if (parent === undefined) return null
+  try {
+    if (git(['rev-parse', '--verify', '-q', 'HEAD'], target).trim() === '') return null
+    const count = Number(git(['rev-list', '--count', `${parent}..HEAD`], target).trim())
+    return Number.isInteger(count) ? count : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * One decoded `STATUS<TAB>path` record, with a rename's or copy's old path named too.
+ *
+ * `git diff --name-status` writes `STATUS<TAB>path`, and a rename or copy adds the old
+ * path first: `STATUS<TAB>old<TAB>new`. The old path is the path the apply removes, so it
+ * has to be read as its own entry rather than dropped with the other leading fields.
+ *
+ * @param {string} line - one stored `--name-status` record.
+ * @returns {{status: string, path: string, oldPath?: string}} the decoded record.
+ */
+function nameStatusEntry(line) {
+  const fields = String(line).split('\t')
+  const status = fields[0] ?? ''
+  if (status.startsWith('R') || status.startsWith('C')) {
+    return { status, oldPath: nameStatusPath(fields[1] ?? ''), path: nameStatusPath(fields[2] ?? '') }
+  }
+  return { status, path: nameStatusPath(fields[1] ?? '') }
+}
+
+/**
+ * The base blob of every path a patch's preimage records, keyed by path.
+ *
+ * @param {object} record - the patch record, with `preimage` when it has one.
+ * @returns {Map<string, string>} path to base blob id.
+ */
+function preimageBlobs(record) {
+  const blobs = new Map()
+  for (const entry of record.preimage ?? []) {
+    if (entry === null || typeof entry !== 'object') continue
+    if (typeof entry.path !== 'string' || typeof entry.blob !== 'string') continue
+    blobs.set(nameStatusPath(entry.path), entry.blob)
+  }
+  return blobs
+}
+
+/**
+ * The blob of one path, read from a caller's batch when one was made.
+ *
+ * A working-tree hash is one `git hash-object` process per file when it is done path by
+ * path, which is what made drift on a 300-file patch take seconds. A caller that has a
+ * batch of the whole patch passes it here; one that does not (a single path, a test)
+ * still gets the per-path read, so both answer the same.
+ *
+ * @param {string} target - the work tree.
+ * @param {string} path - the path, relative to the target.
+ * @param {Map<string, string | null | undefined> | undefined} blobs - the batch, when one
+ *   exists. It must cover every path asked about.
+ * @returns {string | null | undefined} the blob id, null when absent, undefined when the
+ *   path exists but cannot be hashed as a file.
+ */
+function batchedBlob(target, path, blobs) {
+  return blobs === undefined ? workingTreeBlob(target, path) : blobs.get(path)
+}
+
+/**
+ * Whether one path in the tree now holds different content than its base blob.
+ *
+ * A path that cannot be hashed (a directory where a file was, a git failure) is not
+ * evidence of drift and answers false; a missing path answers true against a known base
+ * and false when the patch itself adds the path (there is no base entry).
+ *
+ * @param {string} target - the tree the patch applies to.
+ * @param {string} path - the path, relative to the target.
+ * @param {string | undefined} base - the path's base blob id, when one is recorded.
+ * @param {Map<string, string | null | undefined>} [blobs] - the patch's blob batch, when
+ *   the caller made one.
+ * @returns {boolean} true when the content differs from the base.
+ */
+function blobDiffersFromBase(target, path, base, blobs) {
+  const current = batchedBlob(target, path, blobs)
+  if (current === undefined) return false
+  return base === undefined ? current !== null : current !== base
+}
+
+/**
+ * Every path of a patch whose working-tree blob the drift checks can ask about.
+ *
+ * `filesChangedSinceBase` compares a change's new path and — for a rename — its old
+ * one; `destructiveEdits` compares only the paths the patch removes. One batch over the
+ * union serves both, which is what keeps an apply at one git spawn for the whole patch.
+ *
+ * @param {object} record - the patch record.
+ * @returns {string[]} the record-relative paths, without duplicates.
+ */
+function patchBlobPaths(record) {
+  // A record from before blob saving has no base content, so no blob is ever compared
+  // and hashing anything would be work nobody reads.
+  if (!Array.isArray(record.preimage)) return []
+  const paths = new Set()
+  for (const line of record.filesChanged ?? []) {
+    const { path, oldPath } = nameStatusEntry(line)
+    if (path.length > 0) paths.add(path)
+    if (oldPath !== undefined) paths.add(oldPath)
+  }
+  return [...paths]
+}
+
+/**
+ * One path as `git hash-object --stdin-paths` wants it on its own line.
+ *
+ * The command reads one path per line, so a name holding a line break cannot be sent
+ * plainly, and a line that starts with `"` is read as a C-quoted name. Both are quoted
+ * the way git spells them itself; every other name goes through literally.
+ *
+ * @param {string} path - a path relative to the work tree.
+ * @returns {string} the line to write for it.
+ */
+function stdinPathLine(path) {
+  if (!/^"|[\n\r]/.test(path)) return path
+  const escaped = path.replace(/[\\"]/g, (char) => `\\${char}`).replace(/\r/g, '\\r').replace(/\n/g, '\\n')
+  return `"${escaped}"`
+}
+
+/**
+ * The blob ids of many paths in one working tree, hashed in one git call.
+ *
+ * `git hash-object --stdin-paths` reads file names from standard input and hashes each
+ * file from disk, applying the same path-based filters (`--path`) the per-file call asked
+ * for. That is what keeps the batch's answers identical to the per-file ones: a
+ * `.gitattributes` `text eol=lf` file with a CRLF working copy hashes to its LF blob
+ * either way.
+ *
+ * Symlinks keep their own per-path read: `--stdin-paths` follows the link and would hash
+ * the content it points at, while a symlink's blob is its link text.
+ *
+ * @param {string} target - the work tree.
+ * @param {string[]} paths - the paths to hash, relative to the target. Duplicates are
+ *   allowed; the map keeps one answer per path.
+ * @returns {Map<string, string | null | undefined>} path to blob id: null when the path
+ *   is absent, undefined when it is present but cannot be hashed as a file.
+ */
+function workingTreeBlobs(target, paths) {
+  const blobs = new Map()
+  const regular = []
+  for (const path of paths) {
+    const full = join(target, path)
+    let info
+    try {
+      info = lstatSync(full)
+    } catch {
+      blobs.set(path, null)
+      continue
+    }
+    if (info.isSymbolicLink()) {
+      // The same read `#stageCallerPath` does: a link's blob is its target text.
+      try {
+        blobs.set(path, git(['hash-object', '--stdin'], target, process.env, readlinkSync(full)).trim())
+      } catch {
+        blobs.set(path, undefined)
+      }
+      continue
+    }
+    if (!info.isFile()) {
+      blobs.set(path, undefined)
+      continue
+    }
+    regular.push(path)
+  }
+  // Nothing regular to hash: no process is spawned at all, which is the common case for
+  // a patch that only adds files.
+  if (regular.length === 0) return blobs
+  let output
+  try {
+    output = git(['hash-object', '--stdin-paths'], target, process.env, `${regular.map(stdinPathLine).join('\n')}\n`)
+  } catch {
+    // One unreadable file fails the whole batch. Falling back to the per-path read gives
+    // exactly the answer this gave before the batch existed: an unhashable path is
+    // `undefined`, not an error, and a path that vanished is `null`.
+    for (const path of regular) blobs.set(path, workingTreeBlob(target, path))
+    return blobs
+  }
+  const ids = output.split('\n')
+  for (let at = 0; at < regular.length; at += 1) {
+    const id = ids[at]
+    blobs.set(regular[at], typeof id === 'string' && id.length > 0 ? id.trim() : undefined)
+  }
+  return blobs
+}
+
+/**
+ * The patch's own files whose content in the caller's working tree now differs from the
+ * base it was computed against.
+ *
+ * Only the patch's files are checked, and their base blobs come from the record's preimage:
+ * the base commit itself lived in a copy that is gone, so `git hash-object` of what is on
+ * disk is compared with the saved id. Every path the record names is checked, not only the
+ * last field of a rename: a pure rename hunk carries no content for `git apply` to check,
+ * and the old path — the one the apply deletes — is exactly where the caller's edit can be
+ * lost. A rename's new path did not exist in the base, so it is reported only when
+ * something now occupies it with content other than the old path's base blob. A path the
+ * patch adds has no base entry, so it counts as changed only when occupied.
+ *
+ * @param {object} record - the patch record, with `preimage` for the base blobs.
+ * @param {string} target - the tree the patch applies to.
+ * @param {Map<string, string | null | undefined>} [blobs] - the patch's blob batch, when
+ *   the caller made one (`patchBlobPaths` names every path it must hold).
+ * @returns {string[]} the changed paths, capped only by the patch's own file count.
+ */
+function filesChangedSinceBase(record, target, blobs) {
+  // A record from before blob saving kept no base content, so no blob comparison is
+  // possible; saying "nothing changed" would be a guess, but an empty list is the only
+  // answer a caller can act on and a warning about every file would be worse.
+  if (!Array.isArray(record.preimage)) return []
+  const baseBlobs = preimageBlobs(record)
+  const changed = []
+  for (const line of record.filesChanged ?? []) {
+    const { status, path, oldPath } = nameStatusEntry(line)
+    // A rename removes its old path, and a deletion removes its only path; both are the
+    // path whose content the apply takes away, so both are compared against their own
+    // preimage entry.
+    const removed = oldPath ?? (status.startsWith('D') ? path : undefined)
+    if (removed !== undefined) {
+      if (blobDiffersFromBase(target, removed, baseBlobs.get(removed), blobs)) changed.push(removed)
+      if (oldPath !== undefined) {
+        const current = batchedBlob(target, path, blobs)
+        if (current !== undefined && current !== null && current !== baseBlobs.get(oldPath)) changed.push(path)
+      }
+      continue
+    }
+    if (blobDiffersFromBase(target, path, baseBlobs.get(path), blobs)) changed.push(path)
+  }
+  return changed
+}
+
+/**
+ * The paths a patch deletes or renames away that the caller changed since the base.
+ *
+ * These are the writes a plain or three-way apply cannot verify in the usual way: `git
+ * apply` has no content of its own to compare for a pure rename, so it happily removes the
+ * old path whatever it now holds. The caller's index is never touched, so their edit is
+ * simply gone. Naming the paths before anything is written is what lets the apply refuse
+ * instead of losing the work.
+ *
+ * @param {object} record - the patch record, with `preimage` for the base blobs.
+ * @param {string} target - the tree the patch applies to.
+ * @param {Map<string, string | null | undefined>} [blobs] - the patch's blob batch, when
+ *   the caller made one (`patchBlobPaths` names every path it must hold).
+ * @returns {string[]} the changed paths the patch would remove.
+ */
+function destructiveEdits(record, target, blobs) {
+  if (!Array.isArray(record.preimage)) return []
+  const baseBlobs = preimageBlobs(record)
+  const changed = []
+  for (const line of record.filesChanged ?? []) {
+    const { status, path, oldPath } = nameStatusEntry(line)
+    // A copy leaves its old path in place, so only a rename or a deletion removes one.
+    const removed = status.startsWith('R') ? oldPath : status.startsWith('D') ? path : undefined
+    if (removed === undefined) continue
+    const current = batchedBlob(target, removed, blobs)
+    // A path already gone is fine: there is no edit to lose.
+    if (current === undefined || current === null) continue
+    if (current !== baseBlobs.get(removed)) changed.push(removed)
+  }
+  return changed
+}
+
+/**
+ * The paths a patch deletes or renames away that the caller may still have.
+ *
+ * A record from before blob saving carries no `preimage`, so `destructiveEdits` has no base
+ * content to compare and returns nothing. The plain apply still removes these paths, so
+ * naming the ones that are present is the only warning left to give.
+ *
+ * @param {object} record - the patch record.
+ * @param {string} target - the tree the patch applies to.
+ * @returns {string[]} the scope-relative paths a plain apply would remove.
+ */
+function unverifiableRemovals(record, target) {
+  const removed = []
+  for (const line of record.filesChanged ?? []) {
+    const { status, path, oldPath } = nameStatusEntry(line)
+    // A copy leaves its old path in place, so only a rename or a deletion removes one.
+    const candidate = status.startsWith('R') ? oldPath : status.startsWith('D') ? path : undefined
+    if (candidate === undefined) continue
+    try {
+      // The same "already gone means nothing to lose" rule `destructiveEdits` uses. A
+      // dangling symlink still exists as an entry and would be removed, so `lstat` is the
+      // test rather than `existsSync`.
+      lstatSync(join(target, candidate))
+    } catch {
+      continue
+    }
+    removed.push(candidate)
+  }
+  return removed
+}
+
+/**
+ * The warning an apply of an old record produces for paths it cannot check.
+ *
+ * @param {string[]} paths - the paths the plain apply removes, relative to the service root.
+ * @returns {string} the warning sentence.
+ */
+function unverifiedRemovalWarning(paths) {
+  return (
+    `this patch was stored by an older release, so whether you changed ${paths.join(', ')} since cannot be checked; ` +
+    'a plain apply removes them'
+  )
+}
+
+/**
+ * The refusal an apply of a destructive patch produces for edited paths.
+ *
+ * The refusal names both ways out: the three-way merge, which keeps the caller's edit and
+ * marks a conflict in the file, and `force`, which says the edit may be discarded. Naming
+ * only `force` used to make the safe option look unavailable.
+ *
+ * @param {string} patchId - the patch's full id.
+ * @param {string[]} paths - the caller-changed paths the patch would remove, relative to the
+ *   service root.
+ * @returns {string} the refusal sentence.
+ */
+function destructiveApplyMessage(patchId, paths) {
+  return (
+    `refusing to apply ${patchId}: it deletes or renames ${paths.join(', ')}, which you changed since the worker's ` +
+    'copy was made; your edit would be lost. Pass threeWay: true to merge it (conflicts are marked in the file), ' +
+    'or save it first and pass force: true'
+  )
+}
+
+/**
+ * The blob id of one path in a working tree, as `git add` would compute it.
+ *
+ * @param {string} target - the work tree.
+ * @param {string} path - the path, relative to the target.
+ * @returns {string | null | undefined} the blob id, null when the path is absent, or
+ *   undefined when it exists but cannot be hashed as a file.
+ */
+function workingTreeBlob(target, path) {
+  const full = join(target, path)
+  let info
+  try {
+    info = lstatSync(full)
+  } catch {
+    return null
+  }
+  try {
+    // The same two shapes `#stageCallerPath` reads: a symlink's blob is its target text, and
+    // `--path` lets a regular file get the checkout's end-of-line normalisation.
+    if (info.isSymbolicLink()) return git(['hash-object', '--stdin'], target, process.env, readlinkSync(full)).trim()
+    if (info.isFile()) return git(['hash-object', `--path=${path}`, '--stdin'], target, process.env, readFileSync(full)).trim()
+  } catch {
+    return undefined
+  }
+  return undefined
+}
+
+/**
+ * The warning that a patch's files moved in the caller's tree while the worker ran.
+ *
+ * @param {string[]} files - the patch's files that changed since its base.
+ * @returns {string} the warning, naming at most five files.
+ */
+function driftWarning(files) {
+  const named = files.slice(0, 5).join(', ')
+  const more = files.length > 5 ? `, and ${String(files.length - 5)} more` : ''
+  return (
+    `${String(files.length)} of this patch's files changed in your tree since the worker's copy was made ` +
+    `(${named}${more}); review the result, or use threeWay: true if the plain apply fails`
+  )
+}
+
 export class WorkspaceIsolation {
   /**
    * @param {object} options - isolation settings.
@@ -3750,8 +4319,11 @@ export class WorkspaceIsolation {
     this.closed = false
     // Read once, at construction: the settings describe the repository, not the call, and
     // every call prepares faster when the file is not re-read. A broken file only logs; the
-    // service still starts.
+    // service still starts. The file's identity is recorded now so a later edit can be
+    // reported without re-reading it (see `repoSettingsChanged`).
     const settings = readRepoSettings(this.root, this.log)
+    this.settingsPath = join(this.root, SETTINGS_FILE)
+    this.settingsAtStart = this.#settingsStamp()
     if (copyExclude !== undefined && !Array.isArray(copyExclude)) {
       this.log('ignoring the copyExclude option: it must be an array of strings')
     }
@@ -3785,7 +4357,7 @@ export class WorkspaceIsolation {
         return false
       }),
     }))
-    /** The warning every result carries when steps are configured but not allowed. */
+    /** The warning every flash_task and flash_batch result carries when steps are configured but not allowed. */
     this.slotSetupWarning = undefined
     if (this.slotSetup.length > 0 && !this.slotSetupAllowed) {
       this.slotSetupWarning = SETUP_NOT_ALLOWED_WARNING
@@ -3866,6 +4438,49 @@ export class WorkspaceIsolation {
     // Unref'd: housekeeping must never be the reason a finished process stays alive.
     this.sweepTimer =
       sweepIntervalMs > 0 ? setInterval(() => this.#housekeeping(), sweepIntervalMs).unref() : undefined
+  }
+
+  /**
+   * The identity of `.flash-agents.json` as the constructor found it.
+   *
+   * `mtimeMs` alone misses a replacement that restores the old timestamp: a `mv` of a
+   * prepared file over the settings, with `utimes` putting the original time back, leaves
+   * a different inode and a new `ctime` while the mtime reads unchanged. `size` catches the
+   * common edit, `ino` the rename, and `ctimeMs` any metadata change at all; together they
+   * answer "is this the same file with the same content" closely enough for one `stat`.
+   *
+   * @returns {{exists: boolean, size?: number, ino?: number, mtimeMs?: number, ctimeMs?: number}} the file's stamp.
+   */
+  #settingsStamp() {
+    try {
+      const info = statSync(this.settingsPath)
+      return { exists: true, size: info.size, ino: info.ino, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs }
+    } catch {
+      return { exists: false }
+    }
+  }
+
+  /**
+   * Whether `.flash-agents.json` changed since this pool read it.
+   *
+   * One `stat`, never a re-read: the settings were applied when the pool was built, and a
+   * running server cannot safely re-apply them under calls that are already in flight. The
+   * service turns a positive answer into one warning per `flash_task` and `flash_batch`
+   * result. Any difference in the stamp is a change; only comparing `mtimeMs` called a
+   * replaced file unchanged when its timestamp was restored.
+   *
+   * @returns {boolean} true when the file appeared, disappeared or was replaced/touched.
+   */
+  repoSettingsChanged() {
+    const now = this.#settingsStamp()
+    const before = this.settingsAtStart
+    return (
+      now.exists !== before.exists ||
+      now.size !== before.size ||
+      now.ino !== before.ino ||
+      now.mtimeMs !== before.mtimeMs ||
+      now.ctimeMs !== before.ctimeMs
+    )
   }
 
   /**
@@ -4466,6 +5081,7 @@ export class WorkspaceIsolation {
     slot.scope = scope
     slot.repoDir = repoDir
     slot.base = null
+    slot.baseParent = null
     slot.baseReason = undefined
     slot.uncommitted = { count: 0, files: [] }
     // The worker has nowhere legitimate to name outside its copy — the wall refuses
@@ -4565,13 +5181,17 @@ export class WorkspaceIsolation {
       // failure to remove it must not turn a prepared slot into a failed call.
       rmSync(indexFile, { force: true })
     }
-    let parent = []
+    let parent
     try {
-      parent = ['-p', git(['rev-parse', '--verify', '-q', 'HEAD'], repoDir).trim()]
+      parent = git(['rev-parse', '--verify', '-q', 'HEAD'], repoDir).trim() || undefined
     } catch {
       // A repository without a first commit has no parent to name.
     }
-    slot.base = git([...COMMIT_CONFIG, 'commit-tree', tree, ...parent, '-m', 'flash base'], repoDir).trim()
+    slot.base = git([...COMMIT_CONFIG, 'commit-tree', tree, ...(parent === undefined ? [] : ['-p', parent]), '-m', 'flash base'], repoDir).trim()
+    // The base's parent is the caller's HEAD when the copy was made, and is the commit a
+    // later `drift` counts from. The base commit itself lives only in the copy, which is
+    // emptied after the call, so the parent has to be recorded while it can still be read.
+    slot.baseParent = parent ?? null
     git(['update-ref', BASE_REF, slot.base], repoDir)
     this.#recordIgnored(slot, repoDir)
     return slot.base
@@ -5294,6 +5914,9 @@ export class WorkspaceIsolation {
         root: this.root,
         scope,
         base: slot.base,
+        // Kept beside the base because `drift` has to count from the caller's HEAD at copy
+        // time, and the base commit that names it exists only in the copy.
+        baseParent: slot.baseParent ?? null,
         filesChanged,
         diffstat: diffstat.trim(),
         createdAt: Date.now(),
@@ -5354,11 +5977,16 @@ export class WorkspaceIsolation {
    * @param {string} options.patchId - a patch id from an earlier call, or a unique prefix of
    *   one (at least eight hex digits, with or without the `flash-` prefix).
    * @param {boolean} [options.dryRun] - check that it applies without changing anything.
-   * @param {boolean} [options.force] - apply again even though the record says it was applied.
-   * @param {boolean} [options.threeWay] - merge it when the plain apply fails.
-   * @returns {{patchId: string, applied: boolean, dryRun: boolean, root: string, filesChanged: string[], diffstat: string, threeWay: boolean, conflicts: string[], indexTouched: boolean, note?: string, task?: object}} the outcome, with the full id and the task that made the patch when the record has one.
+   * @param {boolean} [options.force] - apply again even though the record says it was applied,
+   *   and apply a deletion or rename over a path the caller changed since the base.
+   * @param {boolean} [options.threeWay] - merge it in a scratch repository, rather than
+   *   plain-applying it, when the plain apply fails or would remove a path the caller
+   *   changed. The merge keeps that edit and marks a conflict in the file.
+   * @returns {{patchId: string, applied: boolean, dryRun: boolean, root: string, filesChanged: string[], diffstat: string, threeWay: boolean, conflicts: string[], indexTouched: boolean, drift: {commitsBehind: number | null, filesChangedSince: string[]} | null, warnings?: string[], note?: string, task?: object}} the outcome, with the full id, how far the tree moved since the patch's base, the task that made the patch when the record has one, and a warning when the tree touched the patch's files. `drift` and the refusal name paths from the service root.
    * @throws {Error} when the patch is unknown, belongs to another repository, was already
-   *   applied, does not apply, or its base is not available for a three-way merge.
+   *   applied, would delete or rename a path the caller changed since the base without
+   *   `threeWay` or `force`, does not apply, or its base is not available for a three-way
+   *   merge.
    */
   apply({ patchId, dryRun = false, force = false, threeWay = false }) {
     const record = this.#lookupPatch(patchId)
@@ -5373,15 +6001,62 @@ export class WorkspaceIsolation {
     }
     // A patch computed inside one nested repository applies inside that repository.
     const target = record.scope ? join(this.root, record.scope) : this.root
+    // `filesChanged` keeps the record's own spelling, the one `change.filesChanged` and
+    // `flash_patch`'s `files` use; the refusal and the drift name paths from the service root.
     const filesChanged = plainPaths(record.filesChanged)
     const diffstat = (record.diffstat ?? '').trim()
-    const outcome = this.#applyTo(record, { target, dryRun, threeWay, mark: !dryRun })
+    // Read before the write: `filesChangedSince` asks what the tree looked like when the
+    // patch was handed over, not after the patch itself changed those files.
+    //
+    // The drift and the destructive-edit check ask about the same patch files, and a
+    // working-tree hash is one git process per file when it is done path by path. One
+    // batch over every path the patch names serves both, so an apply of a 300-file patch
+    // spawns one `git hash-object` rather than three hundred.
+    const blobs = workingTreeBlobs(target, patchBlobPaths(record))
+    const drift = patchDrift(record, this.root, blobs)
+    const destroyed = destructiveEdits(record, target, blobs).map((path) => serviceRootPath(record, path))
+    // An old record kept no base blobs, so it cannot say whether the caller edited a path
+    // the patch removes. That is a warning, not a refusal: the apply is still the same
+    // apply, and refusing it would strand a patch the caller was told could be used.
+    const unverified = Array.isArray(record.preimage)
+      ? []
+      : unverifiableRemovals(record, target).map((path) => serviceRootPath(record, path))
+    /** @type {string[]} */
+    const warnings = []
+    const destructiveMessage = destroyed.length === 0 ? undefined : destructiveApplyMessage(record.patchId, destroyed)
+    if (destructiveMessage !== undefined) {
+      // A dry run reports the condition without writing anything. Without `threeWay` its
+      // real apply would be refused, so it must not ask git about the rest of the patch;
+      // with `threeWay` the merge below predicts the conflicts the real apply would leave.
+      if (dryRun) warnings.push(destructiveMessage)
+      else if (!threeWay && !force) throw new Error(destructiveMessage)
+    }
+    if (unverified.length > 0) warnings.push(unverifiedRemovalWarning(unverified))
+    // A plain apply of a rename removes the old path without comparing its content, so a
+    // caller edit there would be lost with no warning at all. A three-way merge is the mode
+    // that keeps it, so it skips the plain attempt entirely: a pure rename succeeds plainly
+    // and would never reach the merge.
+    const outcome =
+      dryRun && destroyed.length > 0 && !threeWay
+        ? { threeWay: false, conflicts: [], indexTouched: false, applied: false }
+        : this.#applyTo(record, {
+            target,
+            dryRun,
+            threeWay,
+            mark: !dryRun,
+            ...(destructiveMessage !== undefined && threeWay
+              ? { skipPlain: true, plainError: new Error(destructiveMessage) }
+              : {}),
+          })
+    if (drift !== null && drift.filesChangedSince.length > 0) warnings.push(driftWarning(drift.filesChangedSince))
     return {
       patchId: record.patchId,
       dryRun,
       root: target,
       filesChanged,
       diffstat,
+      drift,
+      ...(warnings.length === 0 ? {} : { warnings }),
       ...(record.task === undefined ? {} : { task: record.task }),
       ...outcome,
     }
@@ -5462,10 +6137,22 @@ export class WorkspaceIsolation {
    * @param {boolean} [options.dryRun] - check that it applies without changing anything.
    * @param {boolean} [options.threeWay] - merge it when the plain apply fails.
    * @param {boolean} [options.mark] - record the apply on the patch record.
+   * @param {boolean} [options.skipPlain] - go straight to the three-way merge, without
+   *   trying the plain apply. An apply of a destructive patch uses this because a pure
+   *   rename would succeed plainly and discard the caller's edit on the old path.
+   * @param {Error} [options.plainError] - the reason the plain apply was skipped, folded
+   *   into a merge failure the same way a real plain failure is.
    * @returns {{applied: boolean, threeWay: boolean, conflicts: string[], indexTouched: false, note?: string}} the outcome.
    * @throws {Error} when the patch does not apply, or its base is unavailable for a merge.
    */
-  #applyTo(record, { target, dryRun = false, threeWay = false, mark = false }) {
+  #applyTo(record, { target, dryRun = false, threeWay = false, mark = false, skipPlain = false, plainError }) {
+    if (skipPlain) {
+      return this.#threeWayMerge(record, target, {
+        dryRun,
+        plainError: plainError ?? new Error('the plain apply was skipped so a caller edit is not lost'),
+        mark,
+      })
+    }
     // Without `--index` the caller's index is left alone; only the working tree moves.
     // Outside a repository the target must not discover one enclosing it: paths in the
     // patch would then be read relative to that repository's top instead of to the target.
@@ -5827,7 +6514,7 @@ export class WorkspaceIsolation {
    * @param {string[]} [options.files] - read only these files' sections.
    * @param {number} [options.offset] - character offset into the selected text.
    * @param {number} options.maxChars - the page budget.
-   * @returns {{patchId: string, patchPath: string, applied: boolean, filesChanged: string[], diffstat: string, totalChars: number, offset: number, diff: string, files: string[], nextOffset: number | null, task?: object, finalMessage?: string, finalMessageTruncated?: true}} the page; `task` rides on every page, while the worker's final message is only on the page that starts at offset 0.
+   * @returns {{patchId: string, patchPath: string, applied: boolean, filesChanged: string[], diffstat: string, drift?: {commitsBehind: number | null, filesChangedSince: string[]} | null, totalChars: number, offset: number, diff: string, files: string[], nextOffset: number | null, task?: object, finalMessage?: string, finalMessageTruncated?: true}} the page; `task` rides on every page, while the worker's final message and the drift are only on the page that starts at offset 0. `drift.filesChangedSince` is named relative to the service root; `filesChanged` keeps the record's own spelling, as `files` expects it.
    * @throws {Error} when the patch is unknown, belongs to another repository, is gone, or
    *   `files` names a file the patch does not contain.
    */
@@ -5865,6 +6552,10 @@ export class WorkspaceIsolation {
       applied: record.appliedAt !== null && record.appliedAt !== undefined,
       filesChanged: plainPaths(record.filesChanged),
       diffstat: (record.diffstat ?? '').trim(),
+      // Drift costs one `git hash-object` spawn per patch file. Computing it on every page
+      // made a 300-file patch paged ten times cost tens of seconds, so it rides with the
+      // worker's final message on the page that starts at offset 0 only.
+      ...(page.offset === 0 ? { drift: patchDrift(record, this.root) } : {}),
       totalChars: text.length,
       offset: page.offset,
       diff: page.diff,
@@ -6144,6 +6835,7 @@ export class WorkspaceIsolation {
     this.#stashKeepPaths(slot)
     emptyDirectory(slot.dir)
     slot.base = null
+    slot.baseParent = null
     slot.scope = undefined
     slot.repoDir = undefined
     slot.task = undefined

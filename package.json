@@ -1,6 +1,6 @@
 {
   "name": "flash-agents",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": true,
   "description": "Cheap DeepSeek Harness Flash workers for an external coding agent",
   "type": "module",

@@ -12,10 +12,27 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { PassThrough } from 'node:stream'
 
-import { startServer } from '../lib/index.js'
+import { startServer, SERVER_INFO } from '../lib/index.js'
 import { HarnessSdkClient, resolveDshCommand } from '../lib/sdk.js'
 
 const FAKE_DSH = resolve(import.meta.dirname, '..', 'test-support', 'fake-dsh.mjs')
+
+/**
+ * A throwaway harness home whose service and read-only profiles carry matching stamps.
+ *
+ * `startServer` reads both profiles' stamps from the environment's `DSH_HOME`; without them
+ * it would read this machine's real harness home, and a missing stamp would put the
+ * "installed by another release" warning in every result, which is a different test's
+ * subject.
+ */
+const STAMP_HOME = mkdtempSync(join(tmpdir(), 'flash-mcp-integration-home-'))
+for (const profile of ['flash-service', 'flash-service-readonly']) {
+  mkdirSync(join(STAMP_HOME, 'profiles', profile, 'plugins'), { recursive: true })
+  writeFileSync(
+    join(STAMP_HOME, 'profiles', profile, 'plugins', 'package.json'),
+    `${JSON.stringify({ private: true, type: 'module', flashAgents: { version: SERVER_INFO.version } }, null, 2)}\n`,
+  )
+}
 
 /** A running server plus a frame-level MCP client over it. */
 async function connect({ env = {}, root } = {}) {
@@ -47,7 +64,7 @@ async function connect({ env = {}, root } = {}) {
       // NO-DELEGATE scenario below is exactly such an attempt, and this harness gives a
       // tools/call two seconds. The wait is injectable for this reason.
       earlyRetryDelayMs: 0,
-      env: { ...process.env, FLASH_DSH_BIN: FAKE_DSH, ...env },
+      env: { ...process.env, DSH_HOME: STAMP_HOME, FLASH_DSH_BIN: FAKE_DSH, ...env },
     },
     input,
     output,

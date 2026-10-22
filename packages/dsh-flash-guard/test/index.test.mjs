@@ -12,7 +12,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { test } from 'node:test'
+import { describe, test } from 'node:test'
 
 import {
   DEFAULT_SETTINGS,
@@ -283,6 +283,756 @@ test('the fence compares canonical paths, not spellings', () => {
   // reaching a secret through the symlink is refused as a secret, not as a fence.
   assert.equal(ask(join(link, '.env'), link, link)?.reason, REASON.SECRET)
   assert.equal(ask(join(link, '.git', 'config'), link, link)?.reason, REASON.STATE)
+})
+
+// ── paths after cd ──────────────────────────────────────────────────────────
+
+/**
+ * Every path a simple command names belongs to the directory *that* command runs
+ * in, not to the directory the command line started in.
+ *
+ * Both directions of the mistake are pinned here. A live worker hit the false
+ * refusal — `cd server && echo x > ../.flash-tmp/types.log` was refused as outside
+ * the workspace although `..` was the workspace — and the same mistake was a hole
+ * the other way round: `cd .. && echo x > slot-2/stolen.txt` looked like an
+ * ordinary write inside the fence. The tree is real and lives under a temp base,
+ * because the fence compares filesystem identity, not spellings.
+ */
+describe('paths after cd', () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cd-')))
+  const root = join(base, 'slot-1')
+  mkdirSync(join(root, 'server'), { recursive: true })
+  mkdirSync(join(base, 'slot-2'), { recursive: true })
+  writeFileSync(join(root, 'README.md'), '# readme\n')
+  writeFileSync(join(root, '.env'), 'TOKEN=x\n')
+  writeFileSync(join(root, 'server', 'a.txt'), 'a\n')
+
+  // `rootExplicit` is what `apply` writes back into the settings; `decideToolCall`
+  // reads it to fence on the configured root rather than on the caller's cwd.
+  const cdSettings = resolveSettings({ root })
+  cdSettings.rootExplicit = true
+
+  /** Ask the guard about one shell command run in the fenced slot. */
+  const ask = (command) => decideToolCall({ name: 'bash', args: { command }, cwd: root, home: HOME, settings: cdSettings })
+
+  test('a redirect after a cd lands where the cd went', () => {
+    // `..` from <root>/server is the workspace itself, so this is an ordinary write.
+    assert.equal(ask('cd server && echo x > ../.flash-tmp/types.log'), undefined)
+  })
+
+  test('walking out of the fence with cd does not make the write legal', () => {
+    // The hole: both of these were allowed while the redirect target was resolved
+    // against the starting directory instead of the one `cd ..` moved to.
+    assert.equal(ask('cd .. && echo x > slot-2/stolen.txt')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('cd .. && touch slot-2/stolen.txt')?.reason, REASON.OUTSIDE_WORKSPACE)
+  })
+
+  test('an input redirect after a cd reads from the directory the command runs in', () => {
+    assert.equal(ask('cd server && cat < ../README.md'), undefined)
+    assert.equal(ask('cd server && cat < ../.env')?.reason, REASON.SECRET)
+  })
+
+  test('a write destination after a cd is resolved the same way as a redirect', () => {
+    assert.equal(ask('cd server && cp a.txt ../b.txt'), undefined)
+    assert.equal(ask('cd .. && cp slot-1/a.txt slot-2/')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('cd server && tee ../../outside.txt')?.reason, REASON.OUTSIDE_WORKSPACE)
+  })
+
+  test('two moves are followed move by move', () => {
+    assert.equal(ask('cd .. && cd slot-1 && echo x > ok.txt'), undefined)
+  })
+
+  test('an unfollowable cd places a relative write, and still refuses a deletion', () => {
+    // A write after a move the guard cannot follow is resolved against the last known
+    // directory, exactly like a read and as the code at HEAD did. Refusing it walled
+    // off the most ordinary lines an agent writes, and the file sandbox confines the
+    // write anyway.
+    assert.equal(ask('cd "$DIR" && echo x > out.txt'), undefined)
+    assert.equal(ask('cd "$DIR" && mkdir -p build'), undefined)
+    assert.equal(ask('cd "$DIR" && echo x > "$LOG"'), undefined)
+    // A device is not a write, and a read is placed the same way.
+    assert.equal(ask('cd "$DIR" && echo x > /dev/null'), undefined)
+    assert.equal(ask('cd "$DIR" && cat < notes.txt'), undefined)
+    // A deletion keeps the stricter rule, and the detail names the deletion that ran
+    // after a move nobody could follow.
+    const refused = ask('cd "$DIR" && rm -rf build')
+    assert.equal(refused?.reason, REASON.CRITICAL_RM)
+    assert.match(refused.detail, /unresolvable cd/)
+    assert.match(refused.detail, /rm -rf build/)
+    // Another user's home is not relative to anything here, so no placement exists.
+    assert.equal(ask('cd "$DIR" && echo x > ~tester/f')?.reason, REASON.OUTSIDE_WORKSPACE)
+  })
+
+  test('a cd inside a bash -c payload is followed inside that payload', () => {
+    assert.equal(ask('bash -c "cd .. && echo x > slot-2/f"')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('bash -c "cd server && echo x > ../ok.txt"'), undefined)
+  })
+
+  test('popd and cd - go back to where the line was, not home', () => {
+    // Both used to read as `cd` with no argument, i.e. the home folder, which put
+    // every write after them outside the fence.
+    assert.equal(ask('pushd server && popd && echo x > ok.txt'), undefined)
+    assert.equal(ask('cd server && cd - && echo x > ok.txt'), undefined)
+    assert.equal(ask('cd server && pushd .. && pushd .. && popd && echo x > ok.txt'), undefined)
+    // A move back past what this line recorded cannot be followed, so a write after it
+    // lands in the last known directory rather than in a directory nobody named.
+    assert.equal(ask('pushd .. && popd && popd && echo x > out.txt'), undefined)
+    // A write that really is outside the fence is refused whether or not the moves
+    // before it were followed: here `cd ..` reached the parent of the workspace.
+    assert.equal(ask('cd .. && cd - && cd - && echo x > slot-2/f')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('popd && echo x > out.txt'), undefined)
+    assert.equal(ask('cd - && echo x > out.txt'), undefined)
+    // A deletion after the same unfollowable move is still refused.
+    assert.equal(ask('popd && rm -rf out.txt')?.reason, REASON.CRITICAL_RM)
+  })
+
+  test('with no cd at all the starting directory still governs', () => {
+    assert.equal(ask('printf x > src/out.txt'), undefined)
+    assert.equal(ask('cp README.md /tmp/leak.md')?.reason, REASON.OUTSIDE_WORKSPACE)
+  })
+})
+
+// ── the shapes that still walk past the wall ────────────────────────────────
+
+/**
+ * The review that followed the `cd` change traced the shapes below, and each was
+ * confirmed on the code as it stood: a newline did not separate commands, `>|` was
+ * cut at its `|`, `( cd .. && … )` was read as a program named `(`, `FOO=1 rm -rf`
+ * was read as a program named `FOO=1`, `cd 2>/dev/null` moved to a directory named
+ * `2`, and `mkdir` was not a writer at all.
+ *
+ * Each item is pinned twice: the shape that must be refused and the ordinary worker
+ * command that shares its syntax and must still run. The tree is real and lives under
+ * the temp base — and so does the home folder, because `cd` with no destination goes
+ * there and `~` expands to it, so no case can reach the real home.
+ */
+describe('shapes that walk past the wall', () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-shapes-')))
+  const root = join(base, 'slot-1')
+  const home = join(base, 'home')
+  mkdirSync(join(root, 'server', 'scripts'), { recursive: true })
+  mkdirSync(join(base, 'slot-2'), { recursive: true })
+  mkdirSync(home, { recursive: true })
+  writeFileSync(join(root, 'README.md'), '# readme\n')
+  writeFileSync(join(root, 'server', 'a.txt'), 'a\n')
+  writeFileSync(join(base, 'slot-2', 'ref.txt'), 'ref\n')
+
+  // `rootExplicit` is what `apply` writes back into the settings, so the fence is the
+  // configured root and not the directory a `cd` reached.
+  const shapeSettings = resolveSettings({ root })
+  shapeSettings.rootExplicit = true
+
+  /** Ask the guard about one shell command run in the fenced slot. */
+  const ask = (command) => decideToolCall({ name: 'bash', args: { command }, cwd: root, home, settings: shapeSettings })
+
+  test('1. a newline ends a command, so the cd above it does not cover it', () => {
+    assert.equal(ask('cd ..\necho x > slot-2/f')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('echo a\nrm -rf /')?.reason, REASON.CRITICAL_RM)
+    // A newline inside quotes is part of the token, not a separator.
+    assert.deepEqual(splitSimpleCommands('printf "a\nb"'), [['printf', 'a\nb']])
+    assert.equal(splitSimpleCommands('cd ..\necho x').length, 2)
+    // Each line runs where the line before it left the shell.
+    assert.equal(ask('cd server\necho x > ok.txt'), undefined)
+  })
+
+  test('1. a here-doc body is data, not a command line', () => {
+    // The body line is text that happens to look like a deletion. Reading it as a
+    // command refused ordinary work (`cat <<EOF > notes.md` with an example in it).
+    assert.equal(ask('cat <<EOF > notes.md\nrm -rf /\nEOF'), undefined)
+    assert.equal(ask("cat <<'EOF' > notes.md\nrm -rf /\nEOF"), undefined)
+    assert.equal(ask('cat <<-EOF > notes.md\n\trm -rf /\n\tEOF'), undefined)
+    // The redirect on the here-doc line still counts, and so does what follows the body.
+    assert.equal(ask('cat <<EOF > ../slot-2/notes.md\nbody\nEOF')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('cat <<EOF > notes.md\nbody\nEOF\nrm -rf /')?.reason, REASON.CRITICAL_RM)
+  })
+
+  test('2. redirect operators are operators, not accidents', () => {
+    // `>|` used to be cut at the `|`, which turned the target into a second command;
+    // `<>` was read as an input redirect only; `>& file` lost its target at the `&`,
+    // which became a separator and left the file as a command of its own.
+    assert.deepEqual(splitSimpleCommands('echo x >|../f'), [['echo', 'x', '>|../f']])
+    assert.deepEqual(splitSimpleCommands('echo x 2>&1'), [['echo', 'x', '2>&1']])
+    assert.equal(ask('echo x >|../slot-2/f')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('echo x <>../slot-2/f')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('echo x >& ../slot-2/f')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('echo x &>>../slot-2/f')?.reason, REASON.OUTSIDE_WORKSPACE)
+    // A descriptor is not a file, and an ordinary pipeline still works.
+    assert.equal(ask('cd server && npm test 2>&1 | tee ../test.log'), undefined)
+    assert.equal(ask('cargo build > build.log 2>&1'), undefined)
+    assert.equal(ask('echo x >&2'), undefined)
+    assert.equal(ask('exec 3>&1'), undefined)
+    assert.equal(ask('echo x &>/dev/null'), undefined)
+  })
+
+  test('3. a subshell or a group cannot hide the program', () => {
+    assert.equal(ask('( cd .. && echo x > slot-2/f )')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('(rm -rf ..)')?.reason, REASON.CRITICAL_RM)
+    assert.equal(ask('{ cd ..; echo x > slot-2/f; }')?.reason, REASON.OUTSIDE_WORKSPACE)
+    // A subshell's `cd` is undone at its `)`, so the write after it is back at the root.
+    assert.equal(ask('( cd .. ) && echo x > ok.txt'), undefined)
+    // A group is the same shell, so its `cd` carries on to the `; }`.
+    assert.equal(ask('{ cd server; echo x > ok.txt; }'), undefined)
+    assert.equal(ask('( cd server && npm test )'), undefined)
+    assert.equal(ask('{ cd server && npm test; }'), undefined)
+  })
+
+  test('4. what stands before the program is read through', () => {
+    assert.equal(ask('FOO=1 rm -rf ../outside')?.reason, REASON.CRITICAL_RM)
+    // A `CDPATH` (or an `env -C`) makes a relative move unfollowable. A write after it
+    // is placed against the last known directory, as any write after a lost `cd` is;
+    // a deletion after the same move keeps the stricter rule.
+    assert.equal(ask('CDPATH=/tmp cd foo && echo x > out.txt'), undefined)
+    assert.equal(ask('CDPATH=/tmp cd foo && rm -rf out.txt')?.reason, REASON.CRITICAL_RM)
+    // A CDPATH set earlier on the line counts too: `export` is not a path program, so
+    // the assignment has to be read wherever it stands.
+    assert.equal(ask('export CDPATH=/tmp; cd foo && echo x > out.txt'), undefined)
+    assert.equal(ask('export CDPATH=/tmp; cd foo && rm -rf out.txt')?.reason, REASON.CRITICAL_RM)
+    assert.equal(ask('env FOO=1 sh -c "rm -rf /"')?.reason, REASON.CRITICAL_RM)
+    assert.equal(ask('env -i rm -rf /')?.reason, REASON.CRITICAL_RM)
+    assert.equal(ask('env -u NAME rm -rf /')?.reason, REASON.CRITICAL_RM)
+    assert.equal(ask('exec bash -c "rm -rf /"')?.reason, REASON.CRITICAL_RM)
+    // An `exec` with nothing but a redirect is still a command whose redirect counts.
+    assert.equal(ask('exec 3<> ../slot-2/f')?.reason, REASON.OUTSIDE_WORKSPACE)
+    // An xargs replacement string is placed by its literal spelling: the file sandbox
+    // confines the write, and `xargs -I{} chmod 644 {}` is an everyday idiom.
+    assert.equal(ask('xargs -I{} touch {}'), undefined)
+    // `env -C DIR` moves before the program runs, and DIR is not followed, so the
+    // relative write is placed against the last known directory — and a deletion is not.
+    assert.equal(ask('env -C /tmp touch out.txt'), undefined)
+    assert.equal(ask('env -C /tmp rm -rf out.txt')?.reason, REASON.CRITICAL_RM)
+    // ...and the ordinary prefixes stay ordinary.
+    assert.equal(ask('FOO=1 npm test'), undefined)
+    assert.equal(ask('env NODE_ENV=test node x.js > out.txt'), undefined)
+    assert.equal(ask('env -u HOME npm test'), undefined)
+    assert.equal(ask('exec npm test'), undefined)
+    assert.equal(ask('nohup npm test'), undefined)
+    assert.equal(ask('time -p npm test'), undefined)
+    assert.equal(ask('command -v npm'), undefined)
+    assert.equal(ask('xargs -0 echo'), undefined)
+  })
+
+  test('5. a cd argument that is only a redirect is not a destination', () => {
+    // `cd 2>/dev/null` takes no destination, so bash goes home — and a write after it
+    // is in the home folder, not in a directory named `2` below the fence.
+    assert.equal(ask('cd 2>/dev/null && echo x > out.txt')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('cd 2>/dev/null && echo x > $HOME/out.txt')?.reason, REASON.OUTSIDE_WORKSPACE)
+    // Flags are flags, and the redirect still belongs to the cd.
+    assert.equal(ask('cd -P server 2>/dev/null && echo x > ../ok.txt'), undefined)
+    assert.equal(ask('cd -- server && echo x > ../ok.txt'), undefined)
+  })
+
+  test('6. a mutation target the shell would rewrite is placed literally', () => {
+    // `~name` stays unplaceable: only the shell can expand another user's home, and
+    // naming it is a guess this row refuses to make.
+    const verdict = ask('echo x > ~tester/f')
+    assert.equal(verdict?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.match(verdict.detail, /cannot be placed/)
+    // A variable, a substitution and an xargs replacement are placed by their literal
+    // spelling again. The previous round refused every one of them, which refused
+    // `> "$LOG"` and `chmod +x "$f"` — ordinary script idioms — while the runtime's
+    // file sandbox already confines the write to the workspace.
+    for (const command of ['echo x > $OUT/file', 'echo x > ${OUT}/file', 'echo x > `pwd`/f', 'echo x > "$LOG"']) {
+      assert.equal(ask(command), undefined, command)
+    }
+    // The home forms this row does expand stay placeable...
+    assert.equal(ask('echo x > out.txt'), undefined)
+    // ...and a read is still placed against the last known directory, not refused.
+    assert.equal(ask('cat < $OUT/file'), undefined)
+    assert.equal(ask('cat "$OUT/file"'), undefined)
+  })
+
+  test('7. the other programs that write are read as writers', () => {
+    for (const command of [
+      'mkdir -p ../slot-2/new',
+      'rmdir ../slot-2/empty',
+      'chmod +x ../slot-2/run.sh',
+      'chown tester ../slot-2/f',
+      'truncate -s 0 ../slot-2/f',
+      'ln -s a.txt ../slot-2/link',
+      'tar -xzf x.tgz -C ../slot-2',
+      'unzip x.zip -d ../slot-2',
+      'patch -d ../slot-2 < fix.patch',
+      'patch -p1 -o ../slot-2/f < fix.patch',
+    ]) {
+      assert.equal(ask(command)?.reason, REASON.OUTSIDE_WORKSPACE, command)
+    }
+    for (const command of [
+      'mkdir -p build/out',
+      'mkdir -m 755 build/out',
+      'rmdir build/empty',
+      'chmod +x scripts/run.sh',
+      'chmod -R 755 build',
+      'chown -R tester build',
+      'truncate -s 0 build.log',
+      'ln -s README.md link',
+      'tar -czf out.tgz src',
+      'tar -xzf out.tgz -C build',
+      'unzip out.zip -d build',
+      'patch -p1 < fix.patch',
+      'patch -p1 -o build/f < fix.patch',
+    ]) {
+      assert.equal(ask(command), undefined, command)
+    }
+  })
+
+  test('8. touch option arguments are not destinations', () => {
+    // The reference file is read, not written: taking it for a destination refused
+    // `touch -r REF a.txt` whenever REF lived outside the fence.
+    assert.equal(ask('touch -r ../slot-2/ref.txt a.txt'), undefined)
+    assert.equal(ask('touch --reference ../slot-2/ref.txt a.txt'), undefined)
+    assert.equal(ask('touch --reference=../slot-2/ref.txt a.txt'), undefined)
+    assert.equal(ask('touch -d 2020-01-01 a.txt'), undefined)
+    assert.equal(ask('touch --date 2020-01-01 a.txt'), undefined)
+    assert.equal(ask('touch --date=2020-01-01 a.txt'), undefined)
+    assert.equal(ask('touch -t 202001010000 a.txt'), undefined)
+    // The file after the options is still the destination.
+    assert.equal(ask('touch -r README.md ../slot-2/a.txt')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('touch -d 2020-01-01 ../slot-2/a.txt')?.reason, REASON.OUTSIDE_WORKSPACE)
+  })
+
+  test('9. rsync --delete is measured where the command runs', () => {
+    // This was refused as "empties the service root" while it emptied `server/dist`.
+    assert.equal(ask('cd server && rsync -a --delete src .'), undefined)
+    assert.equal(ask('cd server && rsync -a --delete src/ dist/'), undefined)
+    // And this emptied the service root itself while reading as an ordinary path.
+    assert.equal(ask('cd .. && rsync -a --delete src/ slot-1')?.reason, REASON.CRITICAL_RM)
+    assert.equal(ask('rsync -a --delete src/ ./')?.reason, REASON.CRITICAL_RM)
+  })
+})
+
+// ── the second review: shell spellings that still walked past ───────────────
+
+/**
+ * A second review traced these shapes on the code as the first round left it, and
+ * each was confirmed by running it. They share one root cause: the lexer and the
+ * classifier read the command line less like a shell than the shell does — a
+ * redirect glued to a word was part of the word, a substitution was one opaque
+ * token, and control structures hid the command after `then`/`do`.
+ *
+ * Every item pins both directions: the shape that must be refused, and the ordinary
+ * worker command that shares its syntax and must still run. The tree is real and
+ * lives under a temp base, as is the home folder, so no case can reach the real home.
+ */
+describe('guard fix round 2', () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-round2-')))
+  const root = join(base, 'slot-1')
+  const home = join(base, 'home')
+  mkdirSync(join(root, 'server', 'scripts'), { recursive: true })
+  mkdirSync(join(base, 'slot-2'), { recursive: true })
+  mkdirSync(home, { recursive: true })
+  writeFileSync(join(root, 'a.txt'), 'a\n')
+  writeFileSync(join(root, 'server', 'a.txt'), 'a\n')
+  writeFileSync(join(base, 'slot-2', 'ref.txt'), 'ref\n')
+
+  // `rootExplicit` is what `apply` writes back into the settings, so the fence is the
+  // configured root and not the directory a `cd` reached.
+  const roundSettings = resolveSettings({ root })
+  roundSettings.rootExplicit = true
+
+  /** Ask the guard about one shell command run in the fenced slot. */
+  const ask = (command) => decideToolCall({ name: 'bash', args: { command }, cwd: root, home, settings: roundSettings })
+
+  /**
+   * Assert that one command is refused for one named reason.
+   * @param {string} command - the command line to ask about.
+   * @param {string} reason - the reason the refusal must carry.
+   * @returns {void}
+   */
+  const denied = (command, reason) => {
+    assert.equal(ask(command)?.reason, reason, command)
+  }
+
+  test('1. shell-expanded mutation targets are placed literally again', () => {
+    // Everyday script idioms: the target is resolved by its literal spelling, exactly
+    // as the code at HEAD did, because the file sandbox confines the write anyway.
+    for (const command of [
+      'echo hi > "$LOG"',
+      'npm test >"$log" 2>&1',
+      'touch "$f"',
+      'mkdir -p "$out"',
+      'chmod +x "$f"',
+      'tee "$log"',
+      'xargs -I{} chmod 644 {}',
+      'xargs -I{} touch {}',
+      'find . -name "*.tmp" | xargs -I{} rm {}',
+      'echo x > $OUT/file',
+      'echo x > ${OUT}/file',
+      'echo x > `pwd`/f',
+    ]) {
+      assert.equal(ask(command), undefined, command)
+    }
+    // `~otheruser` is still another user's home: no literal spelling can place it.
+    denied('echo x > ~tester/f', REASON.OUTSIDE_WORKSPACE)
+    // A relative write after a cd the guard cannot follow is placed against the last
+    // known directory, exactly like a read: it is one of the most common lines an agent
+    // writes, and the file sandbox confines the write. A deletion after the same cd
+    // keeps its own, stricter rule below.
+    assert.equal(ask('cd "$DIR" && touch out.txt'), undefined)
+    // `rm` keeps its own substitution rule: a deletion of a target only the shell can
+    // resolve is still a critical path.
+    for (const command of ['rm -rf $(pwd)', 'rm -rf $PWD', 'rm -rf `pwd`']) {
+      denied(command, REASON.CRITICAL_RM)
+    }
+  })
+
+  test('2. a redirect operator glued to a word is still an operator', () => {
+    // The lexer used to keep `hi>../slot-2/f` in one word, so the redirect never
+    // started a token and the write was never classified.
+    denied('echo hi>../slot-2/f', REASON.OUTSIDE_WORKSPACE)
+    denied('echo hi>>../slot-2/f', REASON.OUTSIDE_WORKSPACE)
+    denied('cat a.txt>../x', REASON.OUTSIDE_WORKSPACE)
+    denied('{ echo x; }> .env', REASON.SECRET)
+    assert.deepEqual(splitSimpleCommands('echo hi>out.txt'), [['echo', 'hi', '>out.txt']])
+    // A descriptor belongs to the operator, not to the word before it.
+    assert.deepEqual(splitSimpleCommands('echo hi 2>&1'), [['echo', 'hi', '2>&1']])
+    assert.deepEqual(splitSimpleCommands('cat a.txt 10>&1'), [['cat', 'a.txt', '10>&1']])
+    // `&>` keeps its `&`, which used to be read as the background separator.
+    assert.deepEqual(splitSimpleCommands('echo x &>out.txt'), [['echo', 'x', '&>out.txt']])
+    // Ordinary glued redirects, and a quoted arrow or an unquoted one: bash really
+    // redirects `echo a->b` to `b`, which is an ordinary write inside the workspace.
+    for (const command of ['echo hi>out.txt', 'cat a.txt>b.txt', 'node -e "a=>b"', 'echo a->b']) {
+      assert.equal(ask(command), undefined, command)
+    }
+  })
+
+  test('3. a command substitution is its own command line', () => {
+    // The lexer split inside `$( … )` at `&&`, so `$(` became a program name and the
+    // `cd` was lost. Its content now classifies as its own line, starting where the
+    // outer command runs, and a `cd` inside does not leak out.
+    for (const command of [
+      '$( cd .. && touch slot-2/x )',
+      'x=$(cd .. && touch slot-2/x)',
+      'echo "$(cd ..; touch slot-2/x)"',
+      'echo `cd ..; touch slot-2/x`',
+    ]) {
+      denied(command, REASON.OUTSIDE_WORKSPACE)
+    }
+    // A substitution's `cd` is a subshell's: it is undone when the substitution ends.
+    assert.equal(ask('$( cd .. ); echo x > ok.txt'), undefined)
+    // Nested substitutions, arithmetic (not a command), and ordinary ones stay open.
+    for (const command of [
+      'x=$(git rev-parse HEAD)',
+      'x=$(echo $(date))',
+      'echo "$(date)" > stamp.txt',
+      'echo $((1+2)) > n.txt',
+      'echo $(cd server && pwd) > stamp.txt',
+    ]) {
+      assert.equal(ask(command), undefined, command)
+    }
+  })
+
+  test('4. a cd inside a control structure moves the directory that follows', () => {
+    // The `cd` after `then`/`do`, after a case pattern or in a function body never
+    // reached the directory tracking, so the write after it was resolved at the root.
+    for (const command of [
+      'if true; then cd ..; fi; echo x > slot-2/y',
+      'if false; then :; else cd ..; fi; echo x > slot-2/y',
+      'for f in a; do cd ..; done; touch slot-2/x',
+      'while true; do cd ..; done; touch slot-2/x',
+      'until false; do cd ..; done; touch slot-2/x',
+      'case x in x) cd .. ;; esac; touch slot-2/x',
+      'case x in a|b) cd .. ;; *) true ;; esac; touch slot-2/x',
+      'f() { cd ..; }; f; echo x > slot-2/y',
+      'function f { cd ..; }; f; echo x > slot-2/y',
+    ]) {
+      denied(command, REASON.OUTSIDE_WORKSPACE)
+    }
+    // The ordinary shapes those structures spell stay open.
+    for (const command of [
+      'if [ -f a ]; then cd server && npm test; fi',
+      'if true; then echo ok; else echo no; fi',
+      'for f in scripts/*.sh; do chmod +x "$f"; done',
+      'while true; do npm test; done',
+      'select x in a b; do echo $x; done',
+      'case "$1" in build) make ;; esac',
+      'case "$1" in build) make ;; *) echo skip ;; esac',
+      'f() { cd server; }; f; echo x > ok.txt',
+    ]) {
+      assert.equal(ask(command), undefined, command)
+    }
+  })
+
+  test('5. a quoted here-doc terminator ends the body', () => {
+    // `<<\EOF` quotes the terminator, so the shell strips the backslash and matches
+    // `EOF`. Keeping the backslash meant nothing matched and every later line was
+    // skipped as body — a fail-open gate in front of the rest of the command.
+    assert.equal(ask('cat <<\\EOF > notes.md\nrm -rf /\nEOF'), undefined)
+    denied('cat <<\\EOF > notes.md\nbody\nEOF\ntouch ../slot-2/x', REASON.OUTSIDE_WORKSPACE)
+    // A terminator that never arrives does not excuse the remaining lines: they are
+    // classified as commands, which is the over-refusing side of the doubt.
+    denied('cat <<EOF > notes.md\nrm -rf /', REASON.CRITICAL_RM)
+    assert.equal(ask("cat <<'EOF' > notes.md\nrm -rf /\nEOF"), undefined)
+    assert.equal(ask('cat <<-EOF > notes.md\n\trm -rf /\n\tEOF'), undefined)
+  })
+
+  test('6. -c in an option cluster and eval payloads are command lines', () => {
+    // Only a bare `-c` was recognised, so `bash -lc "…"` and `zsh -ic "…"` hid their
+    // payload. `-o NAME` takes a value and must not be read as the payload.
+    for (const command of [
+      'bash -lc "rm -rf /"',
+      'sh -xc "rm -rf /"',
+      'bash -euc "rm -rf /"',
+      'bash -o pipefail -c "rm -rf /"',
+      'zsh -ic "rm -rf /"',
+      'eval "rm -rf /"',
+      "eval 'rm -rf /'",
+      'eval rm -rf /',
+    ]) {
+      denied(command, REASON.CRITICAL_RM)
+    }
+    // `eval` runs in the same shell, so its `cd` does leak out of the payload.
+    denied('eval "cd .."; touch slot-2/x', REASON.OUTSIDE_WORKSPACE)
+    denied('bash -lc "cd .. && touch slot-2/f"', REASON.OUTSIDE_WORKSPACE)
+    for (const command of ['bash -lc "npm test"', 'sh -xc "npm test"', 'eval "npm test"', 'eval echo hi']) {
+      assert.equal(ask(command), undefined, command)
+    }
+  })
+
+  test('7. wrapper programs do not hide the program they run', () => {
+    for (const command of [
+      'timeout 5 rm -rf /',
+      'timeout -s KILL 5 rm -rf /',
+      'timeout -k 2 5 rm -rf /',
+      'nice -n 10 rm -rf /',
+      'nice rm -rf /',
+      'ionice -c 3 rm -rf /',
+      'stdbuf -oL rm -rf /',
+      'watch -n 1 rm -rf /',
+      'caffeinate -i rm -rf /',
+      'chronic rm -rf /',
+      'unbuffer rm -rf /',
+      // `time` stays a prefix program rather than a transparent word, so its own
+      // options are skipped before the program is read.
+      'time -p rm -rf /',
+    ]) {
+      denied(command, REASON.CRITICAL_RM)
+    }
+    for (const command of [
+      'timeout 60 npm test',
+      'timeout -s KILL 60 npm test',
+      'nice -n 10 cargo build',
+      'nice cargo build',
+      'ionice -c 3 npm test',
+      'stdbuf -oL npm test',
+      'watch -n 1 npm test',
+      'caffeinate -i npm test',
+      'chronic npm test',
+      'unbuffer npm test',
+    ]) {
+      assert.equal(ask(command), undefined, command)
+    }
+  })
+
+  test('8. tar attached directory options name the destination', () => {
+    // `-C../slot-2` was not matched by the cluster rule, and the old-style
+    // `tar xfC a.tar dir` first argument was not read as a cluster at all.
+    for (const command of [
+      'tar -xf a.tar -C../slot-2',
+      'tar xfC a.tar ../slot-2',
+      'tar -xzf a.tgz --directory=../slot-2',
+      'tar -x -f a.tar -C ../slot-2',
+    ]) {
+      denied(command, REASON.OUTSIDE_WORKSPACE)
+    }
+    for (const command of ['tar -xzf a.tgz -C build', 'tar xf a.tar', 'tar -xf a.tar -Cbuild', 'tar -czf out.tgz src']) {
+      assert.equal(ask(command), undefined, command)
+    }
+  })
+
+  test('9. a prototype key as a program name does not throw', () => {
+    // `INLINE_CODE_FLAGS[program]` inherited from Object.prototype, so a command named
+    // `constructor` threw `inlineFlags.includes is not a function` instead of being
+    // classified. A guard that throws is a guard that fails open.
+    for (const program of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf', 'isPrototypeOf']) {
+      assert.equal(decide('bash', { command: program }), undefined, program)
+      assert.equal(decide('bash', { command: `node ${program}` }), undefined, program)
+      assert.equal(decide('bash', { command: `${program} -e x` }), undefined, program)
+    }
+  })
+
+  test('9. a guard exception is denied, not thrown at the transport', async () => {
+    // A throw inside `decideToolCall` used to escape the `tools/execute` handler as an
+    // opaque transport error, which runs no body but teaches the caller nothing. It is
+    // caught and denied: fail closed, with a reason a caller can route on.
+    const handlers = new Map()
+    apply(
+      {
+        logger: { info: () => {} },
+        on: (eventName, handler) => {
+          handlers.set(eventName, handler)
+          return () => handlers.delete(eventName)
+        },
+      },
+      { root },
+    )
+    let ran = 0
+    const next = async () => {
+      ran += 1
+      return { content: [{ type: 'text', text: 'ran' }] }
+    }
+    const hostile = {
+      get command() {
+        throw new Error('boom from a getter')
+      },
+    }
+    const verdict = await handlers.get('tools/execute')({ name: 'bash', arguments: hostile, agent: { meta: { cwd: root } } }, next)
+    assert.equal(ran, 0)
+    assert.equal(verdict.isError, true)
+    assert.equal(verdict.error.info.code, FLASH_GUARD_DENIED)
+    assert.equal(verdict.error.info.reason, REASON.GUARD_ERROR)
+    assert.match(verdict.error.message, /boom from a getter/)
+  })
+
+  test('20,000 random command lines never throw', () => {
+    // Deterministic and short: a fixed seed and a mixed alphabet of the syntax this
+    // lexer has to survive. The contract is only "never throws", not "always denies":
+    // a random line may legitimately be ordinary, but a throw would become a
+    // transport error the wall cannot account for.
+    const alphabet = [
+      'a', 'b', 'x', '1', ' ', '\t', '\n', '"', "'", '`', '$', '(', ')', '{', '}', '<', '>',
+      '|', '&', ';', '\\', 'é', 'λ', '..', 'cd', 'if', 'then', 'else', 'fi', 'for', 'in',
+      'do', 'done', 'while', 'until', 'case', 'esac', 'select', 'function', '!', 'time',
+      'rm', '-rf', '/', 'slot-2', '$(', '$((', ')', '<<EOF', 'EOF', '&&', '||', '#', '=',
+      '-c', '>>', '>&', '2>&1', '{}', '-I',
+    ]
+    let seed = 0x1f2e3d4c
+    /** One deterministic pseudo-random 32-bit number (a plain LCG, no dependencies). */
+    const random = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
+      return seed
+    }
+    for (let index = 0; index < 20000; index += 1) {
+      let command = ''
+      const parts = 1 + (random() % 12)
+      for (let part = 0; part < parts; part += 1) command += alphabet[random() % alphabet.length]
+      try {
+        decide('bash', { command })
+      } catch (error) {
+        assert.fail(`decideToolCall threw on ${JSON.stringify(command)}: ${error.message}`)
+      }
+    }
+  })
+})
+
+// ── the third review: five regressions from a 0.1.8 round ───────────────────
+
+/**
+ * Each of these was confirmed by running the code as the previous round left it.
+ *
+ * The first turned the guard's own rule into a wall across the most common lines an
+ * agent writes; the second let a trailing separator hide the workspace behind an `rm`;
+ * the third overflowed the stack; and the fourth spent a filesystem call per level of a
+ * path no file will ever reach. The tree is real and lives under a temp base, and so
+ * does the home folder, so no case can reach the real home.
+ */
+describe('guard fix round 3', () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-round3-')))
+  const root = join(base, 'slot-1')
+  const home = join(base, 'home')
+  const project = join(home, 'project')
+  mkdirSync(join(root, 'server', 'build'), { recursive: true })
+  mkdirSync(join(root, 'src'), { recursive: true })
+  mkdirSync(project, { recursive: true })
+  writeFileSync(join(root, 'README.md'), '# readme\n')
+
+  // `rootExplicit` is what `apply` writes back into the settings, so the fence is the
+  // configured root and not the directory a `cd` reached.
+  const roundSettings = resolveSettings({ root })
+  roundSettings.rootExplicit = true
+
+  /** Ask the guard about one shell command run in the fenced slot. */
+  const ask = (command) => decideToolCall({ name: 'bash', args: { command }, cwd: root, home, settings: roundSettings })
+
+  test('1. a relative write after an unfollowable cd is placed, a deletion is not', () => {
+    // These four are among the most common lines an agent writes. Each has a `cd` whose
+    // destination is a substitution, so the directory after it cannot be followed, and
+    // every write behind it was refused as `cannot be placed after an unresolvable cd`.
+    for (const command of [
+      'cd "$(git rev-parse --show-toplevel)" && mkdir -p build',
+      'cd "$(dirname "$0")/.." && npm test 2>&1 | tee .flash-tmp/test.log',
+      'cd "$HOME/project" && echo x > .flash-tmp/x',
+      'pushd "$(pwd)" > /dev/null && npm test >> t.log && popd',
+    ]) {
+      assert.equal(ask(command), undefined, command)
+    }
+    // A write destination is placed the same way as a redirect.
+    for (const command of [
+      'cd "$DIR" && echo x > out.txt',
+      'cd "$DIR" && touch out.txt',
+      'cd "$DIR" && mkdir -p build/x',
+      'cd "$DIR" && cp README.md copy.md',
+    ]) {
+      assert.equal(ask(command), undefined, command)
+    }
+    // A deletion keeps its existing rule, whatever the command line looked like. The
+    // `rm` family names the move it ran after; `find` and `xargs` are refused as
+    // unbounded deletions before the directory question is even asked.
+    for (const command of [
+      'cd "$DIR" && rm -rf build',
+      'cd "$(git rev-parse --show-toplevel)" && rm -rf build',
+      'cd "$DIR" && rmdir build',
+    ]) {
+      const verdict = ask(command)
+      assert.equal(verdict?.reason, REASON.CRITICAL_RM, command)
+      assert.match(verdict.detail, /unresolvable cd/, command)
+    }
+    for (const command of ['cd "$DIR" && find . -delete', 'cd "$DIR" && find . -print | xargs rm -rf']) {
+      assert.equal(ask(command)?.reason, REASON.CRITICAL_RM, command)
+    }
+    // Another user's home stays unplaceable for a write. (A deletion of it after an
+    // unfollowable cd is refused as that move's `CRITICAL_PATH`, as at HEAD.)
+    assert.equal(ask('cd "$DIR" && echo x > ~tester/f')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('rm -rf ~tester/work')?.reason, REASON.OUTSIDE_WORKSPACE)
+  })
+
+  test('2. a trailing separator does not hide the root an rm deletes', () => {
+    // `path.normalize` keeps one trailing separator, so the resolved path was not equal
+    // to the workspace it removes and the root rule never fired.
+    for (const command of ['rm -rf build/', 'rm -rf src/', `rm -rf ${root}/src/`, 'cd server && rm -rf build/']) {
+      assert.equal(ask(command), undefined, command)
+    }
+    for (const command of [`rm -rf ${root}/`, `rm -rf ${root}//`, `rm -rf ${root}///`, 'rm -rf ./', 'cd server && rm -rf ../']) {
+      assert.equal(ask(command)?.reason, REASON.CRITICAL_RM, command)
+    }
+    // The unslashed spellings answered the same way before this round, and still do.
+    assert.equal(ask(`rm -rf ${root}`)?.reason, REASON.CRITICAL_RM)
+    assert.equal(ask('rm -rf .')?.reason, REASON.CRITICAL_RM)
+  })
+
+  test('3. a command substitution nested past 32 levels is denied, not thrown', () => {
+    // `'$('.repeat(1000) …` used to recurse `classifyShell` into a `RangeError`, which
+    // escaped `decideToolCall` and became a transport error rather than a denial.
+    const deep = `${'$('.repeat(1000)}echo x${')'.repeat(1000)}`
+    let verdict
+    assert.doesNotThrow(() => {
+      verdict = ask(deep)
+    })
+    assert.equal(verdict?.reason, REASON.GUARD_ERROR)
+    assert.match(verdict.detail, /command substitutions nested deeper than 32 levels/)
+    // Exactly 32 levels still classify normally...
+    const atLimit = `${'$('.repeat(32)}echo x${')'.repeat(32)}`
+    assert.equal(ask(atLimit), undefined)
+    // ...and the same cap counts a nested `bash -c` / `eval` payload.
+    assert.equal(ask(`${'eval '.repeat(40)}echo x`)?.reason, REASON.GUARD_ERROR)
+    assert.equal(ask(`${'eval '.repeat(4)}echo x`), undefined)
+    // A `bash -c` payload is one level deeper than the line that named it, so a
+    // substitution chain just under the cap becomes too deep inside one payload.
+    assert.equal(ask(`bash -c "${deep}"`)?.reason, REASON.GUARD_ERROR)
+    assert.equal(ask(`bash -c "${'eval '.repeat(40)}echo x"`)?.reason, REASON.GUARD_ERROR)
+  })
+
+  test('4. a very deep not-yet-existing path classifies in linear time', () => {
+    // `canonicalPath` used `tail.unshift` and one `existsSync` per missing ancestor, so
+    // this path was quadratic: 30,000 segments took over 200 ms and a megabyte never
+    // finished. The walk now pushes and reverses once, and stops after 256 levels.
+    const segments = 60_000
+    const deep = `mkdir -p ${'a/'.repeat(segments)}build`
+    const started = process.hrtime.bigint()
+    const verdict = ask(deep)
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6
+    assert.equal(verdict, undefined, 'a path below the fence is an ordinary mkdir')
+    assert.ok(elapsedMs < 100, `expected under 100 ms, took ${elapsedMs.toFixed(1)} ms`)
+  })
 })
 
 // ── helpers ─────────────────────────────────────────────────────────────────
