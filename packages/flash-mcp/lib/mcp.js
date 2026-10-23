@@ -53,6 +53,10 @@ const SERVER_NOT_INITIALIZED = -32002
  * @param {NodeJS.ReadableStream} [options.input] - protocol input (default stdin).
  * @param {NodeJS.WritableStream} [options.output] - protocol output (default stdout).
  * @param {(message: string) => void} [options.log] - diagnostic sink; MUST NOT be stdout.
+ * @param {() => void} [options.onInitializeAnswered] - called each time an `initialize`
+ *   result has been written, before any later request is handled. A server uses it to
+ *   record how long the handshake took; a throw is logged rather than answered, because
+ *   the request's result is already on the wire.
  * @param {() => void} [options.onInitialized] - called once, when the client's
  *   `notifications/initialized` arrives. It runs after the `initialize` result was
  *   written, which is the first moment the client is ready to talk: a server uses it to
@@ -69,6 +73,7 @@ export function serveStdio({
   input = process.stdin,
   output = process.stdout,
   log = () => {},
+  onInitializeAnswered,
   onInitialized,
 }) {
   let buffer = ''
@@ -111,6 +116,13 @@ export function serveStdio({
       serverInfo,
       ...(instructions === undefined ? {} : { instructions }),
     })
+    if (onInitializeAnswered === undefined) return
+    try {
+      onInitializeAnswered()
+    } catch (error) {
+      // The answer is already written; a hook failure cannot turn it into an error frame.
+      log(`onInitializeAnswered failed: ${describeError(error)}`)
+    }
   }
 
   const handleToolsCall = async (id, params) => {

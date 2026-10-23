@@ -12,7 +12,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { accessSync, constants, existsSync, readFileSync, realpathSync } from 'node:fs'
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -31,6 +31,7 @@ export const CHECK_IDS = Object.freeze([
   'profile-models',
   'profile-version',
   'slot-path-length',
+  'state-base-permissions',
   'ollama',
   'model',
   'git',
@@ -136,11 +137,13 @@ try {
 `
 
 /**
- * The filesystem primitives the native-module check reads.
+ * The filesystem primitives the native-module check reads, plus the Windows permission
+ * probe's one directory create and remove.
  *
- * These are lookups only: nothing here spawns a process or loads a native
- * module, and the whole set is injectable through `options.fs`, so the check can
- * be exercised without a real harness install.
+ * Nothing here spawns a process or loads a native module, and the whole set is injectable
+ * through `options.fs`, so the checks can be exercised without a real harness install. The
+ * probe's directory calls are part of the same set for the same reason: a test can model a
+ * Windows state base without creating one on the host.
  */
 const REAL_FS = Object.freeze({
   realpath: (path) => realpathSync(path),
@@ -155,6 +158,9 @@ const REAL_FS = Object.freeze({
   },
   readText: (path) => readFileSync(path, 'utf8'),
   resolvePackage: (request, fromFile) => createRequire(fromFile).resolve(request),
+  mkdir: (path) => mkdirSync(path, { recursive: true }),
+  mkdtemp: (prefix) => mkdtempSync(prefix),
+  remove: (path) => rmSync(path, { recursive: true, force: true }),
 })
 
 /**
@@ -322,17 +328,23 @@ export function profileVersionWarnings({
  * Standard error is kept on success too: `dsh --dump-config` reports a patch that
  * did not apply on standard error and still exits 0.
  *
+ * A missing executable is not a command that ran and failed. `spawnSync` answers it with
+ * `status: null` and the reason in `error`, so both are kept — the status stays null rather
+ * than being turned into a made-up 1, and the message is copied to `stderr` for the checks
+ * that still report a start failure from there.
+ *
  * @param {string} command - executable to invoke.
  * @param {string[]} args - arguments to pass to it.
  * @param {NodeJS.ProcessEnv} env - environment for the child process.
- * @returns {{status: number, stdout: string, stderr: string}} the captured result.
+ * @returns {{status: number | null, stdout: string, stderr: string, error?: Error}} the captured result.
  */
 function defaultRun(command, args, env) {
   const result = spawnSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env })
   return {
-    status: typeof result.status === 'number' ? result.status : 1,
+    status: typeof result.status === 'number' ? result.status : null,
     stdout: result.stdout ?? '',
     stderr: result.stderr ?? (result.error instanceof Error ? result.error.message : ''),
+    ...(result.error instanceof Error ? { error: result.error } : {}),
   }
 }
 
@@ -656,6 +668,96 @@ function checkNativeModules(entry, platform, arch, fs, install, { run, nodePath 
 }
 
 /**
+ * Whether an icacls result means the executable could not be started at all.
+ *
+ * A runner that cannot find `icacls` is a different answer from one where icacls ran and
+ * the folder refused the grant. The first is a warning about the check; the second is the
+ * failure the row exists to report. `spawnSync` does not throw for a missing executable: it
+ * returns `status: null` with the start error in `error` (and `stderr` null), so both shapes
+ * are start failures. A numeric non-zero status means icacls ran, so whatever it printed is
+ * an ACL answer, not a missing executable.
+ *
+ * @param {{status?: number | null, error?: Error}} result - what the runner returned.
+ * @returns {boolean} true when the executable never started, not when the grant failed.
+ */
+function icaclsCouldNotStart(result) {
+  return result?.error instanceof Error || result?.status === null
+}
+
+/**
+ * Probe whether this user may change permissions under the state base.
+ *
+ * Windows grants a folder made directly under `C:\` modify rights without the right to
+ * change its permissions. The sandbox's first step for every command is to grant itself a
+ * write ACE on the slot folder, so that first step fails with `SetNamedSecurityInfoW failed
+ * (Win32 5)` while every other doctor row can stay green. The probe creates one folder
+ * under the same base the slot-path row measures and asks icacls for exactly the grant the
+ * sandbox asks for; the folder is removed on every path out.
+ *
+ * @param {object} options - the probe's inputs.
+ * @param {string} options.base - the state base folder the slots are laid out under.
+ * @param {NodeJS.ProcessEnv} options.env - environment holding USERDOMAIN and USERNAME.
+ * @param {object} options.fs - filesystem probe with exists/mkdir/mkdtemp/remove.
+ * @param {(command: string, args: string[]) => {status: number, stdout: string, stderr: string}} options.run
+ *   command runner; injected so no test starts real `icacls`.
+ * @returns {{status: 'ok' | 'fail' | 'warn', detail: string, fix: string}} the row.
+ */
+function checkStateBasePermissions({ base, env, fs, run }) {
+  const fix = `icacls "${base}" /grant "%USERNAME%:(OI)(CI)F"`
+  const createdBase = fs.exists(base) !== true
+  let probe
+  try {
+    // The server would create this base on its first call; the probe does the same so it
+    // measures the folder the server will really use, not a path that does not exist yet.
+    if (createdBase) fs.mkdir(base)
+    probe = fs.mkdtemp(join(base, 'flash-permission-probe-'))
+    const username = typeof env?.USERNAME === 'string' ? env.USERNAME.trim() : ''
+    if (username === '') {
+      return { status: 'warn', detail: 'USERNAME is not set, so icacls has no account to grant', fix }
+    }
+    const domain = typeof env?.USERDOMAIN === 'string' ? env.USERDOMAIN.trim() : ''
+    const account = domain === '' ? username : `${domain}\\${username}`
+    let result
+    try {
+      result = run('icacls', [probe, '/grant', `${account}:(OI)(CI)M`])
+    } catch (error) {
+      return { status: 'warn', detail: `icacls could not be started: ${reasonOf(error)}`, fix }
+    }
+    if (result === null || typeof result !== 'object') {
+      return { status: 'warn', detail: 'icacls could not be started: no result from the runner', fix }
+    }
+    if (result.status === 0) {
+      const made = createdBase ? ` (created ${base} for the probe, as the server would)` : ''
+      return { status: 'ok', detail: `the sandbox can set permissions on a folder under ${base}${made}`, fix: '' }
+    }
+    const stderr = typeof result.stderr === 'string' ? result.stderr.trim() : ''
+    if (icaclsCouldNotStart(result)) {
+      // The start error lives on `error`; `stderr` is null in that shape and only carries
+      // the message for a runner that copied it there.
+      const reason = result.error instanceof Error && result.error.message !== '' ? result.error.message : stderr
+      return { status: 'warn', detail: `icacls could not be started: ${reason || 'unknown error'}`, fix }
+    }
+    return {
+      status: 'fail',
+      detail: `the sandbox cannot set permissions under ${base} (${stderr}), so no shell command can start in a slot`,
+      fix,
+    }
+  } catch (error) {
+    // A probe folder that cannot even be made is not the ACL failure this row names: warn,
+    // because the row could not establish the fact rather than establishing the bad one.
+    return { status: 'warn', detail: `the state-base permission probe could not run: ${reasonOf(error)}`, fix }
+  } finally {
+    if (probe !== undefined) {
+      try {
+        fs.remove(probe)
+      } catch {
+        // The report is already decided; a failed cleanup must not replace it.
+      }
+    }
+  }
+}
+
+/**
  * Run every prerequisite check in order.
  *
  * @param {object} [options] - injected effects and overrides.
@@ -689,8 +791,9 @@ function checkNativeModules(entry, platform, arch, fs, install, { run, nodePath 
  *        the launcher check names when dsh is missing (default process.execPath).
  * @param {(directory: string) => string[]} [options.listDir] - directory listing used by the
  *        launcher check's sibling lookup; injectable so a check needs no real nvm layout.
- * @param {object} [options.fs] - filesystem probe with realpath/exists/executable/readText/resolvePackage;
- *        defaults to the node:fs calls, and is injectable so the check needs no real harness install.
+ * @param {object} [options.fs] - filesystem probe with realpath/exists/executable/readText/resolvePackage,
+ *        plus mkdir/mkdtemp/remove for the Windows permission probe; defaults to the node:fs
+ *        calls, and is injectable so the checks need no real harness install or state base.
  * @param {{command: string, prefix: string[]}} [options.launcher] - how to start dsh; defaults to the
  *        launcher the server itself resolves, so the doctor checks exactly the dsh the server would run.
  * @returns {Promise<{checks: object[], ok: boolean, failures: number, warnings: number}>} the report.
@@ -895,6 +998,15 @@ export async function runChecks(options = {}) {
         'set the plugin option "state_base" (or FLASH_STATE_BASE) to a short absolute folder such as C:\\fm',
       )
     }
+    // The same base the slots are laid out under. A configured state directory replaces the
+    // default layout, so the probe must follow it rather than measure the unused temp base.
+    const permission = checkStateBasePermissions({
+      base: config.stateDir ?? defaultBase,
+      env,
+      fs,
+      run,
+    })
+    record('state-base-permissions', 'state base permissions', permission.status, permission.detail, permission.fix)
   }
 
   const daemonUp = await safeProbe(OLLAMA_TAGS_URL)

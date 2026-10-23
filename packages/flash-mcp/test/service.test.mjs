@@ -659,16 +659,20 @@ function makeService({ script, ...overrides } = {}) {
 /**
  * A git-backed root, and a worker that writes one file into whatever tree it gets.
  *
- * `settings` is written as `.flash-agents.json` before the pool is constructed, so a test
- * can tell the file the server read at start from one edited afterwards.
+ * `settings` is written as `.flash-agents.json` before the pool is constructed, and
+ * `localSettings` as the untracked `.flash-agents.local.json` after the commit, so a test
+ * can tell the files the server read at start from ones edited afterwards.
  */
-function makeIsolatedService({ slots = 2, file = 'worker-output.txt', script, slotEnv, settings, ...overrides } = {}) {
+function makeIsolatedService({ slots = 2, file = 'worker-output.txt', script, slotEnv, settings, localSettings, ...overrides } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-iso-')))
   execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root })
   writeFileSync(join(root, 'README.md'), '# project\n')
   if (settings !== undefined) writeFileSync(join(root, '.flash-agents.json'), settings)
   execFileSync('git', ['add', '-A'], { cwd: root })
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: root })
+  // The per-machine file is written after the commit, as a user's would be: it is meant to
+  // stay untracked, and a test that needs it ignored writes the .gitignore itself.
+  if (localSettings !== undefined) writeFileSync(join(root, '.flash-agents.local.json'), localSettings)
   const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-iso-state-')))
   const client = new FakeSdkClient({ script })
   client.writes = file
@@ -2170,6 +2174,61 @@ test('flash_apply applies a patch later, and a dry run only checks it', async ()
   await service.close()
 })
 
+test('flash_apply validates files and lets an empty selection reach the patch', async () => {
+  const { root, service } = makeIsolatedService({ file: 'partial.txt' })
+  const result = await service.flashTask({ task: 'write one file', cwd: root })
+
+  for (const files of ['partial.txt', ['partial.txt', 7], [''], [null]]) {
+    assert.throws(
+      () => service.flashApply({ patchId: result.change.patchId, files }),
+      (error) =>
+        error instanceof FlashTaskError &&
+        error.code === 'INVALID_ARGUMENT' &&
+        error.message === 'files must be an array of non-empty file paths when present',
+    )
+  }
+  // An empty array has the right shape; it is the patch that says a selection must name
+  // at least one of its files, and that refusal carries the pool's wording.
+  assert.throws(
+    () => service.flashApply({ patchId: result.change.patchId, files: [] }),
+    (error) =>
+      error instanceof FlashTaskError &&
+      error.code === 'APPLY_FAILED' &&
+      error.message === 'files must name at least one file of the patch',
+  )
+  assert.equal(existsSync(join(root, 'partial.txt')), false)
+  await service.close()
+})
+
+test('flash_apply passes files to the pool, and the applied file is recorded', async () => {
+  const { root, service } = makeIsolatedService({ file: 'partial.txt' })
+  const result = await service.flashTask({ task: 'write one file', cwd: root })
+
+  const applied = service.flashApply({ patchId: result.change.patchId, files: ['partial.txt'] })
+  assert.equal(applied.applied, true)
+  assert.deepEqual(applied.filesChanged, ['partial.txt'])
+  assert.equal(readFileSync(join(root, 'partial.txt'), 'utf8'), 'written by the worker\n')
+  const page = service.flashPatch({ patchId: result.change.patchId })
+  assert.equal(page.applied, true)
+  assert.deepEqual(page.appliedFiles, ['partial.txt'])
+  await service.close()
+})
+
+test('review: change.filesChanged spells a path with a tab, the spelling flash_apply takes', async () => {
+  // The result maps each `STATUS<TAB>path` record with `split('\t').at(-1)`, so a path that
+  // holds a tab is cut short. `flash_apply` takes `change.filesChanged` by contract, and
+  // that spelling names no file of the patch, so a review run's proof test cannot be
+  // handed over.
+  const tabbed = 'a\tb.txt'
+  const { root, service } = makeIsolatedService({ file: tabbed })
+  const result = await service.flashTask({ task: 'write one file', cwd: root })
+  assert.deepEqual(result.change.filesChanged, [tabbed], 'the result spells the path that exists')
+  const applied = service.flashApply({ patchId: result.change.patchId, files: result.change.filesChanged })
+  assert.equal(applied.applied, true)
+  assert.equal(readFileSync(join(root, tabbed), 'utf8'), 'written by the worker\n')
+  await service.close()
+})
+
 test('a read-only call is not isolated: it cannot write, and it reads the caller’s tree', async () => {
   const { root, client, service } = makeIsolatedService({ file: 'never.txt' })
   const result = await service.flashTask({ task: 'read the README', cwd: root, mode: 'read-only' })
@@ -2288,6 +2347,33 @@ test('a timed-out isolated call reports what its tree held, retires the tree, an
   assert.equal(client.initializes.length, 2, 'the new tree gets a fresh runtime')
   assert.equal(client.initializes[1].cwd, slot.dir)
   await service.close()
+})
+
+test('a salvaged patch keeps baseParent across a restart, so its drift counts commits', async () => {
+  const { root, service, stateDir } = makeIsolatedService({ slots: 1, script: 'silent', taskTimeoutMs: 100 })
+  const error = await service.flashTask({ task: 'never finishes', cwd: root }).catch((caught) => caught)
+  const stored = /stored as patch (flash-[0-9a-f-]+):/.exec(error.message)
+  assert.ok(stored, `expected a stored patch in: ${error.message}`)
+  // The salvage path computed the base's parent from the dead copy and used to drop it on
+  // the way to disk. The copy is removed with the owner; only the record can carry it now.
+  await service.close()
+
+  writeFileSync(join(root, 'after.txt'), 'after the salvage\n')
+  execFileSync('git', ['add', '-A'], { cwd: root })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'after the salvage'], { cwd: root })
+  const second = new FlashTaskService({
+    root,
+    clientFactory: () => new FakeSdkClient(),
+    log: () => {},
+    isolate: { slots: 1, stateDir },
+    honoursModelEnv: () => true,
+    earlyRetryDelayMs: 0,
+  })
+  const dry = second.flashApply({ patchId: stored[1], dryRun: true })
+  assert.equal(dry.drift.commitsBehind, 1)
+  const page = second.flashPatch({ patchId: stored[1] })
+  assert.equal(page.drift.commitsBehind, 1)
+  await second.close()
 })
 
 test('a client-cancelled isolated call salvages its change and retires the tree like a timeout', async () => {
@@ -3554,7 +3640,9 @@ test('a stale read-only profile gets its own warning naming its directory', asyn
   const home = profileHome(SERVER_INFO.version, { readOnlyVersion: '0.0.8' })
   const { root, service } = makeDriftService({ env: { DSH_HOME: home }, checkProfileStamp: true })
   try {
-    const result = await service.flashTask({ task: 'read the README', cwd: root })
+    // The warning travels with the runtime that served the call: a read-only call boots
+    // the read-only profile, so that is the one whose verdict it carries.
+    const result = await service.flashTask({ task: 'read the README', cwd: root, mode: 'read-only' })
     const warnings = result.warnings.filter((line) => line.startsWith('the worker profile'))
     assert.equal(warnings.length, 1, `expected one read-only warning, saw ${JSON.stringify(result.warnings)}`)
     assert.ok(warnings[0].includes(join(home, 'profiles', 'flash-service-readonly')), warnings[0])
@@ -3566,15 +3654,22 @@ test('a stale read-only profile gets its own warning naming its directory', asyn
   }
 })
 
-test('two stale profiles are two warnings, one per directory', async () => {
+test('two stale profiles warn on the calls that run on them, one per directory', async () => {
   const home = profileHome('0.0.9', { readOnlyVersion: '0.0.8' })
   const { root, service } = makeDriftService({ env: { DSH_HOME: home }, checkProfileStamp: true })
   try {
-    const result = await service.flashTask({ task: 'read the README', cwd: root })
-    const warnings = result.warnings.filter((line) => line.startsWith('the worker profile'))
-    assert.equal(warnings.length, 2, JSON.stringify(result.warnings))
-    assert.ok(warnings.some((line) => line.includes(join(home, 'profiles', 'flash-service')) && line.includes('0.0.9')))
-    assert.ok(warnings.some((line) => line.includes(join(home, 'profiles', 'flash-service-readonly')) && line.includes('0.0.8')))
+    const writing = await service.flashTask({ task: 'read the README', cwd: root })
+    const writeWarnings = writing.warnings.filter((line) => line.startsWith('the worker profile'))
+    assert.equal(writeWarnings.length, 1, JSON.stringify(writing.warnings))
+    assert.ok(writeWarnings[0].includes(join(home, 'profiles', 'flash-service')) && writeWarnings[0].includes('0.0.9'))
+
+    const readOnly = await service.flashTask({ task: 'read the README', cwd: root, mode: 'read-only' })
+    const readOnlyWarnings = readOnly.warnings.filter((line) => line.startsWith('the worker profile'))
+    assert.equal(readOnlyWarnings.length, 1, JSON.stringify(readOnly.warnings))
+    assert.ok(
+      readOnlyWarnings[0].includes(join(home, 'profiles', 'flash-service-readonly')) &&
+        readOnlyWarnings[0].includes('0.0.8'),
+    )
   } finally {
     await service.close()
     rmSync(home, { recursive: true, force: true })
@@ -3598,6 +3693,165 @@ test('a profile that is not installed is called not installed, not an older rele
   } finally {
     await service.close()
     rmSync(home, { recursive: true, force: true })
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/**
+ * A stamp reader whose answer the test can switch, as `node install.mjs` would.
+ *
+ * The writing profile is stale until `current` is set; the read-only profile is current
+ * from the start, so a warning counted here is the writing profile's alone.
+ *
+ * @returns {{reader: (profile: string) => string | undefined, calls: string[], setCurrent: () => void}}
+ *   the reader, the profiles it was asked about, and the switch.
+ */
+function switchableStampReader() {
+  const stale = 'the worker profile is stale: run node install.mjs, then reconnect'
+  const calls = []
+  let current = false
+  return {
+    calls,
+    reader: (profile) => {
+      calls.push(profile)
+      return profile === 'flash-service' && !current ? stale : undefined
+    },
+    setCurrent: () => {
+      current = true
+    },
+  }
+}
+
+test('a runtime booted after an install clears its profile warning for the calls it serves', async () => {
+  const stamps = switchableStampReader()
+  const logs = []
+  const { root, service } = makeDriftService({
+    env: { DSH_HOME: '/fake/harness' },
+    checkProfileStamp: true,
+    profileStampReader: stamps.reader,
+    log: (line) => logs.push(line),
+  })
+  const second = join(root, 'second-tree')
+  mkdirSync(second)
+  try {
+    const stale = await service.flashTask({ task: 'read the README', cwd: root })
+    assert.match(stale.warnings.join('\n'), /the worker profile is stale/)
+
+    // `node install.mjs` finishes here. A fresh tree needs a fresh runtime, which is the
+    // moment the stamp is read again and the new guard is what that process really loads.
+    stamps.setCurrent()
+    const current = await service.flashTask({ task: 'read the README', cwd: second })
+    assert.equal(current.warnings, undefined, `a current profile must add no warning, saw ${JSON.stringify(current.warnings)}`)
+    assert.ok(
+      logs.includes(
+        `the flash-service profile now matches flash-agents ${SERVER_INFO.version}; its warning is cleared`,
+      ),
+      JSON.stringify(logs),
+    )
+  } finally {
+    await service.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a runtime booted before the install keeps the warning it booted with', async () => {
+  const stamps = switchableStampReader()
+  const logs = []
+  const { root, service } = makeDriftService({
+    env: { DSH_HOME: '/fake/harness' },
+    checkProfileStamp: true,
+    profileStampReader: stamps.reader,
+    log: (line) => logs.push(line),
+  })
+  try {
+    const first = await service.flashTask({ task: 'read the README', cwd: root })
+    assert.match(first.warnings.join('\n'), /the worker profile is stale/)
+    const askedBefore = stamps.calls.length
+
+    stamps.setCurrent()
+    const again = await service.flashTask({ task: 'read the README', cwd: root })
+    assert.match(again.warnings.join('\n'), /the worker profile is stale/, 'the old runtime still runs the old guard')
+    assert.equal(stamps.calls.length, askedBefore, 'a reused runtime is not a boot and must not re-read the stamp')
+    assert.ok(!logs.some((line) => /now matches flash-agents .*; its warning is cleared/.test(line)), JSON.stringify(logs))
+  } finally {
+    await service.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('review: runtime A keeps the stale verdict it booted with after runtime B boots current', async () => {
+  const stamps = switchableStampReader()
+  const { root, service } = makeDriftService({
+    env: { DSH_HOME: '/fake/harness' },
+    checkProfileStamp: true,
+    profileStampReader: stamps.reader,
+  })
+  const second = join(root, 'second-tree')
+  mkdirSync(second)
+  try {
+    // Runtime A boots on `root` while the stamp is stale.
+    const stale = await service.flashTask({ task: 'read the README', cwd: root })
+    assert.match(stale.warnings.join('\n'), /the worker profile is stale/)
+
+    // `node install.mjs` finishes, then runtime B boots on another tree: B loads the new
+    // guard, so its call carries no warning and the service's latest verdict becomes current.
+    stamps.setCurrent()
+    const current = await service.flashTask({ task: 'read the README', cwd: second })
+    assert.equal(current.warnings, undefined, `runtime B must carry no warning, saw ${JSON.stringify(current.warnings)}`)
+
+    // A call served by A must still report what A really loaded, not the later verdict.
+    const again = await service.flashTask({ task: 'read the README', cwd: root })
+    assert.match(
+      again.warnings.join('\n'),
+      /the worker profile is stale/,
+      `runtime A must keep its own verdict, saw ${JSON.stringify(again.warnings)}`,
+    )
+  } finally {
+    await service.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('review: a stamp reader that throws at start logs the failure and leaves the verdict unknown', async () => {
+  const logs = []
+  const { root, service } = makeDriftService({
+    env: { DSH_HOME: '/fake/harness' },
+    checkProfileStamp: true,
+    profileStampReader: () => {
+      throw new Error('EACCES: permission denied')
+    },
+    log: (line) => logs.push(line),
+  })
+  try {
+    // The start must not abort, and neither profile may be reported stale on a read failure.
+    assert.ok(
+      logs.includes('could not read the flash-service profile stamp: EACCES: permission denied'),
+      JSON.stringify(logs),
+    )
+    assert.ok(
+      logs.includes('could not read the flash-service-readonly profile stamp: EACCES: permission denied'),
+      JSON.stringify(logs),
+    )
+    const result = await service.flashTask({ task: 'read the README', cwd: root })
+    assert.equal(result.warnings, undefined, `an unknown verdict must not warn, saw ${JSON.stringify(result.warnings)}`)
+  } finally {
+    await service.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('without checkProfileStamp the injected stamp reader is never called', async () => {
+  const stamps = switchableStampReader()
+  const { root, service } = makeDriftService({
+    env: { DSH_HOME: '/fake/harness' },
+    profileStampReader: stamps.reader,
+  })
+  try {
+    const result = await service.flashTask({ task: 'read the README', cwd: root })
+    assert.equal(result.warnings, undefined)
+    assert.deepEqual(stamps.calls, [], 'an environment and a reader are not a request to inspect the profiles')
+  } finally {
+    await service.close()
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -3637,6 +3891,51 @@ test('.flash-agents.json created after start adds one warning to the next call',
     writeFileSync(join(root, '.flash-agents.json'), JSON.stringify({ copyExcludeDefaults: false }))
     const result = await service.flashTask({ task: 'build it', cwd: service.root })
     assert.equal(result.warnings.filter((line) => line === SETTINGS_CHANGED_WARNING).length, 1)
+  } finally {
+    await service.close()
+  }
+})
+
+/** The warning a local settings edit must produce, named exactly. */
+const LOCAL_SETTINGS_WARNING =
+  '.flash-agents.local.json changed after this server started; its new settings take effect after a reconnect (/mcp reconnect plugin:flash-agents:flash)'
+
+test('.flash-agents.local.json touched after start warns about that file, not the shared one', async () => {
+  const { root, service } = makeIsolatedService({
+    settings: JSON.stringify({ copyExclude: ['dist'] }),
+    localSettings: JSON.stringify({ copyExclude: ['local-dist'] }),
+  })
+  try {
+    const path = join(root, '.flash-agents.local.json')
+    writeFileSync(path, JSON.stringify({ copyExclude: ['local-build'] }))
+    const future = new Date(Date.now() + 2_000)
+    utimesSync(path, future, future)
+    const result = await service.flashTask({ task: 'build it', cwd: service.root })
+    assert.equal(result.warnings.filter((line) => line === LOCAL_SETTINGS_WARNING).length, 1, JSON.stringify(result.warnings))
+    assert.equal(result.warnings.filter((line) => line === SETTINGS_CHANGED_WARNING).length, 0, 'the shared file did not change')
+  } finally {
+    await service.close()
+  }
+})
+
+test('.flash-agents.local.json created after start warns about that file', async () => {
+  const { root, service } = makeIsolatedService()
+  try {
+    assert.equal(existsSync(join(root, '.flash-agents.local.json')), false)
+    writeFileSync(join(root, '.flash-agents.local.json'), JSON.stringify({ copyExcludeDefaults: false }))
+    const result = await service.flashTask({ task: 'build it', cwd: service.root })
+    assert.equal(result.warnings.filter((line) => line === LOCAL_SETTINGS_WARNING).length, 1, JSON.stringify(result.warnings))
+  } finally {
+    await service.close()
+  }
+})
+
+test('.flash-agents.local.json removed after start warns about that file', async () => {
+  const { root, service } = makeIsolatedService({ localSettings: JSON.stringify({ copyExclude: ['local-dist'] }) })
+  try {
+    rmSync(join(root, '.flash-agents.local.json'), { force: true })
+    const result = await service.flashTask({ task: 'build it', cwd: service.root })
+    assert.equal(result.warnings.filter((line) => line === LOCAL_SETTINGS_WARNING).length, 1, JSON.stringify(result.warnings))
   } finally {
     await service.close()
   }

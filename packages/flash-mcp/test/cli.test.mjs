@@ -17,7 +17,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 
-import { createService, instructionsFor, jobLabel, listTools, parseOptions, runDoctor, startServer } from '../lib/index.js'
+import {
+  createService,
+  createToolCaller,
+  instructionsFor,
+  jobLabel,
+  listTools,
+  parseOptions,
+  runDoctor,
+  startServer,
+} from '../lib/index.js'
+import { JobRegistry } from '../lib/jobs.js'
 import { DEFAULT_CONFIG, mergeConfig } from '../lib/config.js'
 import { rootDigest } from '../lib/isolation.js'
 import { resolveDshCommand } from '../lib/sdk.js'
@@ -683,6 +693,127 @@ test('createService only defers the sweep when the serve wiring asks for it', as
     assert.equal(deferred.isolation.startupSweepPending, true)
   } finally {
     await deferred.close()
+  }
+})
+
+test('startServer logs the start line first, even when createService throws', () => {
+  const missing = join(tmpdir(), `flash-cli-missing-root-${String(Date.now())}`)
+  const absentHome = join(tmpdir(), 'flash-cli-start-absent-home')
+  const logs = []
+  assert.throws(() =>
+    startServer(
+      {
+        root: missing,
+        profile: 'flash-service',
+        provider: 'ollama',
+        model: TEST_MODEL,
+        isolate: 'none',
+        env: { DSH_HOME: absentHome },
+      },
+      new PassThrough(),
+      new PassThrough(),
+      { env: { DSH_HOME: absentHome }, platform: 'win32', log: (line) => logs.push(line) },
+    ),
+  )
+  assert.ok(logs.length > 0, 'the start line is written before the service is built')
+  assert.ok(logs[0].startsWith(`start pid ${String(process.pid)}; flash-agents `), logs[0])
+  assert.match(logs[0], /; node \d+\.\d+\.\d+; win32; root /)
+  assert.ok(logs[0].endsWith(`root ${missing}`), logs[0])
+})
+
+test('startServer logs when initialize was answered, timed from process start', async () => {
+  const options = serveOptions()
+  const logs = []
+  const { server, input, frames, send, waitForFrame } = startTestServer(options, {
+    startupSweepDelayMs: 60_000,
+    log: (line) => logs.push(line),
+    uptimeMs: () => 4_321,
+  })
+  try {
+    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
+    await waitForFrame(1)
+    await waitUntil(() => logs.some((line) => line.startsWith('answered initialize ')))
+    assert.equal(frames[0].id, 1)
+    assert.ok(logs[0].startsWith('start pid '), logs[0])
+    assert.ok(logs.includes('answered initialize 4321 ms after the process started'), JSON.stringify(logs))
+  } finally {
+    input.end()
+    await server.done
+  }
+})
+
+test('a background call with invalid arguments answers the error and starts no job', async () => {
+  const options = serveOptions()
+  const service = createService(options)
+  const jobs = new JobRegistry()
+  const call = createToolCaller({ service, jobs })
+  try {
+    const refused = await call(
+      'flash_task',
+      { task: 'inline brief', taskFile: 'brief.txt', cwd: options.root, background: true },
+      {},
+    )
+    assert.equal(refused.isError, true)
+    assert.match(refused.content[0].text, /^flash_task failed: task and taskFile cannot both be given/)
+    // The job door refused before it created anything, so the listing is empty.
+    const status = await call('flash_status', {}, {})
+    const payload = JSON.parse(status.content[0].text)
+    assert.equal(payload.jobs.length, 0)
+    assert.equal(payload.running, 0)
+    assert.equal(jobs.list({ state: 'all', limit: 50 }).length, 0)
+  } finally {
+    await service.close()
+  }
+})
+
+test('review: a background call with two bad arguments names the one a foreground call names', async () => {
+  const options = serveOptions()
+  const service = createService(options)
+  const jobs = new JobRegistry()
+  const call = createToolCaller({ service, jobs })
+  try {
+    const args = {
+      tasks: [{ task: 'x', model: 'not-allowed:cloud' }],
+      model: 'also-not-allowed:cloud',
+      cwd: options.root,
+    }
+    const foreground = await call('flash_batch', args, {})
+    const background = await call('flash_batch', { ...args, background: true }, {})
+    assert.equal(foreground.isError, true)
+    assert.equal(background.isError, true)
+    // Both calls refuse, but they have to refuse the same argument in the same order:
+    // `checkArguments` checks the top-level model before the fleet entries, while the
+    // foreground handler checks every entry first.
+    assert.equal(background.content[0].text, foreground.content[0].text)
+    assert.equal(jobs.list({ state: 'all', limit: 50 }).length, 0, 'no job was created')
+  } finally {
+    await service.close()
+  }
+})
+
+test('review: background refusals name the same argument as foreground for two other bad pairs', async () => {
+  const options = serveOptions()
+  const service = createService(options)
+  const jobs = new JobRegistry()
+  const call = createToolCaller({ service, jobs })
+  const pairs = [
+    // A task pair refused before the model, exactly as the foreground handler orders them.
+    ['flash_task', { task: 'inline brief', taskFile: 'brief.txt', model: 'not-allowed:cloud', cwd: options.root }],
+    // A refused source behind an unreadable task brief: the brief is what the foreground
+    // call looks at first, so the background one must not name the source instead.
+    ['flash_task', { taskFile: 'missing-brief.txt', source: 'nowhere', cwd: options.root }],
+  ]
+  try {
+    for (const [name, args] of pairs) {
+      const foreground = await call(name, args, {})
+      const background = await call(name, { ...args, background: true }, {})
+      assert.equal(foreground.isError, true, JSON.stringify(args))
+      assert.equal(background.isError, true, JSON.stringify(args))
+      assert.equal(background.content[0].text, foreground.content[0].text, JSON.stringify(args))
+    }
+    assert.equal(jobs.list({ state: 'all', limit: 50 }).length, 0, 'no job was created')
+  } finally {
+    await service.close()
   }
 })
 

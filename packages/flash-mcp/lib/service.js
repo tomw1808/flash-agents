@@ -22,15 +22,16 @@ import { randomUUID } from 'node:crypto'
 
 import {
   IsolationError,
-  SETTINGS_CHANGED_WARNING,
   WorkspaceIsolation,
   canonicalTmpdir,
+  recordPaths,
+  settingsChangedWarning,
   slotPathWarning,
   slotRootPath,
 } from './isolation.js'
 import { estimateInstructions } from './instructions.js'
 import { HarnessSdkClient, DEFAULT_INITIALIZE_TIMEOUT_MS, resolveDshCommand } from './sdk.js'
-import { profileHonoursModelEnv, resolveDshHome } from './doctor.js'
+import { FLASH_MCP_VERSION, profileHonoursModelEnv, resolveDshHome } from './doctor.js'
 
 /** Route the service pins; callers can never change the provider. */
 export const DEFAULT_PROVIDER = 'ollama'
@@ -229,8 +230,14 @@ export class FlashTaskService {
    *   how a runtime finds its launcher (default `resolveDshCommand` on `platform`); injectable
    *   so a test can model a version-manager sibling without a real nvm layout.
    * @param {string[]} [options.startupWarnings] - warnings the server established at start
-   *   (the profile release stamps), carried by every `flash_task` and `flash_batch` result
-   *   while they hold.
+   *   that are not tied to one profile (the Windows slot-path advisory is added here too),
+   *   carried by every `flash_task` and `flash_batch` result while they hold.
+   * @param {boolean} [options.checkProfileStamp] - whether a newly booted runtime re-reads
+   *   its profile's release stamp; only the server turns this on.
+   * @param {(profile: string) => string | undefined} [options.profileStampReader] - the
+   *   stamp read used for that re-read (injectable, so a test needs no real `~/.dsh`).
+   * @param {Map<string, string | undefined> | Record<string, string | undefined>} [options.profileStampWarnings]
+   *   the start-time verdict per profile, used until that profile's runtime boots.
    * @param {(message: string) => void} [options.log] - diagnostic sink (stderr).
    * @param {(profile: string, cwd: string, extraEnv?: object) => HarnessSdkClient} [options.clientFactory]
    *   runtime factory (tests).
@@ -259,6 +266,9 @@ export class FlashTaskService {
     platform = process.platform,
     resolveDshCommand: resolveLauncher = (environment) => resolveDshCommand(environment, platform),
     startupWarnings = [],
+    checkProfileStamp = false,
+    profileStampReader,
+    profileStampWarnings = new Map(),
     log = () => {},
     clientFactory,
     isolate = {},
@@ -370,6 +380,24 @@ export class FlashTaskService {
      * @type {string[]}
      */
     this.startupWarnings = Array.isArray(startupWarnings) ? [...startupWarnings] : []
+    /**
+     * The profile release verdict the server established at start, per profile. A runtime
+     * that boots afterwards replaces its own entry (see `#refreshProfileStamp`); one that
+     * was already booted keeps the verdict it booted with.
+     *
+     * @type {Map<string, string | undefined>}
+     */
+    this.profileStampWarnings = new Map()
+    const startVerdicts =
+      profileStampWarnings instanceof Map ? profileStampWarnings : new Map(Object.entries(profileStampWarnings ?? {}))
+    for (const [name, warning] of startVerdicts) {
+      if (typeof warning === 'string') this.profileStampWarnings.set(name, warning)
+      else this.profileStampWarnings.set(name, undefined)
+    }
+    // Only a service created with the flag and a reader may touch a profile's stamp on a
+    // runtime boot. Without both, no read happens at start or later.
+    this.checkProfileStamp = checkProfileStamp === true && typeof profileStampReader === 'function'
+    this.profileStampReader = this.checkProfileStamp ? profileStampReader : undefined
     const lengthWarning =
       this.isolation === undefined
         ? undefined
@@ -416,6 +444,45 @@ export class FlashTaskService {
       sessions: this.sessions,
       profile: profileName,
     }
+  }
+
+  /**
+   * Re-read one profile's release stamp for a runtime that is booting now.
+   *
+   * The server reads the stamps once at start, but `node install.mjs` can run while it is
+   * alive. A runtime booted after that install already loads the new guard, so repeating
+   * the start-time warning until the next reconnect told the caller a problem that no longer
+   * existed. The verdict travels on the runtime record, because a result must report what
+   * the runtime that served it actually loaded, not what a later install changed.
+   *
+   * @param {object} run - the runtime record that just hand-shook.
+   * @param {string} profileName - the profile whose stamp to re-read.
+   * @returns {void}
+   */
+  #refreshProfileStamp(run, profileName) {
+    if (!this.checkProfileStamp || this.profileStampReader === undefined) return
+    let next
+    try {
+      next = this.profileStampReader(profileName)
+    } catch (error) {
+      // A stamp that cannot be read is not a new verdict: keep the one the result already
+      // carries rather than replacing a warning with a read failure nobody asked about.
+      this.log(`could not re-read the ${profileName} profile stamp: ${messageOf(error)}`)
+      run.profileStampWarning = this.profileStampWarnings.get(profileName)
+      return
+    }
+    const previous = this.profileStampWarnings.get(profileName)
+    if (next !== previous) {
+      if (next === undefined) {
+        this.log(
+          `the ${profileName} profile now matches flash-agents ${FLASH_MCP_VERSION}; its warning is cleared`,
+        )
+      } else {
+        this.log(next)
+      }
+    }
+    this.profileStampWarnings.set(profileName, next)
+    run.profileStampWarning = next
   }
 
   /**
@@ -701,6 +768,82 @@ export class FlashTaskService {
   }
 
   /**
+   * Validate every argument a call can refuse before a slot or a runtime is touched.
+   *
+   * The background door answers with a job id before `flashTask`/`flashBatch` runs. A bad
+   * `task`/`taskFile` pair, an unreadable file, an unavailable `apply`, or a `source`/
+   * `basePatch` a read-only call cannot honour used to become a job that failed seconds
+   * later. Raising the same errors here makes the tool call itself answer exactly as a
+   * foreground call does. The checks therefore run in the same order as those methods and
+   * in the same shape — the fleet's per-entry refusals first for `flash_batch`, one task
+   * first for `flash_task`, then cwd, acceptance, apply, mode, model, the pool, source and
+   * basePatch — so a call with several bad arguments names the one the foreground call
+   * names. Anything needing a slot or a runtime — leasing, copying, the worker —
+   * deliberately stays in the job.
+   *
+   * @param {object} args - the MCP tool arguments, as the call received them.
+   * @param {string} toolName - `flash_task` or `flash_batch`.
+   * @returns {void}
+   * @throws {FlashTaskError} the same refusal the synchronous path would raise.
+   */
+  checkArguments(args, toolName) {
+    if (toolName === 'flash_batch') {
+      normalizeTasks(args?.tasks, this.maxTasks, { readTaskFile: (value, field) => this.#readTaskFile(value, field) })
+    } else {
+      this.#resolveTask(args)
+    }
+    this.#resolveCwd(args?.cwd)
+    optionalText(args?.acceptance)
+    this.#resolveApply(args?.apply)
+    const profileName = this.#profileForMode(args?.mode)
+    this.#resolveModel(args?.model, profileName)
+    const pool = this.#isolationFor(profileName)
+    this.#resolveSource(args?.source, pool)
+    this.#resolveBasePatch(args?.basePatch, pool)
+  }
+
+  /**
+   * The `source` argument, refused when a call has no copy to reset.
+   *
+   * @param {unknown} value - the requested source.
+   * @param {WorkspaceIsolation | undefined} pool - the call's copy pool, when it has one.
+   * @returns {'working-tree' | 'head'} the source the call runs with.
+   * @throws {FlashTaskError} `SOURCE_UNAVAILABLE` for an unknown value or a read-only call.
+   */
+  #resolveSource(value, pool) {
+    const source = value ?? 'working-tree'
+    if (source !== 'working-tree' && source !== 'head') {
+      throw new FlashTaskError(
+        `source ${JSON.stringify(source)} is not available; use "working-tree" (default) or "head"`,
+        'SOURCE_UNAVAILABLE',
+      )
+    }
+    if (source === 'head' && pool === undefined) {
+      throw new FlashTaskError('source "head" applies only to writing calls; a read-only call is not isolated', 'SOURCE_UNAVAILABLE')
+    }
+    return source
+  }
+
+  /**
+   * The `basePatch` argument, refused when a call has no copy to apply it to.
+   *
+   * @param {unknown} value - the requested patch id or prefix.
+   * @param {WorkspaceIsolation | undefined} pool - the call's copy pool, when it has one.
+   * @returns {string | undefined} the parsed id, or undefined when none was given.
+   * @throws {FlashTaskError} `BASE_PATCH_UNAVAILABLE` for a read-only call.
+   */
+  #resolveBasePatch(value, pool) {
+    const basePatchId = optionalPatchId(value)
+    if (basePatchId !== undefined && pool === undefined) {
+      throw new FlashTaskError(
+        'basePatch applies only to writing calls; a read-only call is not isolated, so it has no copy to apply the patch to',
+        'BASE_PATCH_UNAVAILABLE',
+      )
+    }
+    return basePatchId
+  }
+
+  /**
    * Run one delegated task.
    * @param {object} args - the MCP tool arguments.
    * @param {string} [args.task] - the work to delegate.
@@ -739,28 +882,13 @@ export class FlashTaskService {
     // call while another session has uncommitted work in the same tree: the copy is reset to
     // the last commit instead of carrying that work. A read-only call is not isolated at all,
     // so there is nothing to reset — and it must not be told otherwise.
-    const source = args?.source ?? 'working-tree'
-    if (source !== 'working-tree' && source !== 'head') {
-      throw new FlashTaskError(
-        `source ${JSON.stringify(source)} is not available; use "working-tree" (default) or "head"`,
-        'SOURCE_UNAVAILABLE',
-      )
-    }
-    if (source === 'head' && pool === undefined) {
-      throw new FlashTaskError('source "head" applies only to writing calls; a read-only call is not isolated', 'SOURCE_UNAVAILABLE')
-    }
+    const source = this.#resolveSource(args?.source, pool)
     // `basePatch` continues a call from a patch an earlier one stored: the patch is planted
     // in this call's copy before the worker starts, never in the caller's tree. Like
     // `source: "head"`, it needs a copy to act on, so a read-only call is refused here. The
     // rest of the id — whether it exists, belongs to this root, and names the repository this
     // call's cwd resolves to — is checked once the copy exists, before the worker starts.
-    const basePatchId = optionalPatchId(args?.basePatch)
-    if (basePatchId !== undefined && pool === undefined) {
-      throw new FlashTaskError(
-        'basePatch applies only to writing calls; a read-only call is not isolated, so it has no copy to apply the patch to',
-        'BASE_PATCH_UNAVAILABLE',
-      )
-    }
+    const basePatchId = this.#resolveBasePatch(args?.basePatch, pool)
     // Progress spans the whole call, including a wait for a free tree: that wait is
     // itself work the client must not mistake for a dead server. The interval is
     // stopped on every path out of this method.
@@ -1088,24 +1216,9 @@ export class FlashTaskService {
     // directory exactly as they share a runtime, so they see each other's edits.
     const pool = this.#isolationFor(profileName)
     // A fleet's copy starts from the same place a single task's does; see flashTask.
-    const source = args?.source ?? 'working-tree'
-    if (source !== 'working-tree' && source !== 'head') {
-      throw new FlashTaskError(
-        `source ${JSON.stringify(source)} is not available; use "working-tree" (default) or "head"`,
-        'SOURCE_UNAVAILABLE',
-      )
-    }
-    if (source === 'head' && pool === undefined) {
-      throw new FlashTaskError('source "head" applies only to writing calls; a read-only call is not isolated', 'SOURCE_UNAVAILABLE')
-    }
+    const source = this.#resolveSource(args?.source, pool)
     // A fleet continues from a base patch exactly as one task does; see flashTask.
-    const basePatchId = optionalPatchId(args?.basePatch)
-    if (basePatchId !== undefined && pool === undefined) {
-      throw new FlashTaskError(
-        'basePatch applies only to writing calls; a read-only call is not isolated, so it has no copy to apply the patch to',
-        'BASE_PATCH_UNAVAILABLE',
-      )
-    }
+    const basePatchId = this.#resolveBasePatch(args?.basePatch, pool)
     // As with flash_task, progress spans the whole call, a wait for a free tree included.
     const activity = createActivity()
     // As in flashTask: the heartbeat reads the session id from the activity record, so a
@@ -1447,6 +1560,8 @@ export class FlashTaskService {
    *
    * @param {object} args - the MCP tool arguments.
    * @param {string} args.patchId - the id from an earlier result.
+   * @param {string[]} [args.files] - apply only these files' sections, named as in
+   *   `change.filesChanged`; a rename may be named by its old or its new path.
    * @param {boolean} [args.dryRun] - check that it applies without changing anything.
    * @param {boolean} [args.force] - apply again even though the record says it was applied.
    * @param {boolean} [args.threeWay] - merge three ways, without touching the index, when the plain apply fails.
@@ -1460,9 +1575,16 @@ export class FlashTaskService {
         'ISOLATION_DISABLED',
       )
     }
+    const files = args?.files
+    // The shape belongs here; whether the selection names a file of the patch, or no file
+    // at all, is the patch's answer and is refused by the pool with the patch's own names.
+    if (files !== undefined && (!Array.isArray(files) || files.some((name) => typeof name !== 'string' || name.length === 0))) {
+      throw new FlashTaskError('files must be an array of non-empty file paths when present', 'INVALID_ARGUMENT')
+    }
     try {
       return this.isolation.apply({
         patchId,
+        ...(files === undefined ? {} : { files }),
         dryRun: args?.dryRun === true,
         force: args?.force === true,
         threeWay: args?.threeWay === true,
@@ -1655,6 +1777,9 @@ export class FlashTaskService {
           run.initialized = true
           run.startedAt = Date.now()
           this.log(`runtime ready: ${info.name} ${info.version} (pid ${String(client.pid)}) on ${profileName}/${model}`)
+          // The runtime is up but has not served the call yet: this is the first moment the
+          // stamp beside the profile it just loaded can be judged.
+          this.#refreshProfileStamp(run, profileName)
           await this.#retireOtherModels(profileName, cwd, model, run)
           return run
         } catch (error) {
@@ -1805,7 +1930,9 @@ export class FlashTaskService {
       change: {
         available: change.available,
         ...(change.available ? {} : { reason: change.reason }),
-        filesChanged: change.filesChanged.map((line) => line.split('\t').at(-1)),
+        // Decoded by the record's own reader, so a name holding a tab, a newline or a
+        // leading quote keeps the spelling `flash_apply`'s `files` takes.
+        filesChanged: recordPaths(change.filesChanged),
         // Files the worker created that git ignores, so the patch cannot carry them.
         // Named so that "no change" is never the whole answer when there was work.
         ...((change.ignored ?? []).length === 0 ? {} : { ignored: change.ignored }),
@@ -2006,7 +2133,7 @@ export class FlashTaskService {
     if (retried !== undefined) warnings.push(earlyRetryWarning(retried.reason))
     // Installation drift: a profile from another release, a Settings edit after start, or a
     // Windows slot root too long for tools without long-path support.
-    warnings.push(...this.#installationWarnings())
+    warnings.push(...this.#installationWarnings(profile, cwd, model))
     const routes = []
     for (const route of state.childRoutes.values()) {
       if (!routes.some((known) => known.provider === route.provider && known.model === route.model)) routes.push(route)
@@ -2052,15 +2179,32 @@ export class FlashTaskService {
   /**
    * The installation warnings this call's result must carry.
    *
-   * The start-up ones were established once and do not change; the settings check is one
-   * `stat` per call, because a file edited after the pool read it is silently ignored until
-   * a reconnect and the caller has to be told (see `WorkspaceIsolation.repoSettingsChanged`).
+   * The stamp warning belongs to the runtime that served the call, because one booted
+   * after an install loads the new profile while one booted before it keeps the old
+   * verdict. A call that never reached a runtime falls back to the latest verdict known
+   * for its profile — the start-time one until a runtime boots. The settings check is one
+   * `stat` per file per call, because a file edited after the pool read it is silently
+   * ignored until a reconnect and the caller has to be told (see
+   * `WorkspaceIsolation.repoSettingsChanged`).
    *
+   * @param {string} profileName - the profile that served, or would have served, the call.
+   * @param {string} cwd - the tree the call ran on.
+   * @param {string} model - the model the call ran.
    * @returns {string[]} the warnings, each at most once.
    */
-  #installationWarnings() {
+  #installationWarnings(profileName, cwd, model) {
     const warnings = [...this.startupWarnings]
-    if (this.isolation?.repoSettingsChanged() === true) warnings.push(SETTINGS_CHANGED_WARNING)
+    const run = this.runtimes.get(this.#runtimeKey(profileName, cwd, model))
+    // A runtime whose stamp matched holds `undefined` as its verdict, which is an answer,
+    // not a missing one: only a runtime that never judged its stamp falls back.
+    const stampWarning =
+      run !== undefined && Object.hasOwn(run, 'profileStampWarning')
+        ? run.profileStampWarning
+        : this.profileStampWarnings.get(profileName)
+    if (stampWarning !== undefined) warnings.push(stampWarning)
+    // One warning per settings file that changed, so a per-machine edit is not mistaken
+    // for a change to the committed file (see `WorkspaceIsolation.repoSettingsChanged`).
+    for (const file of this.isolation?.repoSettingsChanged() ?? []) warnings.push(settingsChangedWarning(file))
     return warnings
   }
 
@@ -2142,7 +2286,7 @@ export class FlashTaskService {
     if (queued !== undefined && background !== true) warnings.push(foregroundQueueWarning(queued))
     if (retried !== undefined) warnings.push(earlyRetryWarning(retried.reason))
     // Same installation drift the fleet's members were started under.
-    warnings.push(...this.#installationWarnings())
+    warnings.push(...this.#installationWarnings(profile, cwd, model))
 
     return {
       status: primary.status,

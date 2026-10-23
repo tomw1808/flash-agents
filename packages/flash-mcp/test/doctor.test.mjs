@@ -65,13 +65,25 @@ function stampText(version) {
  */
 function fakeFs({ files = {}, executables = [], realpaths = {}, resolve = {} } = {}) {
   const resolved = []
+  // Directories the Windows permission probe creates; kept apart from `files` so a null
+  // file entry (a binary) still means a file rather than a folder.
+  const directories = new Set()
+  let probes = 0
   return {
     probe: {
       realpath: (path) => {
         if (path in realpaths) return realpaths[path]
         throw new Error(`ENOENT: no such file or directory, realpath '${path}'`)
       },
-      exists: (path) => path in files,
+      exists: (path) => path in files || directories.has(path),
+      mkdir: (path) => directories.add(path),
+      mkdtemp: (prefix) => {
+        probes += 1
+        const path = `${prefix}${probes.toString(16)}`
+        directories.add(path)
+        return path
+      },
+      remove: (path) => directories.delete(path),
       executable: (path) => executables.includes(path),
       readText: (path) => {
         if (!(path in files)) throw new Error(`ENOENT: no such file or directory, open '${path}'`)
@@ -185,11 +197,12 @@ function fakeOptions(behaviors = {}, options = {}) {
 test('reports eleven ok checks for a fully working environment', async () => {
   const { options } = fakeOptions()
   const result = await runChecks(options)
-  // The slot-path row is Windows-only, so a Unix run reports every other id.
-  assert.equal(result.checks.length, CHECK_IDS.length - 1)
+  // The slot-path and state-base-permission rows are Windows-only, so a Unix run reports
+  // every other id.
+  assert.equal(result.checks.length, CHECK_IDS.length - 2)
   assert.deepEqual(
     result.checks.map((check) => check.id),
-    CHECK_IDS.filter((id) => id !== 'slot-path-length'),
+    CHECK_IDS.filter((id) => id !== 'slot-path-length' && id !== 'state-base-permissions'),
   )
   assert.ok(result.checks.every((check) => check.status === 'ok'))
   assert.equal(result.ok, true)
@@ -917,6 +930,154 @@ test('slot-path-length warns on Windows with a long base and is absent elsewhere
 
   const linux = await runChecks(fakeOptions().options)
   assert.equal(find(linux, 'slot-path-length'), undefined, 'the row exists only on Windows')
+  assert.equal(find(linux, 'state-base-permissions'), undefined, 'the permission probe exists only on Windows')
+})
+
+test('state-base-permissions probes the Windows state base, names icacls, and removes the probe', async () => {
+  const denied = 'C:\\fm\\flash-permission-probe-0: Access is denied.\r\n'
+  const scenarios = [
+    { name: 'grant succeeds', icacls: { status: 0, stdout: '', stderr: '' }, status: 'ok' },
+    { name: 'the grant is denied', icacls: { status: 1, stdout: '', stderr: denied }, status: 'fail' },
+    { name: 'icacls cannot start', error: Object.assign(new Error('spawn icacls ENOENT'), { code: 'ENOENT' }), status: 'warn' },
+  ]
+  for (const scenario of scenarios) {
+    const installed = nativeInstall({ platform: 'win32' })
+    const { options } = fakeOptions(
+      {},
+      {
+        ...installed,
+        root: '/repo',
+        stateBase: 'C:\\fm',
+        env: { USERDOMAIN: 'DOM', USERNAME: 'dev' },
+      },
+    )
+    const baseRun = options.run
+    const icaclsCalls = []
+    let probePresent
+    options.run = (command, args) => {
+      if (command !== 'icacls') return baseRun(command, args)
+      icaclsCalls.push(args)
+      // icacls must be asked about a folder that really exists at that moment; a probe
+      // removed before the runner started would make the success case prove nothing.
+      probePresent = installed.fs.exists(args[0])
+      if (scenario.error !== undefined) throw scenario.error
+      return scenario.icacls
+    }
+
+    const row = find(await runChecks(options), 'state-base-permissions')
+    assert.equal(row.status, scenario.status, scenario.name)
+    assert.equal(probePresent, true, `${scenario.name}: icacls ran before the probe folder existed`)
+    assert.equal(icaclsCalls.length, 1, scenario.name)
+    const [probe, flag, grant] = icaclsCalls[0]
+    assert.ok(probe.startsWith('C:\\fm'), probe)
+    assert.equal(flag, '/grant')
+    assert.equal(grant, 'DOM\\dev:(OI)(CI)M', scenario.name)
+    // The probe is gone whatever icacls answered or however it failed.
+    assert.equal(installed.fs.exists(probe), false, `${scenario.name}: the probe folder was left behind`)
+    if (scenario.status === 'ok') {
+      assert.match(row.detail, /the sandbox can set permissions on a folder under C:\\fm/)
+      assert.match(row.detail, /created C:\\fm for the probe, as the server would/)
+      assert.equal(row.fix, '')
+    } else if (scenario.status === 'fail') {
+      assert.equal(
+        row.detail,
+        'the sandbox cannot set permissions under C:\\fm (C:\\fm\\flash-permission-probe-0: Access is denied.), ' +
+          'so no shell command can start in a slot',
+      )
+      assert.equal(row.fix, 'icacls "C:\\fm" /grant "%USERNAME%:(OI)(CI)F"')
+    } else {
+      assert.match(row.detail, /icacls could not be started: spawn icacls ENOENT/)
+      assert.equal(row.fix, 'icacls "C:\\fm" /grant "%USERNAME%:(OI)(CI)F"')
+    }
+  }
+})
+
+test('review: a spawnSync icacls start failure is a warning, not a denied grant', async () => {
+  const installed = nativeInstall({ platform: 'win32' })
+  const { options } = fakeOptions(
+    {},
+    { ...installed, root: '/repo', stateBase: 'C:\\fm', env: { USERDOMAIN: 'DOM', USERNAME: 'dev' } },
+  )
+  const baseRun = options.run
+  let probe
+  options.run = (command, args) => {
+    if (command !== 'icacls') return baseRun(command, args)
+    probe = args[0]
+    // This is the shape `spawnSync` returns when the executable does not exist: the
+    // start error is in `error`, and `status`, `stdout` and `stderr` are all null.
+    return {
+      status: null,
+      stdout: null,
+      stderr: null,
+      error: Object.assign(new Error('spawnSync icacls ENOENT'), { code: 'ENOENT' }),
+    }
+  }
+  const row = find(await runChecks(options), 'state-base-permissions')
+  assert.equal(row.status, 'warn', 'a runner that could not start icacls has not measured the grant')
+  assert.match(row.detail, /ENOENT/, 'the start error is the reason the row gives')
+  assert.doesNotMatch(row.detail, /cannot set permissions under/, 'a missing executable is not an ACL refusal')
+  assert.equal(installed.fs.exists(probe), false, 'the probe folder was left behind')
+})
+
+test('review: an icacls result carrying a start error warns even when it also has a status and output', async () => {
+  const installed = nativeInstall({ platform: 'win32' })
+  const { options } = fakeOptions(
+    {},
+    { ...installed, root: '/repo', stateBase: 'C:\\fm', env: { USERDOMAIN: 'DOM', USERNAME: 'dev' } },
+  )
+  const baseRun = options.run
+  options.run = (command, args) => {
+    if (command !== 'icacls') return baseRun(command, args)
+    // The executable failed before icacls could judge the grant, so the output that looks
+    // like an ACL refusal must not be reported as one.
+    return {
+      status: 1,
+      stdout: '',
+      stderr: 'C:\\fm\\flash-permission-probe-0: Access is denied.\r\n',
+      error: new Error('spawn icacls EACCES'),
+    }
+  }
+  const row = find(await runChecks(options), 'state-base-permissions')
+  assert.equal(row.status, 'warn')
+  assert.equal(row.detail, 'icacls could not be started: spawn icacls EACCES')
+  assert.doesNotMatch(row.detail, /cannot set permissions under/)
+})
+
+test('review: a non-zero icacls status with output is a grant failure even when the text says "not found"', async () => {
+  const installed = nativeInstall({ platform: 'win32' })
+  const { options } = fakeOptions(
+    {},
+    { ...installed, root: '/repo', stateBase: 'C:\\fm', env: { USERDOMAIN: 'DOM', USERNAME: 'dev' } },
+  )
+  const baseRun = options.run
+  options.run = (command, args) => {
+    if (command !== 'icacls') return baseRun(command, args)
+    // icacls ran (a numeric status) and its answer was an ACL failure; only a start error or
+    // a null status means the executable never ran.
+    return { status: 1, stdout: '', stderr: 'The user name could not be found.\r\n' }
+  }
+  const row = find(await runChecks(options), 'state-base-permissions')
+  assert.equal(row.status, 'fail')
+  assert.match(row.detail, /cannot set permissions under C:\\fm \(The user name could not be found\.\)/)
+  assert.doesNotMatch(row.detail, /could not be started/)
+})
+
+test('state-base-permissions grants the bare username when the environment has no domain', async () => {
+  const installed = nativeInstall({ platform: 'win32' })
+  const { options } = fakeOptions(
+    {},
+    { ...installed, root: '/repo', stateBase: 'C:\\fm', env: { USERNAME: 'dev' } },
+  )
+  const baseRun = options.run
+  let grant
+  options.run = (command, args) => {
+    if (command !== 'icacls') return baseRun(command, args)
+    grant = args[2]
+    return { status: 0, stdout: '', stderr: '' }
+  }
+  const row = find(await runChecks(options), 'state-base-permissions')
+  assert.equal(row.status, 'ok')
+  assert.equal(grant, 'dev:(OI)(CI)M')
 })
 
 test('profileHonoursModelEnv reads the installed patch and fails closed', () => {
@@ -1001,10 +1162,12 @@ test('formats one line per check and a Fix line per broken one', async () => {
   const text = formatChecks(result)
   const lines = text.split('\n')
   const checkLines = lines.filter((line) => /^(ok|warn|fail)\s/.test(line))
-  // dsh-native is skipped without a running dsh, and slot-path-length is Windows-only.
-  assert.equal(checkLines.length, CHECK_IDS.length - 2)
+  // dsh-native is skipped without a running dsh, and both Windows rows are absent here.
+  assert.equal(checkLines.length, CHECK_IDS.length - 3)
   // dsh did not start here, so its native-module check is not run at all.
-  for (const id of CHECK_IDS.filter((id) => id !== 'dsh-native' && id !== 'slot-path-length')) {
+  for (const id of CHECK_IDS.filter(
+    (id) => id !== 'dsh-native' && id !== 'slot-path-length' && id !== 'state-base-permissions',
+  )) {
     assert.ok(text.includes(id), `missing ${id}`)
   }
   const fixLines = lines.filter((line) => line.startsWith('Fix:'))

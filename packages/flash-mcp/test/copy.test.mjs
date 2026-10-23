@@ -939,6 +939,195 @@ test('PATH, NODE_OPTIONS and loader names are refused for every kind of entry', 
   isolation.close()
 })
 
+// ── platform sections and the per-machine settings file ─────────────────────
+
+test('a platform section applies only on the platform the pool runs on', async () => {
+  const repo = makeRepo()
+  writeFileSync(
+    join(repo, '.flash-agents.json'),
+    JSON.stringify({ platform: { win32: { slotEnv: { OPENSSL_DIR: 'value:C:\\openssl' } } } }),
+  )
+  const win = makePool(repo, { platform: 'win32' })
+  const slot = await win.isolation.lease()
+  win.isolation.prepare(slot)
+  assert.equal(win.isolation.slotEnvFor(slot).OPENSSL_DIR, 'C:\\openssl')
+  win.isolation.release(slot)
+  win.isolation.close()
+
+  const linux = makePool(repo, { platform: 'linux' })
+  assert.equal(linux.isolation.slotEnv.OPENSSL_DIR, undefined, 'the win32 section does not apply on linux')
+  linux.isolation.close()
+})
+
+test('the local file and its platform section layer over the shared file, and an option wins', () => {
+  const repo = makeRepo()
+  const shared = join(repo, '.flash-agents.json')
+  const local = join(repo, '.flash-agents.local.json')
+  const entry = (options = {}) => {
+    const { isolation } = makePool(repo, { platform: 'win32', ...options })
+    const value = isolation.slotEnv.CARGO_HOME
+    isolation.close()
+    return value
+  }
+
+  writeFileSync(shared, JSON.stringify({ slotEnv: { CARGO_HOME: 'home:shared' } }))
+  assert.deepEqual(entry(), { kind: 'home', segment: 'shared' })
+
+  writeFileSync(
+    shared,
+    JSON.stringify({
+      slotEnv: { CARGO_HOME: 'home:shared' },
+      platform: { win32: { slotEnv: { CARGO_HOME: 'home:shared-win' } } },
+    }),
+  )
+  assert.deepEqual(entry(), { kind: 'home', segment: 'shared-win' })
+
+  writeFileSync(local, JSON.stringify({ slotEnv: { CARGO_HOME: 'home:local' } }))
+  assert.deepEqual(entry(), { kind: 'home', segment: 'local' })
+
+  writeFileSync(
+    local,
+    JSON.stringify({
+      slotEnv: { CARGO_HOME: 'home:local' },
+      platform: { win32: { slotEnv: { CARGO_HOME: 'home:local-win' } } },
+    }),
+  )
+  assert.deepEqual(entry(), { kind: 'home', segment: 'local-win' })
+  assert.deepEqual(entry({ slotEnv: { CARGO_HOME: 'home:option' } }), { kind: 'home', segment: 'option' })
+})
+
+test('null in a later slotEnv layer removes an earlier entry, and a no-op in the first', () => {
+  const repo = makeRepo()
+  // The first layer has no earlier entry to remove, so a null there changes nothing.
+  writeFileSync(join(repo, '.flash-agents.json'), JSON.stringify({ slotEnv: { OPENSSL_DIR: null, KEEP: 'value:1' } }))
+  const first = makePool(repo, { platform: 'win32' })
+  assert.deepEqual(Object.keys(first.isolation.slotEnv), ['KEEP'])
+  first.isolation.close()
+
+  writeFileSync(
+    join(repo, '.flash-agents.json'),
+    JSON.stringify({ slotEnv: { OPENSSL_DIR: 'value:C:\\shared', KEEP: 'value:1' } }),
+  )
+  writeFileSync(
+    join(repo, '.flash-agents.local.json'),
+    JSON.stringify({ slotEnv: { OPENSSL_DIR: null } }),
+  )
+  const removed = makePool(repo, { platform: 'linux' })
+  assert.deepEqual(Object.keys(removed.isolation.slotEnv), ['KEEP'])
+  removed.isolation.close()
+})
+
+test('win32 folds slotEnv name case, while linux keeps both spellings', () => {
+  const repo = makeRepo()
+  writeFileSync(join(repo, '.flash-agents.json'), JSON.stringify({ slotEnv: { OPENSSL_DIR: 'value:C:\\shared' } }))
+  // `PATH`/`Path` are refused as loader variables, so the rule is shown with a variable a
+  // slot may really set; the spelling pair is what matters, not the name.
+  writeFileSync(join(repo, '.flash-agents.local.json'), JSON.stringify({ slotEnv: { openssl_dir: 'value:C:\\local' } }))
+
+  const win = makePool(repo, { platform: 'win32' })
+  assert.deepEqual(Object.keys(win.isolation.slotEnv), ['openssl_dir'])
+  assert.deepEqual(win.isolation.slotEnv.openssl_dir, { kind: 'value', value: 'C:\\local' })
+  win.isolation.close()
+
+  const linux = makePool(repo, { platform: 'linux' })
+  assert.deepEqual(Object.keys(linux.isolation.slotEnv), ['OPENSSL_DIR', 'openssl_dir'])
+  linux.isolation.close()
+})
+
+test('copyExclude from the shared and local files and both platform sections is applied', async () => {
+  const repo = makeRepo()
+  const names = ['shared-build', 'shared-win-build', 'local-build', 'local-win-build']
+  writeFileSync(join(repo, '.gitignore'), `${names.map((name) => `${name}/`).join('\n')}\n`)
+  execFileSync('git', ['add', '.gitignore'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'ignored builds'], { cwd: repo })
+  for (const name of names) {
+    mkdirSync(join(repo, name))
+    writeFileSync(join(repo, name, 'out.txt'), 'build output\n')
+  }
+  writeFileSync(
+    join(repo, '.flash-agents.json'),
+    JSON.stringify({
+      copyExclude: ['shared-build'],
+      platform: { win32: { copyExclude: ['shared-win-build'] } },
+    }),
+  )
+  writeFileSync(
+    join(repo, '.flash-agents.local.json'),
+    JSON.stringify({
+      copyExclude: ['local-build'],
+      platform: { win32: { copyExclude: ['local-win-build'] } },
+    }),
+  )
+
+  const { isolation } = makePool(repo, { platform: 'win32' })
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  for (const name of names) assert.equal(existsSync(join(slot.dir, name)), false, `${name} is left out`)
+  assert.equal(readFileSync(join(slot.dir, 'README.md'), 'utf8'), '# project\n', 'the rest is copied')
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('copyExcludeDefaults is last layer wins, so the local false copies the secrets again', async () => {
+  const repo = makeRepo()
+  writeFileSync(join(repo, '.gitignore'), '.env\n')
+  execFileSync('git', ['add', '.gitignore'], { cwd: repo })
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'ignore env'], { cwd: repo })
+  writeFileSync(join(repo, '.env'), 'TOKEN=dev\n')
+  writeFileSync(join(repo, '.flash-agents.json'), JSON.stringify({ copyExcludeDefaults: true }))
+  writeFileSync(join(repo, '.flash-agents.local.json'), JSON.stringify({ copyExcludeDefaults: false }))
+
+  const { isolation } = makePool(repo, { platform: 'win32' })
+  const slot = await isolation.lease()
+  isolation.prepare(slot)
+  assert.equal(readFileSync(join(slot.dir, '.env'), 'utf8'), 'TOKEN=dev\n')
+  isolation.release(slot)
+  isolation.close()
+})
+
+test('bad platform sections are named with file and section, and the rest of the file applies', () => {
+  const repo = makeRepo()
+  const shared = join(repo, '.flash-agents.json')
+  writeFileSync(
+    shared,
+    JSON.stringify({
+      copyExclude: ['shared-build'],
+      platform: {
+        win32: {
+          slotEnv: { WIN_ONLY: 'value:1' },
+          platform: { win32: { slotEnv: { NESTED: 'value:1' } } },
+        },
+        plan9: { slotEnv: { PLAN9: 'value:1' } },
+        linux: [],
+      },
+    }),
+  )
+  const logs = []
+  const { isolation } = makePool(repo, { platform: 'win32', log: (line) => logs.push(line) })
+  assert.deepEqual(isolation.slotEnv, { WIN_ONLY: { kind: 'value', value: '1' } })
+  assert.ok(isolation.copyExclude.includes('shared-build'), 'the top-level setting still applies')
+  assert.ok(logs.includes('.flash-agents.json: platform.plan9 is not a known platform; ignoring it'), logs.join('\n'))
+  assert.ok(
+    logs.includes('.flash-agents.json platform.linux: the platform section must be an object; ignoring it'),
+    logs.join('\n'),
+  )
+  assert.ok(
+    logs.includes('.flash-agents.json platform.win32: platform is not a known setting; ignoring it'),
+    logs.join('\n'),
+  )
+  isolation.close()
+
+  // `platform: []` is the whole section of the wrong shape, not one platform's section.
+  writeFileSync(shared, JSON.stringify({ platform: [], copyExclude: ['top-build'] }))
+  const typed = []
+  const second = makePool(repo, { platform: 'win32', log: (line) => typed.push(line) })
+  assert.ok(
+    typed.includes('.flash-agents.json: platform must be an object keyed by process.platform name; ignoring it'),
+    typed.join('\n'),
+  )
+  assert.ok(second.isolation.copyExclude.includes('top-build'), 'the rest of the file still applies')
+  second.isolation.close()
+})
 
 // ── slotSetup: commands run in the copy before the worker ────────────────────
 
@@ -1251,6 +1440,42 @@ test('slotSetup configured without the opt-in does not run, logs how to allow it
     assert.equal(existsSync(join(slot.dir, 'node_modules')), false)
     isolation.release(slot)
     isolation.close()
+  })
+})
+
+test('local slotSetup steps layer after the shared ones and stay behind the same opt-in', async () => {
+  await withSetupCounter(async (counter) => {
+    const repo = makeRepo()
+    const append = (label) =>
+      `require('node:fs').appendFileSync(process.env.FLASH_SETUP_COUNTER, '${label}\\n')`
+    const sharedScript = append('shared')
+    const localScript = append('local')
+    writeFileSync(
+      join(repo, '.flash-agents.json'),
+      JSON.stringify({ slotSetup: [{ run: [process.execPath, '-e', sharedScript], inputs: [] }] }),
+    )
+    writeFileSync(
+      join(repo, '.flash-agents.local.json'),
+      JSON.stringify({ slotSetup: [{ run: [process.execPath, '-e', localScript], inputs: [] }] }),
+    )
+
+    // Without the opt-in neither file's step may run, and both are still reported.
+    const denied = makePool(repo, { platform: 'win32' })
+    assert.deepEqual(denied.isolation.slotSetup.map((step) => step.run[2]), [sharedScript, localScript])
+    assert.equal(denied.isolation.slotSetupWarning, SETUP_NOT_ALLOWED_WARNING)
+    const first = await denied.isolation.lease()
+    denied.isolation.prepare(first)
+    assert.equal(await denied.isolation.runSetup(first), undefined)
+    assert.equal(setupRuns(counter), 0, 'the local file is host code behind the same gate')
+    denied.isolation.release(first)
+    denied.isolation.close()
+
+    const allowed = makePool(repo, { platform: 'win32', allowSlotSetup: true })
+    const { setup } = await prepareAndSetup(allowed.isolation)
+    assert.deepEqual(setup.map((step) => step.run[2]), [sharedScript, localScript], 'shared first, local second')
+    assert.deepEqual(setup.map((step) => step.ran), [true, true])
+    assert.equal(setupRuns(counter), 2)
+    allowed.isolation.close()
   })
 })
 

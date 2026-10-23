@@ -24,10 +24,11 @@
  *   node install.mjs --home /path    # target harness home (default: $DSH_HOME or ~/.dsh)
  */
 
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import vm from 'node:vm'
 
 import { loadConfig } from './packages/flash-mcp/lib/config.js'
 import { renderTemplate } from './packages/flash-mcp/lib/template.js'
@@ -232,6 +233,134 @@ function writePluginPackage(profileDir, dryRun) {
 }
 
 /**
+ * Whether a plugins `package.json` is the one this installer writes.
+ *
+ * The stamp carries `flashAgents.version`; that marker is also what uninstall uses to
+ * decide whether the file belongs to this installer or to the profile's owner.
+ *
+ * @param {string} file - the `package.json` to inspect.
+ * @returns {boolean} true when it carries this installer's stamp.
+ */
+function isOwnPluginPackage(file) {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    return typeof parsed?.flashAgents?.version === 'string' && parsed.flashAgents.version.length > 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Whether one plugin file is an ES module, judged by asking the parser.
+ *
+ * A line test alone cannot tell a real `export` from one quoted in a comment, and a
+ * CommonJS file may mention an old export that way. The file is therefore compiled the
+ * way Node compiles a CommonJS module — wrapped in the function that supplies `exports`,
+ * `require`, `module`, `__filename` and `__dirname` — and only a file that fails that
+ * parse is a candidate for ESM. A file that parses as CommonJS is CommonJS, whatever its
+ * comments say. The second condition keeps a genuinely broken file from being declared a
+ * module: ESM syntax is exactly an `import`/`export` statement at the start of a line.
+ *
+ * @param {string} file - the file to read.
+ * @returns {boolean} true when it is ESM by both the parse and the statement test.
+ */
+function isEsmFile(file) {
+  let source
+  try {
+    source = readFileSync(file, 'utf8')
+  } catch {
+    return false
+  }
+  try {
+    // Compiling, not running: the wrapper only supplies the CommonJS bindings the source
+    // may mention, and a script that compiles here is what Node would load as CommonJS.
+    new vm.Script(`(function (exports, require, module, __filename, __dirname) {${source}\n})`, { filename: file })
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) return false
+    // Either ESM syntax or a real syntax error; the statement test below separates them.
+    return /^\s*(import|export)\s/m.test(source)
+  }
+  return false
+}
+
+/**
+ * Report a plugins folder that cannot be declared a module, withdrawing this installer's
+ * own stamp first.
+ *
+ * The stamp may already be there from an earlier run. Leaving it would declare a CommonJS
+ * file a module and change how the user's own plugins load — the one thing the interactive
+ * stamp must never do — so it is removed, and the report says it was ours and why. A folder
+ * with no stamp of ours keeps the older "without a package.json" wording, which is true
+ * there.
+ *
+ * @param {object} options - what to inspect.
+ * @param {string} options.target - the plugins `package.json`.
+ * @param {string} options.folder - the plugins folder, named when it has no stamp.
+ * @param {string} options.file - the file that is not an ES module.
+ * @param {boolean} options.dryRun - report without removing.
+ * @returns {string} the report line.
+ */
+function reportNotEsmPlugin({ target, folder, file, dryRun }) {
+  if (!existsSync(target)) return `left ${folder} without a package.json: ${file} is not an ES module`
+  if (!dryRun) rmSync(target, { force: true })
+  return `removed ${target}: ${file} is not an ES module, so the folder is no longer declared one`
+}
+
+/**
+ * Write the module stamp into the interactive profile's plugins folder, when it is safe.
+ *
+ * The interactive profile is the user's own: it may already hold their CommonJS plugins,
+ * which `"type": "module"` would break. The file is therefore written only when every
+ * `.js` file in the folder is ESM (by the same test `assertPluginsAreEsm` uses) and there
+ * is either no `package.json` or one this installer wrote. A foreign `package.json` is left
+ * alone. When a rerun finds the folder no longer qualifies, this installer's own stamp is
+ * withdrawn — leaving it would make the folder load its CommonJS files as modules — and the
+ * report names the file that stopped it.
+ *
+ * @param {object} options - what to inspect.
+ * @param {string} options.profileDir - the interactive profile directory.
+ * @param {string} options.providerSource - this repository's provider file, about to be copied.
+ * @param {boolean} options.dryRun - report without writing.
+ * @returns {string} the report line.
+ */
+function writeInteractivePluginPackage({ profileDir, providerSource, dryRun }) {
+  const folder = join(profileDir, 'plugins')
+  const target = join(folder, 'package.json')
+  if (existsSync(target) && !isOwnPluginPackage(target)) {
+    return `left ${folder}'s own package.json alone`
+  }
+  const files = existsSync(folder) ? readdirSync(folder).filter((name) => name.endsWith('.js')) : []
+  for (const name of files) {
+    // The provider copy is replaced from this repository's ESM source just before this
+    // runs; checking the old file in the folder would judge a file that is about to go.
+    if (name === PROVIDER_FILE) continue
+    const file = join(folder, name)
+    if (!isEsmFile(file)) return reportNotEsmPlugin({ target, folder, file, dryRun })
+  }
+  if (!isEsmFile(providerSource)) {
+    return reportNotEsmPlugin({ target, folder, file: join(folder, PROVIDER_FILE), dryRun })
+  }
+  return writePluginPackage(profileDir, dryRun)
+}
+
+/**
+ * Remove a plugins `package.json` only when it carries this installer's stamp.
+ *
+ * A file without `flashAgents` is the profile owner's, even when it sits where this
+ * installer writes its stamp; uninstall must not delete it.
+ *
+ * @param {string} profileDir - the installed profile directory.
+ * @param {boolean} dryRun - report without removing.
+ * @returns {string | undefined} a report line when the file was this installer's.
+ */
+function removeOwnPluginPackage(profileDir, dryRun) {
+  const target = join(profileDir, 'plugins', 'package.json')
+  if (!existsSync(target) || !isOwnPluginPackage(target)) return undefined
+  if (!dryRun) rmSync(target, { force: true })
+  return `removed ${target}`
+}
+
+/**
  * Refuse to declare the plugins folder a module unless every copied file is one.
  *
  * `"type": "module"` governs every `.js` file in the folder, so a CommonJS plugin copied
@@ -243,9 +372,9 @@ function writePluginPackage(profileDir, dryRun) {
  */
 function assertPluginsAreEsm(sources) {
   for (const source of sources) {
-    if (!/^\s*export\s/m.test(readFileSync(source, 'utf8'))) {
+    if (!isEsmFile(source)) {
       throw new Error(
-        `refusing to mark the plugins folder as an ES module: ${source} has no export statement, so it is not ESM`,
+        `refusing to mark the plugins folder as an ES module: ${source} does not parse as CommonJS and carries no import/export statement, so it is not ESM`,
       )
     }
   }
@@ -355,10 +484,11 @@ function uninstallServiceProfile({ home, dryRun, report }) {
     writeFileSync(servicePatchPath, next)
     rmSync(join(serviceDir, 'plugins', PROVIDER_FILE), { force: true })
     rmSync(join(serviceDir, 'plugins', GUARD_FILE), { force: true })
-    // The generated stamp belongs to the plugins this installer copied; the profile's
-    // own seeded package.json is the user's and stays put.
-    rmSync(join(serviceDir, 'plugins', 'package.json'), { force: true })
   }
+  // The generated stamp belongs to the plugins this installer copied; a package.json
+  // without the stamp is the user's and stays put.
+  const removedPackage = removeOwnPluginPackage(serviceDir, dryRun)
+  if (removedPackage !== undefined) report.push(removedPackage)
   report.push(`removed the ${SERVICE_PROFILE} marker block from ${servicePatchPath} (other profile entries were kept)`)
 }
 
@@ -396,6 +526,8 @@ function main() {
       if (!options.dryRun) rmSync(providerTarget, { force: true })
       report.push(`removed ${providerTarget}`)
     }
+    const removedPackage = removeOwnPluginPackage(profileDir, options.dryRun)
+    if (removedPackage !== undefined) report.push(removedPackage)
     if (existsSync(patchPath)) {
       const current = readFileSync(patchPath, 'utf8')
       const next = withoutManagedBlock(current, { startMarker: MARKER_START, endMarker: MARKER_END })
@@ -409,6 +541,11 @@ function main() {
 
   report.push(replaceDir(presetSource, presetTarget, options.dryRun))
   report.push(replaceFile(providerSource, providerTarget, options.dryRun))
+  // The interactive profile keeps the user's own plugins; the stamp is written only when
+  // doing so cannot change how their files are loaded.
+  report.push(
+    writeInteractivePluginPackage({ profileDir, providerSource, dryRun: options.dryRun }),
+  )
 
   const currentPatch = existsSync(patchPath) ? readFileSync(patchPath, 'utf8') : ''
   const nextPatch = withManagedBlock(currentPatch, { block: patchBlock(), startMarker: MARKER_START, endMarker: MARKER_END })
@@ -450,6 +587,8 @@ function main() {
       `The generated plugin stamp is ${join(home, 'profiles', SERVICE_PROFILE, 'plugins', 'package.json')}`,
       `(and the same package.json under ${READONLY_PROFILE}); it records release ${FLASH_VERSION},`,
       'so a server started after an update can name a profile a previous release installed.',
+      `The interactive ${options.profile} profile gets that stamp only when every .js file in its`,
+      'plugins folder is an ES module; otherwise the folder is left alone and the report above says why.',
     ].join('\n') + '\n',
   )
 }

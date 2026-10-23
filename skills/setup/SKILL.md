@@ -24,9 +24,11 @@ absence only warns. A `profile-models` warning means the installed profile preda
 and needs the installer rerun (step 4), and a `profile-version` warning means the profile is not
 installed or came from another release than this server, with `node install.mjs` as the fix. On
 Windows, `slot-path-length` warns when the first copy's path is long enough that MSVC's `cl.exe`
-and other tools without long-path support may fail; step 5 says what to set. If all checks pass
-and none of those warns, skip to step 5. Otherwise fix them in the order below — later checks
-depend on earlier ones.
+and other tools without long-path support may fail, and `state-base-permissions` fails when the
+user cannot change permissions under the state base, which stops every shell command in a slot;
+step 5 says what to set and which `icacls` line to run. If all checks pass and none of those
+warns, skip to step 5. Otherwise fix them in the order below — later checks depend on earlier
+ones.
 
 ## 2. The harness
 
@@ -73,10 +75,16 @@ node "${CLAUDE_PLUGIN_ROOT}/install.mjs"
 This renders two profiles into `$DSH_HOME/profiles` — the writing service and its
 read-only twin — from `flash.config.json`. Re-run it after changing that file and after every
 plugin update: an update replaces the server but not the guard or the profiles the server runs
-with, so the old guard stays in place until the installer rewrites it. Run it once after upgrading
-from 0.1.5 or older too: a profile installed before 0.1.6 pins one literal model and cannot run a
-per-call choice. Then confirm with the doctor again; `profile` must pass, and `profile-models` and
-`profile-version` must not warn.
+with, so the old guard stays in place until the installer rewrites it. It also writes the ESM
+`plugins/package.json` stamp into the interactive profile, but only when every `.js` file in that
+folder is an ES module; otherwise it leaves the folder alone and its report names the file that
+stopped it, because `"type": "module"` there would change how a CommonJS plugin is loaded. Run it
+once after upgrading from 0.1.5 or older too: a profile installed before 0.1.6 pins one literal
+model and cannot run a per-call choice. Then confirm with the doctor again; `profile` must pass,
+and `profile-models` and `profile-version` must not warn. The stamp is re-read by every runtime that
+boots after the installer ran, so a `profile-version` warning clears on the next call without a
+reconnect; only a runtime that booted before the install keeps the old verdict, and reconnecting is
+how that one is replaced.
 
 ## 5. Prove it end to end
 
@@ -108,11 +116,17 @@ and deletes it. If the copy fails, every writing call would fail the same way �
 If it is large or slow, point at the largest entries it lists and at a `.flash-agents.json` in
 the project root (`copyExclude`, `slotEnv`; see the README's "Per-repository settings"). `.env`,
 `.env.*` and `.mcp.json` are already left out by default. `slotEnv` takes `"NAME": "value:<text>"`
-for a plain value set in every copy — a prebuilt OpenSSL, `RUSTC_WRAPPER` — so briefs need not
-repeat it. On Windows, if `slot-path-length` warns, the copy's root is already long before the
+for a plain value set in every copy — `RUSTC_WRAPPER`, `OPENSSL_NO_VENDOR` — so briefs need not
+repeat it; a path only one machine has, a prebuilt OpenSSL for instance, belongs in a git-ignored
+`.flash-agents.local.json` beside it, under `platform.win32` when it is that platform's business.
+On Windows, if `slot-path-length` warns, the copy's root is already long before the
 project's own build folders are added: point the plugin's **Base folder for worker copies** setting
 (`state_base`, or `FLASH_STATE_BASE` / `--state-base` for a manual install) at a short absolute
-folder such as `C:\fm`. It moves the default copy layout only, and a leading `~` expands.
+folder such as `C:\fm`. It moves the default copy layout only, and a leading `~` expands. A folder
+made directly under `C:\` gives the user modify rights but not the right to change its permissions,
+and the sandbox's first step for every shell command then fails (`SetNamedSecurityInfoW failed
+(Win32 5)`); grant them once with `icacls "C:\fm" /grant "%USERNAME%:(OI)(CI)F"`, which is also the
+fix `doctor`'s `state-base-permissions` row prints.
 
 ## 6. Tell them what they have
 
@@ -120,7 +134,8 @@ Close with the tools and two caveats:
 - `flash_task` — one coherent task, one worker, a patch back (`taskFile` sends a long brief).
   Omit `model` for the default, or name one from the allowlist.
 - `flash_batch` — several independent tasks at once, sharing one copy and one model.
-- `flash_apply` — land a patch you decided to keep (`threeWay` when the tree moved on).
+- `flash_apply` — land a patch you decided to keep (`threeWay` when the tree moved on, `files` when
+  only some of its files should land).
 - `flash_patch` — read a stored patch whole or page by page.
 - `background: true` with `flash_status`, `flash_result`, `flash_cancel` — run calls while
   doing other work, and stop one whose framing turned out wrong.

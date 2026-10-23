@@ -53,7 +53,12 @@ function gitOut(dir, ...args) {
 function makeRepo(files) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-patch-')))
   execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir })
-  for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content)
+  for (const [name, content] of Object.entries(files)) {
+    // A nested path is part of the real-shaped data these tests use; the file's directory
+    // does not exist yet when the repository is made.
+    mkdirSync(dirname(join(dir, name)), { recursive: true })
+    writeFileSync(join(dir, name), content)
+  }
   commit(dir, 'init')
   return dir
 }
@@ -69,6 +74,39 @@ function makePool(repo) {
   const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-patch-state-')))
   const isolation = new WorkspaceIsolation({ root: repo, slots: 1, stateDir })
   return { isolation, stateDir }
+}
+
+/** A second pool over the same repository and patch store, as a restarted server builds. */
+function reopenPool(repo, stateDir) {
+  return new WorkspaceIsolation({ root: repo, slots: 1, stateDir })
+}
+
+/** The scratch directories a partial apply leaves behind, if any. */
+function partialTempDirs(stateDir) {
+  return readdirSync(stateDir).filter((name) => name.startsWith('partial-'))
+}
+
+/**
+ * A pool over a repository with three files, and one stored patch that edits all of them.
+ * Two paths live in a subdirectory and one holds a space, so the selection has to keep the
+ * record's spelling rather than flatten or quote it.
+ */
+async function threeFilePatch() {
+  const base = {
+    'sub/one.txt': TWELVE_LINES,
+    'sub/two.txt': TWELVE_LINES,
+    'space name.txt': TWELVE_LINES,
+  }
+  const repo = makeRepo(base)
+  const { isolation, stateDir } = makePool(repo)
+  const { slot, change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, 'sub/one.txt'), TWELVE_LINES.replace('l2\n', 'l2 ONE\n'))
+    writeFileSync(join(dir, 'sub/two.txt'), TWELVE_LINES.replace('l3\n', 'l3 TWO\n'))
+    writeFileSync(join(dir, 'space name.txt'), TWELVE_LINES.replace('l4\n', 'l4 SPACE\n'))
+  })
+  isolation.discard(slot)
+  isolation.release(slot)
+  return { repo, isolation, stateDir, change, base }
 }
 
 /**
@@ -371,6 +409,32 @@ test('a base whose parent is unknown reports commitsBehind null', async () => {
   assert.equal(dry.drift.commitsBehind, null)
   assert.deepEqual(dry.drift.filesChangedSince, [])
   isolation.close()
+})
+
+test('a record reloaded from disk keeps baseParent, so drift can still count commits', async () => {
+  const repo = makeRepo({ 'f.txt': TWELVE_LINES })
+  const { isolation, stateDir } = makePool(repo)
+  const { slot, change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, 'f.txt'), TWELVE_LINES.replace('l2\n', 'l2 WORKER\n'))
+  })
+  // The caller's HEAD at copy time is the base's parent. It exists only in the copy, so
+  // closing the pool removes the one tree `resolveBaseParent` could have asked.
+  isolation.discard(slot)
+  isolation.release(slot)
+  isolation.close()
+  writeFileSync(join(repo, 'unrelated.txt'), 'other work\n')
+  commit(repo, 'the caller moves on')
+  const baseParent = gitOut(repo, 'rev-parse', 'HEAD~1').trim()
+  assert.equal(baseParent.length, 40, 'a real commit id from git')
+
+  const reopened = reopenPool(repo, stateDir)
+  const record = readRecord(reopened, change.patchId)
+  assert.equal(record.baseParent, baseParent, 'the parent is persisted beside the base')
+  const dry = reopened.apply({ patchId: change.patchId, dryRun: true })
+  assert.deepEqual(dry.drift, { commitsBehind: 1, filesChangedSince: [] })
+  const page = reopened.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.deepEqual(page.drift, dry.drift, 'readPatch page 0 counts the same commits')
+  reopened.close()
 })
 
 test('a patch with no recorded base gets drift null', async () => {
@@ -796,6 +860,451 @@ test('flash_patch refuses a malformed id and a patch from another root', async (
   )
   await service.close()
   await other.service.close()
+})
+
+// ── a partial apply: only some of a stored patch ────────────────────────────
+
+test('a partial apply changes one file, records it, and a reloaded pool sees the same', async () => {
+  const { repo, isolation, stateDir, change, base } = await threeFilePatch()
+  const applied = isolation.apply({ patchId: change.patchId, files: ['sub/one.txt'] })
+
+  assert.equal(applied.applied, true)
+  assert.deepEqual(applied.filesChanged, ['sub/one.txt'])
+  assert.match(applied.diffstat, /sub\/one\.txt/)
+  assert.doesNotMatch(applied.diffstat, /space name\.txt|sub\/two\.txt/)
+  assert.equal(readFileSync(join(repo, 'sub/one.txt'), 'utf8'), TWELVE_LINES.replace('l2\n', 'l2 ONE\n'))
+  assert.equal(readFileSync(join(repo, 'sub/two.txt'), 'utf8'), base['sub/two.txt'], 'the other files are untouched')
+  assert.equal(readFileSync(join(repo, 'space name.txt'), 'utf8'), base['space name.txt'])
+
+  const record = readRecord(isolation, change.patchId)
+  assert.deepEqual(record.appliedFiles, ['sub/one.txt'])
+  assert.equal(record.appliedAt, null, 'one file of three is not a whole apply')
+  const page = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.equal(page.applied, false)
+  assert.deepEqual(page.appliedFiles, ['sub/one.txt'])
+  assert.equal(page.filesChanged.length, 3, 'the stored record still describes the whole patch')
+  isolation.close()
+
+  const reopened = reopenPool(repo, stateDir)
+  const reloaded = reopened.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.equal(reloaded.applied, false)
+  assert.deepEqual(reloaded.appliedFiles, ['sub/one.txt'])
+
+  const rest = reopened.apply({ patchId: change.patchId, files: ['sub/two.txt', 'space name.txt'] })
+  assert.equal(rest.applied, true)
+  assert.deepEqual([...rest.filesChanged].sort(), ['space name.txt', 'sub/two.txt'])
+  assert.equal(readFileSync(join(repo, 'sub/two.txt'), 'utf8'), TWELVE_LINES.replace('l3\n', 'l3 TWO\n'))
+  assert.equal(readFileSync(join(repo, 'space name.txt'), 'utf8'), TWELVE_LINES.replace('l4\n', 'l4 SPACE\n'))
+
+  const done = readRecord(reopened, change.patchId)
+  assert.deepEqual(done.appliedFiles, ['space name.txt', 'sub/one.txt', 'sub/two.txt'])
+  assert.equal(typeof done.appliedAt, 'number', 'every file is in, so the whole apply is recorded')
+  const after = reopened.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.equal(after.applied, true)
+  assert.deepEqual(after.appliedFiles, done.appliedFiles)
+  assert.throws(() => reopened.apply({ patchId: change.patchId }), /was already applied/)
+  reopened.close()
+})
+
+test('a partial apply selects a renamed file by its old path or by its new one', async () => {
+  for (const spelling of ['sub/old name.txt', 'sub/new name.txt']) {
+    const repo = makeRepo({ 'sub/old name.txt': TWELVE_LINES, 'sub/keep.txt': 'keep me\n' })
+    const { isolation } = makePool(repo)
+    const { slot, change } = await collectInCopy(isolation, (dir) => {
+      execFileSync('git', ['mv', 'old name.txt', 'new name.txt'], { cwd: join(dir, 'sub') })
+    })
+    isolation.discard(slot)
+    isolation.release(slot)
+
+    const applied = isolation.apply({ patchId: change.patchId, files: [spelling] })
+    assert.equal(applied.applied, true, `selected by ${spelling}`)
+    assert.deepEqual(applied.filesChanged, ['sub/new name.txt'], 'the result reports the name that exists afterwards')
+    assert.equal(existsSync(join(repo, 'sub/new name.txt')), true)
+    assert.equal(existsSync(join(repo, 'sub/old name.txt')), false)
+    assert.equal(readFileSync(join(repo, 'sub/keep.txt'), 'utf8'), 'keep me\n')
+    assert.deepEqual(readRecord(isolation, change.patchId).appliedFiles, ['sub/new name.txt'])
+    isolation.close()
+  }
+})
+
+test('a partial apply checks only the selected rename for a destructive edit', async () => {
+  const repo = makeRepo({ 'sub/old name.txt': TWELVE_LINES, 'sub/other.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { slot, change } = await collectInCopy(isolation, (dir) => {
+    execFileSync('git', ['mv', 'old name.txt', 'new name.txt'], { cwd: join(dir, 'sub') })
+    // The rename also edits a line, so the merge against the caller's edit has a real
+    // conflict to mark; the old path is still what a plain apply would remove.
+    writeFileSync(join(dir, 'sub/new name.txt'), TWELVE_LINES.replace('l6\n', 'l6 WORKER\n'))
+    writeFileSync(join(dir, 'sub/other.txt'), TWELVE_LINES.replace('l3\n', 'l3 OTHER\n'))
+  })
+  isolation.discard(slot)
+  isolation.release(slot)
+  const edited = TWELVE_LINES.replace('l6\n', 'l6 CALLER EDIT\n')
+  writeFileSync(join(repo, 'sub/old name.txt'), edited)
+
+  // The edited rename is not selected, so it is neither applied nor a reason to refuse.
+  const other = isolation.apply({ patchId: change.patchId, files: ['sub/other.txt'] })
+  assert.equal(other.applied, true)
+  assert.equal(other.warnings, undefined)
+  assert.deepEqual(other.drift.filesChangedSince, [])
+  assert.equal(readFileSync(join(repo, 'sub/old name.txt'), 'utf8'), edited)
+  assert.equal(existsSync(join(repo, 'sub/new name.txt')), false)
+
+  const refusal =
+    `refusing to apply ${change.patchId}: it deletes or renames sub/old name.txt, which you changed since the worker's ` +
+    'copy was made; your edit would be lost. Pass threeWay: true to merge it (conflicts are marked in the file), ' +
+    'or save it first and pass force: true'
+  assert.throws(
+    () => isolation.apply({ patchId: change.patchId, files: ['sub/old name.txt'] }),
+    (error) => error.message === refusal,
+  )
+  assert.equal(readFileSync(join(repo, 'sub/old name.txt'), 'utf8'), edited, 'the refusal writes nothing')
+
+  // A dry run with threeWay predicts the conflict on the selected rename without writing.
+  const predicted = isolation.apply({ patchId: change.patchId, files: ['sub/old name.txt'], dryRun: true, threeWay: true })
+  assert.equal(predicted.applied, false)
+  assert.equal(predicted.threeWay, true)
+  assert.ok(predicted.conflicts.length > 0, `expected a predicted conflict, saw ${JSON.stringify(predicted.conflicts)}`)
+  assert.equal(existsSync(join(repo, 'sub/new name.txt')), false)
+
+  const merged = isolation.apply({ patchId: change.patchId, files: ['sub/new name.txt'], threeWay: true })
+  assert.equal(merged.applied, true)
+  assert.equal(merged.threeWay, true)
+  assert.ok(merged.conflicts.length > 0)
+  assert.equal(merged.indexTouched, false)
+  const mergedText = ['sub/old name.txt', 'sub/new name.txt']
+    .map((name) => join(repo, name))
+    .filter((path) => existsSync(path))
+    .map((path) => readFileSync(path, 'utf8'))
+    .join('\n')
+  assert.match(mergedText, /CALLER EDIT/, 'the caller’s edit is still in the tree')
+  assert.match(mergedText, /<<<<<<< /, 'the merge marks the conflict')
+
+  const done = readRecord(isolation, change.patchId)
+  assert.deepEqual(done.appliedFiles, ['sub/new name.txt', 'sub/other.txt'])
+  assert.equal(typeof done.appliedAt, 'number', 'both files are now in')
+  isolation.close()
+})
+
+test('a dry run with files writes nothing and marks nothing', async () => {
+  const { repo, isolation, stateDir, change, base } = await threeFilePatch()
+  const checked = isolation.apply({ patchId: change.patchId, files: ['sub/one.txt'], dryRun: true })
+  assert.equal(checked.applied, false)
+  assert.deepEqual(checked.filesChanged, ['sub/one.txt'])
+  for (const [name, content] of Object.entries(base)) {
+    assert.equal(readFileSync(join(repo, name), 'utf8'), content, `${name} was not written`)
+  }
+  const record = readRecord(isolation, change.patchId)
+  assert.equal(record.appliedAt, null)
+  assert.equal(record.appliedFiles, undefined)
+  const page = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.equal(page.applied, false)
+  assert.equal('appliedFiles' in page, false)
+  assert.deepEqual(partialTempDirs(stateDir), [], 'the temporary patch is removed')
+  isolation.close()
+})
+
+test('a partial apply refuses an unknown file and an empty selection', async () => {
+  const { repo, isolation, stateDir, change, base } = await threeFilePatch()
+  const unknown =
+    `patch ${change.patchId} does not contain "nope.txt"; it changes: space name.txt, sub/one.txt, sub/two.txt`
+  assert.throws(
+    () => isolation.apply({ patchId: change.patchId, files: ['nope.txt'] }),
+    (error) => error.message === unknown,
+  )
+  assert.throws(
+    () => isolation.apply({ patchId: change.patchId, files: [] }),
+    (error) => error.message === 'files must name at least one file of the patch',
+  )
+  for (const [name, content] of Object.entries(base)) {
+    assert.equal(readFileSync(join(repo, name), 'utf8'), content)
+  }
+  assert.deepEqual(partialTempDirs(stateDir), [])
+  isolation.close()
+})
+
+test('a partial apply refuses a file already applied, and force applies it again', async () => {
+  const { repo, isolation, change } = await threeFilePatch()
+  isolation.apply({ patchId: change.patchId, files: ['sub/one.txt'] })
+  const refusal = `patch ${change.patchId}: sub/one.txt already applied to ${repo}; pass force: true to apply them again`
+  assert.throws(
+    () => isolation.apply({ patchId: change.patchId, files: ['sub/one.txt'] }),
+    (error) => error.message === refusal,
+  )
+
+  // Put the file back where the patch expects it, so force reaches git and git agrees.
+  writeFileSync(join(repo, 'sub/one.txt'), TWELVE_LINES)
+  const forced = isolation.apply({ patchId: change.patchId, files: ['sub/one.txt'], force: true })
+  assert.equal(forced.applied, true)
+  assert.equal(readFileSync(join(repo, 'sub/one.txt'), 'utf8'), TWELVE_LINES.replace('l2\n', 'l2 ONE\n'))
+  const record = readRecord(isolation, change.patchId)
+  assert.deepEqual(record.appliedFiles, ['sub/one.txt'])
+  assert.equal(record.appliedAt, null, 'still one file of three')
+  isolation.close()
+})
+
+test('a whole apply refuses after a partial one, and force applies the whole patch', async () => {
+  const { repo, isolation, change, base } = await threeFilePatch()
+  isolation.apply({ patchId: change.patchId, files: ['sub/one.txt'] })
+  const refusal =
+    `patch ${change.patchId}: 1 of 3 files were already applied (sub/one.txt); ` +
+    'pass files with the rest, or force: true to apply the whole patch again'
+  assert.throws(
+    () => isolation.apply({ patchId: change.patchId }),
+    (error) => error.message === refusal,
+  )
+
+  // Restore the one already-applied file so the forced whole apply has a clean surface.
+  writeFileSync(join(repo, 'sub/one.txt'), base['sub/one.txt'])
+  const forced = isolation.apply({ patchId: change.patchId, force: true })
+  assert.equal(forced.applied, true)
+  assert.deepEqual([...forced.filesChanged].sort(), ['space name.txt', 'sub/one.txt', 'sub/two.txt'])
+  for (const [name, content] of Object.entries(base)) {
+    assert.notEqual(readFileSync(join(repo, name), 'utf8'), content, `${name} landed`)
+  }
+  const record = readRecord(isolation, change.patchId)
+  assert.deepEqual(record.appliedFiles, ['space name.txt', 'sub/one.txt', 'sub/two.txt'])
+  assert.equal(typeof record.appliedAt, 'number')
+  isolation.close()
+})
+
+test('the temporary partial patch is removed after a successful and a failing apply', async () => {
+  const { repo, isolation, stateDir, change } = await threeFilePatch()
+  const storedPath = join(isolation.patchDir, `${change.patchId}.patch`)
+  const stored = readFileSync(storedPath, 'utf8')
+  isolation.apply({ patchId: change.patchId, files: ['sub/one.txt'] })
+  assert.deepEqual(partialTempDirs(stateDir), [], 'nothing is left after a successful partial apply')
+  assert.equal(readFileSync(storedPath, 'utf8'), stored, 'the stored patch is never rewritten')
+  isolation.close()
+
+  // The destructive-edit refusal happens after the temporary patch has been written.
+  const otherRepo = makeRepo({ 'sub/old name.txt': TWELVE_LINES })
+  const other = makePool(otherRepo)
+  const { slot, change: renameChange } = await collectInCopy(other.isolation, (dir) => {
+    execFileSync('git', ['mv', 'old name.txt', 'new name.txt'], { cwd: join(dir, 'sub') })
+  })
+  other.isolation.discard(slot)
+  other.isolation.release(slot)
+  writeFileSync(join(otherRepo, 'sub/old name.txt'), TWELVE_LINES.replace('l6\n', 'l6 CALLER EDIT\n'))
+  const renamePath = join(other.isolation.patchDir, `${renameChange.patchId}.patch`)
+  const renameStored = readFileSync(renamePath, 'utf8')
+  assert.throws(
+    () => other.isolation.apply({ patchId: renameChange.patchId, files: ['sub/old name.txt'] }),
+    /refusing to apply/,
+  )
+  assert.deepEqual(partialTempDirs(other.stateDir), [], 'nothing is left after a failing partial apply')
+  assert.equal(readFileSync(renamePath, 'utf8'), renameStored, 'the stored patch is never rewritten')
+  other.isolation.close()
+})
+
+test('review: a partial apply records a path the record cannot spell', async () => {
+  // A record line is `STATUS<TAB>path`, so a path holding a tab cannot be split back into
+  // its fields. The selection still names the section (the header quotes the tab, which
+  // `diffSectionNames` decodes), so the apply runs while the per-file bookkeeping matches
+  // no line: the result claims nothing was applied and the record forgets the file.
+  const tabbed = 'a\tb.txt'
+  const repo = makeRepo({ [tabbed]: TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { slot, change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, tabbed), TWELVE_LINES.replace('l2\n', 'l2 TAB\n'))
+  })
+  isolation.discard(slot)
+  isolation.release(slot)
+
+  const applied = isolation.apply({ patchId: change.patchId, files: [tabbed] })
+  assert.equal(applied.applied, true)
+  assert.equal(readFileSync(join(repo, tabbed), 'utf8'), TWELVE_LINES.replace('l2\n', 'l2 TAB\n'))
+  assert.deepEqual(applied.filesChanged, [tabbed], 'the result names the file it applied')
+  const page = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.deepEqual(page.appliedFiles, [tabbed], 'the record remembers the file')
+  assert.equal(page.applied, true, 'the only file of the patch is in, so the patch is applied')
+  assert.throws(
+    () => isolation.apply({ patchId: change.patchId }),
+    /was already applied/,
+    'a whole apply after it must be refused as applied, not left to git',
+  )
+  isolation.close()
+})
+
+test('review: a path with a tab makes a whole patch look applied when it is not', async () => {
+  // `nameStatusEntry` reads a non-rename line as `STATUS<TAB>path` (field 2) while
+  // `plainPaths` reads the last field, so `M<TAB>a<TAB>b.txt` decodes as `a` in one place
+  // and `b.txt` in the other. Selecting the real file `a` therefore also matches the tab
+  // file's line, and the record claims both files are in: a phantom `b.txt` is stored and
+  // the tabbed file, still untouched, is reported and refused as already applied.
+  const tabbed = 'a\tb.txt'
+  const repo = makeRepo({ a: TWELVE_LINES, [tabbed]: TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { slot, change } = await collectInCopy(isolation, (dir) => {
+    writeFileSync(join(dir, 'a'), TWELVE_LINES.replace('l2\n', 'l2 A\n'))
+    writeFileSync(join(dir, tabbed), TWELVE_LINES.replace('l3\n', 'l3 TAB\n'))
+  })
+  isolation.discard(slot)
+  isolation.release(slot)
+
+  isolation.apply({ patchId: change.patchId, files: ['a'] })
+  assert.equal(readFileSync(join(repo, tabbed), 'utf8'), TWELVE_LINES, 'the tabbed file was not part of the selection')
+  const record = readRecord(isolation, change.patchId)
+  assert.deepEqual(record.appliedFiles, ['a'], 'only the selected file is recorded')
+  assert.equal(record.appliedAt, null, 'the patch is not fully applied')
+  const page = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.equal(page.applied, false)
+  assert.deepEqual(page.filesChanged, ['a', tabbed], 'no phantom name appears in the record')
+  isolation.close()
+})
+
+test('review: files selects a path whose name contains " b/"', async () => {
+  // A `diff --git` header has no quoting for a space, so `diffHeaderPaths` finds the
+  // separator with the last `" b/"` in the line. A path that itself holds `" b/"` — here
+  // the directory `x b` — moves that match into the name and both real spellings are
+  // reported as absent, even though the record names the file correctly.
+  const repo = makeRepo({ 'keep.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { slot, change } = await collectInCopy(isolation, (dir) => {
+    mkdirSync(join(dir, 'x b'), { recursive: true })
+    writeFileSync(join(dir, 'x b/y.txt'), 'added by the worker\n')
+  })
+  isolation.discard(slot)
+  isolation.release(slot)
+
+  const page = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.deepEqual(page.filesChanged, ['x b/y.txt'], 'the record spells the new file')
+  const applied = isolation.apply({ patchId: change.patchId, files: ['x b/y.txt'] })
+  assert.equal(applied.applied, true)
+  assert.deepEqual(applied.filesChanged, ['x b/y.txt'])
+  assert.equal(readFileSync(join(repo, 'x b/y.txt'), 'utf8'), 'added by the worker\n')
+  const read = isolation.readPatch({ patchId: change.patchId, files: ['x b/y.txt'], maxChars: 1_000_000 })
+  assert.deepEqual(read.files, ['x b/y.txt'])
+  isolation.close()
+})
+
+// ── names a record or a diff header cannot spell ─────────────────────────────
+
+test('a record round-trips every name that a plain field would break', async () => {
+  // A record is `STATUS<TAB>path`, so a name holding a tab, a newline or a control byte can
+  // only be stored C-quoted, the way git itself spells such a path, and so can a name that
+  // starts with a quote. Every ordinary name — a space, a backslash of its own, an accent —
+  // must keep the plain spelling earlier records have, so both halves of the rule are
+  // asserted here.
+  const names = ['tab\there.txt', 'line\nbreak.txt', '"quoted.txt', 'back\\slash.txt', 'space name.txt', 'café.txt']
+  const repo = makeRepo(Object.fromEntries(names.map((name) => [name, TWELVE_LINES])))
+  const { isolation } = makePool(repo)
+  const worker = TWELVE_LINES.replace('l2\n', 'l2 WORKER\n')
+  const { slot, change } = await collectInCopy(isolation, (dir) => {
+    for (const name of names) writeFileSync(join(dir, name), worker)
+  })
+  isolation.discard(slot)
+  isolation.release(slot)
+
+  const record = readRecord(isolation, change.patchId)
+  assert.deepEqual(
+    [...record.filesChanged].sort(),
+    [
+      'M\t"line\\nbreak.txt"',
+      'M\t"tab\\there.txt"',
+      'M\t"\\"quoted.txt"',
+      'M\tback\\slash.txt',
+      'M\tcafé.txt',
+      'M\tspace name.txt',
+    ].sort(),
+  )
+
+  // One reader for the record: the list, `files` and a section's own name agree, and every
+  // name selects its own section by the plain spelling a caller sees on disk.
+  const page = isolation.readPatch({ patchId: change.patchId, files: names, maxChars: 1_000_000 })
+  assert.deepEqual([...page.filesChanged].sort(), [...names].sort())
+  assert.deepEqual([...page.files].sort(), [...names].sort())
+
+  const applied = isolation.apply({ patchId: change.patchId })
+  assert.equal(applied.applied, true)
+  assert.deepEqual([...applied.filesChanged].sort(), [...names].sort(), 'the result names the files it applied')
+  assert.deepEqual(readRecord(isolation, change.patchId).appliedFiles, [...names].sort(), 'the record keeps the decoded spelling')
+  for (const name of names) assert.equal(readFileSync(join(repo, name), 'utf8'), worker, `${JSON.stringify(name)} landed`)
+  isolation.close()
+})
+
+test('a rename whose two names hold a space and " b/" is selectable by either name', async () => {
+  // The `diff --git` header cannot be split here: git does not quote a space, so a name in a
+  // directory ` b` moves the separator into the name itself. The rename lines it writes can.
+  const repo = makeRepo({ 'x b/one old.txt': TWELVE_LINES, 'x b/two old.txt': TWELVE_LINES })
+  const { isolation } = makePool(repo)
+  const { slot, change } = await collectInCopy(isolation, (dir) => {
+    mkdirSync(join(dir, 'y b'), { recursive: true })
+    execFileSync('git', ['mv', 'x b/one old.txt', 'y b/one new.txt'], { cwd: dir })
+    execFileSync('git', ['mv', 'x b/two old.txt', 'y b/two new.txt'], { cwd: dir })
+  })
+  isolation.discard(slot)
+  isolation.release(slot)
+
+  const byOld = isolation.readPatch({ patchId: change.patchId, files: ['x b/one old.txt'], maxChars: 1_000_000 })
+  assert.deepEqual(byOld.files, ['y b/one new.txt'], 'the file a reader sees afterwards')
+  assert.match(byOld.diff, /rename from x b\/one old\.txt/)
+  const byNew = isolation.readPatch({ patchId: change.patchId, files: ['y b/two new.txt'], maxChars: 1_000_000 })
+  assert.deepEqual(byNew.files, ['y b/two new.txt'])
+  assert.match(byNew.diff, /rename from x b\/two old\.txt/)
+
+  // One apply selects one file by its old name and the other by its new one.
+  const applied = isolation.apply({ patchId: change.patchId, files: ['x b/one old.txt', 'y b/two new.txt'] })
+  assert.equal(applied.applied, true)
+  assert.deepEqual([...applied.filesChanged].sort(), ['y b/one new.txt', 'y b/two new.txt'])
+  assert.equal(readFileSync(join(repo, 'y b/one new.txt'), 'utf8'), TWELVE_LINES)
+  assert.equal(readFileSync(join(repo, 'y b/two new.txt'), 'utf8'), TWELVE_LINES)
+  assert.equal(existsSync(join(repo, 'x b/one old.txt')), false)
+  assert.deepEqual(readRecord(isolation, change.patchId).appliedFiles, ['y b/one new.txt', 'y b/two new.txt'])
+  isolation.close()
+})
+
+test('a mode-only change on a path with a space is selectable', async () => {
+  // `chmod +x` writes no `---`/`+++` and no rename lines, so the names can only come from
+  // the header — where both halves spell the same path and equality finds the separator.
+  // The path itself holds a ` b/`, which is what the last-` b/` rule trips over.
+  const repo = makeRepo({ 'x b/run me.sh': '#!/bin/sh\necho one\n' })
+  const { isolation } = makePool(repo)
+  const { slot, change } = await collectInCopy(isolation, (dir) => chmodSync(join(dir, 'x b/run me.sh'), 0o755))
+  isolation.discard(slot)
+  isolation.release(slot)
+
+  const page = isolation.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+  assert.deepEqual(page.filesChanged, ['x b/run me.sh'])
+  assert.deepEqual(page.files, ['x b/run me.sh'])
+  const read = isolation.readPatch({ patchId: change.patchId, files: ['x b/run me.sh'], maxChars: 1_000_000 })
+  assert.deepEqual(read.files, ['x b/run me.sh'])
+
+  const applied = isolation.apply({ patchId: change.patchId, files: ['x b/run me.sh'] })
+  assert.equal(applied.applied, true)
+  assert.deepEqual(applied.filesChanged, ['x b/run me.sh'])
+  assert.notEqual(statSync(join(repo, 'x b/run me.sh')).mode & 0o111, 0, 'the executable bit landed')
+  isolation.close()
+})
+
+test('a record written by 0.1.8 with a git-quoted field still applies under its plain name', async () => {
+  const repo = makeRepo({ 'café.txt': TWELVE_LINES })
+  const { isolation, stateDir } = makePool(repo)
+  const worker = TWELVE_LINES.replace('l2\n', 'l2 WORKER\n')
+  const { slot, change } = await collectInCopy(isolation, (dir) => writeFileSync(join(dir, 'café.txt'), worker))
+  isolation.discard(slot)
+  isolation.release(slot)
+
+  // Before `-z`, a record carried git's quoted spelling — here `"caf\303\251.txt"`. Rewrite
+  // the record that way, as a sibling 0.1.8 store left it, and restart the pool over it.
+  const metaPath = join(isolation.patchDir, `${change.patchId}.json`)
+  const record = readRecord(isolation, change.patchId)
+  record.filesChanged = ['M\t"caf\\303\\251.txt"']
+  writeFileSync(metaPath, `${JSON.stringify(record)}\n`)
+  isolation.close()
+  const reopened = reopenPool(repo, stateDir)
+  try {
+    const page = reopened.readPatch({ patchId: change.patchId, maxChars: 1_000_000 })
+    assert.deepEqual(page.filesChanged, ['café.txt'], 'the quoted field decodes to the name on disk')
+    assert.deepEqual(page.files, ['café.txt'])
+    const applied = reopened.apply({ patchId: change.patchId, files: ['café.txt'] })
+    assert.equal(applied.applied, true)
+    assert.deepEqual(applied.filesChanged, ['café.txt'])
+    assert.equal(readFileSync(join(repo, 'café.txt'), 'utf8'), worker)
+    assert.deepEqual(readRecord(reopened, change.patchId).appliedFiles, ['café.txt'])
+  } finally {
+    reopened.close()
+  }
 })
 
 // ── threeWay apply ──────────────────────────────────────────────────────────

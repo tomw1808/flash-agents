@@ -102,8 +102,9 @@ worker profiles into `~/.dsh/profiles` (plus a `flash-orchestrator` preset for d
 proves the pipeline end to end with one real task. Every failing check
 prints the exact command that fixes it.
 
-Run it again after every plugin update, and reconnect: the update replaces the server but not the
-worker profile or the guard it runs with, so the installer has to rewrite both (see
+Run it again after every plugin update: the update replaces the server but not the worker profile or
+the guard it runs with, so the installer has to rewrite both. A runtime that boots after the install
+re-reads the profile's stamp, so the warning clears without a reconnect (see
 [Configuration](#configuration)).
 
 **4. Use it**
@@ -122,7 +123,7 @@ in rounds, and applies the patches it accepts.
 |---|---|
 | `flash_task` | One coherent task on one worker. Returns its report and a patch. |
 | `flash_batch` | Several independent tasks at once; results come back in task order. |
-| `flash_apply` | Land a patch from an earlier call (`dryRun` to check it first, `threeWay` to merge one whose context moved). |
+| `flash_apply` | Land a patch from an earlier call (`dryRun` to check it first, `threeWay` to merge one whose context moved, `files` to land only some of its files). |
 | `flash_patch` | Read a stored patch whole, by file, or page by page — for a diff too long for the result. |
 | `flash_status` · `flash_result` · `flash_cancel` | Follow, collect, and stop calls started with `background: true`. |
 | `/flash-agents:delegate` | The everyday loop: frame → slice → dispatch → verify → review → fix → apply. |
@@ -131,8 +132,10 @@ in rounds, and applies the patches it accepts.
 
 Pass `mode: "read-only"` for reviews and codebase maps: that call runs in a second process whose
 sandbox refuses every write — including the writes a build or a test run makes. For a review that
-has to build or run tests, use a writing call with `apply: "discard"`: it runs in a throwaway copy,
-reports what it changed, and keeps nothing.
+has to build or run tests, use a writing call with `apply: "none"` (the default): it runs in a
+throwaway copy and stores what it changed as a patch, so its test files can be applied later — a
+review's proof tests become the fix's failing-first tests. Use `apply: "discard"` when nothing is to
+be kept: it reports the change and stores nothing.
 
 Pass `background: true` and a call returns at once with a job id, so Claude can run tests or
 review an earlier patch while workers run; `flash_result` collects the result (and can wait for
@@ -146,7 +149,9 @@ with `taskFile` is labelled with the brief's first line rather than `(untitled t
 brief's job is recognisable in the listing. A
 call still waiting for a free copy says so — `queued 1m10s: waiting for a free tree (2 of 2 in use)`,
 and `queued in the foreground …` for a writing call sent without `background: true`, which holds
-your turn while it waits; that call's result carries the same warning.
+your turn while it waits; that call's result carries the same warning. A background call checks its
+arguments before it answers, so a bad `task`/`taskFile` pair, an unreadable brief, an unknown `mode`
+or a `source` a read-only call cannot honour fails the call at once, as a foreground one does.
 
 A first attempt that ends early with nothing — under three minutes and at most twelve model calls,
 nothing delegated or only empty reports, and no change in the copy — is retried once after ten
@@ -169,18 +174,29 @@ the `taskFile` path — and, once the call finished, the worker's final report (
 characters). `flash_patch` returns the task on every page and the report on the first; `flash_apply`
 returns the task. A patch salvaged after a crash still names its task.
 
+A patch can also be applied a file at a time. `flash_apply` takes `files`, naming entries as
+`change.filesChanged` spells them (a rename by its old or by its new path), and records each applied
+file in the patch, so the rest can follow later. A patch applied in part is not rewritten: the
+stored patch stays whole, and `flash_patch` reports `appliedFiles` on its first page. Applying the
+whole patch after a partial one is refused with the count — `3 of 7 files were already applied …;
+pass files with the rest, or force: true to apply the whole patch again` — and `force: true` lifts
+it.
+
 `flash_apply` and `flash_patch` report `drift`: `commitsBehind` (how many commits your `HEAD` has
 since the patch's base; `null` when that cannot be answered) and `filesChangedSince` (the patch's
 own files whose content in your tree differs from the base the copy was made from; `flash_patch`
 computes it on the page at offset 0 only, and it is `null` once the patch was applied). A
-non-empty file list comes back as a warning on the apply. An apply that would delete or rename away
-a file you changed since the copy was made is refused instead: `threeWay: true` merges it and keeps
+non-empty file list comes back as a warning on the apply. `commitsBehind` survives a restart, a
+patch salvaged after a crash and a patch from another session; before 0.1.9 it was `null` for
+those. An apply that would delete or rename away a file you changed since the copy was made is
+refused instead: `threeWay: true` merges it and keeps
 your edit (conflicts are marked in the file), and `force: true` applies it anyway and discards the
 edit. Before 0.1.8 such an apply removed the file without a word.
 
 Every result reports the tokens the call used (`usage`), and lists any uncommitted files the copy
 started with (`isolation.uncommittedAtStart`). If another session has uncommitted work in the same
-tree, `source: "head"` starts the copy from the last commit instead.
+tree, `source: "head"` starts the copy from the last commit instead. `head` is a writing call's
+choice only: a read-only call runs in your tree rather than in a copy, and refuses it.
 
 Project facts every worker needs — layout, check commands, style rules — go in an `AGENTS.md` (or
 `CLAUDE.md`) in your repository. The harness loads it into every worker, from the repository root
@@ -222,14 +238,26 @@ decision; default 2), where copies and patches live, and **Base folder for worke
 (`state_base`; `FLASH_STATE_BASE` or `--state-base` for a manual install). That base moves the
 default copy layout only — a configured state directory replaces it — and it must be an absolute
 path, with a leading `~` expanded. On Windows a short one such as `C:\fm` leaves room for build
-tools that ignore long-path support; see [Honest limits](#honest-limits).
+tools that ignore long-path support; see [Honest limits](#honest-limits). A folder made directly
+under `C:\` gives you modify rights but not the right to change its permissions, and the sandbox's
+first step for every shell command then fails (`SetNamedSecurityInfoW failed (Win32 5)`). Grant
+them once, before the first call:
 
-**After updating the plugin, run `node install.mjs` again in the plugin folder, then reconnect**
+```sh
+icacls "C:\fm" /grant "%USERNAME%:(OI)(CI)F"
+```
+
+`doctor` has a `state-base-permissions` row on Windows that tests exactly this and names the fix.
+
+**After updating the plugin, run `node install.mjs` again in the plugin folder**
 (`/flash-agents:setup` does the same from the plugin). An update replaces the server but not the
 worker profile or the guard the server runs with, so the old guard stays in place until the
 installer rewrites it. 0.1.8 names that drift: the server logs it at start, every `flash_task` and
-`flash_batch` result carries the warning, and `doctor`'s `profile-version` row warns until the installed profile matches the
-server.
+`flash_batch` result carries the warning, and `doctor`'s `profile-version` row warns until the
+installed profile matches the server. The warning clears by itself: a runtime booted after the
+install re-reads its profile's stamp, and a result carries the verdict of the runtime that served
+it. A runtime that booted before the install keeps the old verdict until it is replaced, and
+reconnecting is how you replace it.
 
 **After upgrading from 0.1.5 or older, run the setup once more** (`/flash-agents:setup`, or
 `node install.mjs` in a manual install). Before 0.1.6 the installed worker profile pinned one
@@ -242,10 +270,25 @@ either way, the change so far is salvaged as a patch.
 
 ### Per-repository settings
 
-A `.flash-agents.json` at the repository root tunes the disposable copy for that repository. It
-is read when the server starts; a change made after that is not applied, and every task result warns
-about it (`… changed after this server started; its new settings take effect after a reconnect`)
+A `.flash-agents.json` at the repository root tunes the disposable copy for that repository, and a
+git-ignored `.flash-agents.local.json` beside it holds what belongs to one machine. Both are read
+when the server starts; a change made after that is not applied, and every task result warns about
+it (`<file> changed after this server started; its new settings take effect after a reconnect`)
 until you reconnect.
+
+Both files have the same shape. A top-level `platform` object, keyed by Node's `process.platform`
+names (`win32`, `linux`, `darwin`, …), holds sections with the same keys as the top level; only the
+running platform's section applies. The layers apply in this order: the shared file, its platform
+section, the local file, its platform section, then the server's own options
+(`FLASH_COPY_EXCLUDE`, `--copy-exclude`, …). `copyExclude` and `slotSetup` add up across layers;
+`slotEnv` merges by variable name, case-insensitively on Windows, and a `null` in a later layer
+removes an earlier entry; the last `copyExcludeDefaults` wins. A local `slotSetup` is host code like
+any other, behind the same `--allow-slot-setup` gate.
+
+The server logs the layers it applied
+(`settings: .flash-agents.json, .flash-agents.json platform.win32, .flash-agents.local.json
+platform.win32`), warns once when the local file is tracked by git or not ignored by it, and warns
+per call when either file changed after start.
 
 ```json
 {
@@ -257,6 +300,22 @@ until you reconnect.
   }
 }
 ```
+
+One Windows machine with a prebuilt OpenSSL. The committed `.flash-agents.json` carries what every
+Windows checkout needs — MSVC's build output left out of the copy:
+
+```json
+{ "platform": { "win32": { "copyExclude": ["build-msvc"] } } }
+```
+
+The git-ignored `.flash-agents.local.json` carries the path only this machine has:
+
+```json
+{ "platform": { "win32": { "slotEnv": { "OPENSSL_DIR": "value:C:\\openssl" } } } }
+```
+
+A worker on that machine gets a copy without `build-msvc/` and with `OPENSSL_DIR` set. A Linux
+checkout gets neither, because no `platform.linux` section names them.
 
 - **`copyExclude`** — paths left out of each copy. A bare name matches at any depth (`target`,
   `node_modules`), a bare name ending in `*` matches a prefix (`build-*`), and a name with a slash
@@ -352,7 +411,8 @@ To watch workers live, set a log file and `tail -f` it — see
   and `cd server && … > ../log` is allowed; a deletion after a `cd` it cannot follow is refused
   rather than guessed at. And a plugin update no longer leaves the old guard and worker profile behind silently: the
   server names the drift in its log and in every task result, and `node install.mjs` in the plugin folder
-  is the fix.
+  is the fix. A runtime that boots after that install re-reads the profile's stamp and drops the
+  warning by itself; a runtime booted before it keeps the warning until it is replaced.
 - **A crash used to lose the unfinished work; 0.1.7 fixes that.** Before 0.1.7 the start-up sweep
   looked for a dead server's copies one directory too high, found nothing to salvage, and deleted
   them. It now finds them and salvages a copy that holds work as a patch named in the log, and keeps a copy it
@@ -364,7 +424,12 @@ To watch workers live, set a log file and `tail -f` it — see
   and others still fail past 260 characters, and a slot root is about 85 before a project's own
   build folders are added. A slot root over 64 characters logs a warning at start and on every call,
   and `doctor` reports a `slot-path-length` row; set **Base folder for worker copies** (`state_base`,
-  `FLASH_STATE_BASE` or `--state-base`) to a short absolute folder such as `C:\fm`.
+  `FLASH_STATE_BASE` or `--state-base`) to a short absolute folder such as `C:\fm`, and run
+  `icacls "C:\fm" /grant "%USERNAME%:(OI)(CI)F"` once on it. A folder made directly under `C:\`
+  gives you modify rights but not the right to change its permissions, and every shell command in a
+  slot then fails at the sandbox's first step (`SetNamedSecurityInfoW failed (Win32 5)`);
+  `doctor`'s `state-base-permissions` row tests that and names the fix (see
+  [Configuration](#configuration)).
 - macOS and Linux are what we test on. Windows 11 works in daily use by at least one user; directory
   junctions are recreated as junctions inside the copy.
 

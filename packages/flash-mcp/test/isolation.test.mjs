@@ -2164,20 +2164,20 @@ test('an injected base keeps the slot layout under it and sweeps a dead owner th
   }
 })
 
-test('repoSettingsChanged sees a replacement that keeps the mtime', () => {
+test('repoSettingsChanged sees a replacement that keeps the mtime, in either file', () => {
   const repo = makeRepo()
   const { isolation } = makePool(repo, 1)
   try {
-    assert.equal(isolation.repoSettingsChanged(), false, 'a repository without the file has not changed')
+    assert.deepEqual(isolation.repoSettingsChanged(), [], 'a repository without either file has not changed')
     const path = join(repo, '.flash-agents.json')
     writeFileSync(path, JSON.stringify({ copyExclude: ['dist'] }))
-    assert.equal(isolation.repoSettingsChanged(), true, 'a file created after start is a change')
+    assert.deepEqual(isolation.repoSettingsChanged(), ['.flash-agents.json'], 'a file created after start is a change')
 
     const started = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
-    assert.equal(started.repoSettingsChanged(), false)
+    assert.deepEqual(started.repoSettingsChanged(), [])
     const future = new Date(Date.now() + 2_000)
     utimesSync(path, future, future)
-    assert.equal(started.repoSettingsChanged(), true, 'a touched file is a change')
+    assert.deepEqual(started.repoSettingsChanged(), ['.flash-agents.json'], 'a touched file is a change')
 
     // A different file renamed over the settings, with the original mtime put back: an
     // implementation comparing only mtimeMs calls this unchanged, and the server would
@@ -2186,15 +2186,41 @@ test('repoSettingsChanged sees a replacement that keeps the mtime', () => {
     const fixed = new Date(Math.floor(Date.now() / 1000) * 1000)
     utimesSync(path, fixed, fixed)
     const stable = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
-    assert.equal(stable.repoSettingsChanged(), false)
+    assert.deepEqual(stable.repoSettingsChanged(), [])
     const replacement = join(repo, '.flash-agents.next')
     writeFileSync(replacement, JSON.stringify({ copyExclude: ['build'] }))
     renameSync(replacement, path)
     utimesSync(path, fixed, fixed)
-    assert.equal(stable.repoSettingsChanged(), true, 'a replaced file is a change even with its mtime restored')
+    assert.deepEqual(
+      stable.repoSettingsChanged(),
+      ['.flash-agents.json'],
+      'a replaced file is a change even with its mtime restored',
+    )
+
+    // The per-machine file is watched the same way: appearing, changing and disappearing
+    // after start are all changes the warning must name. A fresh pool starts from the
+    // replacement above so only the local file differs here.
+    const local = join(repo, '.flash-agents.local.json')
+    const created = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
+    writeFileSync(local, JSON.stringify({ copyExclude: ['local-dist'] }))
+    assert.deepEqual(created.repoSettingsChanged(), ['.flash-agents.local.json'], 'a local file created after start is a change')
+
+    const edited = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
+    writeFileSync(local, JSON.stringify({ copyExclude: ['local-build'] }))
+    assert.deepEqual(edited.repoSettingsChanged(), ['.flash-agents.local.json'], 'an edited local file is a change')
+
+    const removed = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
+    rmSync(local, { force: true })
+    assert.deepEqual(removed.repoSettingsChanged(), ['.flash-agents.local.json'], 'a removed local file is a change')
+
+    // Both at once are named together, shared first.
+    const both = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1 })
+    writeFileSync(path, JSON.stringify({ copyExclude: ['build'] }))
+    writeFileSync(local, JSON.stringify({ copyExclude: ['local-build'] }))
+    assert.deepEqual(both.repoSettingsChanged(), ['.flash-agents.json', '.flash-agents.local.json'])
 
     rmSync(path, { force: true })
-    assert.equal(stable.repoSettingsChanged(), true, 'a removed file is a change')
+    assert.deepEqual(both.repoSettingsChanged(), ['.flash-agents.json', '.flash-agents.local.json'])
   } finally {
     rmSync(repo, { recursive: true, force: true })
   }
@@ -2212,6 +2238,85 @@ test('slotPathWarning names a long path with a trailing separator, only on Windo
   assert.match(warning, /A short base leaves more room: set the plugin option "state_base" \(or FLASH_STATE_BASE\) to a folder such as C:\\fm/)
   // slotRootPath always adds the separator the advisory counts.
   assert.equal(slotRootPath('/tmp/fm/digest/1/nonce', 0), join('/tmp/fm/digest/1/nonce', 'slots', 'slot-0') + sep)
+})
+
+test('the start line lists exactly the settings layers that applied', () => {
+  const repo = makeRepo()
+  writeFileSync(
+    join(repo, '.flash-agents.json'),
+    JSON.stringify({
+      copyExclude: ['shared-build'],
+      platform: {
+        win32: { slotEnv: { WIN_ONLY: 'value:1' } },
+        linux: { slotEnv: { LINUX_ONLY: 'value:1' } },
+      },
+    }),
+  )
+  writeFileSync(join(repo, '.flash-agents.local.json'), JSON.stringify({ slotEnv: { LOCAL_ONLY: 'value:1' } }))
+  try {
+    const logs = []
+    const isolation = new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, platform: 'win32', log: (line) => logs.push(line) })
+    isolation.close()
+    const lines = logs.filter((line) => line.startsWith('settings: '))
+    assert.deepEqual(lines, [
+      'settings: .flash-agents.json, .flash-agents.json platform.win32, .flash-agents.local.json',
+    ])
+    assert.equal(lines[0].includes('platform.linux'), false, 'only the running platform is a layer')
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
+
+test('a local settings file git would commit is reported once, and an ignored one logs nothing', () => {
+  const repo = makeRepo()
+  const local = join(repo, '.flash-agents.local.json')
+  try {
+    writeFileSync(local, JSON.stringify({ slotEnv: { CARGO_HOME: 'home:cargo' } }))
+    const notIgnored = []
+    new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, log: (line) => notIgnored.push(line) }).close()
+    assert.ok(
+      notIgnored.includes(`${local} is not ignored by git; add .flash-agents.local.json to .gitignore so it is not committed`),
+      `expected the not-ignored warning, got ${JSON.stringify(notIgnored)}`,
+    )
+
+    // With the file ignored, the same setup says nothing about it.
+    writeFileSync(join(repo, '.gitignore'), '.flash-agents.local.json\n')
+    const ignored = []
+    new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, log: (line) => ignored.push(line) }).close()
+    assert.equal(
+      ignored.some((line) => line.includes(`${local} is`)),
+      false,
+      `an ignored local file must log nothing about tracking, got ${JSON.stringify(ignored)}`,
+    )
+
+    // A force-added local file is tracked even though .gitignore names it.
+    execFileSync('git', ['add', '-f', local], { cwd: repo })
+    const tracked = []
+    new WorkspaceIsolation({ root: repo, baseDir: STATE_BASE, slots: 1, log: (line) => tracked.push(line) }).close()
+    assert.ok(
+      tracked.includes(
+        `${local} is tracked by git, but it is meant for one machine; remove it from the index and add it to .gitignore`,
+      ),
+      `expected the tracked warning, got ${JSON.stringify(tracked)}`,
+    )
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
+
+  // A root that is not a git work tree has no index to warn about.
+  const plain = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-plain-settings-')))
+  try {
+    writeFileSync(join(plain, '.flash-agents.local.json'), JSON.stringify({ copyExclude: ['dist'] }))
+    const logs = []
+    new WorkspaceIsolation({ root: plain, baseDir: STATE_BASE, slots: 1, log: (line) => logs.push(line) }).close()
+    assert.equal(
+      logs.some((line) => line.includes('is not ignored by git') || line.includes('is tracked by git')),
+      false,
+      `a non-git root logs nothing about tracking, got ${JSON.stringify(logs)}`,
+    )
+  } finally {
+    rmSync(plain, { recursive: true, force: true })
+  }
 })
 
 test('the settings warning sentence is the one the service returns', () => {

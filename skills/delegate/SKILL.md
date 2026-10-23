@@ -77,16 +77,23 @@ non-default model while the installed profile predates 0.1.6; the error says to 
    semantic core twice (§1). When `change.diffTruncated` is true, read the rest with `flash_patch`
    (by file or by page) before applying. A patch that no longer applies because a file moved
    meanwhile takes `flash_apply` with `threeWay: true`; it merges without touching the index and
-   names any conflicts. `flash_apply` and `flash_patch` report `drift` (`commitsBehind`, and
-   `filesChangedSince`: the patch's own files you changed in the tree since the copy was made), and
-   an apply that would delete or rename away one of those files is refused unless you pass
+   names any conflicts. To land only part of a patch, pass `files` with names from
+   `change.filesChanged` (a rename by its old or its new path): each file is recorded as it lands,
+   so the rest can follow later, and a whole apply after a partial one is refused with the count
+   unless you pass `force: true`. `flash_apply` and `flash_patch` report `drift` (`commitsBehind`,
+   and `filesChangedSince`: the patch's own files you changed in the tree since the copy was made),
+   and an apply that would delete or rename away one of those files is refused unless you pass
    `threeWay: true` (merges and keeps the edit, marking conflicts) or `force: true` (discards it).
    A worker that reports
    green has still only tested its copy, and
    "no warnings in the files I created" says nothing about the files it changed.
 5. **Review independently.** Send the diff to a **read-only** worker with the review template
    (§5). A read-only worker cannot build or run tests — both write. When the review must, send it
-   as a writing call with `apply: "discard"`: it runs in a throwaway copy and stores nothing. Merge its findings with yours; keep only what you can confirm from the code.
+   as a writing call with `apply: "none"` (the default): it runs in a throwaway copy and stores its
+   change as a patch, so its proof tests survive. Read them with `flash_patch`, then `flash_apply`
+   with `files` naming only the test files — they become the fix round's failing-first tests. Use
+   `apply: "discard"` when nothing is to be kept. Merge its findings with yours; keep only what you
+   can confirm from the code.
 6. **Fix round.** One task carrying every confirmed defect, each with "add a test that fails
    before and passes after". Apply, verify, review again. Stop when a review pass finds nothing
    real. Expect one to two rounds; three means the slice was framed badly — reframe it.
@@ -139,8 +146,10 @@ Rules that held up:
   `.flash-agents.json` can leave `target/` out of the copy and keep a warm per-slot one instead
   (`"slotEnv": { "CARGO_TARGET_DIR": "cache:cargo-target" }`), and give tools that write to the
   home folder a writable one (see the README's per-repository settings). A setting the whole
-  project shares — a prebuilt OpenSSL, `RUSTC_WRAPPER` — belongs there too as
-  `"NAME": "value:<text>"`, not repeated in every brief. A project whose tests
+  project shares — `RUSTC_WRAPPER` — belongs there too as
+  `"NAME": "value:<text>"`, not repeated in every brief; a path only one machine has, such as a
+  prebuilt OpenSSL, belongs in a git-ignored `.flash-agents.local.json` beside it, under
+  `platform.<name>` when it is that platform's business. A project whose tests
   need an environment built inside the copy (a Python venv with editable installs, `node_modules`)
   can have it built once per slot with `slotSetup`; ask the user before enabling it, because those
   commands run outside the sandbox. Keep the recipe in project memory so every task carries it verbatim.
@@ -196,6 +205,13 @@ changes for existing callers (have it grep the call sites and say whether each s
 assertions that do not match the code. Require file:line, a triggering input, and a confidence
 (confirmed by tracing the path / plausible), and an explicit "none found" per category. No style
 remarks. Then confirm each finding yourself before it enters a fix round.
+
+When the review should arrive with proof, ask for one failing test per finding and run it as a
+writing call with `apply: "none"` (the default) — a read-only call cannot write a test file. The
+patch that comes back is the evidence: read it with `flash_patch`, then `flash_apply` it with
+`files` naming only those test files. They fail against today's code, which is exactly what the fix
+round's "fails before and passes after" needs, and the fix round then makes them pass. Keep
+`apply: "discard"` for a review whose change is only read, never kept.
 
 ## 6. Budgets and what to expect
 

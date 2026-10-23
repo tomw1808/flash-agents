@@ -37,7 +37,7 @@ import { DEFAULT_MODEL, FlashTaskService, readTaskFile, taskLabel } from './serv
 import { DEFAULT_INITIALIZE_TIMEOUT_MS, resolveDshCommand } from './sdk.js'
 import { JobRegistry, JOB_TOOLS } from './jobs.js'
 import { allowedModels, loadConfig } from './config.js'
-import { FLASH_MCP_VERSION, formatChecks, profileVersionWarnings, resolveDshHome, runChecks } from './doctor.js'
+import { FLASH_MCP_VERSION, formatChecks, profileVersionWarning, resolveDshHome, runChecks } from './doctor.js'
 import { WorkspaceIsolation, cleanLayout, requireAbsoluteStateBase } from './isolation.js'
 
 /** The repository root this server runs from, named in the profile-stamp warning. */
@@ -188,7 +188,7 @@ export function listTools(models = [DEFAULT_MODEL]) {
           source: {
             type: 'string',
             enum: ['working-tree', 'head'],
-            description: 'What the disposable copy starts from. "working-tree" (the default) copies your tree as it is, uncommitted edits included, and the result lists them under isolation.uncommittedAtStart. "head" starts from the last commit (ignored files such as dependencies and build output are kept), for a call that must not pick up uncommitted work — for instance another session\'s, in the same tree.',
+            description: 'What the disposable copy starts from. "working-tree" (the default) copies your tree as it is, uncommitted edits included, and the result lists them under isolation.uncommittedAtStart. "head" starts from the last commit (ignored files such as dependencies and build output are kept), for a call that must not pick up uncommitted work — for instance another session\'s, in the same tree. "head" applies to writing calls only: a read-only call runs in your tree, not in a copy, so it is refused there.',
           },
           basePatch: {
             type: 'string',
@@ -277,7 +277,7 @@ export function listTools(models = [DEFAULT_MODEL]) {
           source: {
             type: 'string',
             enum: ['working-tree', 'head'],
-            description: 'What the shared copy starts from: "working-tree" (the default, uncommitted edits included) or "head" (the last commit, ignored files kept).',
+            description: 'What the shared copy starts from: "working-tree" (the default, uncommitted edits included) or "head" (the last commit, ignored files kept). "head" applies to writing calls only: a read-only call runs in your tree, not in a copy, so it is refused there.',
           },
           basePatch: {
             type: 'string',
@@ -320,6 +320,8 @@ export function listTools(models = [DEFAULT_MODEL]) {
         'was already applied is refused; pass `force: true` to apply it again anyway. Patches do not',
         'cross repositories: one computed for another root is refused.',
         '',
+        'A review run with `apply: "none"` can hand its proof tests over with `files`.',
+        '',
         'A patch whose surrounding lines moved meanwhile — another session edited or committed the',
         'same file while the worker ran — fails a plain apply. Pass `threeWay: true` to merge it',
         'instead: the plain apply is still tried first, and the merge uses the base the worker',
@@ -337,6 +339,11 @@ export function listTools(models = [DEFAULT_MODEL]) {
           patchId: {
             type: 'string',
             description: 'The change.patchId from the result of the call whose work should be applied, or a unique prefix of it (at least 8 hex digits, with or without the `flash-` prefix).',
+          },
+          files: {
+            type: 'array',
+            items: { type: 'string' },
+            description: "Optional: apply only these files' sections, named as in change.filesChanged (a rename by either its old or its new path). The stored patch is unchanged; a partial apply is recorded per file, so the rest can follow later.",
           },
           dryRun: {
             type: 'boolean',
@@ -692,13 +699,15 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
    * the synchronous path answers it, so a bad model never becomes a failed job.
    */
   const startJob = (name, args) => {
-    // A background call answers before the service runs, so the model refusals a
-    // synchronous call raises from its own path have to be raised here: otherwise an
-    // unlisted model, or a non-default one on an old profile, would start a job and only
-    // fail in `flash_result` minutes later. A stand-in service without the check is
-    // accepted, exactly as the dispatcher accepts one without a real runtime.
+    // A background call answers before the service runs, so every refusal a synchronous
+    // call raises from argument validation has to be raised here: otherwise a bad model,
+    // both `task` and `taskFile`, an unreadable file or a refused `source` would start a
+    // job and only fail in `flash_result` seconds later. Only validation moves — anything
+    // that needs a slot or a runtime still runs inside the job. A stand-in service without
+    // the full check is accepted, exactly as the dispatcher accepts one without a runtime.
     try {
-      service.checkModel?.(args, name)
+      if (typeof service.checkArguments === 'function') service.checkArguments(args, name)
+      else service.checkModel?.(args, name)
     } catch (error) {
       log(`${name} failed: ${describeError(error)}`)
       return errorResult(`${name} failed: ${describeError(error)}`)
@@ -1039,25 +1048,49 @@ export function createService(options, log = () => {}, { deferStartupSweep = fal
   // flash_task and flash_batch result. `doctor --e2e` builds the same service but must
   // read no real harness home, so it does not set the flag: handing in an environment is
   // not the same request as asking to inspect the profiles installed in it.
+  //
+  // The verdicts are kept per profile, not as one flat list, because a runtime that boots
+  // later re-reads its own profile's stamp (see `#ensureRuntime`) and a result carries the
+  // verdict of the runtime that served it. The start lines stay exactly as they were.
   const startupWarnings = []
+  const profileStampWarnings = new Map()
+  const readProfileStampWarning =
+    options?.profileStampReader ??
+    ((name) =>
+      profileVersionWarning({
+        dshHome: resolveDshHome(options?.env?.DSH_HOME, options?.home ?? homedir()),
+        profile: name,
+        pluginFolder: REPO_ROOT,
+      }))
   // Without an environment there is no `DSH_HOME` to resolve, and falling back to the
   // process's own home would read the real `~/.dsh` on a caller that never named one.
-  if (options?.checkProfileStamp === true && options.env !== undefined) {
-    const warnings = profileVersionWarnings({
-      dshHome: resolveDshHome(options.env?.DSH_HOME, options?.home ?? homedir()),
-      profile: options?.profile ?? 'flash-service',
-      pluginFolder: REPO_ROOT,
-    })
-    for (const warning of warnings) {
+  const checkProfileStamp = options?.checkProfileStamp === true && options.env !== undefined
+  if (checkProfileStamp) {
+    const profile = options?.profile ?? 'flash-service'
+    const names = profile.endsWith('-readonly') ? [profile] : [profile, `${profile}-readonly`]
+    for (const name of names) {
+      let warning
+      try {
+        warning = readProfileStampWarning(name)
+      } catch (error) {
+        // A reader that throws has not established a stale profile; it has established
+        // nothing. The start still succeeds, the verdict is unknown (no warning), and the
+        // one log line says why — the same choice `#refreshProfileStamp` makes later.
+        warning = undefined
+        log(`could not read the ${name} profile stamp: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      profileStampWarnings.set(name, warning)
       // One line per stale profile at start: the operator sees the drift before the first
-      // call, and the same sentence comes back in flash_task/flash_batch results while it holds.
-      log(warning)
-      startupWarnings.push(warning)
+      // call, and the same sentence comes back from the runtime that profile boots.
+      if (warning !== undefined) log(warning)
     }
   }
   return new FlashTaskService({
     ...options,
     startupWarnings,
+    checkProfileStamp,
+    profileStampWarnings,
+    ...(checkProfileStamp ? { profileStampReader: readProfileStampWarning } : {}),
     // The service's allowlist always holds its own default first, whichever door named it
     // (`route.models`, FLASH_MODELS, or --model).
     models: modelChoices(options?.model, options?.models),
@@ -1112,6 +1145,9 @@ const STARTUP_SWEEP_FALLBACK_MS = 5_000
  *   sibling lookup; injectable so a start-log test needs no real nvm layout.
  * @param {(message: string) => void} [timing.log] - extra diagnostic sink, so a test can
  *   read the start log without capturing the process's stderr.
+ * @param {() => number} [timing.uptimeMs] - how long the process has been running, measured
+ *   from process start rather than from module load (default `process.uptime()`); injectable
+ *   so the initialize timing can be pinned without waiting.
  * @returns {{service: FlashTaskService, connection: {close: () => void}, done: Promise<void>}}
  */
 export function startServer(
@@ -1125,6 +1161,7 @@ export function startServer(
     execPath = process.execPath,
     listDir,
     log: extraLog,
+    uptimeMs = () => process.uptime() * 1000,
   } = {},
 ) {
   const logFile =
@@ -1158,6 +1195,16 @@ export function startServer(
     }
   }
   const environment = env ?? options.env ?? process.env
+  // First line once the sink exists, before `createService` can spend seconds sweeping or
+  // throw: a client that never connects must still be distinguishable from a server that
+  // never started. The root is named as the caller gave it, because that is what the log
+  // reader can compare with their own command line; a server started without one uses cwd.
+  const rootAsGiven =
+    typeof options?.root === 'string' && options.root.length > 0 ? options.root : process.cwd()
+  log(
+    `start pid ${String(process.pid)}; flash-agents ${FLASH_MCP_VERSION}; node ${process.versions.node}; ` +
+      `${platform}; root ${rootAsGiven}`,
+  )
   // Only the server checks the installed profile stamps: it is the long-lived process whose
   // results carry the warning, and the operator starts it against their real harness home.
   const service = createService({ ...options, env: environment, platform, checkProfileStamp: true }, log, {
@@ -1210,6 +1257,16 @@ export function startServer(
   }
 
   const models = modelChoices(service.model, service.models)
+  // Answered, not merely connected: this is the fact a user could not see when a client
+  // spent four hours deciding not to connect. The measurement starts at process start,
+  // not module load, so a slow module graph is part of what the number reports.
+  let initializeLogged = false
+  const logInitializeAnswered = () => {
+    if (initializeLogged) return
+    initializeLogged = true
+    const elapsed = Math.max(0, Math.round(Number(uptimeMs()) || 0))
+    log(`answered initialize ${String(elapsed)} ms after the process started`)
+  }
   const connection = serveStdio({
     serverInfo: SERVER_INFO,
     instructions: instructionsFor(models),
@@ -1218,6 +1275,7 @@ export function startServer(
     input,
     output,
     callTool: createToolCaller({ service, jobs: new JobRegistry({ log }), log }),
+    onInitializeAnswered: logInitializeAnswered,
     onInitialized: () => startStartupWork('after initialize'),
   })
   // Unref'd: the fallback must never be the reason a finished process stays alive.

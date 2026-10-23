@@ -125,15 +125,41 @@ const SLOT_CACHE = '.flash-cache'
 const SETTINGS_FILE = '.flash-agents.json'
 
 /**
- * The warning a call carries when `.flash-agents.json` changed after this server read it.
+ * The per-machine settings file at the same root, meant to be git-ignored.
  *
- * The file is read once, when the pool is constructed, because its settings describe the
+ * The shared file is committed, but some settings belong to one computer: a prebuilt
+ * OpenSSL lives at a path only that machine has. This file has the shared file's exact
+ * shape, is layered over it, and is checked at start so a machine-local file cannot quietly
+ * be committed for every checkout.
+ */
+const LOCAL_SETTINGS_FILE = '.flash-agents.local.json'
+
+/**
+ * The platform names a `platform` section may name, the same spellings `process.platform`
+ * uses. A section for any other name is a typo and is named in the log rather than kept.
+ */
+const PLATFORM_NAMES = new Set(['aix', 'android', 'darwin', 'freebsd', 'linux', 'openbsd', 'sunos', 'win32'])
+
+/**
+ * The warning for one settings file that changed after this server read it.
+ *
+ * The files are read once, when the pool is constructed, because their settings describe the
  * repository rather than the call and every copy would otherwise pay for a re-read. A file
  * edited afterwards is therefore not applied by the running server; saying so on every call
  * is the only way the edit is not simply ignored until someone happens to reconnect.
+ *
+ * @param {string} file - the settings file name, as the caller knows it.
+ * @returns {string} the warning naming that file.
  */
-export const SETTINGS_CHANGED_WARNING =
-  '.flash-agents.json changed after this server started; its new settings take effect after a reconnect (/mcp reconnect plugin:flash-agents:flash)'
+export function settingsChangedWarning(file) {
+  return `${file} changed after this server started; its new settings take effect after a reconnect (/mcp reconnect plugin:flash-agents:flash)`
+}
+
+/**
+ * The warning a call carries when the shared settings file changed after this server read it.
+ * Kept as a constant because that is the sentence earlier releases returned.
+ */
+export const SETTINGS_CHANGED_WARNING = settingsChangedWarning(SETTINGS_FILE)
 
 /**
  * How long a Windows slot root may be before tools without long-path support can fail.
@@ -1833,13 +1859,37 @@ function gitAllowFailure(args, cwd, env = process.env) {
  * exist, so an ordinary patch's record keeps its previous shape and a record written before
  * these fields existed stays readable.
  *
+ * `baseParent` is the one fact that exists only in the disposable copy: the base commit's
+ * parent is the caller's HEAD at copy time, and the copy is emptied after the call. A
+ * record that did not persist it reported `commitsBehind: null` after a restart, so it is
+ * written whenever it names a commit. `appliedFiles` is written once a partial apply has
+ * recorded its files; a record without one keeps its old shape.
+ *
  * @param {object} record - the record to store.
  * @returns {void}
  */
 function writePatchMeta(record) {
-  const { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt, salvagedFrom, preimage, task, finalMessage, finalMessageTruncated } =
-    record
+  const {
+    patchId,
+    root,
+    base,
+    baseParent,
+    filesChanged,
+    diffstat,
+    createdAt,
+    appliedAt,
+    appliedFiles,
+    salvagedFrom,
+    preimage,
+    task,
+    finalMessage,
+    finalMessageTruncated,
+  } = record
   const meta = { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt }
+  // The parent commit is the caller's HEAD at copy time. It is persisted exactly when it
+  // is known, because a record read after a restart has no copy left to resolve it from.
+  if (typeof baseParent === 'string' && baseParent.length > 0) meta.baseParent = baseParent
+  if (Array.isArray(appliedFiles) && appliedFiles.length > 0) meta.appliedFiles = [...new Set(appliedFiles)].sort()
   if (salvagedFrom !== undefined) meta.salvagedFrom = salvagedFrom
   // Persisted only for a nested repository, so a whole-root record keeps its old shape and
   // a restarted service still applies a scoped patch inside the repository it came from.
@@ -2500,76 +2550,218 @@ function matchesExclude(relPath, name, exclude) {
 }
 
 /**
- * Read the per-repository settings file, one bad key at a time.
+ * Read one settings object, one bad key at a time.
  *
  * A settings file is convenience configuration, not a contract: an unknown key, a value of
  * the wrong type or a file that is not JSON at all is named in one log line and ignored, so
- * a typo cannot keep the service from starting. A file that does not exist is simply the
- * common case.
+ * a typo cannot keep the service from starting. The label names both the file and, for a
+ * section, the platform, so a line like `.flash-agents.local.json platform.win32: …` says
+ * exactly where the typo is.
  *
- * @param {string} root - the service root.
+ * @param {object} parsed - a plain settings object.
+ * @param {string} label - the file and section these keys came from.
  * @param {(message: string) => void} log - where to name a problem.
  * @returns {{copyExclude?: string[], copyExcludeDefaults?: boolean, slotEnv?: object,
  *   slotSetup?: object[]}} the settings that did pass.
  */
-function readRepoSettings(root, log) {
-  const path = join(root, SETTINGS_FILE)
-  let raw
-  try {
-    raw = readFileSync(path, 'utf8')
-  } catch (error) {
-    if (error?.code !== 'ENOENT') log(`ignoring ${path}: ${messageOf(error)}`)
-    return {}
-  }
-  let parsed
-  try {
-    parsed = JSON.parse(raw)
-  } catch (error) {
-    log(`ignoring ${path}: it is not valid JSON (${messageOf(error)})`)
-    return {}
-  }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    log(`ignoring ${path}: the settings must be a JSON object`)
-    return {}
-  }
+function readSettingsObject(parsed, label, log) {
   const settings = {}
   for (const [key, value] of Object.entries(parsed)) {
     if (key === 'copyExclude') {
       if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string')) {
-        log(`${path}: copyExclude must be an array of strings; ignoring it`)
+        log(`${label}: copyExclude must be an array of strings; ignoring it`)
         continue
       }
       settings.copyExclude = value
     } else if (key === 'copyExcludeDefaults') {
       if (typeof value !== 'boolean') {
-        log(`${path}: copyExcludeDefaults must be true or false; ignoring it`)
+        log(`${label}: copyExcludeDefaults must be true or false; ignoring it`)
         continue
       }
       settings.copyExcludeDefaults = value
     } else if (key === 'slotEnv') {
-      if (value === null || typeof value !== 'object' || Array.isArray(value) || !Object.values(value).every((entry) => typeof entry === 'string')) {
-        log(`${path}: slotEnv must be an object of string values; ignoring it`)
+      // `null` is accepted here because a later layer uses it to remove an earlier entry;
+      // the merge drops it. A pool option, which has no earlier layers, does not accept it.
+      if (
+        value === null ||
+        typeof value !== 'object' ||
+        Array.isArray(value) ||
+        !Object.values(value).every((entry) => typeof entry === 'string' || entry === null)
+      ) {
+        log(`${label}: slotEnv must be an object of string values; ignoring it`)
         continue
       }
       settings.slotEnv = value
     } else if (key === 'slotSetup') {
       if (!Array.isArray(value)) {
-        log(`${path}: slotSetup must be an array of setup steps; ignoring it`)
+        log(`${label}: slotSetup must be an array of setup steps; ignoring it`)
         continue
       }
       const steps = []
       for (const [index, entry] of value.entries()) {
-        const step = readSetupStep(entry, `${path}: slotSetup[${String(index)}]`, log)
+        const step = readSetupStep(entry, `${label}: slotSetup[${String(index)}]`, log)
         if (step !== undefined) steps.push(step)
       }
       // A setting whose every entry was refused is not a setting at all: keeping an empty
       // array would make the server announce a setup that can never run.
       if (steps.length > 0) settings.slotSetup = steps
     } else {
-      log(`${path}: ${key} is not a known setting; ignoring it`)
+      log(`${label}: ${key} is not a known setting; ignoring it`)
     }
   }
   return settings
+}
+
+/**
+ * Read the `platform` sections of one settings file.
+ *
+ * Every known section is validated, because a typo in the section for another machine is
+ * still worth naming when the file is read; only the section for the running platform is
+ * kept, and the caller applies it. Unknown names, sections that are not objects and a
+ * `platform` key nested inside a section are all named and dropped.
+ *
+ * @param {unknown} value - the raw value of the top-level `platform` key.
+ * @param {string} label - the file name, for the log line.
+ * @param {(message: string) => void} log - where to name a problem.
+ * @returns {Map<string, object>} accepted sections, by platform name.
+ */
+function readPlatformSections(value, label, log) {
+  const sections = new Map()
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    log(`${label}: platform must be an object keyed by process.platform name; ignoring it`)
+    return sections
+  }
+  for (const [name, section] of Object.entries(value)) {
+    if (!PLATFORM_NAMES.has(name)) {
+      log(`${label}: platform.${name} is not a known platform; ignoring it`)
+      continue
+    }
+    if (section === null || typeof section !== 'object' || Array.isArray(section)) {
+      log(`${label} platform.${name}: the platform section must be an object; ignoring it`)
+      continue
+    }
+    sections.set(name, readSettingsObject(section, `${label} platform.${name}`, log))
+  }
+  return sections
+}
+
+/**
+ * Read one settings file and parse its top-level keys and platform sections.
+ *
+ * A file that does not exist is simply the common case and is not a problem. A file that
+ * exists but cannot be read or parsed is named and contributes nothing, while `present`
+ * still records that it exists so the caller can tell it from no file at all.
+ *
+ * @param {string} path - absolute path to the file.
+ * @param {string} label - the file name the log lines should use.
+ * @param {(message: string) => void} log - where to name a problem.
+ * @returns {{present: boolean, settings: object, sections: Map<string, object>}} the file's
+ *   accepted top-level settings and platform sections.
+ */
+function readSettingsFile(path, label, log) {
+  let raw
+  try {
+    raw = readFileSync(path, 'utf8')
+  } catch (error) {
+    if (error?.code !== 'ENOENT') log(`ignoring ${path}: ${messageOf(error)}`)
+    return { present: error?.code !== 'ENOENT', settings: {}, sections: new Map() }
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    log(`ignoring ${path}: it is not valid JSON (${messageOf(error)})`)
+    return { present: true, settings: {}, sections: new Map() }
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    log(`ignoring ${path}: the settings must be a JSON object`)
+    return { present: true, settings: {}, sections: new Map() }
+  }
+  let settings = {}
+  let sections = new Map()
+  for (const [key, value] of Object.entries(parsed)) {
+    if (key === 'platform') {
+      sections = readPlatformSections(value, label, log)
+    } else {
+      // Keep the top-level keys separate from `platform`; the same reader validates both.
+      settings = { ...settings, ...readSettingsObject({ [key]: value }, label, log) }
+    }
+  }
+  return { present: true, settings, sections }
+}
+
+/**
+ * Read the shared and per-machine settings files and layer them for this platform.
+ *
+ * Layers, lowest first: `.flash-agents.json`, its `platform.<current>` section,
+ * `.flash-agents.local.json`, its `platform.<current>` section. The pool options are
+ * applied later by `mergeSlotEnv` and the constructor. Lists append in that order and the
+ * last `copyExcludeDefaults` wins; `slotEnv` is merged there too, by variable name.
+ *
+ * @param {string} root - the service root.
+ * @param {(message: string) => void} log - where to name a problem.
+ * @param {object} [options] - platform selection, injected by tests.
+ * @param {string} [options.platform] - `process.platform`; chooses the sections to apply.
+ * @returns {{present: boolean, layers: string[], copyExclude: string[],
+ *   copyExcludeDefaults?: boolean, slotEnvLayers: {label: string, values: object}[],
+ *   slotSetup: object[]}} the accepted layers, in order.
+ */
+function readRepoSettings(root, log, { platform = process.platform } = {}) {
+  const result = {
+    present: false,
+    layers: [],
+    copyExclude: [],
+    copyExcludeDefaults: undefined,
+    slotEnvLayers: [],
+    slotSetup: [],
+  }
+  /** Whether some accepted key actually applies, so an empty layer is not announced. */
+  const isLayerPresent = (settings) =>
+    (settings.copyExclude?.length ?? 0) > 0 ||
+    settings.copyExcludeDefaults !== undefined ||
+    Object.keys(settings.slotEnv ?? {}).length > 0 ||
+    (settings.slotSetup?.length ?? 0) > 0
+  const addLayer = (label, settings) => {
+    if (!isLayerPresent(settings)) return
+    result.layers.push(label)
+    if (settings.copyExclude !== undefined) result.copyExclude.push(...settings.copyExclude)
+    // The last layer that sets it wins, including a platform section over its own file.
+    if (settings.copyExcludeDefaults !== undefined) result.copyExcludeDefaults = settings.copyExcludeDefaults
+    if (settings.slotEnv !== undefined) result.slotEnvLayers.push({ label, values: settings.slotEnv })
+    if (settings.slotSetup !== undefined) result.slotSetup.push(...settings.slotSetup)
+  }
+  for (const file of [SETTINGS_FILE, LOCAL_SETTINGS_FILE]) {
+    const parsed = readSettingsFile(join(root, file), file, log)
+    if (parsed.present) result.present = true
+    addLayer(file, parsed.settings)
+    const section = parsed.sections.get(platform)
+    if (section !== undefined) addLayer(`${file} platform.${platform}`, section)
+  }
+  return result
+}
+
+/**
+ * Say once, at start, when the per-machine settings file git would commit anyway.
+ *
+ * The local file is meant for one computer, so a tracked one is a mistake that would leak
+ * a machine-specific path into every checkout, and an untracked, unignored one is one
+ * `git add -A` away from the same. The check only makes sense inside a git work tree; a
+ * plain directory has no index and no .gitignore and logs nothing. `git check-ignore`
+ * positive means ignored; the tracked check comes first because a force-added file is also
+ * ignored.
+ *
+ * @param {string} root - the service root.
+ * @param {string} path - absolute path to `.flash-agents.local.json`.
+ * @param {(message: string) => void} log - where to say it.
+ * @returns {void}
+ */
+function warnLocalSettingsTracking(root, path, log) {
+  if (!existsSync(path) || !isGitWorkTree(root)) return
+  if (gitTracksUnder(root, LOCAL_SETTINGS_FILE)) {
+    log(`${path} is tracked by git, but it is meant for one machine; remove it from the index and add it to .gitignore`)
+  } else if (!gitCheckIgnore(root, LOCAL_SETTINGS_FILE)) {
+    log(`${path} is not ignored by git; add .flash-agents.local.json to .gitignore so it is not committed`)
+  }
 }
 
 /**
@@ -2655,26 +2847,44 @@ function normalizeRepoPath(raw) {
 }
 
 /**
- * Merge the per-slot environment from the file and the pool options, validating each entry.
+ * Merge the per-slot environment over every settings layer and the pool options,
+ * validating each entry.
  *
- * Options are applied last, so a pool option wins per variable. A name that may not be
- * redirected (see FORBIDDEN_SLOT_ENV and LOADER_SLOT_ENV), a value that is not
- * `home:<name>`, `cache:<name>`, `port:<base>[/<stride>]` or `value:<text>`, a `<name>` that
- * is not one path segment, a `value:` over the Windows limit or holding a NUL, or a port
- * range whose highest slot would not fit below 65536 is named and dropped; the entry never
- * makes it into the environment the worker boots with.
+ * Layers are applied lowest first, so a later file, a platform section or a pool option
+ * wins per variable. Windows environment names are case-insensitive and Linux's are not,
+ * so the merge folds case only on `win32`: there `Path` replaces `PATH`, elsewhere both
+ * stay. A `null` value in a later file layer removes the entry from the earlier layers (in
+ * the first layer it is a no-op); an option may not use `null`.
  *
- * @param {object} fromFile - the `slotEnv` object from the settings file, if any.
+ * A name that may not be redirected (see FORBIDDEN_SLOT_ENV and LOADER_SLOT_ENV), a value
+ * that is not `home:<name>`, `cache:<name>`, `port:<base>[/<stride>]` or `value:<text>`, a
+ * `<name>` that is not one path segment, a `value:` over the Windows limit or holding a
+ * NUL, or a port range whose highest slot would not fit below 65536 is named with its file
+ * and section and dropped; the entry never makes it into the environment the worker boots
+ * with.
+ *
+ * @param {{label: string, values: object}[]} fromLayers - each settings layer's `slotEnv`,
+ *   lowest first.
  * @param {unknown} fromOptions - the `slotEnv` pool option, if any.
  * @param {(message: string) => void} log - where to name a rejected entry.
  * @param {number} slotCount - how many slots the pool has, for the highest-port check.
+ * @param {object} [options] - platform details, injected by tests.
+ * @param {string} [options.platform] - `process.platform`; decides the name case rule.
  * @returns {Record<string, {kind: 'home' | 'cache', segment: string} |
  *   {kind: 'port', base: number, stride: number} | {kind: 'value', value: string}>} the
  *   accepted entries.
  */
-function mergeSlotEnv(fromFile, fromOptions, log, slotCount) {
+function mergeSlotEnv(fromLayers, fromOptions, log, slotCount, { platform = process.platform } = {}) {
   const merged = {}
-  const apply = (source, label) => {
+  // On Windows a worker sees `Path` and `PATH` as one variable, so a later layer has to
+  // find and replace the earlier spelling instead of creating a second entry.
+  const folded = (name) => (platform === 'win32' ? name.toLowerCase() : name)
+  const existingKey = (name) => {
+    if (platform !== 'win32') return Object.hasOwn(merged, name) ? name : undefined
+    const key = folded(name)
+    return Object.keys(merged).find((candidate) => folded(candidate) === key)
+  }
+  const apply = (source, label, { allowNull }) => {
     if (source === undefined || source === null) return
     if (typeof source !== 'object' || Array.isArray(source)) {
       log(
@@ -2683,20 +2893,31 @@ function mergeSlotEnv(fromFile, fromOptions, log, slotCount) {
       return
     }
     for (const [name, value] of Object.entries(source)) {
+      const existing = existingKey(name)
+      if (value === null) {
+        if (allowNull) {
+          if (existing !== undefined) delete merged[existing]
+          continue
+        }
+        // An option has no earlier layer to remove from, so `null` is not a value there.
+        log(`ignoring ${label}.${name}: expected "home:<name>", "cache:<name>", "port:<base>[/<stride>]" or "value:<text>", got null`)
+        continue
+      }
       // Windows environment names are case-insensitive, and a worker on that platform sees
       // `Home` and `HOME` as the same variable; the check has to fold case the same way.
       const upper = name.toUpperCase()
       if (FORBIDDEN_SLOT_ENV.has(upper)) {
-        log(`not redirecting ${name} for the worker: the runtime's sandbox and toolchains depend on it`)
+        log(`ignoring ${label}.${name}: not redirecting ${name} for the worker: the runtime's sandbox and toolchains depend on it`)
         continue
       }
       // A plain value would reach the runtime process itself, which runs outside the
       // worker's sandbox, so a name that decides which program runs or how code is loaded
       // is refused for every kind — `home:` and `cache:` included, as before.
       if (LOADER_SLOT_ENV.has(upper) || upper.startsWith('LD_') || upper.startsWith('DYLD_')) {
-        log(`not redirecting ${name} for the worker: it changes how the runtime loads programs`)
+        log(`ignoring ${label}.${name}: not redirecting ${name} for the worker: it changes how the runtime loads programs`)
         continue
       }
+      let accepted
       if (typeof value === 'string' && value.startsWith(SLOT_ENV_TEXT)) {
         // Everything after the first `value:` is the variable's text, verbatim: a Windows
         // path, another `:`-bearing value and an empty value are all legitimate.
@@ -2712,49 +2933,53 @@ function mergeSlotEnv(fromFile, fromOptions, log, slotCount) {
           )
           continue
         }
-        merged[name] = { kind: 'value', value: text }
-        continue
-      }
-      const match = typeof value === 'string' ? SLOT_ENV_VALUE.exec(value) : null
-      if (match !== null) {
-        if (!isPathSegment(match[2])) {
-          log(`ignoring ${label}.${name}: expected "home:<name>" or "cache:<name>" with one path segment, got ${JSON.stringify(value)}`)
-          continue
+        accepted = { kind: 'value', value: text }
+      } else {
+        const match = typeof value === 'string' ? SLOT_ENV_VALUE.exec(value) : null
+        if (match !== null) {
+          if (!isPathSegment(match[2])) {
+            log(`ignoring ${label}.${name}: expected "home:<name>" or "cache:<name>" with one path segment, got ${JSON.stringify(value)}`)
+            continue
+          }
+          accepted = { kind: match[1], segment: match[2] }
+        } else {
+          const port = typeof value === 'string' ? PORT_ENV_VALUE.exec(value) : null
+          if (port === null) {
+            log(
+              `ignoring ${label}.${name}: expected "home:<name>", "cache:<name>", "port:<base>[/<stride>]" or "value:<text>", ` +
+                `got ${JSON.stringify(value)}`,
+            )
+            continue
+          }
+          const base = Number(port[1])
+          const stride = port[2] === undefined ? PORT_STRIDE_DEFAULT : Number(port[2])
+          if (!Number.isInteger(base) || base < PORT_BASE_MIN || base > PORT_BASE_MAX) {
+            log(`ignoring ${label}.${name}: the port base must be a whole number in ${String(PORT_BASE_MIN)}..${String(PORT_BASE_MAX)}, got ${String(base)}`)
+            continue
+          }
+          if (!Number.isInteger(stride) || stride < PORT_STRIDE_MIN || stride > PORT_STRIDE_MAX) {
+            log(`ignoring ${label}.${name}: the port stride must be a whole number in ${String(PORT_STRIDE_MIN)}..${String(PORT_STRIDE_MAX)}, got ${String(stride)}`)
+            continue
+          }
+          const highest = base + (slotCount - 1) * stride
+          if (highest > PORT_BASE_MAX) {
+            log(
+              `ignoring ${label}.${name}: port:${String(base)}/${String(stride)} reaches ${String(highest)} at slot ${String(slotCount - 1)}, ` +
+                `past ${String(PORT_BASE_MAX)}`,
+            )
+            continue
+          }
+          accepted = { kind: 'port', base, stride }
         }
-        merged[name] = { kind: match[1], segment: match[2] }
-        continue
       }
-      const port = typeof value === 'string' ? PORT_ENV_VALUE.exec(value) : null
-      if (port === null) {
-        log(
-          `ignoring ${label}.${name}: expected "home:<name>", "cache:<name>", "port:<base>[/<stride>]" or "value:<text>", ` +
-            `got ${JSON.stringify(value)}`,
-        )
-        continue
-      }
-      const base = Number(port[1])
-      const stride = port[2] === undefined ? PORT_STRIDE_DEFAULT : Number(port[2])
-      if (!Number.isInteger(base) || base < PORT_BASE_MIN || base > PORT_BASE_MAX) {
-        log(`ignoring ${label}.${name}: the port base must be a whole number in ${String(PORT_BASE_MIN)}..${String(PORT_BASE_MAX)}, got ${String(base)}`)
-        continue
-      }
-      if (!Number.isInteger(stride) || stride < PORT_STRIDE_MIN || stride > PORT_STRIDE_MAX) {
-        log(`ignoring ${label}.${name}: the port stride must be a whole number in ${String(PORT_STRIDE_MIN)}..${String(PORT_STRIDE_MAX)}, got ${String(stride)}`)
-        continue
-      }
-      const highest = base + (slotCount - 1) * stride
-      if (highest > PORT_BASE_MAX) {
-        log(
-          `ignoring ${label}.${name}: port:${String(base)}/${String(stride)} reaches ${String(highest)} at slot ${String(slotCount - 1)}, ` +
-            `past ${String(PORT_BASE_MAX)}`,
-        )
-        continue
-      }
-      merged[name] = { kind: 'port', base, stride }
+      // Only replace the earlier spelling once the later entry is accepted, so an invalid
+      // override cannot silently drop a working earlier variable.
+      if (existing !== undefined && existing !== name) delete merged[existing]
+      merged[name] = accepted
     }
   }
-  apply(fromFile, SETTINGS_FILE)
-  apply(fromOptions, 'slotEnv')
+  for (const layer of fromLayers) apply(layer.values, layer.label, { allowNull: true })
+  apply(fromOptions, 'slotEnv', { allowNull: false })
   return merged
 }
 
@@ -3207,15 +3432,56 @@ export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = fal
 }
 
 /**
+ * One path of a stored `--name-status` record, spelled so the record can be split again.
+ *
+ * A record is `STATUS<TAB>path`, with a rename's old path before its new one, so a tab
+ * inside a name ends the field early: `M<TAB>a<TAB>b.txt` reads as the file `a` in one
+ * reader and as `b.txt` in another, and the two disagree about what the patch changed.
+ * `-z` hands back the real bytes, so the record is written in git's own C-quoted spelling
+ * exactly when the name holds a tab, a newline, another control character, or begins with
+ * a quote — the spelling git itself writes without `-z`, which `diffPathToken` decodes. A
+ * name with a space, a backslash of its own or a non-ASCII character is written plainly:
+ * the tab is the only separator, so every other byte is safe, and every ordinary record
+ * keeps the shape it has had since this service first stored one.
+ *
+ * The quoted form is built from UTF-8 bytes, so it is plain ASCII (`é` is `\303\251`),
+ * exactly as git spells it, and the byte-wise decoder gives the name back.
+ *
+ * @param {string} path - the name as it exists on disk.
+ * @returns {string} the field to write.
+ */
+function recordPathField(path) {
+  const text = String(path)
+  if (!/^"|[\u0000-\u001f\u007f]/.test(text)) return text
+  let quoted = '"'
+  for (const byte of Buffer.from(text, 'utf8')) {
+    if (byte === 0x5c) quoted += '\\\\'
+    else if (byte === 0x22) quoted += '\\"'
+    else if (byte === 0x07) quoted += '\\a'
+    else if (byte === 0x08) quoted += '\\b'
+    else if (byte === 0x09) quoted += '\\t'
+    else if (byte === 0x0a) quoted += '\\n'
+    else if (byte === 0x0b) quoted += '\\v'
+    else if (byte === 0x0c) quoted += '\\f'
+    else if (byte === 0x0d) quoted += '\\r'
+    else if (byte < 0x20 || byte >= 0x7f) quoted += `\\${byte.toString(8).padStart(3, '0')}`
+    else quoted += String.fromCharCode(byte)
+  }
+  return `${quoted}"`
+}
+
+/**
  * The `STATUS<TAB>path` records of the staged change, decoded.
  *
  * Read with `-z`, so git neither quotes a path with a non-ASCII byte, quote or backslash
  * nor escapes it: the fields arrive as the real NUL-separated names. The records are then
- * rebuilt in the same `STATUS<TAB>path` shape this service has always stored, which keeps
- * the persisted form and every reader unchanged. The quoted spelling git writes without
- * `-z` used to leak into `filesChanged`: a caller filtering with the plain name could not
- * select the file, and `touchedPaths` staged the quoted string, so the caller's own file at
- * the real path was invisible to the merge and silently overwritten.
+ * rebuilt in the same `STATUS<TAB>path` shape this service has always stored — a name only
+ * a tab, a newline, another control byte or a leading quote would break is written in git's
+ * C-quoted form there (see `recordPathField`), and every other name is written plainly.
+ * The quoted spelling git writes without `-z` used to leak into `filesChanged`: a caller
+ * filtering with the plain name could not select the file, and `touchedPaths` staged the
+ * quoted string, so the caller's own file at the real path was invisible to the merge and
+ * silently overwritten.
  *
  * @param {string} repoDir - the copy the change was computed in.
  * @param {string} base - the base commit the change is diffed against.
@@ -3239,9 +3505,9 @@ function nameStatusRecords(repoDir, base) {
     if (status.startsWith('R') || status.startsWith('C')) {
       const second = fields[at]
       at += 1
-      lines.push(`${status}\t${first}\t${second ?? ''}`)
+      lines.push(`${status}\t${recordPathField(first)}\t${recordPathField(second ?? '')}`)
     } else {
-      lines.push(`${status}\t${first}`)
+      lines.push(`${status}\t${recordPathField(first)}`)
     }
   }
   return lines
@@ -3250,8 +3516,10 @@ function nameStatusRecords(repoDir, base) {
 /**
  * Decode one path field of a stored `--name-status` record.
  *
- * New records carry the plain name; a record stored before `-z` was used can still carry
- * git's quoted spelling, which `diffPathToken` decodes.
+ * New records carry the plain name, except for the names `recordPathField` had to
+ * C-quote; a record stored before `-z` was used can carry git's quoted spelling in any
+ * field. Both are decoded by `diffPathToken`, the decoder a diff header's token goes
+ * through, so a record and a section spell a name the same way.
  *
  * @param {string} field - one tab-separated field of a record.
  * @returns {string} the name as it exists on disk.
@@ -3261,17 +3529,48 @@ function nameStatusPath(field) {
 }
 
 /**
- * The plain repository paths a `--name-status` record names.
+ * One stored record split into its status and its decoded path fields.
  *
  * `git diff --name-status` writes `STATUS<TAB>path`, and a rename or copy adds the old
- * path: `STATUS<TAB>old<TAB>new`. The last field is the name that exists after the
- * change, which is the one a caller recognizes; a deletion has only its one path.
+ * path first: `STATUS<TAB>old<TAB>new`. Splitting on the tabs git wrote is exact, because
+ * a name that holds a tab is stored C-quoted and a quoted field carries no raw tab. Each
+ * field is decoded here and nowhere else: every reader of `filesChanged` goes through this
+ * function or through the two below it, so no two of them can disagree about what a record
+ * names.
+ *
+ * A non-rename record has one path field. An old record that was written before a tab was
+ * quoted still holds the raw tab, and the whole remainder of the line is exactly the name
+ * it was built from (`status + '\t' + path`), so that is what is returned for it.
+ *
+ * @param {string} line - one stored `--name-status` record.
+ * @returns {{status: string, paths: string[]}} the status and the decoded paths, old first.
+ */
+function recordEntry(line) {
+  const text = String(line)
+  const tab = text.indexOf('\t')
+  if (tab < 0) return { status: text, paths: [] }
+  const status = text.slice(0, tab)
+  const rest = text.slice(tab + 1)
+  if (status.startsWith('R') || status.startsWith('C')) {
+    return { status, paths: rest.split('\t').map((field) => nameStatusPath(field)) }
+  }
+  return { status, paths: [nameStatusPath(rest)] }
+}
+
+/**
+ * The plain repository paths a stored `--name-status` record names.
+ *
+ * A rename appears in a record as `old<TAB>new`; the name that exists after the change is
+ * the new one, which is the spelling a caller recognizes and the one `appliedFiles`
+ * stores. A deletion and an ordinary change have one path each. Defined in terms of
+ * `nameStatusEntry`, so this list and the per-record view cannot drift apart — which is
+ * what made a tab in a name move a phantom file into `appliedFiles`.
  *
  * @param {string[] | undefined} lines - raw `--name-status` records.
  * @returns {string[]} the plain paths, in the same order.
  */
-function plainPaths(lines) {
-  return (lines ?? []).map((line) => nameStatusPath(line.split('\t').at(-1) ?? ''))
+export function recordPaths(lines) {
+  return (lines ?? []).map((line) => nameStatusEntry(line).path)
 }
 
 /**
@@ -3379,21 +3678,127 @@ function patchPathOf(token) {
 }
 
 /**
- * The plain path one diff section changes: the new path, or the old one for a deletion.
+ * The path of one `---` or `+++` line of a diff section, decoded.
  *
- * A rename's header names both paths, and the name that exists afterwards is the one the
- * caller sees in `filesChanged`; a deletion has no new path, so the old name is the only
- * one that still means anything.
+ * Git ends the line with a tab when the name holds a space: that tab is the "no
+ * timestamp" marker of the traditional diff header, not part of the name. A name that
+ * holds a tab of its own is C-quoted, so it carries no raw tab and the first tab of the
+ * payload still ends the name.
+ *
+ * @param {string} line - a `--- …` or `+++ …` line.
+ * @returns {string | null} the plain path, or null for `/dev/null`.
+ */
+function filePairPath(line) {
+  const payload = line.slice(4)
+  const tab = payload.indexOf('\t')
+  return patchPathOf(tab < 0 ? payload : payload.slice(0, tab))
+}
+
+/**
+ * The two names one diff section states in its own header lines, decoded.
+ *
+ * `diff --git a/X b/Y` cannot be split back on its own: git does not quote a space, so a
+ * name that itself holds ` b/` moves the separator into the name — a file `x b/y.txt` has
+ * the header `diff --git a/x b/y.txt b/x b/y.txt`. The lines git writes below it are
+ * unambiguous. `rename from`/`rename to` and `copy from`/`copy to` each carry one bare
+ * name, and `--- a/…`/`+++ b/…` carry both sides, with `/dev/null` for a side that does not
+ * exist. A name that needs quoting is quoted there too, so `diffPathToken` gives it back.
+ *
+ * Read only above the first `@@`: a removed line that itself starts with `--` is written
+ * `--- …` inside a hunk, and an added line that starts with `++` is written `+++ …`, so
+ * below that line the prefixes no longer mean a header. The rename lines come first, so a
+ * rename that carries content keeps its own names rather than the pair that repeats them.
  *
  * @param {string} section - one `diff --git` section, newline-terminated.
- * @returns {string | null} the path, or null when the header cannot be parsed.
+ * @returns {{from: string | null, to: string | null} | null} the old and the new name, with
+ *   null for a side that does not exist; null when the section states none of these lines.
  */
-function diffSectionPath(section) {
+function sectionDeclaredPaths(section) {
+  /** @type {Map<string, string | null>} */
+  const declared = new Map()
+  let at = 0
+  while (at < section.length) {
+    const end = section.indexOf('\n', at)
+    const line = end < 0 ? section.slice(at) : section.slice(at, end)
+    at = end < 0 ? section.length : end + 1
+    if (line.startsWith('@@')) break
+    const named = /^(?:rename|copy) (from|to) (.*)$/.exec(line)
+    if (named !== null) declared.set(named[1], diffPathToken(named[2]))
+    else if (line.startsWith('--- ')) {
+      if (!declared.has('from')) declared.set('from', filePairPath(line))
+    } else if (line.startsWith('+++ ')) {
+      if (!declared.has('to')) declared.set('to', filePairPath(line))
+    }
+  }
+  if (declared.size === 0) return null
+  return { from: declared.get('from') ?? null, to: declared.get('to') ?? null }
+}
+
+/**
+ * The one name a `diff --git` header spells twice, split where both halves are equal.
+ *
+ * A mode-only change (`chmod +x`) and a binary change state no name of their own, and
+ * their header names the same path on both sides. Counting spaces cannot find the
+ * separator — `a/x b/y.txt b/x b/y.txt` has two — but equality can: the separator is the
+ * space after which the rest of the line spells the same path as the part before it, both
+ * halves decoded, so a quoted pair (`"a/…" "b/…"`) splits at its own opening quote. Such a
+ * split is unique: the left half is a prefix of the name and the right half is a suffix of
+ * it followed by the whole name again, so their lengths can never match.
+ *
+ * @param {string} header - the `diff --git` line, without its newline.
+ * @returns {string | null} the plain path, or null when no split makes both halves agree.
+ */
+function sameHeaderPath(header) {
+  const rest = header.slice('diff --git '.length)
+  for (let at = 1; at < rest.length; at += 1) {
+    if (rest[at - 1] !== ' ') continue
+    // The second half starts here with `b/` when bare, or with `"b/` when git quoted it.
+    if (!rest.startsWith('b/', at) && !rest.startsWith('"b/', at)) continue
+    const from = patchPathOf(rest.slice(0, at - 1))
+    if (from === null) continue
+    if (from !== patchPathOf(rest.slice(at))) continue
+    return from
+  }
+  return null
+}
+
+/**
+ * The old and the new plain name of one diff section.
+ *
+ * The names git states in the section's own lines come first (see `sectionDeclaredPaths`).
+ * Only a section that states none of them — a mode-only change, a binary change — falls
+ * back to its header, where both sides are the same path and the split can be found by
+ * equality; the old last-` b/` rule is the last resort, right whenever the name that ends
+ * the header holds no ` b/` of its own. A section that states both sides as `/dev/null`
+ * names nothing and is answered the same way.
+ *
+ * @param {string} section - one `diff --git` section, newline-terminated.
+ * @returns {{from: string | null, to: string | null}} the old and the new plain name.
+ */
+function diffSectionPaths(section) {
+  const declared = sectionDeclaredPaths(section)
+  if (declared !== null && (declared.from !== null || declared.to !== null)) return declared
   const newline = section.indexOf('\n')
   const header = newline < 0 ? section : section.slice(0, newline)
+  const same = sameHeaderPath(header)
+  if (same !== null) return { from: same, to: same }
   const [aPath, bPath] = diffHeaderPaths(header)
-  if (/^deleted file mode /m.test(section)) return patchPathOf(aPath) ?? patchPathOf(bPath)
-  return patchPathOf(bPath) ?? patchPathOf(aPath)
+  return { from: patchPathOf(aPath), to: patchPathOf(bPath) }
+}
+
+/**
+ * The plain path one diff section changes: the new path, or the old one for a deletion.
+ *
+ * A rename names both paths, and the name that exists afterwards is the one the caller
+ * sees in `filesChanged`; a deletion has no new path, so the old name is the only one that
+ * still means anything.
+ *
+ * @param {string} section - one `diff --git` section, newline-terminated.
+ * @returns {string | null} the path, or null when the section names none.
+ */
+function diffSectionPath(section) {
+  const { from, to } = diffSectionPaths(section)
+  return to ?? from
 }
 
 /**
@@ -3423,6 +3828,134 @@ function diffSections(diff) {
     sections.push({ start, end, text, path: diffSectionPath(text) })
   }
   return sections
+}
+
+/**
+ * Every path one diff section may be selected by.
+ *
+ * A section names its old and its new path; a rename names different ones. The caller
+ * reviews the record's `filesChanged`, where a rename appears as `old<TAB>new`, so either
+ * spelling must select the section. The names come from the lines git writes for the
+ * section itself, not from the `diff --git` header, which a name holding ` b/` cannot be
+ * split out of (see `diffSectionPaths`). A deletion names one path and an addition's old
+ * side is `/dev/null`, which `patchPathOf` drops.
+ *
+ * @param {{text: string, path: string | null}} section - one `diff --git` section.
+ * @returns {string[]} the distinct plain paths that name this section.
+ */
+function diffSectionNames(section) {
+  if (!section.text.startsWith('diff --git ')) return section.path === null ? [] : [section.path]
+  const { from, to } = diffSectionPaths(section.text)
+  const names = []
+  for (const name of [from, to]) {
+    if (name !== null && !names.includes(name)) names.push(name)
+  }
+  return names
+}
+
+/**
+ * The diff sections a `files` selection names, refusing a name the patch does not contain.
+ *
+ * Both `flash_patch` and a partial `apply` select sections this way, so a name that is
+ * misspelled is answered with the names the patch does contain — and with the same
+ * sentence in both tools. A rename is selectable by its old path and by its new one,
+ * which is what the record's own `STATUS<TAB>old<TAB>new` spelling offers.
+ *
+ * @param {string} patchId - the patch's full id, for the refusal.
+ * @param {Array<{text: string, path: string | null}>} sections - every section of the patch.
+ * @param {string[]} files - the caller's selection.
+ * @returns {Array<{text: string, path: string | null}>} the selected sections, in patch order.
+ * @throws {Error} when a name is not a file of the patch.
+ */
+function selectedPatchSections(patchId, sections, files) {
+  const known = []
+  for (const section of sections) {
+    for (const name of diffSectionNames(section)) {
+      if (!known.includes(name)) known.push(name)
+    }
+  }
+  const unknown = files.filter((name) => !known.includes(name))
+  if (unknown.length > 0) {
+    throw new Error(
+      `patch ${patchId} does not contain ${unknown.map((name) => JSON.stringify(name)).join(', ')}; ` +
+        (known.length === 0 ? 'it changes no files' : `it changes: ${known.join(', ')}`),
+    )
+  }
+  const wanted = new Set(files)
+  return sections.filter((section) => diffSectionNames(section).some((name) => wanted.has(name)))
+}
+
+/**
+ * A record whose patch is one temporary subset of a stored patch.
+ *
+ * The apply pipeline reads three fields from the record: the patch file it applies, the
+ * `filesChanged` its result reports, and the `preimage` a three-way merge rebuilds its
+ * base from. Narrowing all three is what makes a partial apply go through exactly the
+ * same drift, destructive-edit, merge and dry-run code as a whole one. Everything else —
+ * the id, root, scope, base and the blobs directory — stays the record's own.
+ *
+ * @param {object} record - the stored record.
+ * @param {object} selected - the selection.
+ * @param {string} selected.patchPath - the temporary patch holding only these sections.
+ * @param {string[]} selected.filesChanged - the record's `STATUS<TAB>path` lines for them.
+ * @param {Array<{text: string, path: string | null}>} selected.sections - the sections.
+ * @param {string} selected.diffstat - the diffstat of the temporary patch.
+ * @returns {object} the derived record.
+ */
+function partialPatchRecord(record, { patchPath, filesChanged, sections, diffstat }) {
+  const names = new Set()
+  for (const section of sections) {
+    for (const name of diffSectionNames(section)) names.add(name)
+  }
+  const derived = {
+    ...record,
+    patchPath,
+    // Kept for the error messages: the temporary file is removed when the apply ends, so
+    // a caller told "the patch is at" must be pointed at the stored patch instead.
+    storedPatchPath: record.patchPath,
+    filesChanged,
+    diffstat,
+  }
+  if (Array.isArray(record.preimage)) {
+    // A rename's preimage entry is keyed by the old path, which is why both header names
+    // are kept rather than only the paths the record reports as changed. The entry's path
+    // is the plain name the `-z` read produced, not a record field, so it is compared as it
+    // stands: decoding it would drop the leading quote of a name that begins with one.
+    derived.preimage = record.preimage.filter(
+      (entry) => entry !== null && typeof entry === 'object' && typeof entry.path === 'string' && names.has(entry.path),
+    )
+  }
+  return derived
+}
+
+/**
+ * The path a failure message should name for a patch record.
+ *
+ * A partial apply's record points at a temporary file that is deleted in the same call;
+ * naming it would send the caller to a path that no longer exists.
+ *
+ * @param {object} record - the record being applied.
+ * @returns {string} the stored patch's path, or the record's own when it is not derived.
+ */
+function patchMessagePath(record) {
+  return typeof record.storedPatchPath === 'string' ? record.storedPatchPath : record.patchPath
+}
+
+/**
+ * The files of one patch that are already in the caller's tree.
+ *
+ * A record written before per-file state existed says only that the whole patch was
+ * applied, which means every one of its files is here; a record written since names them.
+ * Keeping the old answer here is what lets `files` refuse an already-applied file on a
+ * patch applied by an earlier release instead of running git into a failure.
+ *
+ * @param {object} record - the patch record.
+ * @returns {string[]} the applied files in record spelling, or an empty list.
+ */
+function appliedFileNames(record) {
+  if (Array.isArray(record.appliedFiles)) return record.appliedFiles
+  if (record.appliedAt !== null && record.appliedAt !== undefined) return recordPaths(record.filesChanged)
+  return []
 }
 
 /**
@@ -3618,13 +4151,13 @@ function savePreimageBlobs(repoDir, base, patchDir, patchId, log) {
 function touchedPaths(record) {
   const paths = new Set()
   for (const line of record.filesChanged ?? []) {
-    const fields = String(line).split('\t')
-    for (let at = 1; at < fields.length; at += 1) paths.add(nameStatusPath(fields[at]))
+    for (const path of recordEntry(line).paths) paths.add(path)
   }
   // The name-status list already carries a rename's old path, but every base entry has to
   // be read from the caller's tree all the same; adding them here means a record whose list
-  // is somehow short still stages "ours" completely.
-  for (const entry of record.preimage ?? []) paths.add(nameStatusPath(entry.path))
+  // is somehow short still stages "ours" completely. A preimage path is a plain name, not a
+  // record field, so it is taken as it stands.
+  for (const entry of record.preimage ?? []) paths.add(entry.path)
   return [...paths]
 }
 
@@ -3879,21 +4412,26 @@ function commitsBehindBase(record, base, target) {
  * `git diff --name-status` writes `STATUS<TAB>path`, and a rename or copy adds the old
  * path first: `STATUS<TAB>old<TAB>new`. The old path is the path the apply removes, so it
  * has to be read as its own entry rather than dropped with the other leading fields.
+ * `recordEntry` does the splitting and the decoding, so this view and `recordPaths` name
+ * the same file for the same line.
  *
  * @param {string} line - one stored `--name-status` record.
  * @returns {{status: string, path: string, oldPath?: string}} the decoded record.
  */
 function nameStatusEntry(line) {
-  const fields = String(line).split('\t')
-  const status = fields[0] ?? ''
+  const { status, paths } = recordEntry(line)
   if (status.startsWith('R') || status.startsWith('C')) {
-    return { status, oldPath: nameStatusPath(fields[1] ?? ''), path: nameStatusPath(fields[2] ?? '') }
+    return { status, oldPath: paths[0] ?? '', path: paths[1] ?? '' }
   }
-  return { status, path: nameStatusPath(fields[1] ?? '') }
+  return { status, path: paths[0] ?? '' }
 }
 
 /**
  * The base blob of every path a patch's preimage records, keyed by path.
+ *
+ * A preimage entry's `path` is stored plainly, straight from the `-z` read that produced
+ * it, so it is used as it is: decoding it would read a name that begins with `"` as git's
+ * quoted spelling and lose the leading quote.
  *
  * @param {object} record - the patch record, with `preimage` when it has one.
  * @returns {Map<string, string>} path to base blob id.
@@ -3903,7 +4441,7 @@ function preimageBlobs(record) {
   for (const entry of record.preimage ?? []) {
     if (entry === null || typeof entry !== 'object') continue
     if (typeof entry.path !== 'string' || typeof entry.blob !== 'string') continue
-    blobs.set(nameStatusPath(entry.path), entry.blob)
+    blobs.set(entry.path, entry.blob)
   }
   return blobs
 }
@@ -4269,6 +4807,9 @@ export class WorkspaceIsolation {
    *   state the moment its constructor returns. A server sets it so it can answer the
    *   MCP `initialize` handshake before the sweep — which on a machine that died with
    *   multi-gigabyte slot trees used to take minutes — starts.
+   * @param {string} [options.platform] - platform whose `platform` section applies, and
+   *   whose environment-name case rule is used (default `process.platform`; injectable
+   *   so a Windows section can be tested anywhere).
    * @param {(message: string) => void} [options.log] - progress log.
    */
   constructor({
@@ -4283,6 +4824,7 @@ export class WorkspaceIsolation {
     maxStateBytes = 0,
     sweepIntervalMs = SWEEP_INTERVAL_MS,
     deferStartupSweep = false,
+    platform = process.platform,
     log = () => {},
   }) {
     this.root = resolve(root)
@@ -4318,12 +4860,23 @@ export class WorkspaceIsolation {
     /** Whether `close()` has run; a sweep in flight stops at its next step. */
     this.closed = false
     // Read once, at construction: the settings describe the repository, not the call, and
-    // every call prepares faster when the file is not re-read. A broken file only logs; the
-    // service still starts. The file's identity is recorded now so a later edit can be
-    // reported without re-reading it (see `repoSettingsChanged`).
-    const settings = readRepoSettings(this.root, this.log)
-    this.settingsPath = join(this.root, SETTINGS_FILE)
-    this.settingsAtStart = this.#settingsStamp()
+    // every call prepares faster when the files are not re-read. A broken file only logs;
+    // the service still starts. Both files' identities are recorded now so a later edit
+    // can be reported without re-reading them (see `repoSettingsChanged`).
+    const settings = readRepoSettings(this.root, this.log, { platform })
+    this.platform = platform
+    this.settingsPaths = new Map([
+      [SETTINGS_FILE, join(this.root, SETTINGS_FILE)],
+      [LOCAL_SETTINGS_FILE, join(this.root, LOCAL_SETTINGS_FILE)],
+    ])
+    this.settingsAtStart = new Map(
+      [...this.settingsPaths].map(([file, path]) => [file, this.#settingsStamp(path)]),
+    )
+    // One line, only when a settings file exists, so the start log says which layers the
+    // pool really applied. A layer with no accepted keys is not a layer: announcing it
+    // would claim settings that a typo kept from taking effect.
+    if (settings.present && settings.layers.length > 0) this.log(`settings: ${settings.layers.join(', ')}`)
+    warnLocalSettingsTracking(this.root, this.settingsPaths.get(LOCAL_SETTINGS_FILE), this.log)
     if (copyExclude !== undefined && !Array.isArray(copyExclude)) {
       this.log('ignoring the copyExclude option: it must be an array of strings')
     }
@@ -4335,8 +4888,8 @@ export class WorkspaceIsolation {
      *
      * @type {Record<string, {kind: string, segment?: string, base?: number, stride?: number, value?: string}>}
      */
-    this.slotEnv = mergeSlotEnv(settings.slotEnv, slotEnv, this.log, slotCount)
-    /** Whether `.flash-agents.json`'s `slotSetup` steps may run on the host. */
+    this.slotEnv = mergeSlotEnv(settings.slotEnvLayers, slotEnv, this.log, slotCount, { platform })
+    /** Whether the settings files' `slotSetup` steps may run on the host. */
     this.slotSetupAllowed = allowSlotSetup === true
     /**
      * The setup steps that passed validation, in configuration order. A kept path that the
@@ -4441,7 +4994,7 @@ export class WorkspaceIsolation {
   }
 
   /**
-   * The identity of `.flash-agents.json` as the constructor found it.
+   * The identity of one settings file as the constructor found it.
    *
    * `mtimeMs` alone misses a replacement that restores the old timestamp: a `mv` of a
    * prepared file over the settings, with `utimes` putting the original time back, leaves
@@ -4449,11 +5002,12 @@ export class WorkspaceIsolation {
    * common edit, `ino` the rename, and `ctimeMs` any metadata change at all; together they
    * answer "is this the same file with the same content" closely enough for one `stat`.
    *
+   * @param {string} path - the settings file to stat.
    * @returns {{exists: boolean, size?: number, ino?: number, mtimeMs?: number, ctimeMs?: number}} the file's stamp.
    */
-  #settingsStamp() {
+  #settingsStamp(path) {
     try {
-      const info = statSync(this.settingsPath)
+      const info = statSync(path)
       return { exists: true, size: info.size, ino: info.ino, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs }
     } catch {
       return { exists: false }
@@ -4461,26 +5015,34 @@ export class WorkspaceIsolation {
   }
 
   /**
-   * Whether `.flash-agents.json` changed since this pool read it.
+   * Which settings files changed since this pool read them.
    *
-   * One `stat`, never a re-read: the settings were applied when the pool was built, and a
-   * running server cannot safely re-apply them under calls that are already in flight. The
-   * service turns a positive answer into one warning per `flash_task` and `flash_batch`
-   * result. Any difference in the stamp is a change; only comparing `mtimeMs` called a
+   * One `stat` per file, never a re-read: the settings were applied when the pool was
+   * built, and a running server cannot safely re-apply them under calls that are already
+   * in flight. The service turns each name into the warning that file's edit deserves, so
+   * a local file that appeared, disappeared or was touched is reported as well as the
+   * shared one. Any difference in a stamp is a change; only comparing `mtimeMs` called a
    * replaced file unchanged when its timestamp was restored.
    *
-   * @returns {boolean} true when the file appeared, disappeared or was replaced/touched.
+   * @returns {string[]} the settings files that appeared, disappeared or were replaced/touched,
+   *   in layer order; empty when nothing changed.
    */
   repoSettingsChanged() {
-    const now = this.#settingsStamp()
-    const before = this.settingsAtStart
-    return (
-      now.exists !== before.exists ||
-      now.size !== before.size ||
-      now.ino !== before.ino ||
-      now.mtimeMs !== before.mtimeMs ||
-      now.ctimeMs !== before.ctimeMs
-    )
+    const changed = []
+    for (const [file, path] of this.settingsPaths) {
+      const now = this.#settingsStamp(path)
+      const before = this.settingsAtStart.get(file)
+      if (
+        now.exists !== before.exists ||
+        now.size !== before.size ||
+        now.ino !== before.ino ||
+        now.mtimeMs !== before.mtimeMs ||
+        now.ctimeMs !== before.ctimeMs
+      ) {
+        changed.push(file)
+      }
+    }
+    return changed
   }
 
   /**
@@ -5976,89 +6538,155 @@ export class WorkspaceIsolation {
    * @param {object} options - the patch to apply.
    * @param {string} options.patchId - a patch id from an earlier call, or a unique prefix of
    *   one (at least eight hex digits, with or without the `flash-` prefix).
+   * @param {string[]} [options.files] - apply only these files' sections, named as in
+   *   `change.filesChanged`; a rename may be named by its old or its new path.
    * @param {boolean} [options.dryRun] - check that it applies without changing anything.
    * @param {boolean} [options.force] - apply again even though the record says it was applied,
    *   and apply a deletion or rename over a path the caller changed since the base.
    * @param {boolean} [options.threeWay] - merge it in a scratch repository, rather than
    *   plain-applying it, when the plain apply fails or would remove a path the caller
    *   changed. The merge keeps that edit and marks a conflict in the file.
-   * @returns {{patchId: string, applied: boolean, dryRun: boolean, root: string, filesChanged: string[], diffstat: string, threeWay: boolean, conflicts: string[], indexTouched: boolean, drift: {commitsBehind: number | null, filesChangedSince: string[]} | null, warnings?: string[], note?: string, task?: object}} the outcome, with the full id, how far the tree moved since the patch's base, the task that made the patch when the record has one, and a warning when the tree touched the patch's files. `drift` and the refusal name paths from the service root.
+   * @returns {{patchId: string, applied: boolean, dryRun: boolean, root: string, filesChanged: string[], diffstat: string, threeWay: boolean, conflicts: string[], indexTouched: boolean, drift: {commitsBehind: number | null, filesChangedSince: string[]} | null, warnings?: string[], note?: string, task?: object}} the outcome, with the full id, how far the tree moved since the patch's base, the task that made the patch when the record has one, and a warning when the tree touched the patch's files. `drift` and the refusal name paths from the service root. A partial apply reports only the selected files.
    * @throws {Error} when the patch is unknown, belongs to another repository, was already
-   *   applied, would delete or rename a path the caller changed since the base without
-   *   `threeWay` or `force`, does not apply, or its base is not available for a three-way
-   *   merge.
+   *   applied, `files` names no file or one the patch lacks, would delete or rename a path
+   *   the caller changed since the base without `threeWay` or `force`, does not apply, or
+   *   its base is not available for a three-way merge.
    */
-  apply({ patchId, dryRun = false, force = false, threeWay = false }) {
+  apply({ patchId, files, dryRun = false, force = false, threeWay = false }) {
+    if (files !== undefined && (!Array.isArray(files) || files.length === 0)) {
+      throw new Error('files must name at least one file of the patch')
+    }
     const record = this.#lookupPatch(patchId)
     if (!existsSync(record.patchPath)) throw new Error(`the patch file for ${record.patchId} is gone (${record.patchPath})`)
     // A patch that was applied once is not idempotent: `git apply` may well find a
     // second place to put the change when the surrounding lines repeat. Recording the
-    // apply is what makes "already applied" a rule instead of a coincidence.
-    if (!dryRun && !force && record.appliedAt !== null && record.appliedAt !== undefined) {
+    // apply is what makes "already applied" a rule instead of a coincidence. A partial
+    // apply has its own, per-file version of this refusal below.
+    if (files === undefined && !dryRun && !force && record.appliedAt !== null && record.appliedAt !== undefined) {
       throw new Error(
         `patch ${record.patchId} was already applied to ${this.root} at ${new Date(record.appliedAt).toISOString()}; pass force: true to apply it again`,
       )
     }
-    // A patch computed inside one nested repository applies inside that repository.
-    const target = record.scope ? join(this.root, record.scope) : this.root
-    // `filesChanged` keeps the record's own spelling, the one `change.filesChanged` and
-    // `flash_patch`'s `files` use; the refusal and the drift name paths from the service root.
-    const filesChanged = plainPaths(record.filesChanged)
-    const diffstat = (record.diffstat ?? '').trim()
-    // Read before the write: `filesChangedSince` asks what the tree looked like when the
-    // patch was handed over, not after the patch itself changed those files.
-    //
-    // The drift and the destructive-edit check ask about the same patch files, and a
-    // working-tree hash is one git process per file when it is done path by path. One
-    // batch over every path the patch names serves both, so an apply of a 300-file patch
-    // spawns one `git hash-object` rather than three hundred.
-    const blobs = workingTreeBlobs(target, patchBlobPaths(record))
-    const drift = patchDrift(record, this.root, blobs)
-    const destroyed = destructiveEdits(record, target, blobs).map((path) => serviceRootPath(record, path))
-    // An old record kept no base blobs, so it cannot say whether the caller edited a path
-    // the patch removes. That is a warning, not a refusal: the apply is still the same
-    // apply, and refusing it would strand a patch the caller was told could be used.
-    const unverified = Array.isArray(record.preimage)
-      ? []
-      : unverifiableRemovals(record, target).map((path) => serviceRootPath(record, path))
-    /** @type {string[]} */
-    const warnings = []
-    const destructiveMessage = destroyed.length === 0 ? undefined : destructiveApplyMessage(record.patchId, destroyed)
-    if (destructiveMessage !== undefined) {
-      // A dry run reports the condition without writing anything. Without `threeWay` its
-      // real apply would be refused, so it must not ask git about the rest of the patch;
-      // with `threeWay` the merge below predicts the conflicts the real apply would leave.
-      if (dryRun) warnings.push(destructiveMessage)
-      else if (!threeWay && !force) throw new Error(destructiveMessage)
-    }
-    if (unverified.length > 0) warnings.push(unverifiedRemovalWarning(unverified))
-    // A plain apply of a rename removes the old path without comparing its content, so a
-    // caller edit there would be lost with no warning at all. A three-way merge is the mode
-    // that keeps it, so it skips the plain attempt entirely: a pure rename succeeds plainly
-    // and would never reach the merge.
-    const outcome =
-      dryRun && destroyed.length > 0 && !threeWay
-        ? { threeWay: false, conflicts: [], indexTouched: false, applied: false }
-        : this.#applyTo(record, {
-            target,
-            dryRun,
-            threeWay,
-            mark: !dryRun,
-            ...(destructiveMessage !== undefined && threeWay
-              ? { skipPlain: true, plainError: new Error(destructiveMessage) }
-              : {}),
-          })
-    if (drift !== null && drift.filesChangedSince.length > 0) warnings.push(driftWarning(drift.filesChangedSince))
-    return {
-      patchId: record.patchId,
-      dryRun,
-      root: target,
-      filesChanged,
-      diffstat,
-      drift,
-      ...(warnings.length === 0 ? {} : { warnings }),
-      ...(record.task === undefined ? {} : { task: record.task }),
-      ...outcome,
+    /** @type {string | undefined} */
+    let tempDir
+    // The record the pipeline runs on: the stored one for a whole apply, a narrowed copy
+    // with a temporary patch for a partial one. `record` stays the record to mark, so a
+    // partial apply's bookkeeping lands next to the stored patch.
+    let patchRecord = record
+    // The record spelling of the selected files: what `appliedFiles` stores. A whole
+    // apply passes undefined, which `#markApplied` reads as "every file".
+    /** @type {string[] | undefined} */
+    let selectedFiles
+    try {
+      if (files !== undefined) {
+        const sections = diffSections(readFileSync(record.patchPath, 'utf8'))
+        const chosen = selectedPatchSections(record.patchId, sections, files)
+        const names = new Set()
+        for (const section of chosen) {
+          for (const name of diffSectionNames(section)) names.add(name)
+        }
+        // The record's own lines, so `filesChanged` keeps the spelling every other result
+        // uses; a rename's line carries both paths, either of which may have selected it.
+        const lines = (record.filesChanged ?? []).filter((line) => {
+          const { path, oldPath } = nameStatusEntry(line)
+          return names.has(path) || (oldPath !== undefined && names.has(oldPath))
+        })
+        selectedFiles = recordPaths(lines)
+        const alreadyApplied = appliedFileNames(record)
+        const repeated = selectedFiles.filter((name) => alreadyApplied.includes(name))
+        if (!dryRun && !force && repeated.length > 0) {
+          throw new Error(
+            `patch ${record.patchId}: ${repeated.join(', ')} already applied to ${this.root}; pass force: true to apply them again`,
+          )
+        }
+        tempDir = mkdtempSync(join(this.stateDir, 'partial-'))
+        const patchPath = join(tempDir, 'patch')
+        writeFileSync(patchPath, chosen.map((section) => section.text).join(''))
+        // The diffstat is git's own spelling of the selected change, so a partial result
+        // describes what it applied rather than quoting the whole patch's summary.
+        const diffstat = git(['apply', '--stat', patchPath], this.stateDir).trim()
+        patchRecord = partialPatchRecord(record, { patchPath, filesChanged: lines, sections: chosen, diffstat })
+      } else {
+        const patchFiles = recordPaths(record.filesChanged)
+        const alreadyApplied = new Set(appliedFileNames(record))
+        const repeated = patchFiles.filter((name) => alreadyApplied.has(name))
+        // Some of the patch reached this tree, but not all of it. Applying the whole patch
+        // again would meet the files already here; naming the rest is what lets the caller
+        // finish the apply without forcing a repeat.
+        if (!dryRun && !force && repeated.length > 0 && repeated.length < patchFiles.length) {
+          throw new Error(
+            `patch ${record.patchId}: ${String(repeated.length)} of ${String(patchFiles.length)} files were already applied ` +
+              `(${repeated.join(', ')}); pass files with the rest, or force: true to apply the whole patch again`,
+          )
+        }
+      }
+      // A patch computed inside one nested repository applies inside that repository.
+      const target = patchRecord.scope ? join(this.root, patchRecord.scope) : this.root
+      // `filesChanged` keeps the record's own spelling, the one `change.filesChanged` and
+      // `flash_patch`'s `files` use; the refusal and the drift name paths from the service root.
+      const filesChanged = recordPaths(patchRecord.filesChanged)
+      const diffstat = (patchRecord.diffstat ?? '').trim()
+      // Read before the write: `filesChangedSince` asks what the tree looked like when the
+      // patch was handed over, not after the patch itself changed those files.
+      //
+      // The drift and the destructive-edit check ask about the same patch files, and a
+      // working-tree hash is one git process per file when it is done path by path. One
+      // batch over every path the patch names serves both, so an apply of a 300-file patch
+      // spawns one `git hash-object` rather than three hundred.
+      const blobs = workingTreeBlobs(target, patchBlobPaths(patchRecord))
+      const drift = patchDrift(patchRecord, this.root, blobs)
+      const destroyed = destructiveEdits(patchRecord, target, blobs).map((path) => serviceRootPath(patchRecord, path))
+      // An old record kept no base blobs, so it cannot say whether the caller edited a path
+      // the patch removes. That is a warning, not a refusal: the apply is still the same
+      // apply, and refusing it would strand a patch the caller was told could be used.
+      const unverified = Array.isArray(patchRecord.preimage)
+        ? []
+        : unverifiableRemovals(patchRecord, target).map((path) => serviceRootPath(patchRecord, path))
+      /** @type {string[]} */
+      const warnings = []
+      const destructiveMessage = destroyed.length === 0 ? undefined : destructiveApplyMessage(record.patchId, destroyed)
+      if (destructiveMessage !== undefined) {
+        // A dry run reports the condition without writing anything. Without `threeWay` its
+        // real apply would be refused, so it must not ask git about the rest of the patch;
+        // with `threeWay` the merge below predicts the conflicts the real apply would leave.
+        if (dryRun) warnings.push(destructiveMessage)
+        else if (!threeWay && !force) throw new Error(destructiveMessage)
+      }
+      if (unverified.length > 0) warnings.push(unverifiedRemovalWarning(unverified))
+      // A plain apply of a rename removes the old path without comparing its content, so a
+      // caller edit there would be lost with no warning at all. A three-way merge is the mode
+      // that keeps it, so it skips the plain attempt entirely: a pure rename succeeds plainly
+      // and would never reach the merge.
+      const outcome =
+        dryRun && destroyed.length > 0 && !threeWay
+          ? { threeWay: false, conflicts: [], indexTouched: false, applied: false }
+          : this.#applyTo(patchRecord, {
+              target,
+              dryRun,
+              threeWay,
+              mark: !dryRun,
+              markRecord: record,
+              markFiles: selectedFiles,
+              ...(destructiveMessage !== undefined && threeWay
+                ? { skipPlain: true, plainError: new Error(destructiveMessage) }
+                : {}),
+            })
+      if (drift !== null && drift.filesChangedSince.length > 0) warnings.push(driftWarning(drift.filesChangedSince))
+      return {
+        patchId: record.patchId,
+        dryRun,
+        root: target,
+        filesChanged,
+        diffstat,
+        drift,
+        ...(warnings.length === 0 ? {} : { warnings }),
+        ...(record.task === undefined ? {} : { task: record.task }),
+        ...outcome,
+      }
+    } finally {
+      // Also on a refusal or a failed apply: the subset is a view of the stored patch, and
+      // the stored patch itself is never rewritten.
+      if (tempDir !== undefined) rmSync(tempDir, { recursive: true, force: true })
     }
   }
 
@@ -6120,7 +6748,7 @@ export class WorkspaceIsolation {
       applied: true,
       threeWay: outcome.threeWay === true,
       conflicts: outcome.conflicts ?? [],
-      filesChanged: plainPaths(record.filesChanged),
+      filesChanged: recordPaths(record.filesChanged),
     }
   }
 
@@ -6137,6 +6765,11 @@ export class WorkspaceIsolation {
    * @param {boolean} [options.dryRun] - check that it applies without changing anything.
    * @param {boolean} [options.threeWay] - merge it when the plain apply fails.
    * @param {boolean} [options.mark] - record the apply on the patch record.
+   * @param {object} [options.markRecord] - the stored record to mark when it differs from
+   *   the narrowed record being applied. A partial apply marks the stored record, so its
+   *   `appliedFiles` describes the whole patch rather than the temporary subset.
+   * @param {string[]} [options.markFiles] - the selected files' record spelling. Omitted
+   *   for a whole apply, which marks every file of `markRecord`.
    * @param {boolean} [options.skipPlain] - go straight to the three-way merge, without
    *   trying the plain apply. An apply of a destructive patch uses this because a pure
    *   rename would succeed plainly and discard the caller's edit on the old path.
@@ -6145,12 +6778,14 @@ export class WorkspaceIsolation {
    * @returns {{applied: boolean, threeWay: boolean, conflicts: string[], indexTouched: false, note?: string}} the outcome.
    * @throws {Error} when the patch does not apply, or its base is unavailable for a merge.
    */
-  #applyTo(record, { target, dryRun = false, threeWay = false, mark = false, skipPlain = false, plainError }) {
+  #applyTo(record, { target, dryRun = false, threeWay = false, mark = false, markRecord = record, markFiles, skipPlain = false, plainError }) {
     if (skipPlain) {
       return this.#threeWayMerge(record, target, {
         dryRun,
         plainError: plainError ?? new Error('the plain apply was skipped so a caller edit is not lost'),
         mark,
+        markRecord,
+        markFiles,
       })
     }
     // Without `--index` the caller's index is left alone; only the working tree moves.
@@ -6165,22 +6800,36 @@ export class WorkspaceIsolation {
     } catch (plainError) {
       if (!threeWay) {
         throw new Error(
-          `${messageOf(plainError)}. The patch is at ${record.patchPath}; retry with threeWay: true to merge it.`,
+          `${messageOf(plainError)}. The patch is at ${patchMessagePath(record)}; retry with threeWay: true to merge it.`,
         )
       }
-      return this.#threeWayMerge(record, target, { dryRun, plainError, mark })
+      return this.#threeWayMerge(record, target, { dryRun, plainError, mark, markRecord, markFiles })
     }
-    if (!dryRun && mark) this.#markApplied(record)
+    if (!dryRun && mark) this.#markApplied(markRecord, markFiles)
     return { applied: !dryRun, threeWay: false, conflicts: [], indexTouched: false }
   }
 
   /**
-   * Record that a patch reached the caller's tree, so a second apply is refused.
-   * @param {object} record - the patch record to mark and store.
+   * Record that a patch, or one file of it, reached the caller's tree, so a second apply
+   * is refused.
+   *
+   * `files` is the partial apply's selection in record spelling. A whole apply passes
+   * none and records every file too: a later partial apply then knows exactly which files
+   * are already here, and a record keeps one shape after either kind of apply. The
+   * whole-patch timestamp is set once every file is recorded, which is also what a whole
+   * apply does today.
+   *
+   * @param {object} record - the stored patch record to mark and store.
+   * @param {string[]} [files] - the applied files' record spelling; omitted for a whole apply.
    * @returns {void}
    */
-  #markApplied(record) {
-    record.appliedAt = Date.now()
+  #markApplied(record, files) {
+    const already = new Set(appliedFileNames(record))
+    if (files === undefined) for (const name of recordPaths(record.filesChanged)) already.add(name)
+    else for (const name of files) already.add(name)
+    record.appliedFiles = [...already].sort()
+    const everyFile = recordPaths(record.filesChanged)
+    if (files === undefined || everyFile.every((name) => already.has(name))) record.appliedAt = Date.now()
     this.#writeMeta(record)
     this.patches.set(record.patchId, record)
   }
@@ -6203,16 +6852,20 @@ export class WorkspaceIsolation {
    * @param {Error} options.plainError - the plain apply's failure, folded into ours.
    * @param {boolean} [options.mark] - record the apply on the patch record, which only an
    *   apply into the caller's tree may do.
+   * @param {object} [options.markRecord] - the stored record to mark, when the record being
+   *   applied is a narrowed partial one.
+   * @param {string[]} [options.markFiles] - the selected files' record spelling; omitted
+   *   for a whole apply.
    * @returns {{threeWay: true, applied: boolean, conflicts: string[], indexTouched: false, note?: string}} the outcome.
    * @throws {Error} when the base is unavailable, git is too old, or the merge errors.
    */
-  #threeWayMerge(record, target, { dryRun, plainError, mark = false }) {
+  #threeWayMerge(record, target, { dryRun, plainError, mark = false, markRecord = record, markFiles }) {
     const patchId = record.patchId
     const unavailable =
       `The base of patch ${patchId} is not available for a three-way merge ` +
       '(it was made before blob saving existed, or saving failed).'
     if (!Array.isArray(record.preimage)) {
-      throw new Error(`${messageOf(plainError)}. ${unavailable} The patch is at ${record.patchPath}.`)
+      throw new Error(`${messageOf(plainError)}. ${unavailable} The patch is at ${patchMessagePath(record)}.`)
     }
     requireMergeTree(target)
     const scratch = mkdtempSync(join(this.stateDir, 'merge-'))
@@ -6251,7 +6904,7 @@ export class WorkspaceIsolation {
         }
         baseTree = git(['write-tree'], scratch, env).trim()
       } catch (error) {
-        throw new Error(`${messageOf(plainError)}. ${unavailable} ${messageOf(error)}. The patch is at ${record.patchPath}.`)
+        throw new Error(`${messageOf(plainError)}. ${unavailable} ${messageOf(error)}. The patch is at ${patchMessagePath(record)}.`)
       }
       const base = git([...COMMIT_CONFIG, 'commit-tree', baseTree, '-m', 'flash base'], scratch, env).trim()
       // Theirs W: the patch was computed against exactly this base, so it applies cleanly.
@@ -6267,7 +6920,7 @@ export class WorkspaceIsolation {
       const merged = gitAllowFailure(['merge-tree', '--write-tree', '--name-only', '--no-messages', ours, theirs], scratch, env)
       if (merged.status !== 0 && merged.status !== 1) {
         throw new Error(
-          `${messageOf(plainError)}. The three-way merge of ${record.patchPath} failed in a scratch repository: ${merged.stderr.length > 0 ? merged.stderr : merged.stdout}`.trim(),
+          `${messageOf(plainError)}. The three-way merge of ${patchMessagePath(record)} failed in a scratch repository: ${merged.stderr.length > 0 ? merged.stderr : merged.stdout}`.trim(),
         )
       }
       // Exit 0 writes the result tree alone; exit 1 writes it, then the conflicted paths
@@ -6291,7 +6944,7 @@ export class WorkspaceIsolation {
         // Only the caller's tree is recorded: a base patch planted in a copy reached a
         // throwaway tree, and marking it applied would refuse the apply it still deserves.
         if (mark) {
-          this.#markApplied(record)
+          this.#markApplied(markRecord, markFiles)
           if (conflicts.length > 0) {
             note =
               'the three-way merge left conflict markers in the working tree; the change is recorded as applied so a second apply is refused'
@@ -6511,10 +7164,11 @@ export class WorkspaceIsolation {
    * @param {object} options - which patch, and which slice of it.
    * @param {string} options.patchId - a patch id from an earlier call, or a unique prefix of
    *   one (at least eight hex digits, with or without the `flash-` prefix).
-   * @param {string[]} [options.files] - read only these files' sections.
+   * @param {string[]} [options.files] - read only these files' sections; a rename may be
+   *   named by its old or its new path.
    * @param {number} [options.offset] - character offset into the selected text.
    * @param {number} options.maxChars - the page budget.
-   * @returns {{patchId: string, patchPath: string, applied: boolean, filesChanged: string[], diffstat: string, drift?: {commitsBehind: number | null, filesChangedSince: string[]} | null, totalChars: number, offset: number, diff: string, files: string[], nextOffset: number | null, task?: object, finalMessage?: string, finalMessageTruncated?: true}} the page; `task` rides on every page, while the worker's final message and the drift are only on the page that starts at offset 0. `drift.filesChangedSince` is named relative to the service root; `filesChanged` keeps the record's own spelling, as `files` expects it.
+   * @returns {{patchId: string, patchPath: string, applied: boolean, appliedFiles?: string[], filesChanged: string[], diffstat: string, drift?: {commitsBehind: number | null, filesChangedSince: string[]} | null, totalChars: number, offset: number, diff: string, files: string[], nextOffset: number | null, task?: object, finalMessage?: string, finalMessageTruncated?: true}} the page; `task` rides on every page, while the worker's final message, the applied files and the drift are only on the page that starts at offset 0. `drift.filesChangedSince` is named relative to the service root; `filesChanged` keeps the record's own spelling, as `files` expects it.
    * @throws {Error} when the patch is unknown, belongs to another repository, is gone, or
    *   `files` names a file the patch does not contain.
    */
@@ -6523,19 +7177,7 @@ export class WorkspaceIsolation {
     if (!existsSync(record.patchPath)) throw new Error(`the patch file for ${record.patchId} is gone (${record.patchPath})`)
     const diff = readFileSync(record.patchPath, 'utf8')
     const sections = diffSections(diff)
-    const known = sections.map((section) => section.path).filter((path) => path !== null)
-    let selected = sections
-    if (files !== undefined) {
-      const wanted = new Set(files)
-      const unknown = files.filter((name) => !known.includes(name))
-      if (unknown.length > 0) {
-        throw new Error(
-          `patch ${record.patchId} does not contain ${unknown.map((name) => JSON.stringify(name)).join(', ')}; ` +
-            (known.length === 0 ? 'it changes no files' : `it changes: ${known.join(', ')}`),
-        )
-      }
-      selected = sections.filter((section) => wanted.has(section.path))
-    }
+    const selected = files === undefined ? sections : selectedPatchSections(record.patchId, sections, files)
     // Offsets are computed on the selected text, so a page and its `nextOffset` mean the
     // same thing whether one file or the whole patch was asked for.
     let at = 0
@@ -6546,11 +7188,15 @@ export class WorkspaceIsolation {
     })
     const text = rebased.map((section) => section.text).join('')
     const page = pageSections(rebased, text, offset, maxChars)
+    const appliedFiles = Array.isArray(record.appliedFiles) ? record.appliedFiles : []
     return {
       patchId: record.patchId,
       patchPath: record.patchPath,
       applied: record.appliedAt !== null && record.appliedAt !== undefined,
-      filesChanged: plainPaths(record.filesChanged),
+      // A whole apply records every file too, so this is the record of what is already in
+      // the caller's tree. It is on the first page only, beside the drift and the report.
+      ...(page.offset === 0 && appliedFiles.length > 0 ? { appliedFiles: [...appliedFiles].sort() } : {}),
+      filesChanged: recordPaths(record.filesChanged),
       diffstat: (record.diffstat ?? '').trim(),
       // Drift costs one `git hash-object` spawn per patch file. Computing it on every page
       // made a 300-file patch paged ten times cost tens of seconds, so it rides with the
@@ -6780,17 +7426,26 @@ export class WorkspaceIsolation {
    * The patch directory is shared by every service over one root, so a record loaded here
    * at construction can be applied by a sibling instance afterwards. Without this, the
    * held copy would still say `appliedAt: null` and the "already applied" refusal would
-   * depend on which process won a race. A record this process just wrote is left alone.
+   * depend on which process won a race. `appliedFiles` is refreshed for the same reason:
+   * a sibling's partial apply must be visible before this instance decides the rest can
+   * go in. A record this process just wrote is left alone.
    *
    * @param {object} record - the held record to refresh in place.
    * @returns {void}
    */
   #refreshAppliedAt(record) {
-    if (record.appliedAt !== null && record.appliedAt !== undefined) return
+    const needsAppliedAt = record.appliedAt === null || record.appliedAt === undefined
+    const needsAppliedFiles = !Array.isArray(record.appliedFiles) || record.appliedFiles.length === 0
+    if (!needsAppliedAt && !needsAppliedFiles) return
     if (typeof record.metaPath !== 'string') return
     try {
       const onDisk = JSON.parse(readFileSync(record.metaPath, 'utf8'))
-      if (onDisk?.appliedAt !== null && onDisk?.appliedAt !== undefined) record.appliedAt = onDisk.appliedAt
+      if (needsAppliedAt && onDisk?.appliedAt !== null && onDisk?.appliedAt !== undefined) record.appliedAt = onDisk.appliedAt
+      if (Array.isArray(onDisk?.appliedFiles) && onDisk.appliedFiles.length > 0) {
+        // The on-disk record is authoritative: a sibling may have applied a file this
+        // instance has not seen. The union keeps anything this instance recorded first.
+        record.appliedFiles = [...new Set([...(record.appliedFiles ?? []), ...onDisk.appliedFiles])].sort()
+      }
     } catch {
       // An unreadable record keeps its in-memory value; `apply` still checks the patch file.
     }

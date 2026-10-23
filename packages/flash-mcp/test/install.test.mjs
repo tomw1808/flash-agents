@@ -143,6 +143,173 @@ test('install --dry-run reports the plugin stamp without writing it', () => {
   }
 })
 
+test('install writes the module stamp into the interactive profile only when every plugin is ESM', () => {
+  const home = tempHome()
+  try {
+    const output = install(home)
+    const plugins = join(home, 'profiles', 'web', 'plugins')
+    const stamp = JSON.parse(readFileSync(join(plugins, 'package.json'), 'utf8'))
+    assert.deepEqual(stamp, { private: true, type: 'module', flashAgents: { version: FLASH_VERSION } })
+    assert.match(output, new RegExp(`replaced .*profiles/web/plugins/package\\.json`))
+    // The provider copied there really is ESM, which is what made the stamp safe.
+    assert.match(readFileSync(join(plugins, 'dsh-subagent-flash.js'), 'utf8'), /^\s*export\s/m)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('install leaves the interactive plugins folder without a stamp when a file is CommonJS', () => {
+  const home = tempHome()
+  try {
+    const plugins = join(home, 'profiles', 'web', 'plugins')
+    mkdirSync(plugins, { recursive: true })
+    writeFileSync(join(plugins, 'own-plugin.js'), 'module.exports = {}\n')
+    const output = install(home)
+    assert.equal(existsSync(join(plugins, 'package.json')), false, 'a CommonJS file must not be declared a module')
+    assert.ok(
+      output.includes(`left ${plugins} without a package.json: ${join(plugins, 'own-plugin.js')} is not an ES module`),
+      output,
+    )
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('review: a CommonJS plugin with a commented export line is not declared a module', () => {
+  const home = tempHome()
+  try {
+    const plugins = join(home, 'profiles', 'web', 'plugins')
+    mkdirSync(plugins, { recursive: true })
+    const plugin = join(plugins, 'own-plugin.js')
+    // A CommonJS file may mention an old export in a comment; the installer's line-shaped
+    // test cannot tell that from a real `export` statement and declares the folder ESM.
+    writeFileSync(plugin, '/* the old name was\nexport const legacy = true\n*/\nmodule.exports = {}\n')
+    const output = install(home)
+    assert.equal(
+      existsSync(join(plugins, 'package.json')),
+      false,
+      `a CommonJS plugin must not be declared a module (installer said: ${output.split('\n').find((line) => line.includes('without a package.json')) ?? 'nothing'})`,
+    )
+    // It still has to load as CommonJS after the install.
+    execFileSync(process.execPath, [plugin], { encoding: 'utf8' })
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('review: a rerun withdraws the installer stamp when a CommonJS plugin was added', () => {
+  const home = tempHome()
+  try {
+    install(home)
+    const plugins = join(home, 'profiles', 'web', 'plugins')
+    const stamp = join(plugins, 'package.json')
+    assert.equal(existsSync(stamp), true, 'the first install wrote its own stamp')
+    const plugin = join(plugins, 'own-plugin.js')
+    writeFileSync(plugin, 'module.exports = {}\n')
+    const output = install(home)
+    const effective = existsSync(stamp) ? JSON.parse(readFileSync(stamp, 'utf8')) : undefined
+    assert.notEqual(
+      effective?.type,
+      'module',
+      `the installer left its own stamp declaring a CommonJS plugin a module; it reported: ${output.split('\n').find((line) => line.includes('without a package.json')) ?? 'nothing'}`,
+    )
+    assert.equal(existsSync(stamp), false, 'the installer withdrew its own stamp')
+    assert.ok(
+      output.includes(
+        `removed ${stamp}: ${plugin} is not an ES module, so the folder is no longer declared one`,
+      ),
+      output,
+    )
+    assert.doesNotMatch(output, /without a package\.json/, 'the report must not claim a package.json is absent while one remains')
+    execFileSync(process.execPath, [plugin], { encoding: 'utf8' })
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('review: ESM detection parses each plugin, so only real module syntax declares the folder a module', () => {
+  // `isEsmFile` is private to the installer, so each case is observed through the stamp
+  // the installer does or does not write beside the interactive profile's plugins.
+  const cases = [
+    {
+      name: 'commented-export.js',
+      source: '/* the old name was\nexport const legacy = true\n*/\nmodule.exports = {}\n',
+      esm: false,
+    },
+    { name: 'esm-default.js', source: 'export default function plugin() {}\n', esm: true },
+    { name: 'esm-import.js', source: "import { readFileSync } from 'node:fs'\n", esm: true },
+    { name: 'syntax-error.js', source: 'const = ;\n', esm: false },
+    // Top-level await does not compile inside the CommonJS wrapper, but the contract also
+    // requires an import/export statement; without one the folder stays unmarked.
+    { name: 'top-level-await.js', source: 'const answer = await Promise.resolve(42)\n', esm: false },
+    { name: 'top-level-await-export.js', source: 'export default await Promise.resolve(42)\n', esm: true },
+  ]
+  for (const scenario of cases) {
+    const home = tempHome()
+    try {
+      const plugins = join(home, 'profiles', 'web', 'plugins')
+      mkdirSync(plugins, { recursive: true })
+      writeFileSync(join(plugins, scenario.name), scenario.source)
+      install(home)
+      assert.equal(
+        existsSync(join(plugins, 'package.json')),
+        scenario.esm,
+        `${scenario.name}: expected the folder ${scenario.esm ? 'to be' : 'not to be'} declared a module`,
+      )
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  }
+})
+
+test('review: the parse-based ESM check accepts both shipped plugins', () => {
+  const home = tempHome()
+  try {
+    // `assertPluginsAreEsm` runs before any write; a plugin it rejected would make the
+    // installer exit non-zero instead of returning this output.
+    const output = install(home)
+    assert.match(output, /replaced .*profiles\/web\/plugins\/package\.json/)
+    for (const profile of PROFILES) {
+      assert.equal(existsSync(join(home, 'profiles', profile, 'plugins', 'package.json')), true, `${profile} stamp`)
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('install keeps a foreign package.json in the interactive plugins folder', () => {
+  const home = tempHome()
+  try {
+    const plugins = join(home, 'profiles', 'web', 'plugins')
+    mkdirSync(plugins, { recursive: true })
+    const own = '{"name":"the user\'s own plugins"}\n'
+    writeFileSync(join(plugins, 'package.json'), own)
+    const output = install(home)
+    assert.equal(readFileSync(join(plugins, 'package.json'), 'utf8'), own)
+    assert.ok(output.includes(`left ${plugins}'s own package.json alone`), output)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('uninstall removes the interactive stamp only when it carries flashAgents', () => {
+  const home = tempHome()
+  try {
+    install(home)
+    const target = join(home, 'profiles', 'web', 'plugins', 'package.json')
+    assert.equal(existsSync(target), true)
+    runInstaller(home, ['--uninstall'])
+    assert.equal(existsSync(target), false, 'our own stamp is removed')
+
+    const own = '{"name":"the user\'s own plugins"}\n'
+    writeFileSync(target, own)
+    runInstaller(home, ['--uninstall'])
+    assert.equal(readFileSync(target, 'utf8'), own, 'a package.json without the stamp is not ours to delete')
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
 test('install --uninstall removes the plugin stamp', () => {
   const home = tempHome()
   try {
