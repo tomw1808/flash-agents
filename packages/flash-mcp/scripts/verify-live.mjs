@@ -329,17 +329,25 @@ try {
     )
     check('hostile', 'the refused model started no runtime', startedRuntime().length === boots, `${String(boots)} → ${String(startedRuntime().length)} boots`)
 
-    // The other route-shaped fields are still not capabilities: without a `model`, the
-    // default runs and nothing the caller sent is echoed back as the route.
-    const { payload } = await flashTask({
+    // The other route-shaped fields are not capabilities either. Since 0.1.10 they are not
+    // even accepted: an unknown argument is refused before anything starts, so nothing the
+    // caller sent can reach the route or come back as one.
+    const hostileBoots = startedRuntime().length
+    const routed = await flashTask({
       task: 'Report which model you are running as, in one short line.',
       cwd: ROOT,
       provider: 'deepseek-official',
       reasoningEffort: 'high',
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-reasoner' },
     })
-    check('hostile', 'caller-supplied route fields cannot change the child route', payload.route?.provider === 'ollama' && payload.route?.model === DEFAULT_MODEL, JSON.stringify(payload.route))
-    check('hostile', 'hostile fields are not echoed into the result', payload.route?.model !== 'deepseek-reasoner' && payload.provider === 'flash')
+    const routedText = String(routed.payload.unparsed ?? JSON.stringify(routed.payload))
+    check(
+      'hostile',
+      'caller-supplied route fields are refused as unknown arguments',
+      routed.response.isError === true && /unknown arguments? .*provider/.test(routedText),
+      routedText.slice(0, 240),
+    )
+    check('hostile', 'the refused route fields started no runtime', startedRuntime().length === hostileBoots, `${String(hostileBoots)} → ${String(startedRuntime().length)} boots`)
   }
 
   if (stage('reuse')) {

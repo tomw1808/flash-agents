@@ -103,8 +103,8 @@ proves the pipeline end to end with one real task. Every failing check
 prints the exact command that fixes it.
 
 Run it again after every plugin update: the update replaces the server but not the worker profile or
-the guard it runs with, so the installer has to rewrite both. A runtime that boots after the install
-re-reads the profile's stamp, so the warning clears without a reconnect (see
+the guard it runs with, so the installer has to rewrite both. No reconnect is needed afterwards: a
+worker runtime started before the install is replaced at its next use (see
 [Configuration](#configuration)).
 
 **4. Use it**
@@ -147,11 +147,19 @@ command instead, with `background: <job id>` and the time since the shell call t
 background command that ends non-zero counts toward `warnings` like a foreground one. A job sent
 with `taskFile` is labelled with the brief's first line rather than `(untitled task)`, so a long
 brief's job is recognisable in the listing. A
-call still waiting for a free copy says so — `queued 1m10s: waiting for a free tree (2 of 2 in use)`,
-and `queued in the foreground …` for a writing call sent without `background: true`, which holds
-your turn while it waits; that call's result carries the same warning. A background call checks its
+call still waiting for a free copy says where it stands and what it waits behind — `queued 1m10s: 2nd
+in line for a free tree (first come, first served); trees held by job-ab12cd34 (fix the parser,
+31m0s) and a foreground call (review it, 2m0s)` — and `flash_status` carries the same as
+`queue: { position, of, holders }`. A writing call sent without `background: true` reads
+`queued in the foreground …`: it holds your turn while it waits, and its result carries the same
+warning. A background call checks its
 arguments before it answers, so a bad `task`/`taskFile` pair, an unreadable brief, an unknown `mode`
 or a `source` a read-only call cannot honour fails the call at once, as a foreground one does.
+
+An argument a tool does not know is refused, with the nearest known name:
+`unknown argument "file" for flash_patch; did you mean "files"?`. Before 0.1.10 it was ignored, so
+`flash_patch` with `file` returned the first page of the whole patch. `provider`, `reasoningEffort`,
+`agentOptions`, `permissions` and `sandbox` were ignored the same way and are refused now too.
 
 A first attempt that ends early with nothing — under three minutes and at most twelve model calls,
 nothing delegated or only empty reports, and no change in the copy — is retried once after ten
@@ -163,7 +171,10 @@ verdict.
 A long brief can be written to a file and sent with `taskFile` instead of `task` — exactly as
 written, once. When a worker stopped partway, `basePatch: <its patchId>` starts the next call
 from that work: the patch is applied to the new copy first (merged if your tree moved on), and
-the new call's patch holds both, so you apply only the last one. A call whose worker ends with an empty report and no change comes back as
+the new call's patch holds both, so you apply only the last one. The exception is a base patch you
+already applied: the copy is taken from your tree, so it already holds that change. It is not
+applied again, the result warns (`basePatch … was already in the tree the copy was taken from`), and
+the new patch holds only the new work, to apply on top of the base, not instead of it. A call whose worker ends with an empty report and no change comes back as
 `status: "error"` with `emptyResult: true`, not as a quiet success.
 
 A patch id can be quoted short: `flash_apply`, `flash_patch` and `basePatch` take any unique prefix
@@ -192,6 +203,12 @@ those. An apply that would delete or rename away a file you changed since the co
 refused instead: `threeWay: true` merges it and keeps
 your edit (conflicts are marked in the file), and `force: true` applies it anyway and discards the
 edit. Before 0.1.8 such an apply removed the file without a word.
+
+A `threeWay` apply reads every merged file before it writes the first one, so one that fails
+writes nothing; only a disk error during the writes can stop it partway, and then its error names
+every file it already wrote or deleted. A merged file keeps the line endings it has in your tree
+(CRLF or LF), and binary content is written untouched. Files over 1 MiB merge like any other: before
+0.1.10 they failed the apply with `git cat-file --filters … failed`.
 
 Every result reports the tokens the call used (`usage`), and lists any uncommitted files the copy
 started with (`isolation.uncommittedAtStart`). If another session has uncommitted work in the same
@@ -237,7 +254,9 @@ The settings also cover how many copies may be in flight (each is a process, so 
 decision; default 2), where copies and patches live, and **Base folder for worker copies**
 (`state_base`; `FLASH_STATE_BASE` or `--state-base` for a manual install). That base moves the
 default copy layout only — a configured state directory replaces it — and it must be an absolute
-path, with a leading `~` expanded. On Windows a short one such as `C:\fm` leaves room for build
+path, with a leading `~` expanded. It works on every platform. On Linux and macOS a short one
+such as `/tmp/fm` keeps a test's Unix socket paths under the length limit ("path must be shorter
+than SUN_LEN"). On Windows a short one such as `C:\fm` leaves room for build
 tools that ignore long-path support; see [Honest limits](#honest-limits). A folder made directly
 under `C:\` gives you modify rights but not the right to change its permissions, and the sandbox's
 first step for every shell command then fails (`SetNamedSecurityInfoW failed (Win32 5)`). Grant
@@ -254,10 +273,10 @@ icacls "C:\fm" /grant "%USERNAME%:(OI)(CI)F"
 worker profile or the guard the server runs with, so the old guard stays in place until the
 installer rewrites it. 0.1.8 names that drift: the server logs it at start, every `flash_task` and
 `flash_batch` result carries the warning, and `doctor`'s `profile-version` row warns until the
-installed profile matches the server. The warning clears by itself: a runtime booted after the
-install re-reads its profile's stamp, and a result carries the verdict of the runtime that served
-it. A runtime that booted before the install keeps the old verdict until it is replaced, and
-reconnecting is how you replace it.
+installed profile matches the server. The warning clears by itself, without a reconnect: a
+runtime booted after the install re-reads its profile's stamp, and since 0.1.10 an idle runtime
+that booted before the install is replaced at its next use. A busy one keeps serving its running
+calls, and their warning says it will be replaced when they end.
 
 **After upgrading from 0.1.5 or older, run the setup once more** (`/flash-agents:setup`, or
 `node install.mjs` in a manual install). Before 0.1.6 the installed worker profile pinned one
@@ -271,10 +290,13 @@ either way, the change so far is salvaged as a patch.
 ### Per-repository settings
 
 A `.flash-agents.json` at the repository root tunes the disposable copy for that repository, and a
-git-ignored `.flash-agents.local.json` beside it holds what belongs to one machine. Both are read
-when the server starts; a change made after that is not applied, and every task result warns about
-it (`<file> changed after this server started; its new settings take effect after a reconnect`)
-until you reconnect.
+git-ignored `.flash-agents.local.json` beside it holds what belongs to one machine. Both are
+checked at the start of every writing call and re-read when they changed, so an edit applies from
+the next call on, without a reconnect. That matters where `/mcp reconnect` is not available, as in
+Claude Code's VS Code extension. A call that is already running keeps the settings it started with.
+A changed `slotEnv` restarts that copy's worker runtime when it is idle, since the runtime's
+environment is fixed when it starts. A file that turns invalid (a stray comma) keeps its last good
+settings, and every call warns until it is fixed (`<file> could not be used: …`).
 
 Both files have the same shape. A top-level `platform` object, keyed by Node's `process.platform`
 names (`win32`, `linux`, `darwin`, …), holds sections with the same keys as the top level; only the
@@ -287,8 +309,8 @@ any other, behind the same `--allow-slot-setup` gate.
 
 The server logs the layers it applied
 (`settings: .flash-agents.json, .flash-agents.json platform.win32, .flash-agents.local.json
-platform.win32`), warns once when the local file is tracked by git or not ignored by it, and warns
-per call when either file changed after start.
+platform.win32`) at start and again after a reload (`settings reloaded: …`), and warns once when the
+local file is tracked by git or not ignored by it.
 
 ```json
 {
@@ -329,6 +351,10 @@ checkout gets neither, because no `platform.linux` section names them.
   for tools that otherwise write to your (read-only, to a worker) home folder. `home:<name>` is
   emptied for every call; `cache:<name>` is kept between calls in the same slot, so
   `CARGO_TARGET_DIR: "cache:cargo-target"` keeps incremental builds warm without copying `target/`.
+  A call that timed out or was cancelled retires its copy, and since 0.1.10 the copy's `cache:`
+  folders (and `slotSetup`'s `keep` paths) move to the replacement copy instead of being deleted, so
+  the retry does not build from cold; each `slotSetup` step runs once more there. A result with
+  `isolation.buildCacheEmpty: true` started with an empty cache, which explains a slow build.
   `port:<base>` gives each slot its own port base (`base + slot × 10`; `port:41000/100` for a
   stride of 100), for test servers that would otherwise share a fixed port. `value:<text>` sets a
   plain value in every slot, for a setting the whole project shares rather than one brief:
@@ -362,11 +388,12 @@ checkout gets neither, because no `platform.linux` section names them.
 | Tool | Writes to | Variable to move |
 |---|---|---|
 | wrangler | `~/.config/.wrangler` | `XDG_CONFIG_HOME: "home:config"` |
-| cargo, new crates | `~/.cargo` | `CARGO_HOME: "cache:cargo-home"` (downloads once per slot; your `~/.cargo/config.toml` is not seen) |
+| cargo, new crates | `~/.cargo` | `CARGO_HOME: "cache:cargo-home"` (downloads once per slot; your `~/.cargo/config.toml` is not seen). It starts without the crate registry, so a first `--offline` build fails: seed it with a `slotSetup` step, or leave `CARGO_HOME` out of `slotEnv` so workers read your `~/.cargo` |
 | cargo, build output | `target/` | `CARGO_TARGET_DIR: "cache:cargo-target"` |
 | Go | its build cache and `~/go/pkg/mod` | `GOCACHE: "cache:go-build"`, `GOMODCACHE: "cache:go-mod"` |
 | npm | `~/.npm` | `npm_config_cache: "cache:npm"` |
 | pip | `~/.cache/pip` | `PIP_CACHE_DIR: "cache:pip"` |
+| uv | `~/.cache/uv`, its tools and Pythons | `UV_CACHE_DIR: "cache:uv"`, `UV_TOOL_DIR: "cache:uv-tools"`, `UV_PYTHON_INSTALL_DIR: "cache:uv-python"` |
 
 `FLASH_COPY_EXCLUDE` (comma-separated) or `--copy-exclude` add to `copyExclude` for one server.
 
@@ -376,8 +403,8 @@ To watch workers live, set a log file and `tail -f` it — see
 ## Honest limits
 
 - **A running worker can't be steered** — the harness protocol has no attach. A background call
-  can be cancelled, which stops its runtime and retires its copy (the partial work is not returned);
-  the idle timeout is what stops a stuck one.
+  can be cancelled, which stops its runtime and retires its copy; as on a timeout, the change so far
+  is stored as a patch named in the error. The idle timeout is what stops a stuck one.
 - **Members of one `flash_batch` share one copy**, so they see each other's edits. Give them
   disjoint files.
 - **Gitignored output isn't carried in the patch.** It's named in the result instead — new ignored
@@ -392,16 +419,25 @@ To watch workers live, set a log file and `tail -f` it — see
   after ten seconds. Anything else it got wrong is a verdict, not a hiccup.
 - **A repeated-failure warning reads the shell's exit code, so a pipe hides it.** A command piped
   into `tee` reports `tee`'s exit code, not the failing command's, so a build that fails on the left
-  of a pipe cannot be counted; read the worker's output for those.
+  of a pipe cannot be counted; read the worker's output for those. Exit 1 from `grep`, `rg`,
+  `git grep`, `diff` or `cmp` means "no match" or "they differ" and is not counted, and a warning
+  says so when a later run of the same step succeeded.
+- **A read-only call runs in your live tree, not in a copy.** It sees edits that land while it
+  reads, yours or another session's.
 - **Copies are separate folders, not separate machines.** Two workers in parallel share ports, the
   keyring and other per-user services: a test server on a fixed port can answer the other copy's
   tests. Pick a free port per run.
 - **Parallel slices don't know about each other.** Five workers once picked the same database
   migration number on one day. Give each parallel slice its own range of numbered files, or number
   them yourself at apply time.
-- **A nested repository the root's git ignores is read-only in effect**: a worker can edit it in its
-  copy, but the change can't travel in the root's patch. Point `cwd` into that repository to work
-  on it.
+- **Nested repositories travel in the patch only in the workspace layout.** Since 0.1.10 a worker's
+  edits inside a nested git repository of a whole-root copy are carried in the patch when that
+  repository has its own `.git` directory and the top repository either does not track or ignore
+  it, or ignores exactly its directory (`inner/` in `.gitignore`). A repository under an ignored
+  parent (`vendor/`, `node_modules/`, `.build/checkouts/`) is left out as before, and a submodule
+  keeps its pointer. A nested repository whose changes cannot be read is named in `warnings`, and
+  the copy is kept until the next call in that slot. Pointing `cwd` into the repository still copies
+  only that one.
 - **Jobs are this server's, not your machine's.** `flash_status` and `flash_result` know only the
   jobs the running server process started: another session's jobs, or one from before a restart, are
   not listed. A finished writing call's work survives that as a patch, which `flash_apply` can still
@@ -412,7 +448,8 @@ To watch workers live, set a log file and `tail -f` it — see
   rather than guessed at. And a plugin update no longer leaves the old guard and worker profile behind silently: the
   server names the drift in its log and in every task result, and `node install.mjs` in the plugin folder
   is the fix. A runtime that boots after that install re-reads the profile's stamp and drops the
-  warning by itself; a runtime booted before it keeps the warning until it is replaced.
+  warning by itself; an idle runtime booted before it is replaced at its next use, and a busy one
+  once its calls end.
 - **A crash used to lose the unfinished work; 0.1.7 fixes that.** Before 0.1.7 the start-up sweep
   looked for a dead server's copies one directory too high, found nothing to salvage, and deleted
   them. It now finds them and salvages a copy that holds work as a patch named in the log, and keeps a copy it
@@ -430,6 +467,12 @@ To watch workers live, set a log file and `tail -f` it — see
   slot then fails at the sandbox's first step (`SetNamedSecurityInfoW failed (Win32 5)`);
   `doctor`'s `state-base-permissions` row tests that and names the fix (see
   [Configuration](#configuration)).
+- **On Windows the dsh sandbox blocks owner-only folders and named pipes.** This is the harness's
+  sandbox, not the plugin. A folder created with an owner-only access list cannot be used inside
+  it: Python 3.12.4+ and 3.13 create one for `os.mkdir(..., 0o700)`, `tempfile.mkdtemp()` and
+  therefore pytest's `tmp_path`. Named pipes are blocked too, which stops `multiprocessing` and
+  pytest-xdist, and may be the cause of Node's `spawn EPERM`, since libuv uses named pipes. Run
+  such tests yourself on the applied patch.
 - macOS and Linux are what we test on. Windows 11 works in daily use by at least one user; directory
   junctions are recreated as junctions inside the copy.
 

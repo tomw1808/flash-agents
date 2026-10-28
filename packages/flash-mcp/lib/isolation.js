@@ -25,9 +25,14 @@
  * @property {string} dir - the disposable tree the worker runs in.
  * @property {number} dirIndex - how many times the slot has been moved to a fresh path.
  * @property {string[]} orphans - trees left in place by `retire`, removed when the pool closes.
+ * @property {Set<string>} stoppedOrphans - the orphans whose runtimes were shut down before
+ *   `retire`, so their build cache may be moved into the slot's current directory.
  * @property {string} tmpDir - a temp directory inside `dir`, for the worker's TMPDIR.
  * @property {string | null} base - commit this call started from, or null without git.
  * @property {boolean} busy - whether a call currently holds the slot.
+ * @property {object} [settings] - the repository settings the call holding it leased with.
+ * @property {string[]} [settingsWarnings] - what that call's result must say about them.
+ * @property {boolean} [buildCacheEmpty] - whether the call started with a cold build cache.
  *
  * @typedef {object} Change
  * @property {boolean} available - whether a diff could be computed at all.
@@ -45,6 +50,10 @@
  * @property {boolean} stored - whether the patch was written to disk; false for apply "discard".
  * @property {string} [patchId] - id a later `flash_apply` can refer to.
  * @property {string} [patchPath] - where the patch was stored.
+ * @property {string[]} [nestedUnread] - nested repositories (relative to the copied
+ *   repository) whose changes could not be read and are not in the patch; the copy holding
+ *   them should be kept rather than emptied.
+ * @property {string[]} [warnings] - one sentence per such repository, for the result.
  */
 
 import { execFileSync, spawn } from 'node:child_process'
@@ -112,13 +121,16 @@ const SLOT_HOME = '.flash-home'
  *
  * Unlike `.flash-home`, these deliberately survive a later `prepare` in the same slot:
  * a Rust target directory or a package cache kept warm across calls is the whole point of
- * naming one, and it costs no copy because it lives outside the copied repository. They
- * are still removed by `retire`, by the dead-owner sweep and by `close`.
+ * naming one, and it costs no copy because it lives outside the copied repository. `retire`
+ * leaves them with the retired tree, and `trim` moves them into the slot's new directory
+ * when that one has none yet (see `#keepRetiredCache`); the dead-owner sweep and `close`
+ * remove them with everything else.
  */
 const SLOT_CACHE = '.flash-cache'
 
 /**
- * The per-repository settings file, read once when a pool is constructed. It carries the
+ * The per-repository settings file, read when a pool is constructed and again when a
+ * writing call leases a slot after the file changed (see `refreshSettings`). It carries the
  * copy's exclusions and the worker's per-slot environment, which belong to the repository
  * rather than to the service invocation and so cannot live in `flash.config.json`.
  */
@@ -141,12 +153,15 @@ const LOCAL_SETTINGS_FILE = '.flash-agents.local.json'
 const PLATFORM_NAMES = new Set(['aix', 'android', 'darwin', 'freebsd', 'linux', 'openbsd', 'sunos', 'win32'])
 
 /**
- * The warning for one settings file that changed after this server read it.
+ * The warning earlier releases returned for one settings file that changed after the server
+ * read it.
  *
- * The files are read once, when the pool is constructed, because their settings describe the
- * repository rather than the call and every copy would otherwise pay for a re-read. A file
- * edited afterwards is therefore not applied by the running server; saying so on every call
- * is the only way the edit is not simply ignored until someone happens to reconnect.
+ * Those releases read the files once, at start, so an edit only took effect after a
+ * reconnect — and the VS Code extension has no `/mcp reconnect`, so there it never did. The
+ * pool now re-reads a changed file when the next writing call leases a slot (see
+ * `refreshSettings`), and the service no longer returns this sentence. It stays exported
+ * because it is the sentence older results carried, and something matching on it should
+ * still find the same words.
  *
  * @param {string} file - the settings file name, as the caller knows it.
  * @returns {string} the warning naming that file.
@@ -160,6 +175,52 @@ export function settingsChangedWarning(file) {
  * Kept as a constant because that is the sentence earlier releases returned.
  */
 export const SETTINGS_CHANGED_WARNING = settingsChangedWarning(SETTINGS_FILE)
+
+/**
+ * The warning a call carries while one settings file cannot be used.
+ *
+ * A half-saved edit or a stray comma would otherwise be reported only in a log nobody reads,
+ * and the caller would wonder why the settings they just wrote changed nothing.
+ *
+ * @param {string} file - the settings file name, as the caller knows it.
+ * @param {string} problem - what is wrong with its content.
+ * @param {object} options - what the call uses instead.
+ * @param {boolean} options.kept - whether the file was valid before, so its last valid
+ *   settings still apply.
+ * @returns {string} the warning naming that file and the problem.
+ */
+export function settingsInvalidWarning(file, problem, { kept }) {
+  return kept
+    ? `${file} could not be used: ${problem}. Calls keep the settings last read from it until it is fixed`
+    : `${file} could not be used: ${problem}. None of its settings apply until it is fixed`
+}
+
+/**
+ * Whether two settings-file stamps describe the same file.
+ * @param {{exists: boolean, size?: number, ino?: number, mtimeMs?: number, ctimeMs?: number}} now - the current stamp.
+ * @param {{exists: boolean, size?: number, ino?: number, mtimeMs?: number, ctimeMs?: number}} before - the stamp last read.
+ * @returns {boolean} true when every field matches.
+ */
+function sameSettingsStamp(now, before) {
+  return (
+    now.exists === before.exists &&
+    now.size === before.size &&
+    now.ino === before.ino &&
+    now.mtimeMs === before.mtimeMs &&
+    now.ctimeMs === before.ctimeMs
+  )
+}
+
+/**
+ * A key for what one read of a settings file found, so a file that was only touched (a
+ * save without an edit, a checkout that rewrote it unchanged) is not re-applied.
+ * @param {{present: boolean, hash?: string, problem?: string}} parsed - what `readSettingsFile` returned.
+ * @returns {string} `absent`, the content's digest, or the reason it could not be read.
+ */
+function settingsContentKey(parsed) {
+  if (!parsed.present) return 'absent'
+  return parsed.hash ?? `unreadable: ${parsed.problem ?? ''}`
+}
 
 /**
  * How long a Windows slot root may be before tools without long-path support can fail.
@@ -282,6 +343,12 @@ const SCOPE_MARKER = '.flash-scope'
  */
 const TASK_FILE = 'flash-task.json'
 
+/**
+ * The file inside a copy's own git directory that names the nested repositories its diff
+ * stages file by file (see `stagedRepositories`), so a salvage diffs them the same way.
+ */
+const NESTED_FILE = 'flash-nested.json'
+
 /** How much of a task's label, file path and ids a record keeps. */
 const TASK_LABEL_MAX = 200
 const TASK_FILE_PATH_MAX = 1024
@@ -309,7 +376,8 @@ const BASE_REF = 'refs/flash/base'
  *
  * A workspace root often holds many independent repositories. Copying all of them for a
  * call that works in one of them costs minutes, and the root's own `git diff` cannot see a
- * nested repository's changes at all, so its patch came back empty. The nearest directory
+ * nested repository's changes at all, so its patch came back empty (a whole-root copy now
+ * stages them itself, see `stagedRepositories`, but still copies every one). The nearest directory
  * between `cwd` and the root that carries its own `.git` DIRECTORY is copied instead, at
  * the same relative path inside the slot, and it is where the base, the diff and the apply
  * happen.
@@ -1699,20 +1767,47 @@ function salvageSlot(slotDir, { root, patchDir, pid, sweptAt, log = () => {} }) 
   // Read before the tree is diffed, from the copy's own git directory: it names the task
   // the dead worker was doing, which is the one fact its files cannot tell the caller.
   const task = readSalvagedTask(repoDir, log)
-  git(['add', '-A'], repoDir)
-  if (git(['status', '--porcelain'], repoDir).trim() === '') return null
+  // The nested repositories the base staged as files are staged the same way here, or the
+  // dead worker's edits inside them would be lost with the tree.
+  const nested = readNestedFile(repoDir)
+  git(['add', '-A', ...excludingPaths(repoDir, nested)], repoDir)
+  if (nested.length === 0 && git(['status', '--porcelain'], repoDir).trim() === '') return null
+  return withNestedIndex(repoDir, nested, base, (env, unread) => {
+    // The dead tree is removed once it is salvaged, so a nested repository that cannot be
+    // read now is lost with it; the rest of the work is still stored, and the loss is named.
+    for (const { path, reason } of unread) {
+      log(
+        `the changes inside nested repository ${path} of the dead tree ${slotDir} could not be read (${reason}) ` +
+          'and are not in its salvaged patch; they are lost when the dead tree is removed',
+      )
+    }
+    // The top's status cannot see inside a nested repository, so with one the diff decides.
+    if (nested.length > 0 && gitAllowFailure(['diff', '--cached', '--quiet', base], repoDir, env).status === 0) return null
+    return storeSalvagedPatch(repoDir, { slotDir, root, patchDir, pid, sweptAt, log, scope, base, task, env })
+  })
+}
+
+/**
+ * Store a dead slot's staged change as a patch and its record; `salvageSlot`'s second half.
+ *
+ * @param {string} repoDir - the dead copy's repository, already staged.
+ * @param {object} options - the record's facts, and the environment naming the staged index.
+ * @returns {{patchId: string, diffstat: string, task?: object}} the stored patch.
+ * @throws {Error} when git cannot produce the diff.
+ */
+function storeSalvagedPatch(repoDir, { slotDir, root, patchDir, pid, sweptAt, log, scope, base, task, env }) {
   const patchId = `flash-${randomUUID()}`
   const patchPath = join(patchDir, `${patchId}.patch`)
   const metaPath = join(patchDir, `${patchId}.json`)
-  const diff = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', base], repoDir)
-  const diffstat = git(['diff', '--cached', '--stat', '--no-color', base], repoDir).trim()
-  const filesChanged = nameStatusRecords(repoDir, base)
+  const diff = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', base], repoDir, env)
+  const diffstat = git(['diff', '--cached', '--stat', '--no-color', base], repoDir, env).trim()
+  const filesChanged = nameStatusRecords(repoDir, base, env)
   mkdirSync(patchDir, { recursive: true })
   // Same commit protocol as `collect`: patch, then the blobs a later merge needs, then the
   // record. The dead slot is about to be removed with its owner, so the blobs get exactly
   // the same one chance to be saved.
   writeFileSync(patchPath, diff)
-  const preimage = savePreimageBlobs(repoDir, base, patchDir, patchId, log)
+  const preimage = savePreimageBlobs(repoDir, base, patchDir, patchId, log, env)
   const record = {
     patchId,
     patchPath,
@@ -1779,6 +1874,38 @@ function messageOf(error) {
 }
 
 /**
+ * How much standard output one git command may hand back.
+ *
+ * `execFileSync` stops at 1 MiB by default and kills the child with ENOBUFS. A three-way
+ * apply reads every merged file whole through `cat-file`, so a file past 1 MiB (a lock
+ * file, a generated schema) failed the apply partway through with nothing but
+ * "git cat-file … failed": the spawn error carries no stderr. The cap stays finite so a
+ * runaway command still ends.
+ */
+const GIT_MAX_BUFFER = 1024 * 1024 * 1024
+
+/**
+ * The message git's failure carries, whichever form the spawn error holds it in.
+ *
+ * Without `encoding` the error's stderr is a Buffer, and reading only strings dropped
+ * every byte-mode failure's reason. A spawn that ran out of output buffer has no stderr
+ * at all, so its code is named instead. Nor has one whose output git wrote in full but
+ * V8 could not decode: a string stops at about 512 MiB (0x1fffffe8 characters) whatever
+ * `maxBuffer` allows, and the decoding error carries only a code.
+ *
+ * @param {unknown} error - what `execFileSync` threw.
+ * @returns {string} the reason, or `''` when there is none.
+ */
+function gitFailureReason(error) {
+  const raw = error?.stderr
+  const stderr = typeof raw === 'string' ? raw.trim() : Buffer.isBuffer(raw) ? raw.toString('utf8').trim() : ''
+  if (stderr.length > 0) return stderr
+  if (error?.code === 'ENOBUFS') return `its output was larger than ${String(GIT_MAX_BUFFER)} bytes`
+  if (error?.code === 'ERR_STRING_TOO_LONG') return 'its output was larger than a string can hold'
+  return ''
+}
+
+/**
  * Run one git command and return its standard output.
  *
  * @param {string[]} args - arguments after `git`.
@@ -1797,11 +1924,12 @@ function git(args, cwd, env = process.env, input) {
       cwd,
       env,
       encoding: 'utf8',
+      maxBuffer: GIT_MAX_BUFFER,
       stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       ...(input === undefined ? {} : { input }),
     })
   } catch (error) {
-    const stderr = typeof error?.stderr === 'string' ? error.stderr.trim() : ''
+    const stderr = gitFailureReason(error)
     throw new Error(`git ${args.join(' ')} failed in ${cwd}${stderr.length === 0 ? '' : `: ${stderr}`}`)
   }
 }
@@ -1820,9 +1948,9 @@ function git(args, cwd, env = process.env, input) {
  */
 function gitBuffer(args, cwd, env = process.env) {
   try {
-    return execFileSync('git', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    return execFileSync('git', args, { cwd, env, maxBuffer: GIT_MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'] })
   } catch (error) {
-    const stderr = typeof error?.stderr === 'string' ? error.stderr.trim() : ''
+    const stderr = gitFailureReason(error)
     throw new Error(`git ${args.join(' ')} failed in ${cwd}${stderr.length === 0 ? '' : `: ${stderr}`}`)
   }
 }
@@ -1840,13 +1968,15 @@ function gitBuffer(args, cwd, env = process.env) {
  */
 function gitAllowFailure(args, cwd, env = process.env) {
   try {
-    const stdout = execFileSync('git', args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    const stdout = execFileSync('git', args, { cwd, env, encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'] })
     return { status: 0, stdout, stderr: '' }
   } catch (error) {
     return {
       status: typeof error?.status === 'number' ? error.status : 1,
       stdout: typeof error?.stdout === 'string' ? error.stdout : '',
-      stderr: typeof error?.stderr === 'string' ? error.stderr.trim() : '',
+      // A spawn error (no output buffer left, output too long for a string) has no stderr,
+      // and its reason is all a caller reporting the failure has to go on.
+      stderr: gitFailureReason(error),
     }
   }
 }
@@ -2304,10 +2434,12 @@ function isGitWorkTree(dir) {
  *   per matched path whether it may be left out; the git-safety decision lives with the caller.
  * @returns {{mechanism: 'clone' | 'copy', skipped: string[], vanished: number,
  *   excluded: string[], kept: {path: string, reason?: string}[], linksRepointed: number,
- *   repointed: string[], linksSkipped: {path: string, target: string, reason: string}[]}} which mechanism was used,
+ *   repointed: string[], linksSkipped: {path: string, target: string, reason: string}[],
+ *   repositories: string[]}} which mechanism was used,
  *   the directories left out, how many entries vanished mid-walk, which entries were excluded,
- *   how many absolute links were re-pointed into the copy, and which links could not be
- *   recreated for the copy.
+ *   how many absolute links were re-pointed into the copy, which links could not be
+ *   recreated for the copy, and the nested directories with their own `.git` directory that
+ *   were copied (relative to `from`, with `/` separators, parents before children).
  */
 export function copyTree(from, to, { fs = {}, exclude = [], consider, platform = process.platform } = {}) {
   // FICLONE_FORCE refuses rather than silently copying when the filesystem cannot
@@ -2327,6 +2459,7 @@ export function copyTree(from, to, { fs = {}, exclude = [], consider, platform =
   const kept = []
   const linksSkipped = []
   const repointed = []
+  const repositories = []
   let vanished = 0
   const copyFile = (source, target) => {
     if (mechanism === 'clone') {
@@ -2462,6 +2595,11 @@ export function copyTree(from, to, { fs = {}, exclude = [], consider, platform =
             skipped.push(relPath)
             continue
           }
+          // Named for `prepare`: the top repository's diff cannot see inside a nested
+          // repository, so the copy has to stage its files itself (see `stageNestedRepositories`).
+          // Nothing inside a git directory is a work tree of its own.
+          const parts = relPath.split(sep)
+          if (!parts.includes('.git') && hasGitDirectory(sourcePath)) repositories.push(parts.join('/'))
           mkdir(targetPath, { recursive: true })
           walk(sourcePath, targetPath, false)
         } else if (entry.isFile()) {
@@ -2476,7 +2614,24 @@ export function copyTree(from, to, { fs = {}, exclude = [], consider, platform =
     }
   }
   walk(from, to, true)
-  return { mechanism, skipped, vanished, excluded, kept, linksRepointed: repointed.length, repointed, linksSkipped }
+  return { mechanism, skipped, vanished, excluded, kept, linksRepointed: repointed.length, repointed, linksSkipped, repositories }
+}
+
+/**
+ * Whether a directory is the top of a repository with its own `.git` directory.
+ *
+ * A `.git` file (a submodule or a linked worktree) or a symlink is not counted: its git
+ * state lives elsewhere, and `gitLinkTravels` already decides what happens to it.
+ *
+ * @param {string} dir - a directory.
+ * @returns {boolean} true when `dir/.git` is a real directory.
+ */
+function hasGitDirectory(dir) {
+  try {
+    return lstatSync(join(dir, '.git')).isDirectory()
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -2650,32 +2805,37 @@ function readPlatformSections(value, label, log) {
  *
  * A file that does not exist is simply the common case and is not a problem. A file that
  * exists but cannot be read or parsed is named and contributes nothing, while `present`
- * still records that it exists so the caller can tell it from no file at all.
+ * still records that it exists so the caller can tell it from no file at all. `problem`
+ * says why such a file was unusable, so a pool that re-reads it can keep the settings it
+ * last had and tell the caller, instead of silently dropping them. `hash` is the content's
+ * digest, so a file that was only touched is not re-applied.
  *
  * @param {string} path - absolute path to the file.
  * @param {string} label - the file name the log lines should use.
  * @param {(message: string) => void} log - where to name a problem.
- * @returns {{present: boolean, settings: object, sections: Map<string, object>}} the file's
- *   accepted top-level settings and platform sections.
+ * @returns {{present: boolean, hash?: string, problem?: string, settings: object,
+ *   sections: Map<string, object>}} the file's accepted top-level settings and platform sections.
  */
 function readSettingsFile(path, label, log) {
   let raw
   try {
     raw = readFileSync(path, 'utf8')
   } catch (error) {
-    if (error?.code !== 'ENOENT') log(`ignoring ${path}: ${messageOf(error)}`)
-    return { present: error?.code !== 'ENOENT', settings: {}, sections: new Map() }
+    if (error?.code === 'ENOENT') return { present: false, settings: {}, sections: new Map() }
+    log(`ignoring ${path}: ${messageOf(error)}`)
+    return { present: true, problem: `it could not be read (${messageOf(error)})`, settings: {}, sections: new Map() }
   }
+  const hash = createHash('sha256').update(raw).digest('hex')
   let parsed
   try {
     parsed = JSON.parse(raw)
   } catch (error) {
     log(`ignoring ${path}: it is not valid JSON (${messageOf(error)})`)
-    return { present: true, settings: {}, sections: new Map() }
+    return { present: true, hash, problem: `it is not valid JSON (${messageOf(error)})`, settings: {}, sections: new Map() }
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     log(`ignoring ${path}: the settings must be a JSON object`)
-    return { present: true, settings: {}, sections: new Map() }
+    return { present: true, hash, problem: 'the settings must be a JSON object', settings: {}, sections: new Map() }
   }
   let settings = {}
   let sections = new Map()
@@ -2687,26 +2847,28 @@ function readSettingsFile(path, label, log) {
       settings = { ...settings, ...readSettingsObject({ [key]: value }, label, log) }
     }
   }
-  return { present: true, settings, sections }
+  return { present: true, hash, settings, sections }
 }
 
 /**
- * Read the shared and per-machine settings files and layer them for this platform.
+ * Layer the shared and per-machine settings files for this platform.
  *
  * Layers, lowest first: `.flash-agents.json`, its `platform.<current>` section,
  * `.flash-agents.local.json`, its `platform.<current>` section. The pool options are
- * applied later by `mergeSlotEnv` and the constructor. Lists append in that order and the
+ * applied later by `mergeSlotEnv` and `#buildSettings`. Lists append in that order and the
  * last `copyExcludeDefaults` wins; `slotEnv` is merged there too, by variable name.
  *
- * @param {string} root - the service root.
- * @param {(message: string) => void} log - where to name a problem.
- * @param {object} [options] - platform selection, injected by tests.
- * @param {string} [options.platform] - `process.platform`; chooses the sections to apply.
+ * The files are read by the pool, not here: it keeps what each file last parsed to, so a
+ * file that has turned invalid since can still contribute the settings it had before.
+ *
+ * @param {{file: string, parsed: {present: boolean, settings: object,
+ *   sections: Map<string, object>}}[]} files - each file's parsed content, shared first.
+ * @param {string} platform - `process.platform`; chooses the sections to apply.
  * @returns {{present: boolean, layers: string[], copyExclude: string[],
  *   copyExcludeDefaults?: boolean, slotEnvLayers: {label: string, values: object}[],
  *   slotSetup: object[]}} the accepted layers, in order.
  */
-function readRepoSettings(root, log, { platform = process.platform } = {}) {
+function layerRepoSettings(files, platform) {
   const result = {
     present: false,
     layers: [],
@@ -2730,14 +2892,37 @@ function readRepoSettings(root, log, { platform = process.platform } = {}) {
     if (settings.slotEnv !== undefined) result.slotEnvLayers.push({ label, values: settings.slotEnv })
     if (settings.slotSetup !== undefined) result.slotSetup.push(...settings.slotSetup)
   }
-  for (const file of [SETTINGS_FILE, LOCAL_SETTINGS_FILE]) {
-    const parsed = readSettingsFile(join(root, file), file, log)
+  for (const { file, parsed } of files) {
     if (parsed.present) result.present = true
     addLayer(file, parsed.settings)
     const section = parsed.sections.get(platform)
     if (section !== undefined) addLayer(`${file} platform.${platform}`, section)
   }
   return result
+}
+
+/**
+ * Whether a directory holds at least one file anywhere below it.
+ *
+ * Empty folders do not count: `prepare` creates the folders a `cache:` entry names before
+ * anything has written to them, and such a cache is as cold as none at all. The walk stops
+ * at the first file, so a warm cache of tens of gigabytes costs a few directory reads.
+ *
+ * @param {string} dir - the directory to look into.
+ * @returns {boolean} true when anything that is not a directory exists below it.
+ */
+function holdsAnyFile(dir) {
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return false
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) return true
+    if (holdsAnyFile(join(dir, entry.name))) return true
+  }
+  return false
 }
 
 /**
@@ -3271,6 +3456,375 @@ function excludeFromDiff(dir, name) {
 }
 
 /**
+ * The nested repositories of a copy that its own diff has to stage file by file.
+ *
+ * The top repository's `git add -A` records a nested repository with its own `.git`
+ * directory as one gitlink at that repository's HEAD, and nothing below it. A worker that
+ * edited seven files inside one therefore produced a patch without them, and the copy was
+ * emptied after the call: the work was lost and nothing said so. Every such repository is
+ * staged here as the plain files of its working tree instead, so its changes are part of
+ * the one stored patch and `flash_apply` writes them into the caller's nested repository
+ * (its working tree only, as for every other file).
+ *
+ * Only the "workspace of independent repositories" layout is staged: the repository that
+ * contains it (the top, or a staged nested one) tracks nothing at or under its path, and
+ * either does not ignore it or ignores exactly that directory (`.gitignore` lists
+ * `inner/`). Everything else is left as before:
+ *
+ * - a path the parent tracks — a gitlink the caller committed on purpose keeps its
+ *   pointer semantics;
+ * - a repository under a directory the parent ignores, such as `node_modules/x`,
+ *   `.build/checkouts/x` or `vendor/x` with `vendor/` ignored: that is build output or a
+ *   dependency checkout, which can be large and is not the caller's work;
+ * - a directory whose `.git` git cannot read.
+ *
+ * What is inside a repository left out is left out with it.
+ *
+ * @param {string} repoDir - the copied repository.
+ * @param {string[]} candidates - nested repositories `copyTree` found, parents first.
+ * @returns {string[]} the repositories to stage, relative to `repoDir`, parents first.
+ */
+function stagedRepositories(repoDir, candidates) {
+  const accepted = []
+  const leftOut = []
+  for (const path of candidates) {
+    if (!scopeIsSafe(path)) continue
+    const parent = [...accepted, ...leftOut]
+      .filter((other) => path.startsWith(`${other}/`))
+      .sort((left, right) => right.length - left.length)[0]
+    if (parent !== undefined && leftOut.includes(parent)) {
+      leftOut.push(path)
+      continue
+    }
+    const owner = parent === undefined ? repoDir : join(repoDir, parent)
+    const rel = parent === undefined ? path : path.slice(parent.length + 1)
+    if (gitOrEmpty(['ls-files', '--', `:(literal)${rel}`], owner) !== '' || ignoredBelowItsParent(owner, rel) || !isGitWorkTree(join(repoDir, path))) {
+      leftOut.push(path)
+      continue
+    }
+    accepted.push(path)
+  }
+  return accepted
+}
+
+/**
+ * Whether a nested repository lies inside a directory its parent repository ignores.
+ *
+ * The repository's own directory being ignored is the workspace layout and does not count;
+ * any directory between the parent's top and it being ignored does. Git cannot re-include
+ * a path under an ignored directory, so a path that is not ignored itself has no ignored
+ * ancestor either, and costs one question.
+ *
+ * @param {string} owner - the parent repository.
+ * @param {string} rel - the nested repository, relative to `owner`, with `/` separators.
+ * @returns {boolean} true when an ancestor directory of `rel` is ignored.
+ */
+function ignoredBelowItsParent(owner, rel) {
+  if (!gitCheckIgnore(owner, rel)) return false
+  const parts = rel.split('/')
+  for (let depth = 1; depth < parts.length; depth += 1) {
+    if (gitCheckIgnore(owner, parts.slice(0, depth).join('/'))) return true
+  }
+  return false
+}
+
+/**
+ * Pathspec arguments for `git add -A` in `dir` that leave the given paths alone.
+ *
+ * A path `dir` ignores is left alone by `add -A` already, and naming it in a pathspec,
+ * even as an exclusion, makes `add` fail with "paths are ignored". So only the paths it
+ * would otherwise stage — as a gitlink, or as a failure for a repository with no commit —
+ * are excluded.
+ *
+ * @param {string} dir - where `git add` runs.
+ * @param {string[]} paths - nested repositories, relative to `dir`.
+ * @returns {string[]} nothing when no path needs it, or `--`, `.` and one literal exclusion each.
+ */
+function excludingPaths(dir, paths) {
+  const staged = paths.filter((path) => !gitCheckIgnore(dir, path))
+  return staged.length === 0 ? [] : ['--', '.', ...staged.map((path) => `:(exclude,literal)${path}`)]
+}
+
+/**
+ * The tree of one nested repository's working tree, as `git add -A` there would stage it.
+ *
+ * Staged through a private index, like the top repository's base, so the copy's own index
+ * of the nested repository stays what the caller's was. Its own ignore rules decide what
+ * is in it. The nested repositories inside it that are staged separately are left out.
+ *
+ * @param {string} dir - the nested repository in the copy.
+ * @param {string[]} inner - nested repositories inside it that are staged on their own,
+ *   relative to `dir`.
+ * @returns {string} the tree id, in the nested repository's object store.
+ */
+function nestedWorkTree(dir, inner) {
+  const indexFile = join(dir, '.git', `flash-index-${randomUUID()}`)
+  try {
+    const realIndex = join(dir, '.git', 'index')
+    if (existsSync(realIndex)) copyFileSync(realIndex, indexFile)
+    const env = { ...process.env, GIT_INDEX_FILE: indexFile }
+    git(['add', '-A', ...excludingPaths(dir, inner)], dir, env)
+    return git(['write-tree'], dir, env).trim()
+  } finally {
+    rmSync(indexFile, { force: true })
+  }
+}
+
+/**
+ * The working-tree trees of a copy's staged nested repositories.
+ *
+ * Children are read before their parents. When the base is recorded, a parent leaves out
+ * only the children that staged, and a repository git cannot stage is dropped (with
+ * everything inside it) for the top repository to treat as it always did: one broken
+ * nested repository cannot cost the call its base. At collect time the list is the base's,
+ * so `allChildren` makes every parent leave out every listed child, exactly as the base
+ * did, and a failure is returned for the caller to cover with the base's own content.
+ *
+ * @param {string} repoDir - the copied repository.
+ * @param {string[]} nested - repositories to stage, parents first.
+ * @param {{allChildren?: boolean}} [options] - whether a parent leaves out children that failed.
+ * @returns {{trees: Map<string, string>, failed: {path: string, reason: string}[]}} path to
+ *   tree id for the ones that staged, and the outermost ones that did not (a failed
+ *   repository's children are neither), both parents first.
+ */
+function nestedTrees(repoDir, nested, { allChildren = false } = {}) {
+  const read = new Map()
+  const reasons = new Map()
+  for (const path of [...nested].reverse()) {
+    const inner = nested
+      .filter((other) => other.startsWith(`${path}/`) && (allChildren || read.has(other)))
+      .map((other) => other.slice(path.length + 1))
+    try {
+      read.set(path, nestedWorkTree(join(repoDir, path), inner))
+    } catch (error) {
+      reasons.set(path, messageOf(error))
+    }
+  }
+  const insideFailed = (path) => [...reasons.keys()].some((other) => path.startsWith(`${other}/`))
+  return {
+    trees: new Map(nested.filter((path) => read.has(path) && !insideFailed(path)).map((path) => [path, read.get(path)])),
+    failed: nested.filter((path) => reasons.has(path) && !insideFailed(path)).map((path) => ({ path, reason: reasons.get(path) })),
+  }
+}
+
+/**
+ * Make a copy's nested repositories' objects readable from its top repository.
+ *
+ * Their trees are read into the top repository's index and diffed there, and the blobs of
+ * their files live in their own object stores. The entries are relative to the top's
+ * object directory, so they keep working wherever the tree is when it is salvaged.
+ *
+ * @param {string} repoDir - the copied repository.
+ * @param {string[]} nested - its staged nested repositories.
+ * @returns {void}
+ */
+function linkNestedObjects(repoDir, nested) {
+  const objects = resolve(repoDir, git(['rev-parse', '--git-path', 'objects'], repoDir).trim())
+  const file = join(objects, 'info', 'alternates')
+  const lines = existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter((line) => line !== '') : []
+  for (const path of nested) {
+    const entry = relative(objects, join(repoDir, path, '.git', 'objects')).split(sep).join('/')
+    if (!lines.includes(entry)) lines.push(entry)
+  }
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, `${lines.join('\n')}\n`)
+}
+
+/**
+ * Copy the objects of the base's nested trees into the top repository's own object store.
+ *
+ * The alternates of `linkNestedObjects` reach into the nested repositories themselves, and
+ * a worker may delete one, or only its `.git`. The base's tree for that path then named
+ * objects nobody could read, `read-tree --prefix` of it failed, and the whole change was
+ * unavailable for one deleted directory. Packed into the top's store, the base's nested
+ * files stay readable for as long as the copy does, so a removed repository reads as its
+ * files deleted. Delta search is skipped: the pack lives only as long as the copy, and
+ * speed at prepare matters more than its size.
+ *
+ * Best effort: a failure is logged, and a deleted repository then costs what it did before.
+ *
+ * @param {string} repoDir - the copied repository, with the nested stores already linked.
+ * @param {string[]} trees - the base's tree ids of its staged nested repositories.
+ * @param {(message: string) => void} log - where a failure is named.
+ * @returns {void}
+ */
+function packNestedObjects(repoDir, trees, log) {
+  if (trees.length === 0) return
+  try {
+    const objects = resolve(repoDir, git(['rev-parse', '--git-path', 'objects'], repoDir).trim())
+    const listed = git(['rev-list', '--objects', ...trees], repoDir)
+    git(['pack-objects', '-q', '--window=0', join(objects, 'pack', 'pack')], repoDir, process.env, listed)
+  } catch (error) {
+    log(`could not copy the nested repositories' base objects into the copy's own store: ${messageOf(error)}`)
+  }
+}
+
+/**
+ * The tree of a former nested repository's files, staged as plain files of the top.
+ *
+ * A worker that removed only a nested repository's `.git` left its files as ordinary
+ * files of the top's tree, and they are diffed as such. They are staged through the top's
+ * git directory with the directory as the work tree, so the ignore files inside it still
+ * decide what is in it, as the nested repository's own staging did. The listed nested
+ * repositories inside it are cleared afterwards for their own staging to fill.
+ *
+ * @param {string} repoDir - the copied repository.
+ * @param {string} path - the former nested repository, relative to `repoDir`.
+ * @param {string[]} inner - nested repositories inside it, relative to it.
+ * @returns {string} the tree id, in the top repository's object store.
+ * @throws {Error} when git cannot stage the directory.
+ */
+function plainFilesTree(repoDir, path, inner) {
+  const gitDir = resolve(repoDir, git(['rev-parse', '--git-dir'], repoDir).trim())
+  const indexFile = join(gitDir, `flash-index-${randomUUID()}`)
+  try {
+    const env = { ...process.env, GIT_INDEX_FILE: indexFile }
+    const args = [`--git-dir=${gitDir}`, `--work-tree=${join(repoDir, path)}`]
+    git([...args, 'add', '-A'], repoDir, env)
+    for (const rel of inner) git([...args, 'rm', '--cached', '-r', '-q', '-f', '--ignore-unmatch', '--', `:(literal)${rel}`], repoDir, env)
+    return git([...args, 'write-tree'], repoDir, env).trim()
+  } finally {
+    rmSync(indexFile, { force: true })
+  }
+}
+
+/**
+ * What the index holds for each of a copy's staged nested repositories at collect time.
+ *
+ * A repository that reads is staged as its working tree. One whose directory is gone is
+ * cleared, so its files read as deleted (their base blobs are in the top's store, see
+ * `packNestedObjects`); one whose `.git` alone is gone is staged as the top's plain files,
+ * and the listed repositories inside it are resolved the same way in turn. Any other
+ * failure is filled with what the base held there and reported as unread.
+ *
+ * @param {string} repoDir - the copied repository.
+ * @param {string[]} nested - the repositories to resolve, parents first.
+ * @param {string} base - the base commit.
+ * @returns {{entries: Map<string, string>, unread: {path: string, reason: string}[]}} path to
+ *   tree id (`''` clears the path), parents first, and the repositories left as they were.
+ */
+function nestedIndexEntries(repoDir, nested, base) {
+  const { trees, failed } = nestedTrees(repoDir, nested, { allChildren: true })
+  const entries = new Map(trees)
+  const unread = []
+  for (const failure of failed) {
+    const { path } = failure
+    const dir = join(repoDir, path)
+    const children = nested.filter((other) => other.startsWith(`${path}/`))
+    if (!existsSync(dir)) {
+      entries.set(path, '')
+      continue
+    }
+    let reason = failure.reason
+    if (!isGitWorkTree(dir)) {
+      try {
+        entries.set(path, plainFilesTree(repoDir, path, children.map((other) => other.slice(path.length + 1))))
+        const inside = nestedIndexEntries(repoDir, children, base)
+        for (const [child, tree] of inside.entries) entries.set(child, tree)
+        unread.push(...inside.unread)
+        continue
+      } catch (error) {
+        reason = `${reason}; its files could not be staged as the top's either: ${messageOf(error)}`
+      }
+    }
+    // The base's content keeps the patch from carrying its edits or reading as deleting it.
+    unread.push({ path, reason })
+    entries.set(path, gitOrEmpty(['rev-parse', '--verify', '-q', `${base}:${path}`], repoDir))
+  }
+  // Parents first, so a child's entries land after its parent's tree.
+  return { entries: new Map(nested.filter((path) => entries.has(path)).map((path) => [path, entries.get(path)])), unread }
+}
+
+/**
+ * Put each nested repository's files into the top repository's index under its path.
+ *
+ * Whatever the index held there — a gitlink, or entries left by an earlier staging — is
+ * removed first, because `read-tree --prefix` refuses a path the index already has.
+ *
+ * A tree id of `''` stages nothing there: the path is only cleared.
+ *
+ * @param {string} repoDir - the copied repository.
+ * @param {Map<string, string>} trees - path to tree id, parents first.
+ * @param {NodeJS.ProcessEnv} env - the environment naming the index to stage into.
+ * @returns {void}
+ */
+function stageNestedRepositories(repoDir, trees, env) {
+  for (const [path, tree] of trees) {
+    git(['rm', '--cached', '-r', '-q', '-f', '--ignore-unmatch', '--', `:(literal)${path}`], repoDir, env)
+    if (tree !== '') git(['read-tree', `--prefix=${path}/`, tree], repoDir, env)
+  }
+}
+
+/**
+ * Run `diff --cached` work against an index that holds the nested repositories' files.
+ *
+ * `collect` and `salvageSlot` stage the top repository in its real index, as they always
+ * did; the nested repositories are added to a private copy of it, so the copy's real index
+ * and the ignored-path listing read from it are exactly what they were. Without nested
+ * repositories the real index is used and nothing changes.
+ *
+ * A nested repository that cannot be staged now must not cost the call the rest of its
+ * change. A removed one reads as its files deleted, one whose `.git` alone was removed as
+ * the top's plain files (see `nestedIndexEntries`). Any other's place in the index is
+ * filled with what the base held there, so the patch neither carries its edits nor reads
+ * as deleting it, and it is handed to `run` to report.
+ *
+ * @template T
+ * @param {string} repoDir - the copied repository, already staged with `git add -A`.
+ * @param {string[]} nested - its staged nested repositories.
+ * @param {string} base - the base commit the change is diffed against.
+ * @param {(env: NodeJS.ProcessEnv, unread: {path: string, reason: string}[]) => T} run - the
+ *   work, given the environment to run git in and the repositories left as they were.
+ * @returns {T} what `run` returned.
+ */
+function withNestedIndex(repoDir, nested, base, run) {
+  if (nested.length === 0) return run(process.env, [])
+  const indexFile = join(repoDir, '.git', `flash-index-${randomUUID()}`)
+  try {
+    const realIndex = resolve(repoDir, git(['rev-parse', '--git-path', 'index'], repoDir).trim())
+    if (existsSync(realIndex)) copyFileSync(realIndex, indexFile)
+    const env = { ...process.env, GIT_INDEX_FILE: indexFile }
+    const { entries, unread } = nestedIndexEntries(repoDir, nested, base)
+    stageNestedRepositories(repoDir, entries, env)
+    return run(env, unread)
+  } finally {
+    rmSync(indexFile, { force: true })
+  }
+}
+
+/**
+ * Record a copy's staged nested repositories in its own git directory.
+ *
+ * A dead server's tree is salvaged from the tree alone, and its diff has to stage the same
+ * repositories its base did, or every file of one would read as added or deleted. Git
+ * never reports a file under `.git`, and it lives exactly as long as the tree.
+ *
+ * @param {string} repoDir - the copied repository.
+ * @param {string[]} nested - its staged nested repositories.
+ * @returns {void}
+ */
+function writeNestedFile(repoDir, nested) {
+  const file = join(repoDir, '.git', NESTED_FILE)
+  if (nested.length === 0) rmSync(file, { force: true })
+  else writeFileSync(file, `${JSON.stringify(nested)}\n`)
+}
+
+/**
+ * The staged nested repositories a copy recorded; none when the file is missing or unusable.
+ * @param {string} repoDir - the copied repository.
+ * @returns {string[]} the repositories, relative to `repoDir`.
+ */
+function readNestedFile(repoDir) {
+  try {
+    const parsed = JSON.parse(readFileSync(join(repoDir, '.git', NESTED_FILE), 'utf8'))
+    // A path is joined onto the tree, so only a plain relative one is trusted.
+    return Array.isArray(parsed) && parsed.every((path) => scopeIsSafe(path) && !path.includes('\\')) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+/**
  * Remove a slot's tree without removing the directory that contains it.
  *
  * The directory itself has to survive: a running runtime holds it as its working
@@ -3485,11 +4039,13 @@ function recordPathField(path) {
  *
  * @param {string} repoDir - the copy the change was computed in.
  * @param {string} base - the base commit the change is diffed against.
+ * @param {NodeJS.ProcessEnv} [env] - environment for git; names the staged index when it is
+ *   not the copy's own (see `withNestedIndex`).
  * @returns {string[]} the decoded records, in git's order.
  * @throws {Error} when git cannot produce the list.
  */
-function nameStatusRecords(repoDir, base) {
-  const raw = git(['diff', '--cached', '--name-status', '-z', base], repoDir)
+function nameStatusRecords(repoDir, base, env = process.env) {
+  const raw = git(['diff', '--cached', '--name-status', '-z', base], repoDir, env)
   const fields = raw.split('\0')
   const lines = []
   let at = 0
@@ -4059,12 +4615,13 @@ function pageSections(sections, selected, offset, maxChars) {
  *
  * @param {string} repoDir - the copy the patch was computed in.
  * @param {string} base - the base commit the patch was diffed against.
+ * @param {NodeJS.ProcessEnv} [env] - environment for git, naming the staged index.
  * @returns {{preimage: Array<{path: string, mode: string, blob: string}>, blobs: string[]}} the
  *   base entries and the distinct source blob ids.
  * @throws {Error} when the raw diff cannot be read.
  */
-function preimageEntries(repoDir, base) {
-  const raw = git(['diff', '--cached', '--raw', '--no-abbrev', '-z', base], repoDir)
+function preimageEntries(repoDir, base, env = process.env) {
+  const raw = git(['diff', '--cached', '--raw', '--no-abbrev', '-z', base], repoDir, env)
   const fields = raw.split('\0')
   const preimage = []
   const blobs = new Set()
@@ -4110,13 +4667,14 @@ function preimageEntries(repoDir, base) {
  * @param {string} patchDir - where stored patches live.
  * @param {string} patchId - the id the patch is stored under.
  * @param {(message: string) => void} log - where a failure is named.
+ * @param {NodeJS.ProcessEnv} [env] - environment for git, naming the staged index.
  * @returns {Array<{path: string, mode: string, blob: string}> | undefined} the base entries,
  *   or undefined when they could not be read or saved.
  */
-function savePreimageBlobs(repoDir, base, patchDir, patchId, log) {
+function savePreimageBlobs(repoDir, base, patchDir, patchId, log, env = process.env) {
   let entries
   try {
-    entries = preimageEntries(repoDir, base)
+    entries = preimageEntries(repoDir, base, env)
   } catch (error) {
     log(`could not read the preimage of ${patchId} (${messageOf(error)}); a three-way merge of this patch will not be possible`)
     return undefined
@@ -4162,6 +4720,28 @@ function touchedPaths(record) {
 }
 
 /**
+ * Whether a tree already holds a patch's whole change.
+ *
+ * `git apply --reverse --check` succeeds when every hunk's result is in the tree. That alone
+ * can also be true of a tree that never had the change: a hunk in repeated lines can find a
+ * second place to match. So the forward check has to fail as well, which is what a tree that
+ * already holds the change does; when both succeed the answer is unclear, and the caller
+ * goes on as it would have without asking. An empty patch has nothing to find.
+ *
+ * @param {object} record - the patch record; `patchPath` is read.
+ * @param {string} target - the tree to look in.
+ * @returns {boolean} true when the reverse applies and the patch itself does not.
+ */
+function basePatchInTree(record, target) {
+  // The same discovery rule `#applyTo` uses: outside a repository the target must not find
+  // one enclosing it, or the paths would be read from that repository's top.
+  const env = isGitWorkTree(target) ? process.env : { ...process.env, GIT_CEILING_DIRECTORIES: dirname(target) }
+  const check = ['apply', '--check', '--whitespace=nowarn']
+  if (gitAllowFailure([...check, '--reverse', record.patchPath], target, env).status !== 0) return false
+  return gitAllowFailure([...check, record.patchPath], target, env).status !== 0
+}
+
+/**
  * Refuse a three-way merge the installed git cannot do.
  *
  * `merge-tree --write-tree` is what merges two trees and writes the result without an
@@ -4198,35 +4778,179 @@ function treeEntry(scratch, tree, path, env) {
   return { mode: match[1], type: match[2], sha: match[3] }
 }
 
+/** How far into a buffer git looks for a NUL before it calls the content binary. */
+const BINARY_SNIFF_BYTES = 8000
+
 /**
- * Write one merged blob into the caller's tree.
+ * Whether content is binary the way git decides it: a NUL byte near the start.
+ * @param {Buffer} content - the bytes.
+ * @returns {boolean} true when git would not treat it as text.
+ */
+function looksBinary(content) {
+  return content.subarray(0, BINARY_SNIFF_BYTES).includes(0)
+}
+
+/**
+ * The line-ending style a file already uses: CRLF when most of its line breaks are CRLF.
+ *
+ * A majority rather than "every line" so a CRLF file with one stray LF line still reads as
+ * the CRLF file it is. A file with no line break at all says nothing, and gets LF. Only the
+ * fallback of `mergedContent` asks, for a file that matches neither form of "ours".
+ *
+ * @param {Buffer} content - the caller's file.
+ * @returns {'crlf' | 'lf'} the style.
+ */
+function lineEndingOf(content) {
+  let crlf = 0
+  let lf = 0
+  for (let at = content.indexOf(0x0a); at !== -1; at = content.indexOf(0x0a, at + 1)) {
+    if (at > 0 && content[at - 1] === 0x0d) crlf += 1
+    else lf += 1
+  }
+  return crlf > lf ? 'crlf' : 'lf'
+}
+
+/**
+ * Text content with every line break in one style.
+ *
+ * Worked on bytes, not on a decoded string, so a file that is not valid UTF-8 keeps every
+ * byte that is not part of a line break. The line breaks are found with `indexOf` and the
+ * lines between them copied whole into one buffer sized up front: building the result one
+ * byte at a time in a JS array failed every file past 2^27 bytes ("Invalid array length")
+ * and needed some twenty bytes of heap per byte before that.
+ *
+ * @param {Buffer} content - the merged text.
+ * @param {'crlf' | 'lf'} style - the style to write.
+ * @returns {Buffer} the converted content.
+ */
+function withLineEndings(content, style) {
+  let breaks = 0
+  let crlf = 0
+  for (let at = content.indexOf(0x0a); at !== -1; at = content.indexOf(0x0a, at + 1)) {
+    breaks += 1
+    if (at > 0 && content[at - 1] === 0x0d) crlf += 1
+  }
+  const out = Buffer.allocUnsafe(style === 'crlf' ? content.length + breaks - crlf : content.length - crlf)
+  let from = 0
+  let to = 0
+  for (let at = content.indexOf(0x0a); at !== -1; at = content.indexOf(0x0a, at + 1)) {
+    // A CR that ends a line is dropped with the line and put back when the style wants it.
+    // It belongs to this line only when it is past the previous break.
+    const end = at > from && content[at - 1] === 0x0d ? at - 1 : at
+    to += content.copy(out, to, from, end)
+    if (style === 'crlf') {
+      out[to] = 0x0d
+      to += 1
+    }
+    out[to] = 0x0a
+    to += 1
+    from = at + 1
+  }
+  content.copy(out, to, from)
+  return out
+}
+
+/**
+ * The paths among `paths` that the caller's own attributes say are not text.
+ *
+ * A `-text` or `binary` attribute is the caller telling git never to convert a file's line
+ * endings, so the merged content of such a path is written exactly as the blob holds it.
+ * The scratch repository carries no attribute files, so the question is asked in the
+ * caller's tree, once for every path. A tree that is not a repository has no attributes.
+ *
+ * @param {string} target - the caller's tree.
+ * @param {string[]} paths - the paths about to be written.
+ * @returns {Set<string>} the paths whose `text` attribute is unset.
+ */
+function notTextPaths(target, paths) {
+  const found = new Set()
+  if (paths.length === 0 || !isGitWorkTree(target)) return found
+  let output
+  try {
+    output = git(['check-attr', '-z', '--stdin', 'text'], target, process.env, `${paths.join('\0')}\0`)
+  } catch {
+    // No answer means no attribute is known to forbid conversion; the content checks still apply.
+    return found
+  }
+  const fields = output.split('\0')
+  for (let at = 0; at + 2 < fields.length; at += 3) {
+    if (fields[at + 2] === 'unset') found.add(fields[at])
+  }
+  return found
+}
+
+/**
+ * What one merged path will be written as, read without touching the caller's tree.
  *
  * The blob is read as bytes: a text read would replace every invalid UTF-8 sequence and
- * corrupt a binary file. An existing symlink is removed rather than written through, or
- * the blob would land on whatever it points at.
+ * corrupt a binary file. How its line endings are written follows how the caller's file
+ * relates to "ours", the blob `hash-object --path` made of that very file:
+ *
+ * - binary content (a NUL near the start, in the blob or in the caller's file, or a path
+ *   the caller's attributes mark `-text`) is the raw blob, never converted;
+ * - a file that is exactly what `cat-file --filters` makes of "ours" is checked out the way
+ *   git converts, so the merged blob goes through `--filters` too: git's own behaviour;
+ * - a file that is exactly the raw "ours" blob is an unconverted checkout — a Windows
+ *   caller with `core.autocrlf=true` and an LF checkout, whose every merged file came back
+ *   CRLF while a plain apply kept LF — so the raw merged blob is written;
+ * - a file that is neither (a clean filter that does more than line endings, say) keeps the
+ *   style most of its line breaks use;
+ * - a new file goes through `cat-file --filters`, because there is no checkout to follow.
+ *
+ * The blob already carries every line ending the worker chose, and the lines neither side
+ * touched exactly as "ours" had them, so the first two cases keep a worker's own
+ * CRLF-to-LF conversion and a mixed file's odd lines; the majority rule, once applied to
+ * every existing file, undid both.
  *
  * @param {string} scratch - the scratch repository the blob lives in.
  * @param {string} target - the caller's tree.
+ * @param {{path: string, entry: {mode: string, sha: string}}} write - the merged path and its blob.
+ * @param {Set<string>} notText - paths the caller's attributes mark as not text.
+ * @param {string} ours - the merge's "ours" commit, holding the caller's file as hashed.
+ * @param {NodeJS.ProcessEnv} env - environment for git.
+ * @returns {{link: string} | {content: Buffer}} the link text, or the file's bytes.
+ */
+function mergedContent(scratch, target, { path, entry }, notText, ours, env) {
+  const blob = gitBuffer(['cat-file', 'blob', entry.sha], scratch, env)
+  if (entry.mode === '120000') return { link: blob.toString('utf8') }
+  const filtered = (sha) => gitBuffer(['cat-file', '--filters', `--path=${path}`, sha], scratch, env)
+  let existing
+  try {
+    const full = join(target, path)
+    if (lstatSync(full).isFile()) existing = readFileSync(full)
+  } catch {
+    // Not there, or not readable as a file: it is written as a new file.
+  }
+  if (notText.has(path) || looksBinary(blob) || (existing !== undefined && looksBinary(existing))) return { content: blob }
+  if (existing === undefined) return { content: filtered(entry.sha) }
+  const mine = treeEntry(scratch, ours, path, env)
+  if (mine !== undefined && mine.type === 'blob') {
+    if (existing.equals(filtered(mine.sha))) return { content: filtered(entry.sha) }
+    if (existing.equals(gitBuffer(['cat-file', 'blob', mine.sha], scratch, env))) return { content: blob }
+  }
+  return { content: withLineEndings(blob, lineEndingOf(existing)) }
+}
+
+/**
+ * Write one merged path into the caller's tree, from content already read.
+ *
+ * An existing symlink is removed rather than written through, or the content would land
+ * on whatever it points at.
+ *
+ * @param {string} target - the caller's tree.
  * @param {string} path - the path, relative to the target.
  * @param {string} mode - the result's git mode.
- * @param {string} sha - the blob id.
- * @param {NodeJS.ProcessEnv} env - environment for git.
+ * @param {{link: string} | {content: Buffer}} merged - what `mergedContent` read.
  * @returns {void}
  */
-function writeResultFile(scratch, target, path, mode, sha, env) {
+function writeResultFile(target, path, mode, merged) {
   const full = join(target, path)
-  if (mode === '120000') {
-    const link = gitBuffer(['cat-file', 'blob', sha], scratch, env).toString('utf8')
+  if ('link' in merged) {
     mkdirSync(dirname(full), { recursive: true })
     rmSync(full, { force: true })
-    symlinkSync(link, full)
+    symlinkSync(merged.link, full)
     return
   }
-  // `--filters` is the inverse of the `hash-object --path` that read "ours": the same
-  // end-of-line conversion the caller's git config asks for (core.autocrlf on Windows) is
-  // applied on the way out, so a merged file keeps the line endings the caller's checkout
-  // uses instead of every line of it reading as changed.
-  const content = gitBuffer(['cat-file', '--filters', `--path=${path}`, sha], scratch, env)
   // The caller's own permission bits survive a rewrite; only the executable bits follow the
   // merged mode. A file a umask or a deliberate chmod made private stays private.
   let previous
@@ -4238,7 +4962,7 @@ function writeResultFile(scratch, target, path, mode, sha, env) {
   }
   mkdirSync(dirname(full), { recursive: true })
   rmSync(full, { force: true })
-  writeFileSync(full, content)
+  writeFileSync(full, merged.content)
   const base = previous ?? 0o644
   chmodSync(full, mode === '100755' ? base | ((base & 0o444) >> 2) : base & ~0o111)
 }
@@ -4859,75 +5583,59 @@ export class WorkspaceIsolation {
     this.startupSweepPromise = undefined
     /** Whether `close()` has run; a sweep in flight stops at its next step. */
     this.closed = false
-    // Read once, at construction: the settings describe the repository, not the call, and
-    // every call prepares faster when the files are not re-read. A broken file only logs;
-    // the service still starts. Both files' identities are recorded now so a later edit
-    // can be reported without re-reading them (see `repoSettingsChanged`).
-    const settings = readRepoSettings(this.root, this.log, { platform })
+    // Read now, and again whenever a writing call leases a slot after a file changed (see
+    // `refreshSettings`): the VS Code extension has no `/mcp reconnect`, so a server that
+    // read them only once could never be given new settings there. A broken file only logs;
+    // the service still starts.
     this.platform = platform
     this.settingsPaths = new Map([
       [SETTINGS_FILE, join(this.root, SETTINGS_FILE)],
       [LOCAL_SETTINGS_FILE, join(this.root, LOCAL_SETTINGS_FILE)],
     ])
-    this.settingsAtStart = new Map(
-      [...this.settingsPaths].map(([file, path]) => [file, this.#settingsStamp(path)]),
-    )
+    /**
+     * What each settings file held when it was last read: its stamp, a key for its content,
+     * the last content that parsed (which is what the layers are built from), and the
+     * problem with its current content, if it has one.
+     *
+     * @type {Map<string, {stamp: object, contentKey: string, parsed: object, problem?: string, hadGood: boolean}>}
+     */
+    this.settingsFiles = new Map()
+    for (const [file, path] of this.settingsPaths) {
+      // The stamp is taken before the read, so an edit landing between the two is seen as a
+      // change next time and re-read rather than missed.
+      const stamp = this.#settingsStamp(path)
+      const parsed = readSettingsFile(path, file, this.log)
+      this.settingsFiles.set(file, {
+        stamp,
+        contentKey: settingsContentKey(parsed),
+        parsed: parsed.problem === undefined ? parsed : { present: true, settings: {}, sections: new Map() },
+        problem: parsed.problem,
+        // A missing file parses cleanly but holds nothing to keep; only a file that was
+        // there and valid gives a later broken edit something to fall back on.
+        hadGood: parsed.present === true && parsed.problem === undefined,
+      })
+    }
+    const layered = this.#layerSettingsFiles()
     // One line, only when a settings file exists, so the start log says which layers the
     // pool really applied. A layer with no accepted keys is not a layer: announcing it
     // would claim settings that a typo kept from taking effect.
-    if (settings.present && settings.layers.length > 0) this.log(`settings: ${settings.layers.join(', ')}`)
+    if (layered.present && layered.layers.length > 0) this.log(`settings: ${layered.layers.join(', ')}`)
     warnLocalSettingsTracking(this.root, this.settingsPaths.get(LOCAL_SETTINGS_FILE), this.log)
     if (copyExclude !== undefined && !Array.isArray(copyExclude)) {
       this.log('ignoring the copyExclude option: it must be an array of strings')
     }
-    const slotCount = Math.max(1, slots)
-    /**
-     * Accepted `slotEnv` entries, resolved per slot by `slotEnvFor`. A `port` entry creates
-     * no directory and a `value` entry is plain text, so neither makes the copy name
-     * `.flash-home` or `.flash-cache`.
-     *
-     * @type {Record<string, {kind: string, segment?: string, base?: number, stride?: number, value?: string}>}
-     */
-    this.slotEnv = mergeSlotEnv(settings.slotEnvLayers, slotEnv, this.log, slotCount, { platform })
+    /** The pool options that are layered over the files on every (re)read. */
+    this.optionCopyExclude = Array.isArray(copyExclude) ? copyExclude : []
+    this.optionSlotEnv = slotEnv
+    this.slotCount = Math.max(1, slots)
     /** Whether the settings files' `slotSetup` steps may run on the host. */
     this.slotSetupAllowed = allowSlotSetup === true
     /**
-     * The setup steps that passed validation, in configuration order. A kept path that the
-     * caller's own git does not ignore — or that it tracks — is refused here, so the step
-     * still runs but cannot move tracked source out of the copy.
-     *
-     * @type {{run: string[], inputs: string[], keep: string[], timeoutSeconds: number}[]}
+     * The settings a call leased now would use. A leased slot keeps its own reference
+     * (`slot.settings`), so a reload while a call runs never changes that call.
      */
-    this.slotSetup = (settings.slotSetup ?? []).map((step) => ({
-      ...step,
-      keep: step.keep.filter((relPath) => {
-        const decision = this.#excludeDecision(this.root, relPath)
-        if (decision.omit) return true
-        this.log(
-          `not keeping ${relPath} for slotSetup (${step.run.join(' ')}): ${decision.reason ?? 'it is not ignored'}; ` +
-            'the step still runs, without it',
-        )
-        return false
-      }),
-    }))
-    /** The warning every flash_task and flash_batch result carries when steps are configured but not allowed. */
-    this.slotSetupWarning = undefined
-    if (this.slotSetup.length > 0 && !this.slotSetupAllowed) {
-      this.slotSetupWarning = SETUP_NOT_ALLOWED_WARNING
-      this.log(SETUP_NOT_ALLOWED_WARNING)
-    }
-    // A kept path is left out of the copy as well: there is no point copying the caller's
-    // `node_modules` only to replace it with the slot's own.
-    const keptPaths = this.slotSetup.flatMap((step) => step.keep)
-    this.copyExclude = normalizeExclude([
-      ...(settings.copyExcludeDefaults === false ? [] : DEFAULT_COPY_EXCLUDE),
-      ...(settings.copyExclude ?? []),
-      ...(Array.isArray(copyExclude) ? copyExclude : []),
-      ...keptPaths,
-    ])
-    // A default that git keeps (a tracked `.env.example`) is the expected case, not news
-    // worth a log line on every call; only the entries someone asked for are reported.
-    this.namedExclude = normalizeExclude([...(settings.copyExclude ?? []), ...(Array.isArray(copyExclude) ? copyExclude : []), ...keptPaths])
+    this.settings = this.#buildSettings(layered)
+    if (this.settings.slotSetupWarning !== undefined) this.log(SETUP_NOT_ALLOWED_WARNING)
     this.clones = 0
     /** Patches kept for a later `flash_apply`. @type {Map<string, object>} */
     this.patches = new Map()
@@ -4941,13 +5649,14 @@ export class WorkspaceIsolation {
     this.legacyPatchDir = undefined
     /** Callers waiting for a slot, oldest first. @type {Function[]} */
     this.waiting = []
-    this.slots = Array.from({ length: slotCount }, (_, id) => ({
+    this.slots = Array.from({ length: this.slotCount }, (_, id) => ({
       id,
       dirIndex: 0,
       dir: slotDirectory(this.stateDir, id, 0),
       base: null,
       busy: false,
       orphans: [],
+      stoppedOrphans: new Set(),
     }))
     // Only trees this process owns are cleared. A default state directory is private
     // by construction, so clearing it cannot touch a live service; the dead owners of
@@ -4994,7 +5703,7 @@ export class WorkspaceIsolation {
   }
 
   /**
-   * The identity of one settings file as the constructor found it.
+   * The identity of one settings file as it was last read.
    *
    * `mtimeMs` alone misses a replacement that restores the old timestamp: a `mv` of a
    * prepared file over the settings, with `utimes` putting the original time back, leaves
@@ -5015,14 +5724,13 @@ export class WorkspaceIsolation {
   }
 
   /**
-   * Which settings files changed since this pool read them.
+   * Which settings files changed since this pool last read them.
    *
-   * One `stat` per file, never a re-read: the settings were applied when the pool was
-   * built, and a running server cannot safely re-apply them under calls that are already
-   * in flight. The service turns each name into the warning that file's edit deserves, so
-   * a local file that appeared, disappeared or was touched is reported as well as the
-   * shared one. Any difference in a stamp is a change; only comparing `mtimeMs` called a
-   * replaced file unchanged when its timestamp was restored.
+   * One `stat` per file, never a re-read, so it is cheap enough for every call;
+   * `refreshSettings` uses the same comparison to decide which files to read again. A local
+   * file that appeared, disappeared or was touched counts as well as the shared one. Any
+   * difference in a stamp is a change; only comparing `mtimeMs` called a replaced file
+   * unchanged when its timestamp was restored.
    *
    * @returns {string[]} the settings files that appeared, disappeared or were replaced/touched,
    *   in layer order; empty when nothing changed.
@@ -5030,19 +5738,179 @@ export class WorkspaceIsolation {
   repoSettingsChanged() {
     const changed = []
     for (const [file, path] of this.settingsPaths) {
-      const now = this.#settingsStamp(path)
-      const before = this.settingsAtStart.get(file)
-      if (
-        now.exists !== before.exists ||
-        now.size !== before.size ||
-        now.ino !== before.ino ||
-        now.mtimeMs !== before.mtimeMs ||
-        now.ctimeMs !== before.ctimeMs
-      ) {
-        changed.push(file)
-      }
+      if (!sameSettingsStamp(this.#settingsStamp(path), this.settingsFiles.get(file).stamp)) changed.push(file)
     }
     return changed
+  }
+
+  /**
+   * Re-read the settings files that changed since they were last read, and give a leased
+   * slot the settings its call will use.
+   *
+   * Called by `lease` for every writing call, before anything is copied. A file whose stamp
+   * is unchanged is not read at all; one that was only touched is read but not re-applied,
+   * because its content key is the same. A file whose new content cannot be used keeps the
+   * settings it last parsed to — dropping them would quietly change every later copy because
+   * of a half-saved edit — and every call carries a warning until it is fixed.
+   *
+   * The slot keeps a reference to the settings object, not to the pool: a later reload
+   * replaces `this.settings` and leaves a call that is already running exactly as it began.
+   *
+   * @param {Slot} [slot] - the slot a call has just leased; omitted, only the pool is updated.
+   * @returns {{reloaded: string[], warnings: string[]}} the files whose new settings now
+   *   apply, and the warnings this call must carry.
+   */
+  refreshSettings(slot) {
+    const reloaded = []
+    for (const [file, path] of this.settingsPaths) {
+      const entry = this.settingsFiles.get(file)
+      const stamp = this.#settingsStamp(path)
+      if (sameSettingsStamp(stamp, entry.stamp)) continue
+      entry.stamp = stamp
+      const parsed = readSettingsFile(path, file, this.log)
+      const contentKey = settingsContentKey(parsed)
+      if (contentKey === entry.contentKey) continue
+      entry.contentKey = contentKey
+      if (parsed.problem !== undefined) {
+        entry.problem = parsed.problem
+        this.log(
+          `${file}: ${parsed.problem}; ${entry.hadGood ? 'keeping the settings last read from it' : 'none of its settings apply'} until it is fixed`,
+        )
+        continue
+      }
+      entry.problem = undefined
+      entry.parsed = parsed
+      // A file deleted since the last read has nothing to keep for a later broken edit.
+      entry.hadGood = parsed.present === true
+      reloaded.push(file)
+    }
+    if (reloaded.length > 0) {
+      const layered = this.#layerSettingsFiles()
+      this.log(`settings reloaded: ${reloaded.join(', ')}`)
+      this.log(`settings: ${layered.layers.length > 0 ? layered.layers.join(', ') : 'none'}`)
+      if (reloaded.includes(LOCAL_SETTINGS_FILE)) {
+        warnLocalSettingsTracking(this.root, this.settingsPaths.get(LOCAL_SETTINGS_FILE), this.log)
+      }
+      const before = this.settings
+      this.settings = this.#buildSettings(layered)
+      if (this.settings.slotSetupWarning !== undefined && before.slotSetupWarning === undefined) this.log(SETUP_NOT_ALLOWED_WARNING)
+    }
+    const warnings = []
+    for (const [file, entry] of this.settingsFiles) {
+      if (entry.problem !== undefined) warnings.push(settingsInvalidWarning(file, entry.problem, { kept: entry.hadGood }))
+    }
+    if (slot !== undefined) {
+      slot.settings = this.settings
+      slot.settingsWarnings = warnings
+    }
+    return { reloaded, warnings }
+  }
+
+  /**
+   * Layer what each settings file last parsed to, for this pool's platform.
+   * @returns {ReturnType<typeof layerRepoSettings>} the accepted layers, in order.
+   */
+  #layerSettingsFiles() {
+    return layerRepoSettings(
+      [...this.settingsFiles].map(([file, entry]) => ({ file, parsed: entry.parsed })),
+      this.platform,
+    )
+  }
+
+  /**
+   * Turn the layered files and the pool options into the settings one call uses.
+   *
+   * The pool options are applied last on every build, exactly as at start, so a reload can
+   * never lose a `--copy-exclude` or a `slotEnv` option. The kept-path check asks the
+   * caller's git again, because a reload may name a path the last one did not.
+   *
+   * @param {ReturnType<typeof layerRepoSettings>} layered - the files' layers.
+   * @returns {{layers: string[], slotEnv: object, slotSetup: object[], slotSetupWarning?: string,
+   *   copyExclude: string[], namedExclude: string[]}} the settings, never mutated afterwards.
+   */
+  #buildSettings(layered) {
+    /**
+     * Accepted `slotEnv` entries, resolved per slot by `slotEnvFor`. A `port` entry creates
+     * no directory and a `value` entry is plain text, so neither makes the copy name
+     * `.flash-home` or `.flash-cache`.
+     */
+    const slotEnv = mergeSlotEnv(layered.slotEnvLayers, this.optionSlotEnv, this.log, this.slotCount, { platform: this.platform })
+    // The setup steps that passed validation, in configuration order. A kept path that the
+    // caller's own git does not ignore — or that it tracks — is refused here, so the step
+    // still runs but cannot move tracked source out of the copy.
+    const slotSetup = (layered.slotSetup ?? []).map((step) => ({
+      ...step,
+      keep: step.keep.filter((relPath) => {
+        const decision = this.#excludeDecision(this.root, relPath)
+        if (decision.omit) return true
+        this.log(
+          `not keeping ${relPath} for slotSetup (${step.run.join(' ')}): ${decision.reason ?? 'it is not ignored'}; ` +
+            'the step still runs, without it',
+        )
+        return false
+      }),
+    }))
+    // A kept path is left out of the copy as well: there is no point copying the caller's
+    // `node_modules` only to replace it with the slot's own.
+    const keptPaths = slotSetup.flatMap((step) => step.keep)
+    return Object.freeze({
+      layers: layered.layers,
+      slotEnv,
+      slotSetup,
+      // The warning every flash_task and flash_batch result carries when steps are
+      // configured but not allowed.
+      slotSetupWarning: slotSetup.length > 0 && !this.slotSetupAllowed ? SETUP_NOT_ALLOWED_WARNING : undefined,
+      copyExclude: normalizeExclude([
+        ...(layered.copyExcludeDefaults === false ? [] : DEFAULT_COPY_EXCLUDE),
+        ...(layered.copyExclude ?? []),
+        ...this.optionCopyExclude,
+        ...keptPaths,
+      ]),
+      // A default that git keeps (a tracked `.env.example`) is the expected case, not news
+      // worth a log line on every call; only the entries someone asked for are reported.
+      namedExclude: normalizeExclude([...(layered.copyExclude ?? []), ...this.optionCopyExclude, ...keptPaths]),
+    })
+  }
+
+  /**
+   * The settings one slot's call uses: the ones it leased with, or the pool's current ones
+   * for a slot that was never leased through `lease`.
+   * @param {Slot} slot - the slot.
+   * @returns {object} the settings object (see `#buildSettings`).
+   */
+  #settingsOf(slot) {
+    return slot?.settings ?? this.settings
+  }
+
+  /**
+   * Accepted `slotEnv` entries of the settings a call leased now would use.
+   * @type {Record<string, {kind: string, segment?: string, base?: number, stride?: number, value?: string}>}
+   */
+  get slotEnv() {
+    return this.settings.slotEnv
+  }
+
+  /**
+   * The validated setup steps of the current settings, in configuration order.
+   * @type {{run: string[], inputs: string[], keep: string[], timeoutSeconds: number}[]}
+   */
+  get slotSetup() {
+    return this.settings.slotSetup
+  }
+
+  /** The warning a result carries when setup steps are configured but not allowed. @type {string | undefined} */
+  get slotSetupWarning() {
+    return this.settings.slotSetupWarning
+  }
+
+  /** What the copy leaves out under the current settings. @type {string[]} */
+  get copyExclude() {
+    return this.settings.copyExclude
+  }
+
+  /** The exclusions someone asked for, the ones a "not leaving out" line may name. @type {string[]} */
+  get namedExclude() {
+    return this.settings.namedExclude
   }
 
   /**
@@ -5290,8 +6158,14 @@ export class WorkspaceIsolation {
     let total = [...trees, ...patches].reduce((sum, entry) => sum + entry.bytes, 0)
     for (const tree of trees) {
       if (total <= this.maxStateBytes) break
+      // The warm build cache is the one part of a retired tree worth more than its bytes: a
+      // user lost 35.6 GB of cargo target and seeded cargo home here, and the next call
+      // compiled from cold for 65 minutes. It still leaves the measured state, because the
+      // slot's own directory is not part of what the cap counts.
+      this.#keepRetiredCache(tree.slot, tree.dir)
       rmSync(tree.dir, { recursive: true, force: true })
       tree.slot.orphans.splice(tree.slot.orphans.indexOf(tree.dir), 1)
+      tree.slot.stoppedOrphans.delete(tree.dir)
       total -= tree.bytes
       result.removedTrees += 1
       this.log(`trim: removed retired tree ${tree.dir} (${formatBytes(tree.bytes)})`)
@@ -5317,6 +6191,114 @@ export class WorkspaceIsolation {
     }
     result.bytes = total
     return result
+  }
+
+  /**
+   * Move a retired tree's build cache into its slot's current directory, if that one has
+   * none, before the retired tree is removed.
+   *
+   * `prepare` normally got there first (see `#adoptRetiredCache`); this is the second chance
+   * for a cache it could not take, such as one whose rename failed while a stray process
+   * still held it open. The same rule applies: only a tree whose runtimes were shut down
+   * before `retire` (`stoppedOrphans`) gives up its cache, because only then can no session
+   * still be writing into it. The slot that replaced the tree is the other question: while a
+   * call holds it, its worker may be filling a cache of its own, and a rename under a running
+   * build would swap its files out from under it. A busy slot, or one whose cache already
+   * holds something, is therefore left alone and the retired cache goes with the tree, as
+   * before. A rename that fails here removes the cache with the tree, which is what `trim` is
+   * for.
+   *
+   * @param {Slot} slot - the slot the retired tree belonged to.
+   * @param {string} retired - the retired tree about to be removed.
+   * @returns {boolean} whether the cache was moved.
+   */
+  #keepRetiredCache(slot, retired) {
+    const source = join(retired, SLOT_CACHE)
+    if (!holdsAnyFile(source)) return false
+    if (!slot.stoppedOrphans.has(retired)) {
+      this.log(`trim: not moving the build cache of retired tree ${retired}: its runtimes were not shut down when it was retired`)
+      return false
+    }
+    if (slot.busy) {
+      this.log(`trim: not moving the build cache of retired tree ${retired}: slot ${String(slot.id)} is in use by a running call`)
+      return false
+    }
+    if (holdsAnyFile(join(slot.dir, SLOT_CACHE))) {
+      this.log(`trim: not moving the build cache of retired tree ${retired}: ${slot.dir} already has a build cache of its own`)
+      return false
+    }
+    return this.#moveRetiredCache(slot, retired, { prefix: 'trim: ', fallback: 'removing it with the tree' })
+  }
+
+  /**
+   * Take the newest retired tree's build cache into a slot that is being prepared cold.
+   *
+   * The call after a timeout is usually the retry, leased into the replacement slot within
+   * seconds: a user's retry ran there for 65 minutes compiling from cold while the retired
+   * tree beside it held 35.6 GB of warm cargo target. Waiting for `trim` cannot help that
+   * call, because its own slot is busy the whole time. `prepare` runs before the copy and
+   * before the worker, so nothing in the new directory is using the cache yet.
+   *
+   * Only a tree in `stoppedOrphans` is taken from: the service puts it there when every
+   * runtime rooted at the tree was shut down before `retire` (see `#salvageOrphaned` in
+   * service.js), which is what stops the session that wrote the cache. A tree retired
+   * without that may still have a build writing into it and is left alone. One attempt per
+   * call: a rename that fails (Windows refuses one while a stray build process still has a
+   * file open) logs and leaves the cache where it is, for `trim` to deal with as before.
+   *
+   * @param {Slot} slot - the slot being prepared.
+   * @returns {boolean} whether a cache was moved.
+   */
+  #adoptRetiredCache(slot) {
+    if (slot.orphans.length === 0 || holdsAnyFile(join(slot.dir, SLOT_CACHE))) return false
+    const retired = [...slot.orphans]
+      .reverse()
+      .find((dir) => slot.stoppedOrphans.has(dir) && holdsAnyFile(join(dir, SLOT_CACHE)))
+    if (retired === undefined) return false
+    return this.#moveRetiredCache(slot, retired, { prefix: '', fallback: 'it stays there until the tree is removed' })
+  }
+
+  /**
+   * Rename one retired tree's `.flash-cache` into the slot's current directory.
+   *
+   * The caller has checked that the move is safe and wanted. A rename is the only way that
+   * is cheap: copying gigabytes would freeze the server, so a rename that fails (EXDEV
+   * across devices, EPERM or EBUSY with an open handle on Windows) is logged and the caller's
+   * fallback stands.
+   *
+   * The setup stamps are not moved with the rest. A stamp only fingerprints the step's argv,
+   * platform, scope and inputs, so it would still match in the new directory — but what a
+   * step keeps routinely holds the absolute path it was built at (a virtualenv's `bin/`
+   * scripts and `pyvenv.cfg`, a `node_modules/.bin` shim, a `.pth` file), which names the
+   * retired tree that is about to vanish. Dropping the stamps makes each step run once in
+   * the new directory, on top of the kept files, which is what repairs those paths. The
+   * `cache:` folders need no such repair, because `slotEnvFor` resolves them from the slot's
+   * current directory on every call.
+   *
+   * @param {Slot} slot - the slot the retired tree belonged to.
+   * @param {string} retired - the retired tree.
+   * @param {{prefix: string, fallback: string}} wording - the log prefix, and what happens
+   *   to the cache when the rename fails.
+   * @returns {boolean} whether the cache was moved.
+   */
+  #moveRetiredCache(slot, retired, { prefix, fallback }) {
+    const source = join(retired, SLOT_CACHE)
+    const target = join(slot.dir, SLOT_CACHE)
+    // No size in the log line: measuring walks every file, and a warm cache of tens of
+    // gigabytes would hold the server up for seconds inside `prepare`.
+    try {
+      mkdirSync(slot.dir, { recursive: true })
+      // Only empty folders can be here (the caller checked), and a rename onto a directory
+      // that has entries fails with ENOTEMPTY.
+      rmSync(target, { recursive: true, force: true })
+      renameSync(source, target)
+    } catch (error) {
+      this.log(`${prefix}could not move the build cache of retired tree ${retired} to ${slot.dir} (${messageOf(error)}); ${fallback}`)
+      return false
+    }
+    rmSync(join(target, SETUP_STAMP_DIR), { recursive: true, force: true })
+    this.log(`${prefix}moved the build cache of retired tree ${retired} to ${slot.dir}`)
+    return true
   }
 
   /** How many trees may be in flight at once. */
@@ -5442,9 +6424,10 @@ export class WorkspaceIsolation {
     const free = this.slots.find((slot) => !slot.busy)
     if (free !== undefined) {
       free.busy = true
+      this.#leaseSettings(free)
       return free
     }
-    return await new Promise((resolveLease, rejectLease) => {
+    const handed = await new Promise((resolveLease, rejectLease) => {
       const waiter = { resolveLease, rejectLease, signal, timer: undefined, onAbort: undefined }
       waiter.settle = (settle, value) => {
         this.#dropWaiter(waiter)
@@ -5463,6 +6446,31 @@ export class WorkspaceIsolation {
       }
       this.waiting.push(waiter)
     })
+    // A slot handed over by `release` is leased here as much as a free one is: the waiting
+    // call reads the settings as they are now, not as they were when it started to wait.
+    this.#leaseSettings(handed)
+    return handed
+  }
+
+  /**
+   * Give a freshly leased slot the settings its call will use, re-reading changed files.
+   *
+   * Every writing call leases exactly once, before anything is copied, so this is where an
+   * edited settings file reaches the next call without a reconnect. A failure here must not
+   * strand a slot that is already marked busy, so it is logged and the call keeps the
+   * settings that were already in force.
+   *
+   * @param {Slot} slot - the slot just leased.
+   * @returns {void}
+   */
+  #leaseSettings(slot) {
+    try {
+      this.refreshSettings(slot)
+    } catch (error) {
+      this.log(`could not re-read the settings files: ${messageOf(error)}; this call uses the settings already in force`)
+      slot.settings = this.settings
+      slot.settingsWarnings = []
+    }
   }
 
   /**
@@ -5573,6 +6581,8 @@ export class WorkspaceIsolation {
     // The task belongs to the call, not to the slot: the next call in this tree must not
     // inherit the last one's identity.
     slot.task = normalizeTask(task)
+    // The settings this call leased with; a reload by a later call does not reach them.
+    const settings = this.#settingsOf(slot)
     // A server that died while this one ran leaves its trees behind; the next call is the
     // cheapest moment to notice, since it is about to need disk anyway.
     this.#sweepDeadOwners()
@@ -5581,6 +6591,19 @@ export class WorkspaceIsolation {
     // what makes the next call find it, and what keeps the worker's changes to it across
     // calls.
     this.#stashKeepPaths(slot)
+    // Measured after the stash (a kept path counts as cache) and before `#createSlotEnv`
+    // makes the empty `cache:` folders: a fresh or replaced slot can make a build that took
+    // minutes take an hour, and a slow job should say why.
+    // A slot replaced after a timeout takes the retired tree's warm cache first, so the
+    // retry that usually follows does not build from cold.
+    this.#adoptRetiredCache(slot)
+    slot.buildCacheEmpty = this.#buildCacheEmpty(slot, settings)
+    if (slot.buildCacheEmpty) {
+      this.log(
+        `slot ${String(slot.id)} starts with an empty build cache in ${join(slot.dir, SLOT_CACHE)}: ` +
+          'this call builds from cold',
+      )
+    }
     emptyDirectory(slot.dir)
     const scope = repositoryScope(this.root, cwd)
     const repoDir = scope === '' ? slot.dir : join(slot.dir, scope)
@@ -5598,7 +6621,7 @@ export class WorkspaceIsolation {
     try {
       copied = copyTree(original, repoDir, {
         fs,
-        exclude: this.copyExclude,
+        exclude: settings.copyExclude,
         // The safety of leaving a matched path out needs git, so the decision stays here
         // rather than in the walk. It runs once per matched path, not once per file.
         consider: (relPath) => this.#excludeDecision(original, relPath),
@@ -5612,7 +6635,7 @@ export class WorkspaceIsolation {
           'If the tree was changing while it was copied (a build running), a retry usually works.',
       )
     }
-    const { mechanism, skipped, vanished, excluded, kept, linksRepointed, repointed, linksSkipped } = copied
+    const { mechanism, skipped, vanished, excluded, kept, linksRepointed, repointed, linksSkipped, repositories } = copied
     if (vanished > 0) {
       this.log(`skipped ${String(vanished)} file(s) that vanished while the copy was made (a build was writing in ${original})`)
     }
@@ -5633,7 +6656,7 @@ export class WorkspaceIsolation {
     }
     for (const entry of kept) {
       const name = entry.path.split(sep).pop()
-      if (!matchesExclude(entry.path.split(sep).join('/'), name, this.namedExclude)) continue
+      if (!matchesExclude(entry.path.split(sep).join('/'), name, settings.namedExclude)) continue
       this.log(`not leaving out ${entry.path}: ${entry.reason ?? 'it is not ignored'}`)
     }
     if (excluded.length > 0) {
@@ -5642,6 +6665,9 @@ export class WorkspaceIsolation {
     this.clones += 1
     slot.scope = scope
     slot.repoDir = repoDir
+    // Which of them the diff stages file by file is decided when the base is recorded.
+    slot.repositories = repositories ?? []
+    slot.nested = []
     slot.base = null
     slot.baseParent = null
     slot.baseReason = undefined
@@ -5669,10 +6695,10 @@ export class WorkspaceIsolation {
       // exists; `.flash-home` is named only when a `slotEnv` entry creates it, and
       // `.flash-cache` when one does or when a setup step keeps something in the slot, so
       // an ordinary copy's ignore list stays exactly what it was.
-      const hasDirEnv = Object.values(this.slotEnv).some((spec) => spec.kind === 'home' || spec.kind === 'cache')
+      const hasDirEnv = Object.values(settings.slotEnv).some((spec) => spec.kind === 'home' || spec.kind === 'cache')
       const slotNames = [SLOT_TMP]
       if (hasDirEnv) slotNames.push(SLOT_HOME)
-      if (hasDirEnv || this.slotSetup.length > 0) slotNames.push(SLOT_CACHE)
+      if (hasDirEnv || settings.slotSetup.length > 0) slotNames.push(SLOT_CACHE)
       for (const name of slotNames) {
         excludeFromDiff(slot.dir, name)
         // A worker told to keep scratch next to its cwd writes inside the copied repository
@@ -5732,11 +6758,23 @@ export class WorkspaceIsolation {
     const repoDir = slot.repoDir
     const indexFile = join(slot.tmpDir, `base-index-${randomUUID()}`)
     const realIndex = resolve(repoDir, git(['rev-parse', '--git-path', 'index'], repoDir).trim())
+    // Nested repositories are staged as their files, so a worker's edit inside one is part
+    // of the diff; the list is recorded with the copy so `collect` and a salvage stage the
+    // same ones.
+    const { trees, failed } = nestedTrees(repoDir, stagedRepositories(repoDir, slot.repositories ?? []))
+    for (const { path, reason } of failed) {
+      this.log(`left the nested repository ${path} to the top repository's diff, its files could not be staged: ${reason}`)
+    }
+    slot.nested = [...trees.keys()]
+    if (slot.nested.length > 0) linkNestedObjects(repoDir, slot.nested)
+    packNestedObjects(repoDir, [...trees.values()], this.log)
+    writeNestedFile(repoDir, slot.nested)
     let tree
     try {
       if (existsSync(realIndex)) copyFileSync(realIndex, indexFile)
       const env = { ...process.env, GIT_INDEX_FILE: indexFile }
-      git(['add', '-A'], repoDir, env)
+      git(['add', '-A', ...excludingPaths(repoDir, slot.nested)], repoDir, env)
+      stageNestedRepositories(repoDir, trees, env)
       tree = git(['write-tree'], repoDir, env).trim()
     } finally {
       // The temp index is a copy of the caller's and holds nothing worth keeping; a
@@ -5851,6 +6889,29 @@ export class WorkspaceIsolation {
   }
 
   /**
+   * Whether a call starts with nothing in the build cache its settings fill.
+   *
+   * Only the folders the settings actually put build output in are asked about: each
+   * `cache:` entry's folder, and the kept paths of a setup step that is allowed to run. A
+   * repository that names none of those has no build cache to be cold, so the answer is
+   * false for it rather than a warning about something it never asked for. Stamps under
+   * `.flash-cache/setup` are not build output, so a slot holding only those is still cold.
+   *
+   * @param {Slot} slot - the slot being prepared, after its kept paths were stashed.
+   * @param {object} settings - the settings the call leased with.
+   * @returns {boolean} true when the settings fill a cache and every folder of it is empty.
+   */
+  #buildCacheEmpty(slot, settings) {
+    const folders = Object.values(settings.slotEnv)
+      .filter((spec) => spec.kind === 'cache')
+      .map((spec) => join(slot.dir, SLOT_CACHE, spec.segment))
+    if (this.slotSetupAllowed && settings.slotSetup.some((step) => step.keep.length > 0)) {
+      folders.push(join(slot.dir, SLOT_CACHE, SETUP_KEEP_DIR))
+    }
+    return folders.length > 0 && !folders.some((folder) => holdsAnyFile(folder))
+  }
+
+  /**
    * Create the per-slot directories the configured `slotEnv` entries point at.
    *
    * Called from `prepare` after the slot has been emptied (which preserves `.flash-cache`)
@@ -5862,8 +6923,8 @@ export class WorkspaceIsolation {
    * @returns {void}
    */
   #createSlotEnv(slot) {
-    if (Object.keys(this.slotEnv).length === 0) return
-    for (const spec of Object.values(this.slotEnv)) {
+    if (Object.keys(this.#settingsOf(slot).slotEnv).length === 0) return
+    for (const spec of Object.values(this.#settingsOf(slot).slotEnv)) {
       // A port entry reserves a number and a value entry is plain text: neither names a
       // directory, so neither may create one.
       if (spec.kind !== 'home' && spec.kind !== 'cache') continue
@@ -5886,7 +6947,7 @@ export class WorkspaceIsolation {
    */
   slotEnvFor(slot) {
     const env = {}
-    for (const [name, spec] of Object.entries(this.slotEnv)) {
+    for (const [name, spec] of Object.entries(this.#settingsOf(slot).slotEnv)) {
       if (spec.kind === 'value') {
         env[name] = spec.value
         continue
@@ -6041,8 +7102,8 @@ export class WorkspaceIsolation {
    * @returns {void}
    */
   #stashKeepPaths(slot) {
-    if (this.slotSetup.length === 0 || slot.repoDir === undefined) return
-    for (const [index, step] of this.slotSetup.entries()) {
+    if (this.#settingsOf(slot).slotSetup.length === 0 || slot.repoDir === undefined) return
+    for (const [index, step] of this.#settingsOf(slot).slotSetup.entries()) {
       for (const relPath of step.keep) {
         const source = join(slot.repoDir, relPath)
         if (!existsSync(source) || !this.#keepPathInCopy(slot.repoDir, relPath) || !this.#keepAllowed(slot, relPath)) continue
@@ -6276,12 +7337,12 @@ export class WorkspaceIsolation {
    * @throws {IsolationError} with code `SETUP_FAILED` when a step fails, times out or is cancelled.
    */
   async runSetup(slot, { signal, onStep } = {}) {
-    if (this.slotSetup.length === 0 || !this.slotSetupAllowed) return undefined
+    if (this.#settingsOf(slot).slotSetup.length === 0 || !this.slotSetupAllowed) return undefined
     if (slot.repoDir === undefined) return undefined
     const results = []
     let ranAny = false
     let restoredAny = false
-    for (const [index, step] of this.slotSetup.entries()) {
+    for (const [index, step] of this.#settingsOf(slot).slotSetup.entries()) {
       const moved = this.#restoreKeepPaths(slot, index, step)
       if (moved > 0) restoredAny = true
       const stampPath = this.#stampPath(slot, index)
@@ -6353,9 +7414,18 @@ export class WorkspaceIsolation {
    * moved instead: it is given a path it has never used, created empty, and the orphaned
    * tree is remembered so `close()` still removes it.
    *
+   * Its `.flash-cache` stays with it, but is not lost with it: the next `prepare` in the slot
+   * moves it into the new directory, and `trim` tries again before removing the tree (see
+   * `#adoptRetiredCache` and `#keepRetiredCache`). Both only do so when the caller says the
+   * runtimes rooted at the tree were shut down first, because "may still be writing" above
+   * is otherwise exactly true of the cache.
+   *
    * @param {Slot} slot - the slot whose call timed out.
+   * @param {object} [options] - what the caller did before retiring the tree.
+   * @param {boolean} [options.sessionStopped] - whether every runtime rooted at the tree was
+   *   shut down, so no session can write into its build cache any more.
    */
-  retire(slot) {
+  retire(slot, { sessionStopped = false } = {}) {
     const orphan = slot.dir
     const nextIndex = slot.dirIndex + 1
     const nextDir = slotDirectory(this.stateDir, slot.id, nextIndex)
@@ -6368,6 +7438,7 @@ export class WorkspaceIsolation {
     slot.dirIndex = nextIndex
     slot.dir = nextDir
     slot.orphans.push(orphan)
+    if (sessionStopped === true) slot.stoppedOrphans.add(orphan)
     slot.base = null
     slot.baseReason = undefined
     slot.tmpDir = undefined
@@ -6387,10 +7458,12 @@ export class WorkspaceIsolation {
    * @param {number} [options.diffChars] - clip the returned diff to whole file sections within this many characters.
    * @param {boolean} [options.store] - write the patch and its record; false for apply "discard",
    *   which reports the change without keeping it.
+   * @param {boolean} [options.retiring] - the tree is retired right after (a salvaged call),
+   *   so no later call in the slot empties it, and a warning must not say one will.
    * @returns {Change} the change, ready to be projected into a tool result.
    */
-  collect(slot, { diffChars = 20000, store = true } = {}) {
-    const change = this.#collect(slot, { diffChars, store })
+  collect(slot, { diffChars = 20000, store = true, retiring = false } = {}) {
+    const change = this.#collect(slot, { diffChars, store, retiring })
     // Every call that stored something is the moment to check the cap. A discard stored
     // nothing, so there is nothing to trim for.
     if (store) {
@@ -6403,8 +7476,8 @@ export class WorkspaceIsolation {
     return change
   }
 
-  /** `collect` without the trim. @param {Slot} slot @param {{diffChars: number, store: boolean}} options @returns {Change} */
-  #collect(slot, { diffChars, store = true }) {
+  /** `collect` without the trim. @param {Slot} slot @param {{diffChars: number, store: boolean, retiring?: boolean}} options @returns {Change} */
+  #collect(slot, { diffChars, store = true, retiring = false }) {
     // A slot prepared for one nested repository keeps its git state there, not at the top.
     const repoDir = slot.repoDir ?? slot.dir
     const scope = slot.scope ?? ''
@@ -6421,78 +7494,28 @@ export class WorkspaceIsolation {
         diffOmitted: [],
       }
     }
+    const nested = slot.nested ?? []
     try {
-      git(['add', '-A'], repoDir)
-      const full = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', slot.base], repoDir)
-      const diffstat = git(['diff', '--cached', '--stat', '--no-color', slot.base], repoDir)
-      const filesChanged = nameStatusRecords(repoDir, slot.base)
-      // Work that git ignores is work the patch cannot carry. It is reported rather
-      // than silently dropped: a caller told "no change" while the worker wrote a
-      // whole build directory has been misled, not informed. A path that already
-      // existed at the base is not new, so it is compared against the recorded facts
-      // instead: a rewritten or deleted ignored file is just as invisible to the patch.
-      const ignored = ignoredPaths(repoDir).filter((entry) => !(slot.ignoredBase ?? []).includes(entry))
-      const ignoredChanged = ignoredChangedFiles(repoDir, slot.ignoredFiles)
-      // The diff is clipped at a file boundary: a caller can read every line it holds,
-      // and `diffOmitted` names what is not there. The whole patch is what `apply` uses.
-      const clipped = clipPatch(full, diffChars)
-      const change = {
-        available: true,
-        filesChanged,
-        ignored,
-        ignoredChanged,
-        diffstat: diffstat.trim(),
-        diff: clipped.diff,
-        diffChars: full.length,
-        diffOmitted: clipped.diffOmitted,
-        stored: store,
-      }
-      // apply "discard" reports the change but keeps nothing: the tree it ran in is
-      // emptied afterwards, so writing a patch (or a record) here would be the only
-      // remaining copy of work nobody asked to keep.
-      if (!store) return change
-      // The record travels with the patch, so a restarted service can still tell which
-      // repository the patch was computed for and whether it has already been applied.
-      const patchId = `flash-${randomUUID()}`
-      const patchPath = join(this.patchDir, `${patchId}.patch`)
-      const metaPath = join(this.patchDir, `${patchId}.json`)
-      // The patch directory is shared with sibling services and the startup prune, so
-      // it is recreated defensively: writing a finished call's patch must not fail
-      // because a concurrent sweep decided this digest looked empty.
-      mkdirSync(this.patchDir, { recursive: true })
-      // Write order is a commit protocol: patch, then the blobs a merge needs, then the
-      // record. A crash before the record leaves artefacts with no `.json` to reference
-      // them, and `prunePatches` reclaims exactly those once they are old enough; writing
-      // the record first would instead leave a record whose patch does not exist.
-      writeFileSync(patchPath, full)
-      // The copy is emptied after this call, so the base blobs have to be saved now; a
-      // failure is logged and the patch is stored without them.
-      const preimage = savePreimageBlobs(repoDir, slot.base, this.patchDir, patchId, this.log)
-      const record = {
-        patchId,
-        patchPath,
-        metaPath,
-        storeDir: this.patchDir,
-        root: this.root,
-        scope,
-        base: slot.base,
-        // Kept beside the base because `drift` has to count from the caller's HEAD at copy
-        // time, and the base commit that names it exists only in the copy.
-        baseParent: slot.baseParent ?? null,
-        filesChanged,
-        diffstat: diffstat.trim(),
-        createdAt: Date.now(),
-        appliedAt: null,
-      }
-      if (preimage !== undefined) record.preimage = preimage
-      // The task the copy was prepared for travels with the patch: after a crash or a
-      // restart, the record itself says whose work this was.
-      if (slot.task !== undefined) record.task = slot.task
-      // The record is the commit point: until it lands, the patch and its blobs are
-      // unreferenced and a prune may reclaim them.
-      this.#writeMeta(record)
-      this.patches.set(patchId, record)
-      return { ...change, patchId, patchPath, scope }
+      git(['add', '-A', ...excludingPaths(repoDir, nested)], repoDir)
+      return withNestedIndex(repoDir, nested, slot.base, (env, unread) => {
+        const change = this.#collectStaged(slot, { repoDir, scope, diffChars, store, env })
+        if (unread.length === 0) return change
+        // The rest of the change is kept; what is missing is named, and the service keeps
+        // this copy (see `nestedUnread`) so those edits are still on disk to recover. A
+        // retired tree is never reused by a later call: it goes when the state cap trims it
+        // or the server exits, and the warning has to name that instead.
+        const warnings = unread.map(({ path, reason }) => {
+          const named = scope === '' ? path : `${scope}/${path}`
+          const where = join(repoDir, path)
+          const kept = retiring
+            ? `the retired copy keeps them at ${where} until the state cap trims it or the server exits`
+            : `the copy keeps them at ${where} until the next call in this slot, or the server's exit, empties it`
+          const message = `the changes inside nested repository ${named} could not be read (${reason}) and are not in this patch; ${kept}`
+          this.log(message)
+          return message
+        })
+        return { ...change, nestedUnread: unread.map(({ path }) => path), warnings }
+      })
     } catch (error) {
       return {
         available: false,
@@ -6506,6 +7529,92 @@ export class WorkspaceIsolation {
         diffOmitted: [],
       }
     }
+  }
+
+  /**
+   * The staged half of `collect`: the diff against the base, and the stored patch.
+   *
+   * @param {Slot} slot - the slot being collected.
+   * @param {object} options - where, how much, whether to store, and the index to read.
+   * @param {string} options.repoDir - the copy's repository.
+   * @param {string} options.scope - the nested repository the call was scoped to, or `''`.
+   * @param {number} options.diffChars - the clipped diff's budget.
+   * @param {boolean} options.store - whether to keep the patch.
+   * @param {NodeJS.ProcessEnv} options.env - the environment naming the staged index.
+   * @returns {Change} the change.
+   * @throws {Error} when git cannot produce the diff.
+   */
+  #collectStaged(slot, { repoDir, scope, diffChars, store, env }) {
+    const full = git(['diff', '--cached', '--binary', '--no-color', '--no-ext-diff', slot.base], repoDir, env)
+    const diffstat = git(['diff', '--cached', '--stat', '--no-color', slot.base], repoDir, env)
+    const filesChanged = nameStatusRecords(repoDir, slot.base, env)
+    // Work that git ignores is work the patch cannot carry. It is reported rather
+    // than silently dropped: a caller told "no change" while the worker wrote a
+    // whole build directory has been misled, not informed. A path that already
+    // existed at the base is not new, so it is compared against the recorded facts
+    // instead: a rewritten or deleted ignored file is just as invisible to the patch.
+    const ignored = ignoredPaths(repoDir).filter((entry) => !(slot.ignoredBase ?? []).includes(entry))
+    const ignoredChanged = ignoredChangedFiles(repoDir, slot.ignoredFiles)
+    // The diff is clipped at a file boundary: a caller can read every line it holds,
+    // and `diffOmitted` names what is not there. The whole patch is what `apply` uses.
+    const clipped = clipPatch(full, diffChars)
+    const change = {
+      available: true,
+      filesChanged,
+      ignored,
+      ignoredChanged,
+      diffstat: diffstat.trim(),
+      diff: clipped.diff,
+      diffChars: full.length,
+      diffOmitted: clipped.diffOmitted,
+      stored: store,
+    }
+    // apply "discard" reports the change but keeps nothing: the tree it ran in is
+    // emptied afterwards, so writing a patch (or a record) here would be the only
+    // remaining copy of work nobody asked to keep.
+    if (!store) return change
+    // The record travels with the patch, so a restarted service can still tell which
+    // repository the patch was computed for and whether it has already been applied.
+    const patchId = `flash-${randomUUID()}`
+    const patchPath = join(this.patchDir, `${patchId}.patch`)
+    const metaPath = join(this.patchDir, `${patchId}.json`)
+    // The patch directory is shared with sibling services and the startup prune, so
+    // it is recreated defensively: writing a finished call's patch must not fail
+    // because a concurrent sweep decided this digest looked empty.
+    mkdirSync(this.patchDir, { recursive: true })
+    // Write order is a commit protocol: patch, then the blobs a merge needs, then the
+    // record. A crash before the record leaves artefacts with no `.json` to reference
+    // them, and `prunePatches` reclaims exactly those once they are old enough; writing
+    // the record first would instead leave a record whose patch does not exist.
+    writeFileSync(patchPath, full)
+    // The copy is emptied after this call, so the base blobs have to be saved now; a
+    // failure is logged and the patch is stored without them.
+    const preimage = savePreimageBlobs(repoDir, slot.base, this.patchDir, patchId, this.log, env)
+    const record = {
+      patchId,
+      patchPath,
+      metaPath,
+      storeDir: this.patchDir,
+      root: this.root,
+      scope,
+      base: slot.base,
+      // Kept beside the base because `drift` has to count from the caller's HEAD at copy
+      // time, and the base commit that names it exists only in the copy.
+      baseParent: slot.baseParent ?? null,
+      filesChanged,
+      diffstat: diffstat.trim(),
+      createdAt: Date.now(),
+      appliedAt: null,
+    }
+    if (preimage !== undefined) record.preimage = preimage
+    // The task the copy was prepared for travels with the patch: after a crash or a
+    // restart, the record itself says whose work this was.
+    if (slot.task !== undefined) record.task = slot.task
+    // The record is the commit point: until it lands, the patch and its blobs are
+    // unreferenced and a prune may reclaim them.
+    this.#writeMeta(record)
+    this.patches.set(patchId, record)
+    return { ...change, patchId, patchPath, scope }
   }
 
   /**
@@ -6704,10 +7813,19 @@ export class WorkspaceIsolation {
    * `conflicts` and the worker is told to resolve them — and the record is deliberately NOT
    * marked applied: it reached a throwaway tree, not the caller's.
    *
+   * A base patch the caller had already applied (uncommitted) arrives with the copy itself,
+   * because the copy is taken from the caller's working tree. Applying it again merged the
+   * change over itself, and one caller got conflicts in five files. When the reverse of the
+   * patch applies to the copy and the patch itself does not, its whole change is already
+   * there: it is skipped, and `warning` says so. The copy's base was recorded from that same
+   * tree, so the patch this call stores then holds the new work only, not the base patch's
+   * change. A patch that is only partly present goes through the merge as before.
+   *
    * @param {Slot} slot - a slot `prepare` has already filled.
    * @param {string} patchId - the stored patch to continue from, or a unique prefix of its id.
-   * @returns {{patchId: string, applied: true, threeWay: boolean, conflicts: string[],
-   *   filesChanged: string[]}} what landed in the copy.
+   * @returns {{patchId: string, applied: boolean, alreadyInTree?: true, threeWay: boolean,
+   *   conflicts: string[], filesChanged: string[], warning?: string}} what landed in the copy;
+   *   `applied: false` with `alreadyInTree` and `warning` when the copy already held it.
    * @throws {Error} when the patch is unknown, belongs to another root or scope, its file is
    *   gone, or its base is unavailable for the merge the copy needs.
    */
@@ -6726,6 +7844,23 @@ export class WorkspaceIsolation {
       )
     }
     const target = slot.repoDir ?? slot.dir
+    if (basePatchInTree(record, target)) {
+      this.log(
+        `not applying base patch ${record.patchId} in slot ${String(slot.id)}: the copy already holds its whole change, ` +
+          'taken from the caller’s tree',
+      )
+      return {
+        patchId: record.patchId,
+        applied: false,
+        alreadyInTree: true,
+        threeWay: false,
+        conflicts: [],
+        filesChanged: recordPaths(record.filesChanged),
+        warning:
+          `basePatch ${record.patchId} was already in the tree the copy was taken from, so it was not applied again; ` +
+          "this call's patch does not contain it",
+      }
+    }
     let outcome
     try {
       // Always through the merge fallback: the caller's tree may have moved on since the base
@@ -6878,6 +8013,16 @@ export class WorkspaceIsolation {
     }
     try {
       git(['init', '-q'], scratch, env)
+      // "Ours" is hashed here with `--path`, and a new file is written back through
+      // `--filters`; both convert line endings by `core.autocrlf`/`core.eol`. A fresh
+      // repository only sees the global value, so a caller who set it in the repository
+      // itself had every CRLF line of "ours" read as changed against an LF base.
+      if (isGitWorkTree(target)) {
+        for (const key of ['core.autocrlf', 'core.eol']) {
+          const value = gitOrEmpty(['config', '--get', key], target)
+          if (value !== '') git(['config', key, value], scratch, env)
+        }
+      }
       // Blobs from either side have to resolve: the patch's saved base, and the caller's
       // repository objects when the base was committed there. The scratch repository
       // borrows both read-only, so a merge never writes into either.
@@ -7043,6 +8188,11 @@ export class WorkspaceIsolation {
    * own deletions, and every existing parent component that is not a directory must itself
    * be deleted by the merge. A refusal writes nothing.
    *
+   * The content of every write is read before the first mutation too, so a blob git cannot
+   * hand back is a refusal that writes nothing. Only a filesystem error during the writes
+   * themselves can leave the tree part-merged, and its error names every path already
+   * deleted or written.
+   *
    * @param {string} scratch - the scratch repository the result tree lives in.
    * @param {string} target - the caller's tree.
    * @param {string} ours - the commit "ours" was committed as.
@@ -7050,6 +8200,8 @@ export class WorkspaceIsolation {
    * @param {NodeJS.ProcessEnv} env - environment for git.
    * @returns {{written: boolean, submodules: string[]}} whether anything was written, and
    *   the submodule pointers the change named (which are never written).
+   * @throws {Error} when a path collides with the caller's tree or its content cannot be read
+   *   (nothing written), or when a write fails (the paths already changed are named).
    */
   #writeMergedTree(scratch, target, ours, resultTree, env) {
     const raw = git(['diff-tree', '-r', '--no-renames', '--name-status', '-z', ours, resultTree], scratch, env)
@@ -7119,41 +8271,74 @@ export class WorkspaceIsolation {
         break
       }
     }
-    let written = false
-    // Deletions first, so the paths a write replaces are gone before anything is created.
-    for (const { status, path } of changes) {
-      if (status !== 'D') continue
-      // A deleted path that is a directory on disk is a submodule checkout whose gitlink the
-      // change removes. Like a moved pointer, it is named rather than acted on: removing a
-      // checkout would delete a repository the merge knows nothing about.
-      let info
+    // Every merged file and link text is read before the first deletion. A 27-file apply
+    // whose 22nd read failed had already written 21 files while its error read as though
+    // nothing had been applied; a read that fails here leaves the tree exactly as it was.
+    const notText = notTextPaths(target, writes.filter(({ entry }) => entry.mode !== '120000').map(({ path }) => path))
+    const contents = new Map()
+    for (const write of writes) {
       try {
-        info = lstatSync(join(target, path))
-      } catch {
-        continue
+        contents.set(write.path, mergedContent(scratch, target, write, notText, ours, env))
+      } catch (error) {
+        throw new Error(
+          `the three-way merge could not read the merged content of ${write.path} (${messageOf(error)}); ` +
+            `nothing was written to ${target}`,
+        )
       }
-      if (info.isDirectory()) {
-        submodules.push(path)
-        continue
+    }
+    // From here on the tree changes. A filesystem error part-way through cannot be undone,
+    // so it is reported with everything already changed, for the caller to inspect.
+    const deleted = []
+    const wrote = []
+    let current
+    try {
+      // Deletions first, so the paths a write replaces are gone before anything is created.
+      for (const { status, path } of changes) {
+        if (status !== 'D') continue
+        // A deleted path that is a directory on disk is a submodule checkout whose gitlink the
+        // change removes. Like a moved pointer, it is named rather than acted on: removing a
+        // checkout would delete a repository the merge knows nothing about.
+        let info
+        try {
+          info = lstatSync(join(target, path))
+        } catch {
+          continue
+        }
+        if (info.isDirectory()) {
+          submodules.push(path)
+          continue
+        }
+        current = path
+        rmSync(join(target, path), { force: true })
+        deleted.push(path)
       }
-      rmSync(join(target, path), { force: true })
-      written = true
-    }
-    // A directory whose files were all deleted now makes way for the file at its own path.
-    for (const { path } of writes) {
-      let info
-      try {
-        info = lstatSync(join(target, path))
-      } catch {
-        info = undefined
+      // A directory whose files were all deleted now makes way for the file at its own path.
+      for (const { path } of writes) {
+        let info
+        try {
+          info = lstatSync(join(target, path))
+        } catch {
+          info = undefined
+        }
+        if (!info?.isDirectory()) continue
+        current = path
+        rmSync(join(target, path), { recursive: true, force: true })
+        deleted.push(`${path}/`)
       }
-      if (info?.isDirectory()) rmSync(join(target, path), { recursive: true, force: true })
+      for (const { path, entry } of writes) {
+        current = path
+        writeResultFile(target, path, entry.mode, contents.get(path))
+        wrote.push(path)
+      }
+    } catch (error) {
+      const named = (paths) => (paths.length === 0 ? 'nothing' : paths.join(', '))
+      throw new Error(
+        `the three-way merge failed while writing ${current} in ${target} (${messageOf(error)}); ` +
+          `before that it had deleted ${named(deleted)} and written ${named(wrote)}, ` +
+          'which are now in the tree; the rest of the merge was not written',
+      )
     }
-    for (const { path, entry } of writes) {
-      writeResultFile(scratch, target, path, entry.mode, entry.sha, env)
-      written = true
-    }
-    return { written, submodules }
+    return { written: deleted.length > 0 || wrote.length > 0, submodules }
   }
 
   /**
@@ -7510,6 +8695,9 @@ export class WorkspaceIsolation {
     this.closed = true
     if (this.sweepTimer !== undefined) clearInterval(this.sweepTimer)
     for (const slot of this.slots) {
+      // No build cache is moved here, unlike in `trim`: the slot's own directory goes in the
+      // same pass, and a default state directory belongs to this process alone, so there is
+      // no later call that could find a cache kept for it.
       rmSync(slot.dir, { recursive: true, force: true })
       for (const orphan of slot.orphans) rmSync(orphan, { recursive: true, force: true })
     }

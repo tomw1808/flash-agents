@@ -678,8 +678,15 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
   // `background` and `jobId` travel with a job's call: the first is what makes a queued
   // writing call say it is holding the caller's turn, the second is what a stored patch
   // records as the job the change belongs to.
-  const runFor = (name, args, { signal, progress, progressToken, background = false, jobId = undefined }) => {
-    const context = { signal, progress, progressToken, background, ...(jobId === undefined ? {} : { jobId }) }
+  const runFor = (name, args, { signal, progress, progressToken, background = false, jobId = undefined, label = undefined }) => {
+    const context = {
+      signal,
+      progress,
+      progressToken,
+      background,
+      ...(jobId === undefined ? {} : { jobId }),
+      ...(label === undefined ? {} : { label }),
+    }
     return name === 'flash_task'
       ? () => service.flashTask(args, context)
       : name === 'flash_batch'
@@ -712,9 +719,12 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
       log(`${name} failed: ${describeError(error)}`)
       return errorResult(`${name} failed: ${describeError(error)}`)
     }
+    // Computed before the job exists: `jobs.start` runs `run` at once, and the service names
+    // this call by the same label to any call that queues behind it for a tree.
+    const label = jobLabel(name, args, service?.model, service?.root)
     const job = jobs.start({
       kind: name,
-      label: jobLabel(name, args, service?.model, service?.root),
+      label,
       run: ({ signal, jobId, progress }) =>
         runFor(name, args, {
           signal,
@@ -725,6 +735,7 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
           progressToken: jobId,
           background: true,
           jobId,
+          label,
         })(),
     })
     return okResult({
@@ -891,7 +902,20 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
     })
   }
 
+  // Read once from the schemas themselves, so a property added to a tool is accepted the
+  // moment it is described, and the refusal below can never disagree with `tools/list`.
+  const argumentNames = toolArgumentNames(listTools(service?.models))
+
   return async function callTool(name, args = {}, { signal, progressToken, sendProgress } = {}) {
+    // Before anything else, the background door included: a misspelt argument is otherwise
+    // ignored, and `flash_patch` with `file` instead of `files` answered three times with the
+    // first page of the whole patch rather than once with the mistake.
+    // The refusal reads like every other INVALID_ARGUMENT one: the tool, then the reason.
+    const unknown = unknownArgumentsMessage(name, args, argumentNames.get(name))
+    if (unknown !== undefined) {
+      log(`${name} failed: ${unknown}`)
+      return errorResult(`${name} failed: ${unknown}`)
+    }
     // Jobs first. A background call must answer at once and must not own the starting
     // request's signal, and the three job tools are about jobs rather than one synchronous call.
     if (name === 'flash_task' || name === 'flash_batch') {
@@ -937,6 +961,127 @@ function omit(args, key) {
   if (args === null || typeof args !== 'object') return {}
   const { [key]: _dropped, ...rest } = args
   return rest
+}
+
+/**
+ * Argument names MCP itself may put on any object. `_meta` is reserved by the protocol for
+ * client metadata; a client that sends it inside `arguments` has not misspelt anything.
+ */
+const MCP_RESERVED_ARGUMENTS = new Set(['_meta'])
+
+/**
+ * The argument names each tool's schema declares, top level and, for `flash_batch`, inside
+ * an object task entry.
+ *
+ * Every schema says `additionalProperties: false`, but nothing enforced it. Reading the names
+ * out of the descriptors `tools/list` returns, rather than listing them again, is what keeps
+ * the check and the schema one fact.
+ *
+ * @param {Array<object>} tools - the MCP tool descriptors (see `listTools`).
+ * @returns {Map<string, {top: string[], item?: string[]}>} the names, by tool.
+ */
+export function toolArgumentNames(tools) {
+  const names = new Map()
+  for (const tool of tools) {
+    const properties = tool?.inputSchema?.properties ?? {}
+    const entry = properties.tasks?.items?.oneOf?.find((choice) => choice?.type === 'object')
+    names.set(tool.name, {
+      top: Object.keys(properties),
+      ...(entry?.properties === undefined ? {} : { item: Object.keys(entry.properties) }),
+    })
+  }
+  return names
+}
+
+/**
+ * The refusal for arguments a tool does not declare, or undefined when every name is known.
+ *
+ * Unknown names in a `flash_batch` task entry are refused the same way, with the entry's
+ * index. A `model` inside an entry is left alone here: the service refuses it with the
+ * sentence that says where the fleet's model goes, which is more use than "unknown".
+ *
+ * @param {string} tool - the tool name.
+ * @param {unknown} args - the call's arguments.
+ * @param {{top: string[], item?: string[]} | undefined} names - what the tool's schema declares.
+ * @returns {string | undefined} the refusal message.
+ */
+export function unknownArgumentsMessage(tool, args, names) {
+  if (names === undefined || args === null || typeof args !== 'object' || Array.isArray(args)) return undefined
+  const top = unknownNames(args, names.top)
+  if (top.length > 0) return describeUnknown(top, names.top, `for ${tool}`)
+  if (names.item === undefined || !Array.isArray(args.tasks)) return undefined
+  for (const [index, entry] of args.tasks.entries()) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+    const inEntry = unknownNames(entry, names.item).filter((key) => key !== 'model')
+    if (inEntry.length > 0) return describeUnknown(inEntry, names.item, `in tasks[${String(index)}] of ${tool}`)
+  }
+  return undefined
+}
+
+/** The keys of `object` that are neither declared nor reserved by MCP, in their own order. */
+function unknownNames(object, known) {
+  return Object.keys(object).filter((key) => !known.includes(key) && !MCP_RESERVED_ARGUMENTS.has(key))
+}
+
+/**
+ * One sentence naming the unknown keys, with the closest declared name for each that has one.
+ * The declared names are listed whenever a key has no close match, because then the caller
+ * needs the list rather than a guess.
+ */
+function describeUnknown(unknown, known, where) {
+  const guesses = unknown.map((key) => closestName(key, known))
+  if (unknown.length === 1 && guesses[0] !== undefined) {
+    return `unknown argument "${unknown[0]}" ${where}; did you mean "${guesses[0]}"?`
+  }
+  const named = unknown.map((key, index) =>
+    guesses[index] === undefined ? `"${key}"` : `"${key}" (did you mean "${guesses[index]}"?)`,
+  )
+  const noun = unknown.length === 1 ? 'argument' : 'arguments'
+  return `unknown ${noun} ${named.join(', ')} ${where}; its arguments are ${known.join(', ')}`
+}
+
+/**
+ * The declared name a misspelt key most plausibly meant, or undefined when none is close.
+ *
+ * Case is ignored (`taskfile` meant `taskFile`), a short key that starts a single declared
+ * name counts (`wait` meant `waitSeconds`), and otherwise the edit distance must stay small:
+ * one edit for a name of three letters or fewer, two for a longer one, so `foo` is never read
+ * as `cwd`.
+ *
+ * @param {string} key - the unknown key.
+ * @param {string[]} known - the declared names.
+ * @returns {string | undefined} the closest declared name.
+ */
+function closestName(key, known) {
+  const lower = key.toLowerCase()
+  const same = known.find((name) => name.toLowerCase() === lower)
+  if (same !== undefined) return same
+  let best
+  let bestDistance = Infinity
+  for (const name of known) {
+    const distance = editDistance(lower, name.toLowerCase())
+    if (distance < bestDistance) {
+      best = name
+      bestDistance = distance
+    }
+  }
+  const allowed = Math.min(lower.length, best?.length ?? 0) <= 3 ? 1 : 2
+  if (best !== undefined && bestDistance <= allowed) return best
+  const prefixed = known.filter((name) => lower.length >= 3 && name.toLowerCase().startsWith(lower))
+  return prefixed.length === 1 ? prefixed[0] : undefined
+}
+
+/** Levenshtein distance; the names compared are a dozen characters, so the table is tiny. */
+function editDistance(a, b) {
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index)
+  for (let i = 1; i <= a.length; i += 1) {
+    const row = [i]
+    for (let j = 1; j <= b.length; j += 1) {
+      row[j] = Math.min(previous[j] + 1, row[j - 1] + 1, previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1))
+    }
+    previous = row
+  }
+  return previous[b.length]
 }
 
 /**

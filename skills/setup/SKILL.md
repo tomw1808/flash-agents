@@ -81,10 +81,10 @@ folder is an ES module; otherwise it leaves the folder alone and its report name
 stopped it, because `"type": "module"` there would change how a CommonJS plugin is loaded. Run it
 once after upgrading from 0.1.5 or older too: a profile installed before 0.1.6 pins one literal
 model and cannot run a per-call choice. Then confirm with the doctor again; `profile` must pass,
-and `profile-models` and `profile-version` must not warn. The stamp is re-read by every runtime that
-boots after the installer ran, so a `profile-version` warning clears on the next call without a
-reconnect; only a runtime that booted before the install keeps the old verdict, and reconnecting is
-how that one is replaced.
+and `profile-models` and `profile-version` must not warn. No reconnect is needed: a runtime that
+boots after the installer ran re-reads the stamp, and an idle runtime that booted before it is
+replaced at its next use. A busy one keeps serving its running calls, whose warning says it will be
+replaced when they end.
 
 ## 5. Prove it end to end
 
@@ -128,9 +128,28 @@ and the sandbox's first step for every shell command then fails (`SetNamedSecuri
 (Win32 5)`); grant them once with `icacls "C:\fm" /grant "%USERNAME%:(OI)(CI)F"`, which is also the
 fix `doctor`'s `state-base-permissions` row prints.
 
+A few tips to pass on when they fit the project:
+- `state_base` works on Linux and macOS too. A short base such as `/tmp/fm` avoids "path must be
+  shorter than SUN_LEN" when the project's tests open Unix sockets inside the copy.
+- Tools that write to the home folder take `slotEnv` entries like `CARGO_HOME` does. For `uv`:
+  `"UV_CACHE_DIR": "cache:uv"`, `"UV_TOOL_DIR": "cache:uv-tools"`, `"UV_PYTHON_INSTALL_DIR":
+  "cache:uv-python"` (`home:<name>` instead of `cache:` for a folder emptied every call).
+- A cargo home per slot (`"CARGO_HOME": "cache:cargo-home"`) starts without the crate registry, so a
+  first `--offline` build fails. Seed it with a `slotSetup` step (`cargo fetch`, say), or leave
+  `CARGO_HOME` out of `slotEnv` so workers read the user's own `~/.cargo`.
+- An edit to `.flash-agents.json` or `.flash-agents.local.json` applies from the next writing call,
+  without a reconnect, which matters in Claude Code's VS Code extension, where `/mcp reconnect` is
+  not available. A call already running keeps the settings it started with, and a file that turns
+  invalid keeps its last good settings and warns on every call until it is fixed.
+- On Windows the dsh sandbox (the harness's, not the plugin's) currently blocks folders created
+  with an owner-only access list — Python 3.12.4+ and 3.13 `os.mkdir(..., 0o700)`,
+  `tempfile.mkdtemp()`, pytest's `tmp_path` — and named pipes (`multiprocessing`, pytest-xdist;
+  possibly the cause of Node's `spawn EPERM`, since libuv uses named pipes). Tests that need those
+  have to run outside the worker, on the applied patch.
+
 ## 6. Tell them what they have
 
-Close with the tools and two caveats:
+Close with the tools and three caveats:
 - `flash_task` — one coherent task, one worker, a patch back (`taskFile` sends a long brief).
   Omit `model` for the default, or name one from the allowlist.
 - `flash_batch` — several independent tasks at once, sharing one copy and one model.
@@ -143,3 +162,4 @@ Close with the tools and two caveats:
   `scripts/flash-sessions.mjs` for watching, and at the `delegate` skill for the everyday loop
   and `gauntlet` for rounds of competing attempts.
 - Workers share the machine: two copies in parallel share ports and per-user services.
+- A read-only call runs in the live tree, not a copy, so it sees edits that land while it reads.

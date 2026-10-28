@@ -50,6 +50,9 @@ export const JOB_TOOLS = [
       'A running job also shows what its workers are doing as of the last heartbeat: `current` lists',
       'each open tool call (tool, command, since, runningMs), and `warnings` names a command that',
       'failed three or more times in the call — a worker repeating a step its sandbox cannot finish.',
+      'A job still waiting for a free tree shows `queue`: its place in line (`position` of `of`; trees go',
+      'to the longest waiter first) and the calls holding the trees (`holders`: jobId when it is a job,',
+      'label, runningMs).',
       '',
       'This reports status only: it never returns a job\'s result — use flash_result for that. A job',
       'id is meaningful only to the server process that created it, and jobs do not survive a restart.',
@@ -443,14 +446,16 @@ export class JobRegistry {
    * The status projection: identity, state, timing, latest progress — never the result.
    *
    * A running job also reports what its call is doing right now: the open commands and the
-   * repeated-failure warnings the last heartbeat carried. Both are dropped once the job has
-   * ended — an ended job's answer is its result, and a stale snapshot of a command that was
-   * running an hour ago would read as if it were still running.
+   * repeated-failure warnings the last heartbeat carried, and, while it waits for a tree, its
+   * place in the queue and who holds the trees. All are dropped once the job has ended — an
+   * ended job's answer is its result, and a stale snapshot of a command that was running an
+   * hour ago would read as if it were still running.
    */
   #project(job) {
     const detail = job.state === 'running' ? job.lastProgress?.detail : undefined
     const current = detail?.current
     const warnings = detail?.warnings
+    const queue = detail?.queue
     return {
       jobId: job.jobId,
       kind: job.kind,
@@ -464,6 +469,7 @@ export class JobRegistry {
         : { lastProgress: { message: job.lastProgress.message, at: job.lastProgress.at } }),
       ...(Array.isArray(current) && current.length > 0 ? { current } : {}),
       ...(Array.isArray(warnings) && warnings.length > 0 ? { warnings } : {}),
+      ...(queue !== null && typeof queue === 'object' && !Array.isArray(queue) ? { queue } : {}),
       resultReady: job.state === 'ok',
     }
   }

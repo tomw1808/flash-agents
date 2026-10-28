@@ -25,7 +25,6 @@ import {
   WorkspaceIsolation,
   canonicalTmpdir,
   recordPaths,
-  settingsChangedWarning,
   slotPathWarning,
   slotRootPath,
 } from './isolation.js'
@@ -118,6 +117,9 @@ const REPEATED_FAILURE_THRESHOLD = 3
 /** How much of a task a stored patch's task record keeps for each kind of call. */
 const TASK_LABEL_CHARS = 160
 const BATCH_TASK_LABEL_CHARS = 200
+
+/** How much of a brief names a tree's holder in a queued call's status: a job label's width. */
+const HOLDER_LABEL_CHARS = 80
 
 /**
  * The window in which an empty, unproductive first attempt is read as a start-up hiccup
@@ -318,6 +320,25 @@ export class FlashTaskService {
     this.initTimeoutMs = initTimeoutMs
     this.env = env
     this.log = log
+    // Kept for the worker's prompt: the shell a worker's commands run in differs by platform,
+    // and a worker that writes bash for PowerShell spends its turns on syntax errors.
+    this.platform = platform
+    /**
+     * The calls waiting for a tree, in the order they asked. The pool hands a freed tree to
+     * its oldest waiter (`WorkspaceIsolation.release` shifts its queue), and each call joins
+     * this list in the same tick as it calls `lease`, so a call's index here is its place in
+     * the pool's own line. A call leaves the list when its lease settles, either way.
+     *
+     * @type {Array<{activity: object}>}
+     */
+    this.leaseQueue = []
+    /**
+     * Who holds each leased tree, so a queued call can say what it is waiting behind: the
+     * background job (when there is one), the call's label, and since when.
+     *
+     * @type {Map<object, {jobId?: string, label: string, since: number}>}
+     */
+    this.treeHolders = new Map()
     // The environment a runtime boots with may be extended per call. It is no longer
     // used to move TMPDIR into the disposable tree: the runtime's sandbox grants the
     // platform temp area from its *own* TMPDIR, so narrowing it silently withdrew that
@@ -419,6 +440,14 @@ export class FlashTaskService {
      * @type {Map<string, object>}
      */
     this.runtimes = new Map()
+    /**
+     * The per-slot environment each slot runtime was booted with, by runtime key. A runtime
+     * keeps its boot environment for life, so a reloaded `slotEnv` is compared against this
+     * to decide whether the runtime must be restarted (see `#restartForSlotEnv`).
+     *
+     * @type {Map<string, Record<string, string>>}
+     */
+    this.runtimeEnvs = new Map()
     this.sessions = 0
   }
 
@@ -483,6 +512,47 @@ export class FlashTaskService {
     }
     this.profileStampWarnings.set(profileName, next)
     run.profileStampWarning = next
+  }
+
+  /**
+   * Whether a running runtime that booted with a stale profile should be replaced now.
+   *
+   * A runtime keeps the guard it loaded for its whole life, so one booted before
+   * `node install.mjs` kept the old guard and its warning until a reconnect — and the VS Code
+   * extension cannot reconnect. The stamp is therefore read again, through the same injected
+   * reader `#refreshProfileStamp` uses, each time a call is about to use such a runtime. Only a
+   * runtime that holds a stale verdict is asked about, and only when the server reads stamps
+   * at all. A stamp that now matches retires the runtime when nothing else is on it; a busy one
+   * keeps serving — killing it would take its calls with it — and its warning says it will go.
+   *
+   * @param {object} run - the running runtime record.
+   * @param {string} profileName - its profile.
+   * @param {string} key - its runtime key, whose holds count the calls reaching for it.
+   * @returns {boolean} true when the caller should boot a fresh runtime in its place.
+   */
+  #outlivedInstall(run, profileName, key) {
+    if (!this.checkProfileStamp || this.profileStampReader === undefined) return false
+    if (typeof run.profileStampWarning !== 'string') return false
+    let next
+    try {
+      next = this.profileStampReader(profileName)
+    } catch (error) {
+      this.log(`could not re-read the ${profileName} profile stamp: ${messageOf(error)}`)
+      return false
+    }
+    if (next !== undefined) return false
+    // This call already holds the key (see `#runSession`), so one hold is its own.
+    const busy = (run.sessions ?? 0) > 0 || (this.inFlight.get(key) ?? 0) > 1
+    if (!busy) {
+      this.log(`the ${profileName} runtime was started before the install; replacing it`)
+      return true
+    }
+    if (run.replaceWhenIdle !== true) {
+      run.replaceWhenIdle = true
+      run.profileStampWarning = `${run.profileStampWarning}; this runtime was started before the install, and it will be replaced once its running calls end`
+      this.log(`the ${profileName} runtime was started before the install; it will be replaced once its running calls end`)
+    }
+    return false
   }
 
   /**
@@ -607,18 +677,66 @@ export class FlashTaskService {
    * @param {string} label - the tool name, for the error message.
    * @param {number} budgetMs - the wall-clock budget of the call being served.
    * @param {AbortSignal} [signal] - client cancellation.
+   * @param {{activity: object}} ticket - the call's place in line (see `#joinLeaseQueue`),
+   *   given up however the wait ends.
+   * @param {{jobId?: string, label: string}} holder - how the call is named to the calls
+   *   queued behind it once it holds the tree.
    * @returns {Promise<object>} the leased slot.
    * @throws {FlashTaskCancelled | FlashTaskError} when the call is cancelled or out of time.
    */
-  async #lease(pool, label, budgetMs, signal) {
+  async #lease(pool, label, budgetMs, signal, ticket, holder) {
     try {
-      return await pool.lease({ signal, deadline: Date.now() + budgetMs })
+      const slot = await pool.lease({ signal, deadline: Date.now() + budgetMs })
+      this.treeHolders.set(slot, { ...holder, since: Date.now() })
+      return slot
     } catch (error) {
       if (error instanceof IsolationError && error.code === 'CANCELLED') {
         throw new FlashTaskCancelled(`${label} was cancelled while waiting for a free tree`, error.code)
       }
       throw new FlashTaskError(messageOf(error), error?.code ?? 'ISOLATION_FAILED')
+    } finally {
+      // Leased, cancelled or out of time: either way this call is no longer in line.
+      const at = this.leaseQueue.indexOf(ticket)
+      if (at >= 0) this.leaseQueue.splice(at, 1)
     }
+  }
+
+  /**
+   * Join the line for a tree, in the same tick as the lease that follows.
+   *
+   * The pool serves its waiters oldest first, so joining here, immediately before `lease`
+   * queues the waiter, keeps this list in the pool's own order without reading its internals.
+   *
+   * @param {object} activity - the call's activity record.
+   * @returns {{activity: object}} the call's ticket, handed to `#noteQueue` and `#lease`.
+   */
+  #joinLeaseQueue(activity) {
+    const ticket = { activity }
+    this.leaseQueue.push(ticket)
+    return ticket
+  }
+
+  /**
+   * Where one queued call stands: its place in line, how long the line is, and who holds
+   * the trees it is waiting for, longest-held first.
+   *
+   * Only what the service itself knows is reported. A holder started as a background job is
+   * named by its job id and label; a foreground call has no job, so its label is all there is.
+   *
+   * @param {{activity: object}} ticket - the queued call's ticket.
+   * @param {number} now - the clock the hold times are measured against.
+   * @returns {{position: number, of: number, holders: Array<{jobId?: string, label: string, runningMs: number}>}}
+   *   the call's place in the queue.
+   */
+  #queueView(ticket, now) {
+    const holders = [...this.treeHolders.values()]
+      .sort((a, b) => a.since - b.since)
+      .map((holder) => ({
+        ...(holder.jobId === undefined ? {} : { jobId: holder.jobId }),
+        label: holder.label,
+        runningMs: Math.max(0, now - holder.since),
+      }))
+    return { position: this.leaseQueue.indexOf(ticket) + 1, of: this.leaseQueue.length, holders }
   }
 
   /**
@@ -633,12 +751,16 @@ export class FlashTaskService {
    * so the wait says so in the progress line and in the log: a caller that sent a writing
    * call without `background: true` cannot see what it is waiting for otherwise.
    *
+   * The call's place in line and the trees' holders are read through `queueView` at render
+   * time, like the counts: the line moves while the call waits.
+   *
    * @param {WorkspaceIsolation} pool - the pool the call is about to lease from.
    * @param {object} activity - the call's activity record.
    * @param {boolean} [foreground] - whether this call holds the caller's turn while it waits.
+   * @param {{activity: object}} [ticket] - the call's place in line.
    * @returns {number | undefined} when the wait began, or undefined when a tree was free.
    */
-  #noteQueue(pool, activity, foreground = false) {
+  #noteQueue(pool, activity, foreground = false, ticket = undefined) {
     // A deferred start-up sweep (the stdio server's) may still be reclaiming the previous
     // server's trees when the first call arrives. That wait has no session event behind it,
     // so without this the heartbeat reads "starting" and the call looks hung; `undefined`
@@ -662,6 +784,7 @@ export class FlashTaskService {
     }
     // Read through at render time: another waiting call may take the freeing tree first.
     activity.pool = pool
+    if (ticket !== undefined) activity.queueView = (now = Date.now()) => this.#queueView(ticket, now)
     return since
   }
 
@@ -675,8 +798,13 @@ export class FlashTaskService {
   #noteLeased(activity, queuedSince) {
     const queuedMs = queuedSince === undefined ? 0 : Math.max(0, Date.now() - queuedSince)
     delete activity.queuedSince
+    delete activity.queueView
     activity.what = 'copying the repository'
     activity.at = Date.now()
+    // The last heartbeat of a call that waited still carries its place in line, and
+    // `flash_status` reads that heartbeat: without a fresh one, a call that holds its tree
+    // went on being shown in line behind the previous holder for up to a whole interval.
+    if (queuedSince !== undefined) activity.heartbeat?.()
     return queuedMs
   }
 
@@ -690,6 +818,7 @@ export class FlashTaskService {
    *
    * @param {object | undefined} slot - the leased tree, when the call is isolated.
    * @param {string} rootCwd - the resolved directory inside the caller's root.
+   * @param {WorkspaceIsolation | undefined} pool - the pool the slot was leased from.
    * @returns {{promptCwd: string, runtimeCwd: string, extraEnv: object | undefined,
    *   slotPorts: string[], slotValues: string[]}} where to run, and which of `extraEnv`'s
    *   names are port ranges and which are plain values the project's settings set.
@@ -706,12 +835,16 @@ export class FlashTaskService {
     // the same directory succeeded. The tree's own scratch directory still exists and the
     // worker is told about it in its prompt.
     const slotEnv = pool.slotEnvFor(slot)
+    // The specs come from the settings this slot leased with, as `slotEnvFor` reads them: the
+    // pool's current settings may have been reloaded since, and a name they added or retyped
+    // must not be described to a worker whose environment was built without it.
+    const specs = (slot.settings ?? pool).slotEnv
     // A `port:` entry resolves to a bare number and a `value:` entry to plain text, which the
     // worker must not read as a path: the prompt names each kind in its own sentence.
-    const slotPorts = Object.entries(pool.slotEnv)
+    const slotPorts = Object.entries(specs)
       .filter(([, spec]) => spec.kind === 'port')
       .map(([name]) => name)
-    const slotValues = Object.entries(pool.slotEnv)
+    const slotValues = Object.entries(specs)
       .filter(([, spec]) => spec.kind === 'value')
       .map(([name]) => name)
     return {
@@ -724,6 +857,60 @@ export class FlashTaskService {
       slotPorts,
       slotValues,
     }
+  }
+
+  /**
+   * Restart the idle runtimes on a slot that were booted with another `slotEnv`.
+   *
+   * The pool re-reads the settings files when a call leases a slot, and the prompt, the
+   * setup steps and the `cache:` folders follow the new settings from that call on. The
+   * runtime does not: `slotEnv` is its process environment, fixed when it boots (see
+   * `#ensureRuntime`), and the worker's commands inherit it. A runtime on a slot that already
+   * served a call would therefore keep the old variables until a reconnect, which the VS
+   * Code extension does not offer. Shutting it down here, before the copy is made, makes the
+   * call boot a fresh one with the environment it was given.
+   *
+   * Only a runtime nobody is using is shut down. The slot is leased by this call, so another
+   * session on it would be a leftover the service cannot see the end of; it is left running,
+   * and the call says which variables its commands still see the old way.
+   *
+   * @param {object} slot - the leased tree.
+   * @param {string} profileName - the profile the call runs on.
+   * @param {string} cwd - the tree the runtime is rooted at.
+   * @param {string} model - the model the call runs.
+   * @param {Record<string, string> | undefined} extraEnv - the environment this call boots with.
+   * @returns {Promise<void>}
+   */
+  async #restartForSlotEnv(slot, profileName, cwd, model, extraEnv) {
+    const wanted = extraEnv ?? {}
+    for (const [key, run] of [...this.runtimes]) {
+      // The walk is a snapshot and every shutdown is awaited, as in `#retireOtherModels`.
+      if (this.runtimes.get(key) !== run) continue
+      if (run.profile !== profileName || run.cwd !== cwd) continue
+      const booted = this.runtimeEnvs.get(key)
+      if (booted === undefined) continue
+      const changed = changedEnvNames(booted, wanted)
+      if (changed.length === 0) continue
+      if (run.initialized !== true || (run.sessions ?? 0) > 0 || (this.inFlight.get(key) ?? 0) > 0) {
+        slot.settingsWarnings = [
+          ...(slot.settingsWarnings ?? []),
+          `slotEnv changed (${changed.join(', ')}), but the ${run.model} runtime on this tree was still in use, ` +
+            'so its commands see the values it was started with; the next call on this tree restarts it',
+        ]
+        continue
+      }
+      this.runtimes.delete(key)
+      this.runtimeEnvs.delete(key)
+      try {
+        await run.client?.shutdown()
+        this.log(`restarted the ${run.model} runtime on ${cwd}: slotEnv changed (${changed.join(', ')})`)
+      } catch (error) {
+        this.log(`could not shut down the ${run.model} runtime on ${cwd} for its new slotEnv: ${messageOf(error)}`)
+      }
+    }
+    // Whatever runtime serves this key next is booted by this call, with this environment.
+    const key = this.#runtimeKey(profileName, cwd, model)
+    if (this.runtimes.get(key)?.client?.running !== true) this.runtimeEnvs.set(key, { ...wanted })
   }
 
   /**
@@ -860,9 +1047,11 @@ export class FlashTaskService {
    *   so while it waits and in its result; a background one has no turn to hold.
    * @param {string} [options.jobId] - the background job serving the call, recorded on the
    *   patch's task so a stored change can be traced back to it.
+   * @param {string} [options.label] - the job's label, which names this call to the calls
+   *   queued behind it while it holds a tree (default the brief's first line).
    * @returns {Promise<object>} the compact structured result.
    */
-  async flashTask(args, { signal, progress, progressToken, background = false, jobId } = {}) {
+  async flashTask(args, { signal, progress, progressToken, background = false, jobId, label } = {}) {
     const task = this.#resolveTask(args)
     // The path the caller gave, not the resolved one: a stored patch names the brief the
     // call named, so it can be found again from the record alone.
@@ -915,8 +1104,12 @@ export class FlashTaskService {
       /** The wait for a tree, when there was one: its length, the pool's counts, nothing else. */
       let queued
       if (pool !== undefined) {
-        const queuedSince = this.#noteQueue(pool, activity, background !== true)
-        slot = await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal)
+        const ticket = this.#joinLeaseQueue(activity)
+        const queuedSince = this.#noteQueue(pool, activity, background !== true, ticket)
+        slot = await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal, ticket, {
+          ...(jobId === undefined ? {} : { jobId }),
+          label: label ?? taskLabel(task, HOLDER_LABEL_CHARS),
+        })
         queuedMs = this.#noteLeased(activity, queuedSince)
         if (queuedSince !== undefined) {
           // Snapshotted now: the counts a result reports are the ones the caller waited
@@ -925,6 +1118,7 @@ export class FlashTaskService {
         }
       }
       const { promptCwd, runtimeCwd, extraEnv, slotPorts, slotValues } = this.#runLocation(slot, rootCwd, pool)
+      if (slot !== undefined) await this.#restartForSlotEnv(slot, profileName, runtimeCwd, model, extraEnv)
       if (slot !== undefined) {
         try {
           pool.prepare(slot, {
@@ -968,6 +1162,7 @@ export class FlashTaskService {
         cwd: promptCwd,
         task,
         acceptance,
+        platform: this.platform,
         ...(slot === undefined
           ? {}
           : {
@@ -976,7 +1171,7 @@ export class FlashTaskService {
               slotEnv: extraEnv,
               slotPorts,
               slotValues,
-              slotSetup: promptSlotSetup(pool, setup),
+              slotSetup: promptSlotSetup(pool, setup, slot),
               discard: apply === 'discard',
               ...(baseApplied === undefined ? {} : { basePatch: promptBasePatch(baseApplied) }),
             }),
@@ -1096,7 +1291,12 @@ export class FlashTaskService {
    * @param {object | undefined} change - what `collect` returned, if it ran.
    */
   #settleSlot(pool, slot, change) {
-    if (change?.available === true) {
+    // Before the release, which may hand the tree straight to the next waiter.
+    this.treeHolders.delete(slot)
+    if (change?.available === true && (change.nestedUnread ?? []).length > 0) {
+      // The patch is stored, but some nested repository's edits are only in this tree.
+      this.log(`kept ${slot.dir} until the next call in this slot: ${change.nestedUnread.join(', ')} could not be read into its patch`)
+    } else if (change?.available === true) {
       try {
         pool.discard(slot)
       } catch (error) {
@@ -1134,8 +1334,18 @@ export class FlashTaskService {
    */
   async #salvageOrphaned(pool, slot, error, profileName) {
     let note
+    /** What the collect itself warned about, such as a nested repository it could not read. */
+    let warnings = []
     try {
-      const change = pool.collect(slot, { diffChars: this.diffChars })
+      const change = pool.collect(slot, { diffChars: this.diffChars, retiring: true })
+      // A finished call carries these in its result's warnings; a salvaged one has only its
+      // error, and a patch stored without a nested repository's edits must not read as whole.
+      warnings = Array.isArray(change.warnings) ? change.warnings : []
+      const unread = Array.isArray(change.nestedUnread) ? change.nestedUnread : []
+      if (warnings.length === 0 && unread.length > 0) {
+        // The paths alone still say which edits the patch is missing.
+        warnings = [`the changes inside nested repositories ${unread.join(', ')} could not be read and are not in this patch`]
+      }
       if (!change.available) {
         note = `no change could be collected from the tree (${change.reason})`
       } else if (change.filesChanged.length === 0) {
@@ -1160,19 +1370,27 @@ export class FlashTaskService {
     // the worker processes it spawned with it. Every model's runtime on that tree goes:
     // one slot can have held more than one, and the one that served this call is not
     // necessarily the only one still alive.
+    //
+    // Whether every one of them really stopped decides whether the tree's build cache may be
+    // moved into the slot's new directory: a runtime still booting has no client to shut
+    // down yet, and one whose shutdown failed may still be running a build there.
+    let sessionStopped = true
     for (const [key, run] of [...this.runtimes]) {
       if (run.profile !== profileName || run.cwd !== slot.dir) continue
       this.runtimes.delete(key)
+      if (run.client === undefined && run.starting !== undefined) sessionStopped = false
       try {
         await run.client?.shutdown()
         this.log(`shut down the ${run.model} runtime of the orphaned session on ${slot.dir}`)
       } catch (shutdownError) {
+        sessionStopped = false
         this.log(`could not shut down the runtime of the orphaned session: ${messageOf(shutdownError)}`)
       }
     }
-    pool.retire(slot)
-    this.log(`salvage: ${note}${refusals}`)
-    error.message = `${error.message}. ${note.charAt(0).toUpperCase()}${note.slice(1)}${refusals}`
+    pool.retire(slot, { sessionStopped })
+    const warned = warnings.map((warning) => `; ${warning}`).join('')
+    this.log(`salvage: ${note}${warned}${refusals}`)
+    error.message = `${error.message}. ${note.charAt(0).toUpperCase()}${note.slice(1)}${warned}${refusals}`
   }
 
   /**
@@ -1197,9 +1415,10 @@ export class FlashTaskService {
    *   `flashTask`.
    * @param {string} [options.jobId] - the background job serving the call, recorded on the
    *   fleet's patch task.
+   * @param {string} [options.label] - the job's label; see `flashTask`.
    * @returns {Promise<object>} the compact per-task fleet result.
    */
-  async flashBatch(args, { signal, progress, progressToken, background = false, jobId } = {}) {
+  async flashBatch(args, { signal, progress, progressToken, background = false, jobId, label } = {}) {
     const tasks = normalizeTasks(args?.tasks, this.maxTasks, {
       readTaskFile: (value, field) => this.#readTaskFile(value, field),
     })
@@ -1243,14 +1462,20 @@ export class FlashTaskService {
       /** The wait for a tree, when there was one; see flashTask. */
       let queued
       if (pool !== undefined) {
-        const queuedSince = this.#noteQueue(pool, activity, background !== true)
-        slot = await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal)
+        const ticket = this.#joinLeaseQueue(activity)
+        const queuedSince = this.#noteQueue(pool, activity, background !== true, ticket)
+        slot = await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal, ticket, {
+          ...(jobId === undefined ? {} : { jobId }),
+          // The same words a fleet's job label uses, so the two never name one call differently.
+          label: label ?? `${String(tasks.length)} tasks`,
+        })
         queuedMs = this.#noteLeased(activity, queuedSince)
         if (queuedSince !== undefined) {
           queued = { ms: queuedMs, inUse: activity.queuedInUse, size: activity.queuedSize }
         }
       }
       const { promptCwd, runtimeCwd, extraEnv, slotPorts, slotValues } = this.#runLocation(slot, rootCwd, pool)
+      if (slot !== undefined) await this.#restartForSlotEnv(slot, profileName, runtimeCwd, model, extraEnv)
       if (slot !== undefined) {
         try {
           pool.prepare(slot, {
@@ -1290,14 +1515,20 @@ export class FlashTaskService {
               slotEnv: extraEnv,
               slotPorts,
               slotValues,
-              slotSetup: promptSlotSetup(pool, setup),
+              slotSetup: promptSlotSetup(pool, setup, slot),
               discard: apply === 'discard',
               ...(baseApplied === undefined ? {} : { basePatch: promptBasePatch(baseApplied) }),
             }
       const items = tasks.map((entry, index) => ({
         label: `task-${String(index + 1)}`,
         prompt: [
-          buildChildPrompt({ cwd: promptCwd, task: entry.task, acceptance: entry.acceptance ?? acceptance, ...copy }),
+          buildChildPrompt({
+            cwd: promptCwd,
+            task: entry.task,
+            acceptance: entry.acceptance ?? acceptance,
+            platform: this.platform,
+            ...copy,
+          }),
           '',
           WORKER_RULES,
         ].join('\n'),
@@ -1741,8 +1972,17 @@ export class FlashTaskService {
    */
   async #ensureRuntime(profileName, cwd, extraEnv, model) {
     const key = this.#runtimeKey(profileName, cwd, model)
-    const existing = this.runtimes.get(key)
-    if (existing?.client?.running && existing.initialized) return existing
+    let existing = this.runtimes.get(key)
+    /** A runtime from before the install, shut down before its replacement boots. */
+    let outdated
+    if (existing?.client?.running && existing.initialized) {
+      if (!this.#outlivedInstall(existing, profileName, key)) return existing
+      // Out of the map at once, and the replacement in it before anything is awaited: a call
+      // arriving meanwhile then waits for the fresh runtime instead of booting a second one.
+      outdated = existing
+      existing = undefined
+      this.runtimes.delete(key)
+    }
     if (existing?.starting !== undefined) return await existing.starting
     const run = existing ?? {
       client: undefined,
@@ -1756,6 +1996,15 @@ export class FlashTaskService {
     }
     this.runtimes.set(key, run)
     run.starting = (async () => {
+      if (outdated !== undefined) {
+        // Stopped first, as a model switch stops an idle runtime: one tree, one process for
+        // this profile and model, and the old guard gone before the new one serves anything.
+        try {
+          await outdated.client?.shutdown()
+        } catch (error) {
+          this.log(`could not shut down the ${profileName} runtime started before the install: ${messageOf(error)}`)
+        }
+      }
       let client
       // A cold runtime on a busy disk can miss the handshake deadline without anything
       // being wrong with it. That failure is the one worth retrying: a fresh process gets
@@ -1920,6 +2169,9 @@ export class FlashTaskService {
         mode: isolated ? 'copy' : 'none',
         slot: slot?.id ?? null,
         ...(slot?.uncommitted?.count > 0 ? { uncommittedAtStart: slot.uncommitted } : {}),
+        // Only when it is true: a warm slot is the normal case and says nothing, while a cold
+        // one explains why a build that usually takes minutes took an hour.
+        ...(slot?.buildCacheEmpty === true ? { buildCacheEmpty: true } : {}),
       },
       ...basePatchFields(basePatch),
     }
@@ -1980,6 +2232,10 @@ export class FlashTaskService {
     const warnings = []
     // What every member of the fleet was given in its prompt before it read the task.
     if (instructions.overBudget) warnings.push(overBudgetWarning(instructions))
+    // A base patch the copy already held was skipped, which changes what this call's patch holds.
+    if (basePatch?.warning !== undefined) warnings.push(basePatch.warning)
+    // Nested repositories whose edits the patch could not carry.
+    warnings.push(...(change?.warnings ?? []))
     // Operational breadcrumb: enough to tell an unreadable value from a
     // mis-shaped one without ever returning the workflow's raw text.
     const header = parseWorkflowHeader(state.workflowText)
@@ -2123,9 +2379,9 @@ export class FlashTaskService {
     if ((change?.ignoredChanged ?? []).length > 0) {
       warnings.push(ignoredChangedWarning(change))
     }
-    if (slot !== undefined && this.isolation?.slotSetupWarning !== undefined) {
-      warnings.push(this.isolation.slotSetupWarning)
-    }
+    // The call's own settings: a reload by a later call must not add or drop this line.
+    const setupWarning = slot === undefined ? undefined : (slot.settings ?? this.isolation)?.slotSetupWarning
+    if (setupWarning !== undefined) warnings.push(setupWarning)
     // The fleet's shared activity record: one warning per command that keeps failing,
     // whichever member of the fleet was running it.
     warnings.push(...activityWarnings(activity))
@@ -2182,10 +2438,11 @@ export class FlashTaskService {
    * The stamp warning belongs to the runtime that served the call, because one booted
    * after an install loads the new profile while one booted before it keeps the old
    * verdict. A call that never reached a runtime falls back to the latest verdict known
-   * for its profile — the start-time one until a runtime boots. The settings check is one
-   * `stat` per file per call, because a file edited after the pool read it is silently
-   * ignored until a reconnect and the caller has to be told (see
-   * `WorkspaceIsolation.repoSettingsChanged`).
+   * for its profile — the start-time one until a runtime boots. The settings warnings are
+   * the ones the call's slot leased with: a settings file that cannot be used, and a
+   * changed `slotEnv` its runtime could not be restarted for (see
+   * `WorkspaceIsolation.refreshSettings` and `#restartForSlotEnv`). An edit that applied
+   * needs no warning at all, because the call already ran with it.
    *
    * @param {string} profileName - the profile that served, or would have served, the call.
    * @param {string} cwd - the tree the call ran on.
@@ -2202,9 +2459,12 @@ export class FlashTaskService {
         ? run.profileStampWarning
         : this.profileStampWarnings.get(profileName)
     if (stampWarning !== undefined) warnings.push(stampWarning)
-    // One warning per settings file that changed, so a per-machine edit is not mistaken
-    // for a change to the committed file (see `WorkspaceIsolation.repoSettingsChanged`).
-    for (const file of this.isolation?.repoSettingsChanged() ?? []) warnings.push(settingsChangedWarning(file))
+    // An isolated call's runtime is rooted at its slot's directory, so the slot is found by
+    // it; a call in place has no slot, and no settings it could have been given.
+    const slot = this.isolation?.slots.find((candidate) => candidate.dir === cwd)
+    for (const warning of slot?.settingsWarnings ?? []) {
+      if (!warnings.includes(warning)) warnings.push(warning)
+    }
     return warnings
   }
 
@@ -2259,6 +2519,10 @@ export class FlashTaskService {
     } else if (emptyResult) {
       warnings.push('the worker ended with an empty final message, so its account of the change is missing; review the diff before applying it')
     }
+    // A base patch the copy already held was skipped, which changes what this call's patch holds.
+    if (basePatch?.warning !== undefined) warnings.push(basePatch.warning)
+    // Nested repositories whose edits the patch could not carry.
+    warnings.push(...(change?.warnings ?? []))
     if ((change?.ignored ?? []).length > 0) {
       warnings.push(
         `the worker created ${String(change.ignored.length)} path(s) that git ignores, so the patch cannot carry them: ${change.ignored.slice(0, 5).join(', ')}`,
@@ -2270,9 +2534,9 @@ export class FlashTaskService {
     // Over budget, the harness keeps the most specific files and drops the broader
     // ones, so the worker's prompt is quietly missing project-wide rules. Say so.
     if (instructions.overBudget) warnings.push(overBudgetWarning(instructions))
-    if (slot !== undefined && this.isolation?.slotSetupWarning !== undefined) {
-      warnings.push(this.isolation.slotSetupWarning)
-    }
+    // The call's own settings: a reload by a later call must not add or drop this line.
+    const setupWarning = slot === undefined ? undefined : (slot.settings ?? this.isolation)?.slotSetupWarning
+    if (setupWarning !== undefined) warnings.push(setupWarning)
     // The route the result carries is what the child was observed running on. When that
     // is not the model this call asked for, the result must say so rather than let the
     // caller take the requested model on trust.
@@ -2507,8 +2771,29 @@ export function createActivity(now = Date.now()) {
     backgroundJobs: new Map(),
     /** How many calls this record has seen, so an id-less call still gets a unique key. */
     callSeq: 0,
-    /** @type {Map<string, {count: number, lastAt: number, lastExitCode?: number, lastName?: string}>} */
+    /**
+     * Failed commands by key (see `failureKeyOf`). `lastSeq` and `succeededSeq` order a
+     * failure against a later success of the same key; `file` is the file an edit-type
+     * failure was about, so a later successful edit of that file can be recognised;
+     * `commands` holds the exact commands that failed under a command key (see
+     * `exactCommandOf`), since only a later run of one of them is that step's success.
+     *
+     * @type {Map<string, {count: number, lastAt: number, lastSeq: number, lastExitCode?: number, lastName?: string, file?: string, commands?: Set<string>, succeededSeq?: number, succeededAt?: number}>}
+     */
     failures: new Map(),
+    /**
+     * The latest successful change of each file through `edit` or `write`, so an edit that
+     * failed and was then made another way (a `write` of the whole file, say) is not warned
+     * about as if the worker were still stuck on it.
+     *
+     * @type {Map<string, {seq: number, at: number}>}
+     */
+    edits: new Map(),
+    /**
+     * How many tool results this record has counted. Results arrive faster than the clock
+     * ticks, so "later" is decided by this count, not by timestamps.
+     */
+    resultSeq: 0,
   }
 }
 
@@ -2679,11 +2964,15 @@ function noteToolCall(activity, session, tool, args, id) {
   // A shell result can only announce a background job when its own call asked for one; the
   // flag is kept here so the result reader never has to trust the result text alone.
   const background = (tool === 'bash' || tool === 'pwsh') && shellRunsInBackground(args)
+  // A file tool's failures are counted per file rather than by the head of its JSON, which
+  // carried the edit's own text and so split one stuck edit into many keys.
+  const file = tool === 'bash' || tool === 'pwsh' ? undefined : fileArgumentOf(args)
   activity.openCalls.set(openCallKey(session, callId), {
     session,
     ...(id === undefined ? {} : { id }),
     tool,
     command: describeToolCall(tool, args),
+    ...(file === undefined ? {} : { file }),
     ...(jobId === undefined ? {} : { jobId }),
     ...(background ? { background: true } : {}),
     since: Date.now(),
@@ -2759,8 +3048,11 @@ function noteToolResult(activity, session, event, log) {
   const exitCode = exitCodeOf(text)
   const failure = event.data?.error
   const failed = (failure !== undefined && failure !== null) || (exitCode !== undefined && exitCode !== 0)
-  if (!failed) return
-  countFailure(activity, call.command, {
+  if (!failed) {
+    countSuccess(activity, call)
+    return
+  }
+  countFailure(activity, call, {
     exitCode,
     name: typeof failure?.name === 'string' ? failure.name : undefined,
     log,
@@ -2849,8 +3141,9 @@ function noteJobOutputResult(activity, call, event, text, log) {
   // a passing test run that prints the exit code of a deliberately failing child, say —
   // and counting that as the job's own failure warned about a command that succeeded.
   const exitCode = exitCodeInStatus(status)
+  if (exitCode === 0) countSuccess(activity, job)
   if (exitCode === undefined || exitCode === 0) return
-  countFailure(activity, job.command, { exitCode, log })
+  countFailure(activity, job, { exitCode, log })
 }
 
 /**
@@ -2897,26 +3190,156 @@ function exitCodeInStatus(text) {
  * Both a foreground result and a background job's terminal read come through here, so a
  * command is warned about the same way whichever way it failed.
  *
+ * Exit status 1 of a search or a comparison (`grep`, `rg`, `git grep`, `diff`, `cmp`) is
+ * an answer — no match, or the files differ — not a failure: a worker that searched for a
+ * name three times and found it nowhere was warned about as if its sandbox refused it.
+ * Their status 2 and above is an error and still counts.
+ *
  * @param {object} activity - the call's activity record.
- * @param {string} command - the command line that failed.
+ * @param {{tool: string, command: string, file?: string}} call - the call that failed.
  * @param {object} options - what the failure was.
  * @param {number | undefined} options.exitCode - the exit code, when there was one.
  * @param {string | undefined} [options.name] - the tool error's name, when there was one.
  * @param {(message: string) => void} options.log - diagnostic sink.
  * @returns {void}
  */
-function countFailure(activity, command, { exitCode, name, log }) {
-  const key = failureKey(command)
+function countFailure(activity, call, { exitCode, name, log }) {
+  if (exitCode === 1 && name === undefined && exitOneIsAnAnswer(call.command)) return
+  const key = failureKeyOf(call)
   if (key.length === 0) return
   const record = activity.failures.get(key) ?? { count: 0 }
   record.count += 1
   record.lastAt = Date.now()
+  activity.resultSeq = (activity.resultSeq ?? 0) + 1
+  record.lastSeq = activity.resultSeq
   record.lastExitCode = exitCode
   record.lastName = name
+  if (call.file !== undefined) {
+    record.file = call.file
+  } else {
+    // The key folds `npm run build` and `npm run lint` together so a step retried with other
+    // flags is counted once; the exact commands are kept beside it so only a later run of one
+    // of them reads as that step going through.
+    record.commands = record.commands ?? new Set()
+    record.commands.add(exactCommandOf(call.command))
+  }
   activity.failures.set(key, record)
   if (record.count < REPEATED_FAILURE_THRESHOLD) return
   if (record.count % REPEATED_FAILURE_THRESHOLD !== 0) return
-  log(repeatedFailureWarning(key, record, record.lastAt))
+  log(repeatedFailureWarning(key, record, record.lastAt, activity))
+}
+
+/**
+ * Note one successful run, so a warning about earlier failures of the same step can say the
+ * step went through after all.
+ *
+ * A success is a result with no tool error and an exit code of 0 (or none, for a tool that
+ * reports none), looked up under the same key its failures are counted under. The key alone
+ * is not enough for a command: `npm run lint` passing shares the key `npm run` with a stuck
+ * `npm run build`, and reading it as the build's success dropped the advice to look at the
+ * call. So a command only counts when it is one of the exact commands that failed under that
+ * key (see `exactCommandOf`); a file tool's key already names the tool and the file. A
+ * successful `edit` or `write` is also noted for its file: an edit that failed with an
+ * `FsError` and was then done with a `write` of the whole file is a step the worker got past,
+ * not one it is stuck in.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {{tool: string, command: string, file?: string}} call - the call that succeeded.
+ * @returns {void}
+ */
+function countSuccess(activity, call) {
+  if (activity?.failures === undefined) return
+  activity.resultSeq = (activity.resultSeq ?? 0) + 1
+  const seq = activity.resultSeq
+  const at = Date.now()
+  const record = activity.failures.get(failureKeyOf(call))
+  const same = record !== undefined && (call.file !== undefined || record.commands?.has(exactCommandOf(call.command)) === true)
+  if (same) {
+    record.succeededSeq = seq
+    record.succeededAt = at
+  }
+  if (call.file !== undefined && FILE_CHANGING_TOOLS.has(call.tool)) activity.edits?.set(call.file, { seq, at })
+}
+
+/** The file tools whose success means the file now holds the worker's change. */
+const FILE_CHANGING_TOOLS = new Set(['edit', 'write'])
+
+/** Programs whose exit status 1 means "no match" or "the inputs differ". */
+const EXIT_ONE_ANSWERS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'diff', 'cmp'])
+
+/**
+ * Whether a command's exit status 1 is an answer rather than a failure.
+ *
+ * The status a shell reports is the last pipeline stage's, so `cat log | grep x` is a search
+ * and `grep x log | head` is not. A chain (`&&`, `||`, `;`) stays counted: its status 1 may
+ * come from any step before the search. Both are read outside quotes (see `shellLineOf`),
+ * so a pattern such as `"fooName|barName"` is part of the search, not a pipe.
+ *
+ * @param {string} command - the command line.
+ * @returns {boolean} true for `grep`, `rg`, `git grep`, `diff` or `cmp` as the last stage.
+ */
+function exitOneIsAnAnswer(command) {
+  const line = shellLineOf(withoutSetup(command))
+  // A line whose quoting does not close is not one this can read; it stays counted.
+  if (line === undefined || line.chained) return false
+  const words = (line.stages.at(-1) ?? '').trim().split(/\s+/)
+  const program = (words[0] ?? '').split(/[\\/]/).at(-1)
+  if (EXIT_ONE_ANSWERS.has(program)) return true
+  return program === 'git' && words[1] === 'grep'
+}
+
+/**
+ * The pipeline stages of one command line, and whether it chains commands.
+ *
+ * A search pattern may hold the very characters that separate commands —
+ * `rg -n "fooName|barName" src`, `grep 'a;b' f` — so the line is scanned once, and `|`,
+ * `&&`, `||` and `;` only count outside single quotes, double quotes and backslash escapes.
+ * Splitting on every `|` took `barName" src` for the program and warned about three empty
+ * searches as a step the sandbox could not finish.
+ *
+ * @param {string} text - the command line.
+ * @returns {{stages: string[], chained: boolean} | undefined} the text of each pipeline
+ *   stage, and whether `&&`, `||` or `;` joins commands; undefined when a quote or an
+ *   escape is left open.
+ */
+function shellLineOf(text) {
+  const stages = []
+  let chained = false
+  let quote
+  let start = 0
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    if (quote === "'") {
+      // Nothing escapes inside single quotes, not even a backslash.
+      if (char === "'") quote = undefined
+      continue
+    }
+    if (char === '\\') {
+      if (index + 1 >= text.length) return undefined
+      index += 1
+      continue
+    }
+    if (quote === '"') {
+      if (char === '"') quote = undefined
+      continue
+    }
+    if (char === "'" || char === '"') {
+      quote = char
+    } else if (char === ';' || (char === '&' && text[index + 1] === '&')) {
+      chained = true
+    } else if (char === '|') {
+      if (text[index + 1] === '|') {
+        chained = true
+        index += 1
+      } else {
+        stages.push(text.slice(start, index))
+        start = index + 1
+      }
+    }
+  }
+  if (quote !== undefined) return undefined
+  stages.push(text.slice(start))
+  return { stages, chained }
 }
 
 /**
@@ -3011,6 +3434,36 @@ function describeToolCall(tool, args) {
  * @returns {string} the key, or `''` when nothing but setup segments was there.
  */
 function failureKey(command) {
+  return withoutSetup(command)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter((word) => word.length > 0)
+    .slice(0, 2)
+    .join(' ')
+}
+
+/**
+ * The exact command a failure or success is matched by: the command line without its
+ * leading setup segments (see `withoutSetup`) and with its whitespace collapsed, so
+ * `cd app && cargo build` and `cargo build` are one command while `npm run lint` and
+ * `npm run build` stay two.
+ *
+ * @param {string} command - the command line.
+ * @returns {string} the normalized command.
+ */
+function exactCommandOf(command) {
+  return withoutSetup(command).replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * A command line without its leading setup segments: `cd <dir> &&` (or `;`) and
+ * `NAME=value` assignments, which only set where and with what the real command runs.
+ *
+ * @param {string} command - the command line.
+ * @returns {string} what is left.
+ */
+function withoutSetup(command) {
   let text = String(command ?? '')
   for (;;) {
     const match = /^\s*cd\s+(?:"[^"]*"|'[^']*'|[^\s&;]+)\s*(?:&&|;)\s*/.exec(text)
@@ -3023,12 +3476,42 @@ function failureKey(command) {
     text = text.slice(match[0].length)
   }
   return text
-    .replace(/\s+/g, ' ')
-    .trim()
-    .split(' ')
-    .filter((word) => word.length > 0)
-    .slice(0, 2)
-    .join(' ')
+}
+
+/**
+ * The key one call's failures are counted under: `<tool> <file>` for a file tool, the folded
+ * command (see `failureKey`) for everything else.
+ *
+ * @param {{tool?: string, command: string, file?: string}} call - the call.
+ * @returns {string} the key, or `''` when there is nothing to count under.
+ */
+function failureKeyOf(call) {
+  if (call.file !== undefined) return `${call.tool} ${call.file}`
+  return failureKey(call.command)
+}
+
+/**
+ * The file a file tool's call names, read out of its JSON arguments.
+ *
+ * The Harness file tools (`read`, `write`, `edit`) take `file_path`; `path` is read too, as
+ * the other common spelling.
+ *
+ * @param {unknown} args - the tool call's arguments, a JSON string in practice.
+ * @returns {string | undefined} the path, or undefined when the call names none.
+ */
+function fileArgumentOf(args) {
+  const raw = typeof args === 'string' ? args : args === undefined || args === null ? '' : JSON.stringify(args)
+  if (raw.length === 0) return undefined
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+  for (const candidate of [parsed?.file_path, parsed?.path]) {
+    if (typeof candidate === 'string' && candidate.length > 0) return candidate
+  }
+  return undefined
 }
 
 /** The exit code a shell result is marked with, or undefined when it carries none. */
@@ -3061,16 +3544,40 @@ function failureSummary(record, now) {
  * same record produces a current line in every heartbeat and in the result — the count in
  * the warning never speaks about an earlier moment than the call itself.
  *
+ * A step that went through after its last failure — the same key ran cleanly, or the file
+ * an edit failed on was later edited or written — is no longer a worker stuck in a loop, so
+ * the line says so and does not suggest cancelling the call: its worker got past the step.
+ *
  * @param {string} key - the command key.
  * @param {object} record - its failure record.
  * @param {number} now - the clock to measure against.
+ * @param {object} [activity] - the call's activity record, for successful edits of a file.
  * @returns {string} the warning.
  */
-function repeatedFailureWarning(key, record, now) {
-  return (
-    `"${key}" failed ${String(record.count)} times in this call (last: ${failureSummary(record, now)}); ` +
-    'a worker repeating a step its sandbox cannot finish keeps its tree busy — check its report or cancel the call'
-  )
+function repeatedFailureWarning(key, record, now, activity) {
+  const failed = `"${key}" failed ${String(record.count)} times in this call (last: ${failureSummary(record, now)})`
+  const later = laterSuccess(record, activity)
+  if (later !== undefined) {
+    const what = later.kind === 'edit' ? `a later edit of ${record.file}` : 'a later run'
+    return `${failed}; ${what} succeeded ${formatElapsed(now - later.at)} ago`
+  }
+  return `${failed}; a worker repeating a step its sandbox cannot finish keeps its tree busy — check its report or cancel the call`
+}
+
+/**
+ * The success that came after a record's last failure, if there was one.
+ *
+ * @param {object} record - the failure record.
+ * @param {object} [activity] - the call's activity record.
+ * @returns {{kind: 'run' | 'edit', at: number} | undefined} the later success.
+ */
+function laterSuccess(record, activity) {
+  if (record.succeededSeq !== undefined && record.succeededSeq > record.lastSeq) {
+    return { kind: 'run', at: record.succeededAt }
+  }
+  const edit = record.file === undefined ? undefined : activity?.edits?.get(record.file)
+  if (edit !== undefined && edit.seq > record.lastSeq) return { kind: 'edit', at: edit.at }
+  return undefined
 }
 
 /**
@@ -3084,7 +3591,7 @@ function activityWarnings(activity, now = Date.now()) {
   const warnings = []
   for (const [key, record] of activity?.failures ?? []) {
     if (record.count < REPEATED_FAILURE_THRESHOLD) continue
-    warnings.push(repeatedFailureWarning(key, record, now))
+    warnings.push(repeatedFailureWarning(key, record, now, activity))
   }
   return warnings
 }
@@ -3144,7 +3651,14 @@ export function describeActivity(activity, now = Date.now()) {
   if (activity.queuedSince !== undefined) {
     const inUse = activity.pool?.inUse ?? activity.queuedInUse ?? 0
     const size = activity.pool?.size ?? activity.queuedSize ?? 0
-    const counts = `waiting for a free tree (${String(inUse)} of ${String(size)} in use)`
+    // A call the service queued itself knows its place in line and who holds the trees, and
+    // "2 of 2 in use" alone left the caller guessing how long the wait might be. A record
+    // without that view (one built by hand, say) keeps the counts.
+    const queue = typeof activity.queueView === 'function' ? activity.queueView(now) : undefined
+    const counts =
+      queue === undefined
+        ? `waiting for a free tree (${String(inUse)} of ${String(size)} in use)`
+        : describeQueue(queue, { inUse, size })
     // A foreground call is holding the caller's whole turn while it waits, and the line is
     // read by that caller: say so, and say how long, instead of leaving it as an ordinary
     // queue line whose only clock is the last-event age.
@@ -3159,6 +3673,46 @@ export function describeActivity(activity, now = Date.now()) {
   const suffix =
     running === undefined ? '' : `; running "${running.command}" for ${formatElapsed(running.runningMs)}`
   return `${step}${activity.what} · last event ${ago} ago${suffix}`
+}
+
+/**
+ * The queue half of a queued call's line: its place, the order rule, and who holds the trees.
+ *
+ * The rule is the pool's: `WorkspaceIsolation.release` hands a freed tree to the oldest
+ * waiter, so the line is first come, first served. A holder that is a background job is named
+ * by its id, so the caller can look it up or cancel it; a foreground call has no id.
+ *
+ * @param {{position: number, of: number, holders: Array<{jobId?: string, label: string, runningMs: number}>}} queue
+ *   the call's place in the queue (see `FlashTaskService#queueView`).
+ * @param {{inUse: number, size: number}} counts - the pool's counts, for a line with no holders.
+ * @returns {string} e.g. `2nd in line for a free tree (first come, first served); trees held
+ *   by job-ab12cd34 (fix the parser, 31m0s) and a foreground call (review it, 2m0s)`.
+ */
+function describeQueue(queue, { inUse, size }) {
+  const place = queue.position > 0 ? `${ordinal(queue.position)} in line` : 'in line'
+  const names = queue.holders.map(
+    (holder) =>
+      `${holder.jobId ?? 'a foreground call'} (${holder.label}, ${formatElapsed(holder.runningMs)})`,
+  )
+  const held =
+    names.length === 0
+      ? `${String(inUse)} of ${String(size)} in use`
+      : `${names.length === 1 ? 'tree held by' : 'trees held by'} ${joinWithAnd(names)}`
+  return `${place} for a free tree (first come, first served); ${held}`
+}
+
+/** `1st`, `2nd`, `3rd`, `4th`, … `11th`, `12th`, `13th`, `21st`. */
+function ordinal(n) {
+  const tens = n % 100
+  if (tens >= 11 && tens <= 13) return `${String(n)}th`
+  const suffix = { 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] ?? 'th'
+  return `${String(n)}${suffix}`
+}
+
+/** `a`, `a and b`, `a, b and c`. */
+function joinWithAnd(items) {
+  if (items.length <= 1) return items.join('')
+  return `${items.slice(0, -1).join(', ')} and ${items.at(-1)}`
 }
 
 export function createObserveState() {
@@ -3604,13 +4158,16 @@ function truncateText(text, maxChars) {
  * @param {string} options.sessionId - the worker session the call is waiting on.
  * @param {number} [options.budgetMs] - the call's wall-clock budget, when known.
  * @param {number} options.intervalMs - how often to report.
+ * @param {object} [options.activity] - the call's activity record; it gets `heartbeat`, which
+ *   sends one report at once, until the reporting stops.
  * @param {(message: string) => void} [options.log] - diagnostic sink.
  * @returns {() => void} stops the reporting.
  */
 function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs, activity, log = () => {} }) {
   if (token === undefined || token === null || typeof progress !== 'function') return () => {}
   const startedAt = Date.now()
-  const timer = setInterval(() => {
+  /** One heartbeat: what the call is doing as of now. */
+  const beat = () => {
     try {
       const now = Date.now()
       const elapsedMs = now - startedAt
@@ -3624,16 +4181,30 @@ function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs
         // Structured, for a status reader rather than a client: which commands are open and
         // which keep failing. `mcp.js` forwards only progress/total/message, so this never
         // reaches the MCP wire (a test pins that).
-        detail: { current: openCommands(activity, now), warnings: activityWarnings(activity, now) },
+        // A queued call also says where it stands, for `flash_status`'s `queue`.
+        detail: {
+          current: openCommands(activity, now),
+          warnings: activityWarnings(activity, now),
+          ...(activity?.queuedSince !== undefined && typeof activity?.queueView === 'function'
+            ? { queue: activity.queueView(now) }
+            : {}),
+        },
       })
     } catch (error) {
       // A client that has gone away must not turn a heartbeat into a task failure.
       log(`could not send a progress notification: ${messageOf(error)}`)
     }
-  }, intervalMs)
+  }
+  const timer = setInterval(beat, intervalMs)
   // The heartbeat must never be the only thing keeping the process alive.
   timer.unref?.()
-  return () => clearInterval(timer)
+  // Reachable from the activity record, so a moment that makes the last heartbeat wrong —
+  // a queued call getting its tree — can send a fresh one instead of waiting an interval.
+  if (activity !== undefined) activity.heartbeat = beat
+  return () => {
+    clearInterval(timer)
+    if (activity?.heartbeat === beat) delete activity.heartbeat
+  }
 }
 
 /** Render elapsed milliseconds as a compact span, e.g. `4m20s`. */
@@ -3903,7 +4474,10 @@ function warnAboutIgnoredArguments(args, toolName, log) {
  * looks wrong is the caller's decision rather than something to route around, and a task
  * abandoned halfway must say so before its partial result is mistaken for a whole one. The
  * last three cover what a diff cannot show either: a command whose exit code was hidden, a
- * feature removed without a word, and a file changed outside the task's list.
+ * feature removed without a word, and a file changed outside the task's list. The last line
+ * asks for a heading of its own: a change beside a rule the brief states ("only here", "never
+ * that") is the one a reviewer most needs to find, and a sentence in the middle of a report
+ * is where it gets lost.
  */
 export const WORKER_INSTRUCTIONS = [
   'Do not commit unless the task explicitly asks: the service reads the change from the working tree, and a commit only confuses the report.',
@@ -3917,7 +4491,19 @@ export const WORKER_INSTRUCTIONS = [
   'Run a command bare so its exit code shows; do not hide it behind `; echo` or `|| true`, which makes a failing command look like a success.',
   'In the report, list anything you removed or left out that existed before (a menu item, an option, a test, a check), each with why.',
   'In the report, name every file you changed outside the files the task named, and why.',
+  'If a change touches code beside a stated rule (an "only", a "never", a "one place", a design note the task quotes), list it in the report under its own heading "Rules crossed", with the reason.',
 ]
+
+/**
+ * The line a Windows worker reads about its shell.
+ *
+ * On win32 the profile swaps the bash tool for the pwsh one (see
+ * `presets/flash-orchestrator/agent.cordis.yml`), and dsh's PowerShell executor runs PowerShell
+ * 7 when it is installed and falls back to Windows PowerShell 5.1 otherwise. Workers wrote bash
+ * there and spent their turns on the errors.
+ */
+export const WINDOWS_SHELL_INSTRUCTION =
+  'Commands run in PowerShell here, not bash (PowerShell 7 when it is installed, otherwise Windows PowerShell 5.1): bash syntax does not work, `&&` works only in PowerShell 7, and a program in the current folder needs `.\\` in front of it.'
 
 /** How many of the copy's uncommitted paths are worth naming in the prompt. */
 const PROMPT_UNCOMMITTED_LIMIT = 20
@@ -3942,14 +4528,25 @@ const DISCARD_SCRATCH =
  * merge mode, and the sentence it reads is built from these three.
  *
  * @param {object} basePatch - what `applyBasePatch` planted in the copy.
- * @returns {{patchId: string, filesChanged: string[], conflicts: string[]}} the prompt facts.
+ * @returns {{patchId: string, filesChanged: string[], conflicts: string[], alreadyInTree?: true}} the
+ *   prompt facts; `alreadyInTree` when the copy already held the change and nothing was applied.
  */
 function promptBasePatch(basePatch) {
-  return { patchId: basePatch.patchId, filesChanged: basePatch.filesChanged ?? [], conflicts: basePatch.conflicts ?? [] }
+  return {
+    patchId: basePatch.patchId,
+    filesChanged: basePatch.filesChanged ?? [],
+    conflicts: basePatch.conflicts ?? [],
+    ...(basePatch.alreadyInTree === true ? { alreadyInTree: true } : {}),
+  }
 }
 
-/** The worker-facing task text. */
-export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slotEnv, slotPorts, slotValues, slotSetup, discard, basePatch }) {
+/**
+ * The worker-facing task text.
+ *
+ * `platform` is the server's platform, which is the worker's: on win32 one more line names
+ * the shell its commands run in. Omitted, no platform line is added.
+ */
+export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slotEnv, slotPorts, slotValues, slotSetup, discard, basePatch, platform }) {
   const started = Number(uncommitted?.count) > 0
   const startedFiles = started ? (uncommitted.files ?? []).slice(0, PROMPT_UNCOMMITTED_LIMIT) : []
   const allEnvNames = slotEnv === undefined || slotEnv === null ? [] : Object.keys(slotEnv)
@@ -3968,6 +4565,7 @@ export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slo
     `Working directory: ${cwd}`,
     '',
     ...WORKER_INSTRUCTIONS,
+    ...(platform === 'win32' ? [WINDOWS_SHELL_INSTRUCTION] : []),
     ...(copy === true
       ? [
           '',
@@ -3993,7 +4591,9 @@ export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slo
       ? []
       : [
           '',
-          `The copy already contains the change from an earlier call (patch ${basePatch.patchId}), applied before you started: ${baseFiles.join(', ')}. Continue from it; do not redo it.`,
+          basePatch.alreadyInTree === true
+            ? `The copy already contains the change from an earlier call (patch ${basePatch.patchId}) to ${baseFiles.join(', ')}: it was already in the tree the copy was taken from, so it was not applied again. Continue from it; do not redo it.`
+            : `The copy already contains the change from an earlier call (patch ${basePatch.patchId}), applied before you started: ${baseFiles.join(', ')}. Continue from it; do not redo it.`,
           ...(baseConflicts.length === 0 ? [] : [`It did not apply cleanly: ${baseConflicts.join(', ')} hold conflict markers. Resolve them first.`]),
         ]),
     ...(envNames.length === 0 && portNames.length === 0 && valueNames.length === 0
@@ -4036,15 +4636,29 @@ function slotSetupPromptLine(step) {
 }
 
 /**
+ * The variables whose value differs between two environments, in name order.
+ * @param {Record<string, string>} before - the environment a runtime was booted with.
+ * @param {Record<string, string>} after - the environment a call would boot it with.
+ * @returns {string[]} the names added, removed or changed.
+ */
+function changedEnvNames(before, after) {
+  const names = new Set([...Object.keys(before), ...Object.keys(after)])
+  return [...names].filter((name) => before[name] !== after[name]).sort()
+}
+
+/**
  * The setup facts the worker prompt may name, or nothing when no step ran.
  *
  * @param {WorkspaceIsolation | undefined} pool - the call's pool.
  * @param {object[] | undefined} setup - what `runSetup` reported.
+ * @param {object} [slot] - the call's slot, whose settings are the ones the steps ran with.
  * @returns {{run: string[], inputs: string[]}[] | undefined} the prompt facts.
  */
-function promptSlotSetup(pool, setup) {
+function promptSlotSetup(pool, setup, slot) {
   if (pool === undefined || setup === undefined || setup.length === 0) return undefined
-  return pool.slotSetup.map((step) => ({ run: step.run, inputs: step.inputs }))
+  // The steps the call leased with, not the pool's current ones: a reload during a long
+  // setup step must not make the prompt describe steps that never ran in this copy.
+  return (slot?.settings ?? pool).slotSetup.map((step) => ({ run: step.run, inputs: step.inputs }))
 }
 
 /**
@@ -4055,11 +4669,27 @@ function promptSlotSetup(pool, setup) {
  * the new work. A caller that applies both would fail or duplicate the change, so the result
  * says which one replaces which.
  *
+ * A base patch the copy already held was not applied, and the copy's base already had it,
+ * so this call's patch is not cumulative and the note says the opposite: the base patch is
+ * still the one that carries that change.
+ *
  * @param {object} [basePatch] - what `applyBasePatch` planted in the copy.
  * @returns {object} the field to spread into the result, or nothing when no base was used.
  */
 function basePatchFields(basePatch) {
   if (basePatch === undefined) return {}
+  if (basePatch.alreadyInTree === true) {
+    return {
+      basePatch: {
+        patchId: basePatch.patchId,
+        applied: false,
+        alreadyInTree: true,
+        threeWay: false,
+        conflicts: [],
+        note: "the base patch was already in your tree when the copy was taken, so this call's change.patchId holds only the new work; it does not replace the base patch",
+      },
+    }
+  }
   return {
     basePatch: {
       patchId: basePatch.patchId,

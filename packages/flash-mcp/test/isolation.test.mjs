@@ -2319,7 +2319,7 @@ test('a local settings file git would commit is reported once, and an ignored on
   }
 })
 
-test('the settings warning sentence is the one the service returns', () => {
+test('the settings warning sentence is the one earlier releases returned', () => {
   assert.equal(
     SETTINGS_CHANGED_WARNING,
     '.flash-agents.json changed after this server started; its new settings take effect after a reconnect (/mcp reconnect plugin:flash-agents:flash)',

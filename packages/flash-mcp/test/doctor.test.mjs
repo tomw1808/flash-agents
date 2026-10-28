@@ -810,7 +810,7 @@ test('profile-version warns for a missing stamp and for another release', async 
   assert.equal(missingRow.status, 'warn')
   assert.match(missingRow.detail, /installed by an older release, not \d+\.\d+\.\d+/)
   assert.match(missingRow.detail, /run node install\.mjs in the plugin folder/)
-  assert.match(missingRow.detail, /then reconnect/)
+  assert.doesNotMatch(missingRow.detail, /reconnect/, 'an idle runtime replaces itself since 0.1.10')
   assert.equal(missingRow.fix, 'node install.mjs')
   assert.equal(missingResult.ok, true)
 
@@ -890,7 +890,7 @@ test('readProfileStamp and profileVersionWarning read the generated plugins mani
     assert.equal(
       warning,
       `the worker profile in ${join(home, 'profiles', 'flash-service')} was installed by 9.9.9, not 1.2.3: ` +
-        'run node install.mjs in the plugin folder (/repo), then reconnect',
+        'run node install.mjs in the plugin folder (/repo)',
     )
     // The read-only profile is a separate stamp; once it matches too, nothing is stale.
     const readOnlyPlugins = join(home, 'profiles', 'flash-service-readonly', 'plugins')

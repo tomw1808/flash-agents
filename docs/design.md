@@ -121,8 +121,13 @@ The server reads that stamp when it starts and again whenever a runtime boots, a
 its own release: a profile that is not installed, has no stamp, or was written by another release
 logs one line, and the warning rides in every `flash_task` and `flash_batch` result the runtime
 serves. `doctor` reports it as `profile-version`. The verdict belongs to the runtime: one booted
-after `node install.mjs` re-reads the stamp and clears the warning by itself, while one booted
-before it keeps the verdict it booted with until it is replaced — reconnecting is how. A Claude Code
+after `node install.mjs` re-reads the stamp and clears the warning by itself. One booted before it
+keeps the guard it loaded, so since 0.1.10 the server reads the stamp again whenever a call is about
+to use a runtime holding a stale verdict: when the stamp now matches and nothing else is on that
+runtime, it is shut down and a fresh one boots in its place; a busy one keeps serving, because
+killing it would take its calls with it, and its warning adds that it will be replaced once its
+running calls end. No reconnect is needed, which matters in Claude Code's VS Code extension, where
+`/mcp reconnect` is not available. A Claude Code
 plugin update replaces the server but runs no installer, so the guard and the profiles stay at the
 release that installed them until `node install.mjs` is run again.
 
@@ -205,7 +210,13 @@ global CSS class or variable, a route, an environment variable, a config key) is
 code first: if it already means something else, the worker chooses another name and says so. 0.1.8
 adds three more: a command is run bare so its exit code shows, rather than hidden behind `; echo`
 or `|| true`; anything removed or left out that existed before is listed with why; and every file
-changed outside the files the task named is named too.
+changed outside the files the task named is named too. 0.1.10 adds one more and a platform line: a
+change that touches code beside a rule the task states (an "only", a "never", a "one place", a
+quoted design note) goes in the report under its own heading, "Rules crossed", with the reason,
+because that is the change a reviewer most needs to find. On Windows the prompt also says that
+commands run in PowerShell, not bash (PowerShell 7 when it is installed, otherwise Windows
+PowerShell 5.1), that `&&` works only in PowerShell 7, and that a program in the current folder
+needs `.\` in front of it; workers had written bash there and spent their turns on the errors.
 
 ### The pipeline
 
@@ -248,7 +259,7 @@ Two doors that start work, and five that only look at, land, or stop work alread
 | `flash_batch` | `tasks` | a fleet the caller has already split, one worker per task |
 | `flash_apply` | `patchId` | put the change an earlier call produced into the workspace (`files?` to apply only some of its files, `dryRun?`, `force?`, `threeWay?`); the result names the task that made the patch |
 | `flash_patch` | `patchId` | read a stored patch whole, by file (`files?`), or by page (`offset?`, `maxChars?`); `task` on every page, the worker's report and `appliedFiles` on the first |
-| `flash_status` | — | the state of one background job (`jobId?`), or a listing: running jobs first, then up to `limit?` (default 10) ended ones; `state?` filters. A running job also reports `current` (its workers' open tool calls) and `warnings` (commands failing repeatedly) |
+| `flash_status` | — | the state of one background job (`jobId?`), or a listing: running jobs first, then up to `limit?` (default 10) ended ones; `state?` filters. A running job also reports `current` (its workers' open tool calls) and `warnings` (commands failing repeatedly), and one still waiting for a tree reports `queue` (`position` of `of`, first come, first served, and the `holders` of the trees: `jobId` when it is a job, `label`, `runningMs`) |
 | `flash_result` | `jobId` | a background job's result, waiting up to `waitSeconds?` (≤ 600) for it; `wait.endedBy` says what ended the wait |
 | `flash_cancel` | `jobId` | stop a background job; its tree is retired as on a timeout |
 
@@ -258,7 +269,8 @@ Optional on `flash_task` / `flash_batch`: `acceptance` (one string, or per task 
 `head`: start the copy from the last commit, keeping ignored files; `head` is refused for a
 `read-only` call, which runs in your tree rather than in a copy), `basePatch` (a patchId whose change
 is applied to the copy before the worker starts, merged three ways if the tree moved on; the call's
-own patch is then cumulative and replaces it), `taskFile` (instead of `task`: a file inside the root,
+own patch is then cumulative and replaces it — unless the copy already held the whole change, see
+below), `taskFile` (instead of `task`: a file inside the root,
 at most 256 KB, sent exactly as written; per task in `flash_batch`), `model` (one id from the user's
 allowlist; omitted, the default runs), and `background` (answer at once
 with a job id; the job owns its own abort signal, so the starting request ending cannot cancel it).
@@ -269,9 +281,17 @@ rather than a job seconds later. Only validation moves — anything that needs a
 still happens inside the job.
 Jobs are in memory: they do not survive a restart, but a finished writing call's work is still
 salvaged as a patch by the next server. The provider, the reasoning effort, and the sandbox are not
-caller capabilities; `provider`, `reasoningEffort` and `agentOptions` are logged and ignored. A
+caller capabilities. A
 `flash_batch` takes one `model` for the whole fleet — a `model` inside a task is refused with
-`INVALID_ARGUMENT`. Unknown arguments are ignored rather than forwarded.
+`INVALID_ARGUMENT`. Every other argument a tool's schema does not declare is refused before anything
+else runs, the background door included, with the nearest declared name when one is close
+(`flash_patch failed: unknown argument "file" for flash_patch; did you mean "files"?`) and the full
+list when none is; an unknown key inside a `flash_batch` task entry is named with its index
+(`in tasks[2] of flash_batch`). The names are read from the same schemas `tools/list` returns, so the
+check and the schema cannot disagree; only MCP's own `_meta` is let through. Before 0.1.10 unknown
+arguments were ignored — `flash_patch` with `file` instead of `files` returned the first page of the
+whole patch — and `provider`, `reasoningEffort`, `agentOptions`, `permissions` and `sandbox` were
+logged and ignored; they are refused now like any other unknown name.
 
 `basePatch`, `flash_apply` and `flash_patch` all take a patch id from a result, or a unique prefix of it:
 at least eight hex digits, with or without the `flash-` prefix (`1a2b3c4d`,
@@ -342,7 +362,12 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
   its status, sets `emptyResult`, and warns that the account of the change is missing.
 - `durationMs` is the session's own run time. A call that waited for a free copy reports the wait
   as `queuedMs` and the pool counts it waited behind as `queued` (`{ ms, inUse, size }`); while it
-  waits, its progress line reads `queued …: waiting for a free tree`. A writing call sent without
+  waits, its progress line says its place in line and who holds the trees — `queued 1m10s: 2nd in
+  line for a free tree (first come, first served); trees held by job-ab12cd34 (fix the parser,
+  31m0s) and a foreground call (review it, 2m0s)`. The pool hands a freed tree to its oldest waiter,
+  and the service joins its own list in the same tick as the lease, so the position is the pool's.
+  A holder started with `background: true` is named by its job id, so it can be looked up or
+  cancelled; a foreground call has no id. A writing call sent without
   `background: true` holds the caller's whole turn while it queues, so its line says
   `queued in the foreground …` and its `warnings` carry the same fact plus the remedy (send writing
   calls with `background: true` when trees may be busy). `background` stays opt-in.
@@ -361,7 +386,18 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
   `CLAUDE.md`, their `.local` overlays and `$DSH_HOME/AGENTS.md`, root to cwd). The harness renders
   at most 64 KB of them, most specific first; over that, a warning says the worker saw only part.
 - `basePatch` (`{ patchId, applied, threeWay, conflicts, note }`) appears when the call continued
-  from a stored patch.
+  from a stored patch. A base patch the caller had already applied (uncommitted) arrives with the
+  copy itself, because the copy is taken from the working tree, and applying it again merged the
+  change over itself (one caller got conflicts in five files). So when the reverse of the patch
+  applies to the copy and the patch itself does not, it is skipped: `applied: false`,
+  `alreadyInTree: true`, a warning (`basePatch … was already in the tree the copy was taken from, so
+  it was not applied again; this call's patch does not contain it`), and the worker is told the
+  change is already there. The copy's base was recorded from that same tree, so this call's patch
+  holds only the new work: it is applied on top of the base patch, not instead of it. A patch that
+  is only partly present goes through the merge as before.
+- `isolation.buildCacheEmpty: true` appears when the call's settings fill a build cache (a `cache:`
+  entry, or an allowed `slotSetup` step with `keep` paths) and every folder of it was empty when the
+  call started: the reason a build that usually takes minutes took an hour. A warm slot says nothing.
 - `change.ignored` names git-ignored paths the worker created; `change.ignoredChanged`
   (`[{ path, change: "modified" | "deleted" }]`) names ignored *files* that existed when the copy was
   made and that the worker rewrote or deleted, compared by size and mtime. Neither can be in the
@@ -372,9 +408,19 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
   the foreground queue wait, the automatic retry — and a command that failed three or more times in
   the call. Failures are counted by a command's first two words after any leading `cd … &&` and
   `NAME=value` segments, so `cd repo && cargo build --release` and `CARGO_X=1 cargo build -p app` are
-  the one step `cargo build`. A shell result carries `[exit code: N]`; a non-zero one, or a tool
-  error, is a failure. A command piped into `tee` reports `tee`'s exit code, so a failure on the left
+  the one step `cargo build`. A file tool (`edit`, `write`, `read`) is counted per file instead, as
+  `<tool> <file>`. A shell result carries `[exit code: N]`; a non-zero one, or a tool
+  error, is a failure — except exit 1 from `grep`, `egrep`, `fgrep`, `rg`, `git grep`, `diff` or
+  `cmp` as the last stage of the command, which is an answer ("no match", "the files differ"); their
+  exit 2 and above still counts, and so does any exit 1 in a chain (`&&`, `||`, `;`), where an
+  earlier step may have failed. When the same step later ran cleanly, or the file an edit failed on
+  was later edited or written, the warning says so (`…; a later run succeeded 2m0s ago`) instead of
+  suggesting a cancel. A command piped into `tee` reports `tee`'s exit code, so a failure on the left
   of a pipe cannot be seen there.
+- `warnings` also carries, per call: a base patch skipped because the tree already held it; a
+  nested repository whose changes could not be read into the patch; a settings file that cannot be
+  used; and a changed `slotEnv` whose runtime was still in use (see
+  [What the copy holds](#what-the-copy-holds-and-what-it-leaves-out)).
 
 `flash_batch { tasks, cwd?, acceptance?, mode? }` returns one entry per task, **in task order**, so
 `results[i]` always answers `tasks[i]`:
@@ -541,6 +587,25 @@ instead of all of them, and a nested repository's changes reach the patch at all
 `git diff` cannot see them). A `cwd` at the root, or with no nested repository above it, keeps
 the whole-root copy.
 
+A whole-root copy carries edits inside its nested repositories too, since 0.1.10. Before, the top
+repository's `git add -A` recorded each one as a single gitlink at its `HEAD`, a worker's seven
+edits inside one produced a patch without them, and the copy was emptied: the work was lost without
+a word. Now the copy stages such a repository as the plain files of its working tree (through a
+private index, by its own ignore rules), both when the base is recorded and when the change is
+collected, so its edits are part of the one stored patch and `flash_apply` writes them into the
+caller's nested repository, working tree only. The list is kept in the copy's
+`.git/flash-nested.json`, so a salvage after a crash stages the same ones. The rule is the
+"workspace of independent repositories" layout and nothing wider: the nested repository has its own
+`.git` directory, and the repository that contains it tracks nothing at or under its path and either
+does not ignore it or ignores exactly that directory (`inner/` in `.gitignore`). Left as before are a
+path the parent tracks (a gitlink or submodule keeps its pointer semantics), a repository under a
+directory the parent ignores (`vendor/x` with `vendor/` ignored, `node_modules/x`,
+`.build/checkouts/x` — build output or dependency checkouts, which can be large and are not the
+caller's work), and a `.git` git cannot read. A nested repository that staged at the base but cannot
+be read at collect time keeps its base content in the patch, so the patch neither carries its edits
+nor reads as deleting it; `warnings` names it, and the copy is kept until the next call in that slot
+(or the server's exit) so those edits can still be recovered from disk.
+
 A repository whose `.git` is a *file* — a linked worktree, a submodule, or the root itself in a
 Claude Code worktree session — links to git state outside the copy. Copied as it was, that link
 made the "disposable" copy share the caller's index and refs: preparing a call staged the
@@ -640,13 +705,30 @@ both layouts, which is what makes a crash survivable.
 A tree is emptied as soon as its change is stored as a patch, rather than at the start of the next
 call in its slot: an idle server used to hold a full copy plus the worker's build output per slot,
 indefinitely. A tree whose change could not be collected (no git, or a failed diff) is the only copy
-of that work, so it stays, named in the log, until the slot is needed again.
+of that work, so it stays, named in the log, until the slot is needed again. So does a tree holding
+a nested repository whose edits could not be read into the patch.
+
+**A retired tree's warm cache moves to its replacement.** A call that timed out, went idle or was
+cancelled retires its tree, and the slot gets a fresh directory. Before 0.1.10 the tree's
+`.flash-cache` — the `cache:` folders and `slotSetup`'s `keep` paths — went with it, and the retry
+that usually follows within seconds compiled from cold: one user's retry ran 65 minutes while the
+retired tree beside it held 35.6 GB of warm cargo target. Now the next `prepare` in that slot renames
+the newest retired tree's `.flash-cache` into the new directory, before the copy and before the
+worker, so nothing in the new directory is using it yet. It does so only when every runtime rooted at
+the retired tree was shut down before `retire` — otherwise an orphaned build may still be writing
+into it — and only when the new directory's cache is empty. A rename that fails (EXDEV, or EPERM or
+EBUSY on Windows while a stray process holds a file open) is logged and the cache stays with the
+tree; `trim` tries once more before removing it. The setup stamps are not moved: what a step keeps
+often holds the absolute path it was built at (a virtualenv's scripts, a `node_modules/.bin` shim),
+so every `slotSetup` step runs once more in the new directory, on top of the kept files.
 
 After every call, `limits.maxStateBytes` (default 20 GiB) bounds what this root keeps: stored
 patches plus the trees a timed-out call retired. Over it, retired trees go first (their work was
 already collected into a patch), then applied patches, oldest application first. Unapplied patches
 are never removed by the cap, because one may be the only copy of finished work; a root still over
-it is reported in the log, and the retention window ages those out.
+it is reported in the log, and the retention window ages those out. A retired tree's build cache is
+moved into its slot's current directory before the tree is removed, when that slot is idle and has
+no cache of its own (see above).
 
 Patches sit one level above that, in `<sha256(root)[0:12]>/patches`, precisely because the sweep
 reclaims a dead owner's directory whole: a self-test lost a finished worker's patch that way when
@@ -721,11 +803,13 @@ Honest limits of this design:
 - A call that runs out of budget **still reports what its tree held**: the change so far is stored as
   a patch, any tool refusals seen are named, and the tree is retired rather than recycled — the SDK
   has no cancel, so the orphaned session may still be writing, and the next call must not inherit
-  that as its own work.
+  that as its own work. Its build cache is the exception, moved to the replacement once the
+  session's runtimes are shut down (see above).
 - A call that is waiting for a tree is **bounded by its own budget and cancellable**: it used to queue,
   take a tree, copy the repository, and only then notice that nobody was waiting for the answer.
 - A `read-only` call is deliberately **not** isolated: it cannot write anything, and running it in
-  your real tree means it reads your current state rather than a copy's.
+  your real tree means it reads your current state rather than a copy's — including edits that
+  land while it reads.
 - A **non-git root** is still isolated, but there is no diff to compute, so there is no verdict — only
   the worker's report.
 - Without copy-on-write the copy is a real copy and costs real time and space per call, and
@@ -745,8 +829,7 @@ Honest limits of this design:
   names how many), not fatal; any other copy failure names the path and suggests a retry.
 - **Two settings files, four layers.** `.flash-agents.json` at the root is the committed
   per-repository file; a git-ignored `.flash-agents.local.json` beside it holds what belongs to one
-  machine, such as a path only that computer has. Both are read once when the server starts, and both
-  may hold a top-level `platform` object keyed by `process.platform` names (`win32`, `linux`,
+  machine, such as a path only that computer has. Both may hold a top-level `platform` object keyed by `process.platform` names (`win32`, `linux`,
   `darwin`, …), each section taking the same keys as the top level; only the running platform's
   section applies, and a section named for any other spelling is logged and dropped. The layers apply
   lowest first — the shared file, its platform section, the local file, its platform section — and
@@ -756,10 +839,24 @@ Honest limits of this design:
   `slotSetup` is host code like the shared one, behind the same `--allow-slot-setup` gate. When a
   settings file contributes a setting, the start log names the layers it applied
   (`settings: .flash-agents.json, .flash-agents.json platform.win32`); a local file that git tracks,
-  or that git does not ignore, is named once at start, because that file is meant for one machine;
-  and a file edited after the server read it is named in every call's `warnings`, one line per file.
+  or that git does not ignore, is named once at start, because that file is meant for one machine.
   The [README](../README.md#per-repository-settings) has one worked example: a prebuilt OpenSSL on
   one Windows machine, beside a shared `platform.win32` entry.
+- **Settings change without a reconnect.** Before 0.1.10 both files were read once, at start, and
+  an edit took effect only after a reconnect — which Claude Code's VS Code extension does not offer,
+  so there it never did. Now every writing call checks both files when it leases a tree, before
+  anything is copied, and re-reads a file whose stamp (size, inode, mtime, ctime) changed; a file
+  that was only touched, with the same content, is not re-applied. The call keeps a reference to the
+  settings it leased with, so a reload by a later call never changes a call that is already running:
+  its copy, its `slotEnv`, its `slotSetup` steps and its prompt all come from the settings it started
+  with. A `slotEnv` is also the worker runtime's process environment, fixed when it boots, so a call
+  whose `slotEnv` differs from the one its tree's runtime booted with shuts that runtime down first
+  when nothing is using it, and boots a fresh one; a runtime still in use keeps running, and the call
+  warns which variables its commands still see the old way. A file whose new content cannot be used
+  (unreadable, not JSON, not an object) keeps the settings it last parsed to, and every call warns
+  until it is fixed (`<file> could not be used: <problem>. Calls keep the settings last read from it
+  until it is fixed`, or `None of its settings apply …` when it never parsed). A reload logs
+  `settings reloaded: <files>` and the new layer list.
 - **`copyExclude`** names paths to leave out — a bare name at any depth, a bare name ending in `*`
   as a prefix, a name with a slash from the root — and a match is
   honoured only where `git check-ignore` reports it ignored and `git ls-files` lists nothing under it,
@@ -769,7 +866,8 @@ Honest limits of this design:
   file holding the secret. `slotEnv` maps
   environment variables to folders inside the slot: `home:<name>` under `.flash-home/`, emptied every
   call, and `cache:<name>` under `.flash-cache/`, which `prepare` keeps between calls in the same slot
-  and retire, sweep and close remove with the slot. Both folders are excluded from the diff like
+  and that a retired tree hands on to its replacement (see above); the dead-owner sweep and close
+  remove it with the slot. Both folders are excluded from the diff like
   `.flash-tmp/`. A fourth form, `value:<text>`, sets a plain value in every slot — for the worker and
   for the `slotSetup` steps — so a project-wide setting does not have to be repeated in every brief:
   `"OPENSSL_NO_VENDOR": "value:1"`, `"OPENSSL_DIR": "value:C:\\openssl"` or
@@ -838,8 +936,25 @@ Before anything is written, every target is checked: no write goes through a sym
 is one of the merge's own deletions, and a path whose parent is a caller file is refused. A refusal
 writes nothing. Submodules are never touched: "ours" records a checkout as a gitlink at its HEAD,
 as `git add` would, and a merged pointer move or removal is named in the result, not acted on.
-Written files keep the caller's permission bits and get the line endings the caller's git config
-asks for (`cat-file --filters`, the inverse of the `hash-object --path` that read them).
+
+Every merged file and link text is read before the first deletion or write, so a blob git cannot
+hand back is a refusal that writes nothing (`… could not read the merged content of <path> …;
+nothing was written to <tree>`). Before 0.1.10 a 27-file apply whose 22nd read failed had already
+written 21 files while its error read as though nothing had been applied. Only a filesystem error
+during the writes themselves can leave the tree part-merged, and that error names every path
+already deleted and written. Git's output buffer was the usual cause of such a read failure: git
+commands ran with Node's 1 MiB default, so any merged file over 1 MiB (a lock file, a generated
+schema) failed with nothing but `git cat-file --filters … failed`. The limit is now 1 GiB, and a
+failure that has no stderr names its cause.
+
+Written files keep the caller's permission bits, and their line endings follow the file the caller
+has now rather than git's conversion settings: `cat-file --filters` applied `core.autocrlf`, so a
+Windows caller with `core.autocrlf=true` and an LF checkout got every merged file back as CRLF. Binary
+content — a NUL in the first 8,000 bytes of the blob or of the caller's file, or a path the caller's
+attributes mark `-text` — is the raw blob, never converted. A text file the caller already has keeps
+its style, CRLF when most of its line breaks are CRLF, LF otherwise. Only a new file goes through
+`cat-file --filters`, the inverse of the `hash-object --path` that read "ours", and the scratch
+repository copies the caller's own `core.autocrlf` and `core.eol` so both directions agree with it.
 
 A patch can also be applied a file at a time. `flash_apply` takes `files`, naming entries as
 `change.filesChanged` spells them — a rename by its old or by its new path — and the record keeps the
@@ -900,7 +1015,8 @@ after every plugin update, because an update replaces the server and runs no ins
 and the profiles stay at the release that wrote them, the server says so at start and in every
 result, and `doctor`'s `profile-version` row warns until the installer has been rerun. Once it has,
 a runtime that boots afterwards re-reads its profile's stamp and the warning clears without a
-reconnect; only a runtime that booted before the install still needs to be replaced.
+reconnect, and a runtime that booted before the install is replaced at its next use when it is
+idle, or once its running calls end (see [Install](#install)).
 
 The client that launches this server owns its own timeout for a tool call, and that timeout
 must be **longer than the service's task budget** in `flash.config.json` — otherwise the
@@ -998,7 +1114,10 @@ waiting on it with `job_output` is shown as that command, not as the wait: the e
 `background: <job id>` and takes `since` and `runningMs` from the shell call that started the job,
 so the clock does not restart with every poll. When the `job_output` read ends with a non-zero exit
 code, the command counts toward the same repeated-failure warning as a foreground one; an unknown
-job id has no command to show and keeps the ordinary `job_output {…}` rendering. Both fields are
+job id has no command to show and keeps the ordinary `job_output {…}` rendering. A job still
+waiting for a tree carries `queue` instead: `{ position, of, holders }`, its place in a
+first-come-first-served line and the calls holding the trees, longest-held first, each with
+`jobId` (when it is a background job), `label` and `runningMs`. All three fields are
 dropped once the job ends: an ended job's
 answer is its result, and a snapshot of a command that ran an hour ago would read as if it were
 still running. The dispatcher's own `flash`/`workflow` call is never one of them — it stays open for
@@ -1067,7 +1186,7 @@ checks** passed live.
 | `lazy` | 1 | no runtime process exists before the first call |
 | `task` | 21 | a real worker writes and reads a repo-local file **without interactive approval**, the file is **not** in the caller's tree, the change comes back as a patch holding the worker's own line, usage and instruction facts are reported, `flash_patch` reads the patch, `flash_apply` puts it there, and a second apply is refused |
 | `route` | 2 | the worker ran the default `ollama/deepseek-v4.1-flash:cloud` route under `provider: flash` |
-| `hostile` | 4 | a model outside the allowlist is refused (`MODEL_NOT_ALLOWED`) and starts no runtime; `provider`/`reasoningEffort`/`agentOptions` without `model` cannot change the default route and are not echoed |
+| `hostile` | 4 | a model outside the allowlist is refused (`MODEL_NOT_ALLOWED`) and starts no runtime; `provider`/`reasoningEffort`/`agentOptions` are refused as unknown arguments and start no runtime |
 | `models` | 6 | every non-default allowed model runs one discarded probe on its own route with no mismatch warning; a fleet runs only on the model chosen for it; a per-task model is refused |
 | `reuse` | 6 | one process, one handshake, same pid across calls, a fresh orchestration **and** worker session per call |
 | `local` | 2 | a repo-local command runs unattended, and the worker's reported output is real |
@@ -1294,7 +1413,10 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
   carries the exit code of the pipeline's last command, so a build piped into `tee` reports `tee`'s
   status and its failure never reaches `warnings`; the worker's own output is the only place it
   shows. The key is the command's first two words, so every `npm run …` script counts as one
-  command, and a command whose first two words differ from an earlier one is counted separately.
+  command, and a command whose first two words differ from an earlier one is counted separately. The
+  exit-1 exception for a search or a comparison holds only when that program is the last stage of
+  the pipeline and the line is not a chain (`&&`, `||`, `;`), whose status 1 may come from a step
+  before the search.
 - **A cancelled call that is mid-flight is not interrupted.** Cancellation now stops a call that is
   *waiting for a tree* (and it never copies the repository), but once a worker is running, the SDK has
   no cancel method — the session finishes inside Harness and its notifications are ignored.

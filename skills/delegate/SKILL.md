@@ -77,7 +77,8 @@ non-default model while the installed profile predates 0.1.6; the error says to 
    semantic core twice (§1). When `change.diffTruncated` is true, read the rest with `flash_patch`
    (by file or by page) before applying. A patch that no longer applies because a file moved
    meanwhile takes `flash_apply` with `threeWay: true`; it merges without touching the index and
-   names any conflicts. To land only part of a patch, pass `files` with names from
+   names any conflicts, keeps each file's line endings, and either writes nothing when it fails or
+   names every file it already wrote. To land only part of a patch, pass `files` with names from
    `change.filesChanged` (a rename by its old or its new path): each file is recorded as it lands,
    so the rest can follow later, and a whole apply after a partial one is refused with the count
    unless you pass `force: true`. `flash_apply` and `flash_patch` report `drift` (`commitsBehind`,
@@ -152,11 +153,14 @@ Rules that held up:
   `platform.<name>` when it is that platform's business. A project whose tests
   need an environment built inside the copy (a Python venv with editable installs, `node_modules`)
   can have it built once per slot with `slotSetup`; ask the user before enabling it, because those
-  commands run outside the sandbox. Keep the recipe in project memory so every task carries it verbatim.
+  commands run outside the sandbox. An edit to either settings file applies from the next writing
+  call, with no reconnect; a call already running keeps the settings it started with. Keep the recipe in project memory so every task carries it verbatim.
 - **Ask for verbatim output** and for a "deviations" section. Workers use both honestly; that is
   where the real information is. Every worker is already told to say first when it built a
   different interface than the task names, to report a contract that looks wrong instead of
-  working around it, and to say why it stopped when it stops early.
+  working around it, to say why it stopped when it stops early, and to list any change beside a
+  rule the task states ("only here", "never that") under a "Rules crossed" heading — read that
+  section first. On Windows it is also told that its commands run in PowerShell, not bash.
 - **Make the tests go through the real entry point.** A test of a security rule must enter where
   real input enters: one worker "tested" that an agent key cannot send a reviewed post by passing
   the sender's kind into the store by hand, so the receive path that labelled every sender a person
@@ -186,14 +190,21 @@ Rules that held up:
   either order; a commit in between does not matter as long as the files are disjoint. Keep a
   note of which files each running worker owns so the next task you write does not touch them.
 - Read-only work (maps, reviews) uses `mode: "read-only"`; it cannot change anything and needs no
-  patch.
+  patch. It runs in your live tree, not a copy, so it sees edits that land while it reads: do not
+  apply patches under a review that is still reading them.
 - `background: true` returns a job id at once. Use it when there is something to do meanwhile —
   verifying the previous patch, writing the next task — and collect with `flash_result`
   (`waitSeconds: 300` per wait); `flash_cancel` stops a call whose framing turned out wrong.
   Prefer it for writing calls when copies may be busy: a foreground one that has to wait for a
-  free copy holds your whole turn, and says so while it waits and in its warnings. When a job runs
+  free copy holds your whole turn, and says so while it waits and in its warnings. A queued job's
+  `flash_status` has `queue` (`position`, `of`, and the `holders` of the trees, first come, first
+  served), so you can see which job to wait for or cancel. When a job runs
   long, `flash_status` says what its workers are doing — `current` lists each open tool call
-  (`command`, `runningMs`) and `warnings` names a command that has failed three times.
+  (`command`, `runningMs`) and `warnings` names a command that has failed three times (exit 1 from
+  `grep`, `rg`, `diff` or `cmp` is not a failure, and the line says when a later run succeeded).
+- A misspelt argument is refused with the nearest known name, and so are `provider`,
+  `reasoningEffort`, `agentOptions`, `permissions` and `sandbox`: fix the call rather than dropping
+  the field.
 
 ## 5. The review task
 
@@ -217,7 +228,9 @@ round's "fails before and passes after" needs, and the fix round then makes them
 
 - Per-task and per-fleet budgets are in `flash.config.json` (three hours each by default, and
   ten minutes without any activity stops a stuck call). A timed-out call still stores the change so far as a patch and names the refusals it
-  saw; the tree it used is retired, never recycled.
+  saw; the tree it used is retired, never recycled, but its warm build cache (`cache:` folders)
+  moves to the replacement tree, so a retry does not build from cold. `isolation.buildCacheEmpty:
+  true` says a call started with an empty cache.
 - A slice of a few hundred lines with tests typically returns in two to six minutes; a coherent
   feature slice of 1,000–1,500 lines with tests in thirty to forty; a fix round of ten findings
   in thirty to forty. A large mechanical job (a multi-thousand-line split with scripts to
@@ -231,7 +244,10 @@ round's "fails before and passes after" needs, and the fix round then makes them
 - `NOT_DELEGATED`: the dispatcher did the work itself instead of delegating; re-run the call.
 - A worker that **stopped partway** (it says why, first) left a good start: send the next task
   with `basePatch: <that patchId>` and say what is left. The copy starts with that change already
-  applied, and the new patch is cumulative — apply it instead of the old one, never both. An id can
+  applied, and the new patch is cumulative — apply it instead of the old one, never both. The
+  exception: when you already applied the base patch to the tree, it is not applied again, the
+  result warns and `basePatch.alreadyInTree` is true, and the new patch holds only the new work —
+  apply it on top of the base. An id can
   be quoted short: `flash_apply`, `flash_patch` and `basePatch` take any unique prefix of at least
   eight hex digits, with or without `flash-`, and refuse an ambiguous one with the matches named.
 - `emptyResult: true` with `status: "error"`: the worker ended without a report and without a

@@ -1572,7 +1572,7 @@ test('reports progress while a queued call waits for a free tree', async () => {
   // `background: true`, so it is holding the caller's turn and says that too.
   assert.match(
     reports[0].message,
-    /^flash_task running \d+m?\d*s; queued in the foreground \d+m?\d*s: waiting for a free tree \(1 of 1 in use\) \(session flash-task-.*\)$/,
+    /^flash_task running \d+m?\d*s; queued in the foreground \d+m?\d*s: 1st in line for a free tree \(first come, first served\); tree held by a foreground call \(hold the only tree, \d+m?\d*s\) \(session flash-task-.*\)$/,
   )
   // A call that never got a tree is still a call the client must see living; but its
   // interval stops when it is cancelled, and nothing is salvaged because nothing ran.
@@ -1733,7 +1733,8 @@ test('prompt builders keep the dispatcher on a single delegation', () => {
 test('every child prompt carries the standing worker instructions, in order', () => {
   // The first two are the originals; the next three exist so a caller reading the report
   // (never the transcript) learns about a deviation, a wrong contract, or an unfinished task.
-  assert.equal(WORKER_INSTRUCTIONS.length, 11)
+  // The twelfth, "Rules crossed", is pinned in service-0110.test.mjs.
+  assert.equal(WORKER_INSTRUCTIONS.length, 12)
   assert.match(WORKER_INSTRUCTIONS[0], /^Do not commit unless the task explicitly asks/)
   assert.match(WORKER_INSTRUCTIONS[1], /^If the work reaches for an escape hatch/)
   assert.equal(
@@ -3625,7 +3626,7 @@ test('a missing or older profile stamp logs once and warns once in every call re
           warnings[0],
         )
         assert.ok(warnings[0].includes(`installed by ${version ?? 'an older release'}, not ${SERVER_INFO.version}`), warnings[0])
-        assert.match(warnings[0], /run node install\.mjs in the plugin folder \(.*\), then reconnect/)
+        assert.match(warnings[0], /run node install\.mjs in the plugin folder \(.*\)/)
       }
       assert.equal(logs.filter((line) => line.startsWith('the worker profile')).length, 1, 'the start log says it once')
     } finally {
@@ -3754,10 +3755,10 @@ test('a runtime booted after an install clears its profile warning for the calls
   }
 })
 
-test('a runtime booted before the install keeps the warning it booted with', async () => {
+test('a runtime booted before the install is replaced by the next call once it is idle', async () => {
   const stamps = switchableStampReader()
   const logs = []
-  const { root, service } = makeDriftService({
+  const { root, client, service } = makeDriftService({
     env: { DSH_HOME: '/fake/harness' },
     checkProfileStamp: true,
     profileStampReader: stamps.reader,
@@ -3769,10 +3770,13 @@ test('a runtime booted before the install keeps the warning it booted with', asy
     const askedBefore = stamps.calls.length
 
     stamps.setCurrent()
+    // Since 0.1.10 an idle runtime from before the install is retired and a fresh one serves
+    // the call (see service-0110.test.mjs for the busy case).
     const again = await service.flashTask({ task: 'read the README', cwd: root })
-    assert.match(again.warnings.join('\n'), /the worker profile is stale/, 'the old runtime still runs the old guard')
-    assert.equal(stamps.calls.length, askedBefore, 'a reused runtime is not a boot and must not re-read the stamp')
-    assert.ok(!logs.some((line) => /now matches flash-agents .*; its warning is cleared/.test(line)), JSON.stringify(logs))
+    assert.equal(again.warnings, undefined, JSON.stringify(again.warnings))
+    assert.ok(stamps.calls.length > askedBefore, 'a stale runtime re-reads the stamp before it is reused')
+    assert.equal(client.shutdowns, 1)
+    assert.ok(logs.includes('the flash-service runtime was started before the install; replacing it'), JSON.stringify(logs))
   } finally {
     await service.close()
     rmSync(root, { recursive: true, force: true })
@@ -3799,13 +3803,10 @@ test('review: runtime A keeps the stale verdict it booted with after runtime B b
     const current = await service.flashTask({ task: 'read the README', cwd: second })
     assert.equal(current.warnings, undefined, `runtime B must carry no warning, saw ${JSON.stringify(current.warnings)}`)
 
-    // A call served by A must still report what A really loaded, not the later verdict.
+    // Since 0.1.10 the next call on `root` finds A idle and stale, so A is replaced and the
+    // call is served by a runtime that loaded the new guard: no warning, because none applies.
     const again = await service.flashTask({ task: 'read the README', cwd: root })
-    assert.match(
-      again.warnings.join('\n'),
-      /the worker profile is stale/,
-      `runtime A must keep its own verdict, saw ${JSON.stringify(again.warnings)}`,
-    )
+    assert.equal(again.warnings, undefined, `A must have been replaced, saw ${JSON.stringify(again.warnings)}`)
   } finally {
     await service.close()
     rmSync(root, { recursive: true, force: true })
@@ -3867,7 +3868,7 @@ test('an untouched .flash-agents.json adds no warning', async () => {
   }
 })
 
-test('.flash-agents.json touched after start adds one warning to the next call', async () => {
+test('.flash-agents.json touched after start is applied by the next call, without a reconnect warning', async () => {
   const { root, service } = makeIsolatedService({ settings: JSON.stringify({ copyExclude: ['dist'] }) })
   try {
     const path = join(root, '.flash-agents.json')
@@ -3876,31 +3877,31 @@ test('.flash-agents.json touched after start adds one warning to the next call',
     const future = new Date(Date.now() + 2_000)
     utimesSync(path, future, future)
     const result = await service.flashTask({ task: 'build it', cwd: service.root })
-    const warnings = result.warnings.filter((line) => line === SETTINGS_CHANGED_WARNING)
-    assert.equal(warnings.length, 1, `expected exactly the settings warning, saw ${JSON.stringify(result.warnings)}`)
-    assert.match(warnings[0], /take effect after a reconnect \(\/mcp reconnect plugin:flash-agents:flash\)/)
+    // The pool re-reads the file when the call leases a slot, so there is nothing left to reconnect for.
+    const warnings = (result.warnings ?? []).filter((line) => /take effect after a reconnect/.test(line))
+    assert.deepEqual(warnings, [], `no reconnect warning, saw ${JSON.stringify(result.warnings)}`)
   } finally {
     await service.close()
   }
 })
 
-test('.flash-agents.json created after start adds one warning to the next call', async () => {
+test('.flash-agents.json created after start is applied by the next call, without a warning', async () => {
   const { root, service } = makeIsolatedService()
   try {
     assert.equal(existsSync(join(root, '.flash-agents.json')), false)
     writeFileSync(join(root, '.flash-agents.json'), JSON.stringify({ copyExcludeDefaults: false }))
     const result = await service.flashTask({ task: 'build it', cwd: service.root })
-    assert.equal(result.warnings.filter((line) => line === SETTINGS_CHANGED_WARNING).length, 1)
+    assert.equal((result.warnings ?? []).filter((line) => line === SETTINGS_CHANGED_WARNING).length, 0)
   } finally {
     await service.close()
   }
 })
 
-/** The warning a local settings edit must produce, named exactly. */
+/** The warning a local settings edit produced before the pool re-read the files per call. */
 const LOCAL_SETTINGS_WARNING =
   '.flash-agents.local.json changed after this server started; its new settings take effect after a reconnect (/mcp reconnect plugin:flash-agents:flash)'
 
-test('.flash-agents.local.json touched after start warns about that file, not the shared one', async () => {
+test('.flash-agents.local.json touched after start is applied without the old warning for either file', async () => {
   const { root, service } = makeIsolatedService({
     settings: JSON.stringify({ copyExclude: ['dist'] }),
     localSettings: JSON.stringify({ copyExclude: ['local-dist'] }),
@@ -3911,31 +3912,31 @@ test('.flash-agents.local.json touched after start warns about that file, not th
     const future = new Date(Date.now() + 2_000)
     utimesSync(path, future, future)
     const result = await service.flashTask({ task: 'build it', cwd: service.root })
-    assert.equal(result.warnings.filter((line) => line === LOCAL_SETTINGS_WARNING).length, 1, JSON.stringify(result.warnings))
-    assert.equal(result.warnings.filter((line) => line === SETTINGS_CHANGED_WARNING).length, 0, 'the shared file did not change')
+    assert.equal((result.warnings ?? []).filter((line) => line === LOCAL_SETTINGS_WARNING).length, 0, JSON.stringify(result.warnings))
+    assert.equal((result.warnings ?? []).filter((line) => line === SETTINGS_CHANGED_WARNING).length, 0, 'the shared file did not change')
   } finally {
     await service.close()
   }
 })
 
-test('.flash-agents.local.json created after start warns about that file', async () => {
+test('.flash-agents.local.json created after start is applied without the old warning', async () => {
   const { root, service } = makeIsolatedService()
   try {
     assert.equal(existsSync(join(root, '.flash-agents.local.json')), false)
     writeFileSync(join(root, '.flash-agents.local.json'), JSON.stringify({ copyExcludeDefaults: false }))
     const result = await service.flashTask({ task: 'build it', cwd: service.root })
-    assert.equal(result.warnings.filter((line) => line === LOCAL_SETTINGS_WARNING).length, 1, JSON.stringify(result.warnings))
+    assert.equal((result.warnings ?? []).filter((line) => line === LOCAL_SETTINGS_WARNING).length, 0, JSON.stringify(result.warnings))
   } finally {
     await service.close()
   }
 })
 
-test('.flash-agents.local.json removed after start warns about that file', async () => {
+test('.flash-agents.local.json removed after start is applied without the old warning', async () => {
   const { root, service } = makeIsolatedService({ localSettings: JSON.stringify({ copyExclude: ['local-dist'] }) })
   try {
     rmSync(join(root, '.flash-agents.local.json'), { force: true })
     const result = await service.flashTask({ task: 'build it', cwd: service.root })
-    assert.equal(result.warnings.filter((line) => line === LOCAL_SETTINGS_WARNING).length, 1, JSON.stringify(result.warnings))
+    assert.equal((result.warnings ?? []).filter((line) => line === LOCAL_SETTINGS_WARNING).length, 0, JSON.stringify(result.warnings))
   } finally {
     await service.close()
   }

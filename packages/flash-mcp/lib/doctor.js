@@ -289,7 +289,7 @@ export function profileVersionWarning({
   if (installed === version) return undefined
   return (
     `the worker profile in ${dir} was installed by ${installed ?? 'an older release'}, not ${version}: ` +
-    `run node install.mjs in the plugin folder${folder}, then reconnect`
+    `run node install.mjs in the plugin folder${folder}`
   )
 }
 
