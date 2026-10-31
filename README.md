@@ -1,65 +1,98 @@
 # Flash Agents
 
-**Let Claude Code steer, and let a cheap model do the reading and the typing.**
+<p align="center">
+  <em>Claude is your tech lead. Stop paying a tech lead to type.</em>
+</p>
 
-Flash Agents is a Claude Code plugin that hands bounded coding work — implement this slice,
-port these tests, review this diff, map this codebase — to cheap **DeepSeek V4.1 Flash** workers
-instead of Claude subagents, or to another model on your list, such as **MiniMax M3.1 Flash**,
-chosen per hand-off. Claude keeps the architecture, the acceptance criteria and the final review.
-The workers spend their tokens, not yours.
+<p align="center">
+  <strong>Claude plans, briefs and reviews. Cheap flash models read and type, each in a throwaway copy of your repo.<br>
+  Nothing lands until Claude has read the diff.</strong>
+</p>
 
-Every writing job runs in a **disposable copy of your repository** and comes back as a
-**patch**. Nothing touches your working tree until you (or Claude) apply it.
+---
 
-```
-You ── "add retry with backoff to the API client, with tests" ──► Claude Code (Opus / Sonnet)
-                                                                     │ frames the task, slices it
-                                                                     ▼
-                                                    flash_task / flash_batch  (MCP)
-                                                                     │
-                                       ┌─────────────────────────────┼─────────────────────────────┐
-                                       ▼                             ▼                             ▼
-                              DeepSeek Flash worker         DeepSeek Flash worker         DeepSeek Flash worker
-                              in a throwaway copy           in a throwaway copy           in a throwaway copy
-                                       │                             │                             │
-                                       └──────────── patch + diffstat, computed by git ────────────┘
-                                                                     │
-                                                                     ▼
-                                              Claude reviews the diff, runs the tests,
-                                              and applies only what it accepts
-```
+A good tech lead doesn't write every line. They cut the work into pieces, brief the team, and read
+every pull request. That's where their hours are worth the most.
 
-## Why
+Claude Code works the other way round. Your most expensive model reads 40 files to find one seam,
+types 1,200 lines of adapter and tests, reruns the suite, and your plan runs out by lunchtime.
+Subagents don't help: they spend the same budget.
 
-- **Your Claude budget goes to judgement, not keystrokes.** Reading 40 files to find a seam, or
-  writing 1,200 lines of adapter and tests, is exactly what burns a session. A worker does it on
-  its own model; Claude reads the result and the diff.
-- **Workers can't wreck your tree.** They work in a copy-on-write clone (milliseconds, no extra
-  space on APFS/Btrfs/XFS). A worker that runs `rm -rf .` deletes a throwaway copy, and you see
-  that as a patch you decline.
-- **You get evidence, not a story.** `filesChanged`, `diffstat` and the patch are computed by
-  `git` from the copy — never taken from the worker's own account of what it did.
-- **You choose the worker, per hand-off.** Claude can send one slice to DeepSeek V4.1 Flash and the
-  next to MiniMax M3.1 Flash or the newer DeepSeek `1017` build, from a list you control. Each result
-  reports the model that actually ran, so you can compare them on your own work.
-- **Fan-out is built in.** `flash_batch` runs up to 16 independent tasks in one call, four at a
-  time, and returns each result in task order.
+**Flash Agents gives Claude a team.** Claude writes the brief. A flash model does the work:
+DeepSeek V4.1 Flash by default, at $0.30 per million input tokens on Ollama. Claude reads the
+diff, runs your tests, and applies only what it accepts.
 
-## What a worker can actually take on
+## The receipt
 
-Measured on a 50k-line Swift app, with Claude steering and reviewing:
+Flash Agents built its own 0.1.6 release (20 October 2026):
 
-| Task | Size | Wall time | Outcome |
+- Claude wrote the design and briefed **3 workers** on DeepSeek V4.1 Flash.
+- Claude's review **caught a race condition**. A 4th worker fixed it.
+- **25 files, +2,011 lines, 116/116 live checks**, 78 minutes from first hand-off to commit.
+- What the workers' tokens cost: **under $0.50.**
+
+Claude's own tokens for the design and the review aren't in that number.
+
+## Why I built this
+
+I saw DeepSeek's prices on Ollama, which says it never trains on your prompts. I wanted Claude's
+judgement without paying Claude prices for keystrokes.
+
+Now I use it every day as CTO of a fintech. More gets shipped, and tests and review are held to
+the same bar as before.
+
+## How it works
+
+1. **Claude briefs.** One goal per hand-off: the files it owns, the tests to write, the exact
+   commands that prove it works. The `delegate` skill teaches Claude this loop, so you just ask
+   for the change as usual.
+2. **A worker does it, in a copy.** Every writing job runs in a throwaway copy of your repo,
+   inside a sandbox that stops at the copy's edge. A worker that runs `rm -rf .` deletes a copy.
+   Claude picks the model per hand-off from your list (DeepSeek V4.1 Flash, MiniMax M3.1 Flash, …)
+   and can run several workers at once.
+3. **Claude checks.** The patch and the file list come from `git`, not from the worker's story.
+   Claude reads the diff, runs your tests, can have it reviewed by a second worker, and applies
+   what passes. Uncommitted: committing stays your call.
+
+## What it really handled
+
+On a 50k-line Swift app, with Claude steering and reviewing:
+
+| Task | Size | Time | Outcome |
 |---|---|---|---|
-| Domain seam: protocol, adapter, injection into two coordinators, fake, tests | 1,250 lines, 15 tests | 30 min | landed after review; one warning fixed by hand |
-| Security fix round on an OAuth/MCP client, 11 findings, each with a fail-before/pass-after test | 1,400 lines | 40 min | landed; review still found one flow defect |
-| Test-harness rework: parsing, scope policy, schema table, allow-list | 1,500 lines, 29 tests | 37 min | landed unchanged |
-| Read-only security review of the same client against the RFCs | — | 25 min | 11 confirmed findings |
-| Mechanical split of a 7,000-line file into 16, 41 scripts re-pointed | 7,900 lines moved | ~60 min | complete |
+| A new seam: protocol, adapter, fake, wired into two coordinators | 1,250 lines, 15 tests | 30 min | landed; one warning fixed by hand |
+| Security fix round, 11 findings, each with a test that fails before the fix | 1,400 lines | 40 min | landed; review still found one flow defect |
+| Test-harness rework | 1,500 lines, 29 tests | 37 min | landed unchanged |
+| A 7,000-line file split into 16, 41 scripts re-pointed | 7,900 lines moved | ~60 min | complete |
 
-What it gets wrong — and what Claude therefore still reads itself: flow semantics across a
-boundary, policy nuance, and anything outside the files it touched. The `delegate` skill
-encodes that loop, so Claude does it without being told.
+## What I won't hide
+
+- **A flash model's diff is good; its picture of the whole system is not.** It misses flow across
+  a boundary and the nuance of a policy. That's why Claude still reads the core of every change.
+- **You need Ollama.** The cloud models run on your Ollama account and are billed by Ollama
+  (Pro: $20 a month with $60 of usage). Local Ollama models work too; they're weaker.
+- **Windows works, with limits.** The sandbox blocks owner-only temp folders and named pipes,
+  so some Python test setups don't run there. Details under [Honest limits](#honest-limits).
+
+## FAQ
+
+**Is a model this cheap any good?**
+On its own, no. With a written brief, the files it owns and the commands that prove it, yes.
+See the table above. When it stops partway, it says why, and the next hand-off carries on from its patch.
+
+**Why not just use subagents?**
+They run on Claude, so they spend your plan. Flash workers run on a different model.
+
+**Where does my code go?**
+To the Ollama model you pick, and nowhere else. Ollama: "we process your prompts and responses
+transiently to provide the service and never train on it" ([privacy](https://ollama.com/privacy)).
+With a local model it stays on your machine.
+
+**Will it commit or push?**
+No. A patch lands only when Claude or you apply it, and it lands uncommitted.
+
+**What does it cost?**
+The plugin is free and MIT-licensed. The models cost what your Ollama plan charges.
 
 ## Install
 
@@ -122,7 +155,7 @@ in rounds, and applies the patches it accepts.
 | | |
 |---|---|
 | `flash_task` | One coherent task on one worker. Returns its report and a patch. |
-| `flash_batch` | Several independent tasks at once; results come back in task order. |
+| `flash_batch` | Up to 16 independent tasks in one call, four at a time; results come back in task order. |
 | `flash_apply` | Land a patch from an earlier call (`dryRun` to check it first, `threeWay` to merge one whose context moved, `files` to land only some of its files). |
 | `flash_patch` | Read a stored patch whole, by file, or page by page — for a diff too long for the result. |
 | `flash_status` · `flash_result` · `flash_cancel` | Follow, collect, and stop calls started with `background: true`. |
