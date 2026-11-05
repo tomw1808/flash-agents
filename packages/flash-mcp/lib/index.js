@@ -20,6 +20,7 @@ import { spawnSync } from 'node:child_process'
 import {
   appendFileSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   openSync,
   readdirSync,
@@ -29,7 +30,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { serveStdio, describeError } from './mcp.js'
@@ -38,7 +39,7 @@ import { DEFAULT_INITIALIZE_TIMEOUT_MS, resolveDshCommand } from './sdk.js'
 import { JobRegistry, JOB_TOOLS } from './jobs.js'
 import { allowedModels, loadConfig } from './config.js'
 import { FLASH_MCP_VERSION, formatChecks, profileVersionWarning, resolveDshHome, runChecks } from './doctor.js'
-import { WorkspaceIsolation, cleanLayout, requireAbsoluteStateBase } from './isolation.js'
+import { WorkspaceIsolation, cleanLayout, durableBaseDir, requireAbsoluteStateBase } from './isolation.js'
 
 /** The repository root this server runs from, named in the profile-stamp warning. */
 const REPO_ROOT = resolve(fileURLToPath(new URL('../../../', import.meta.url)))
@@ -112,7 +113,9 @@ export function instructionsFor(models = [DEFAULT_MODEL]) {
     '',
     '`flash_status` on a running job reports what its workers are doing: `current` lists each open',
     'tool call (`tool`, `command`, `since`, `runningMs`) as of the last heartbeat, and `warnings`',
-    'names a command that failed three or more times in the call.',
+    'names a command that failed three or more times in the call, or one whose process tree has',
+    'used no CPU for minutes; a `current` entry carries `child` when a process under the runtime',
+    'has run longer than the command.',
     '',
     'Project facts every worker needs (layout, check commands, style rules) belong in an',
     '`AGENTS.md` or `CLAUDE.md` in the repository: the Harness loads those into every worker',
@@ -175,10 +178,18 @@ export function listTools(models = [DEFAULT_MODEL]) {
             type: 'string',
             description: 'Optional acceptance criteria describing what a correct result looks like.',
           },
+          label: {
+            type: 'string',
+            description: 'Optional name for this call, 1 to 120 characters, shown in flash_status, the queue and the stored patch. Without it the label is the first line of the brief, which is the same for every brief that starts with shared rules.',
+          },
           mode: {
             type: 'string',
             enum: ['workspace-write', 'read-only'],
             description: 'Optional narrowing of what this call may change. "workspace-write" (the default) confines writes to the service root; "read-only" runs the call in a process whose file sandbox denies every mutation, so it cannot change anything — which also means it cannot build or run tests, since compilers and test runners write (cargo, for one, takes a lock file in target/). For a review that must build or test, use the default mode with apply: "discard" instead. No mode can widen the standing confinement.',
+          },
+          readOnly: {
+            type: 'boolean',
+            description: 'Shorthand for mode: "read-only" when true; false changes nothing. Combined with mode "workspace-write" it is refused.',
           },
           apply: {
             type: 'string',
@@ -264,6 +275,10 @@ export function listTools(models = [DEFAULT_MODEL]) {
             type: 'string',
             description: 'Optional acceptance criteria applied to every task that does not carry its own.',
           },
+          label: {
+            type: 'string',
+            description: 'Optional name for this fleet, 1 to 120 characters, shown in flash_status, the queue and the stored patch. Without it the label is the number of tasks.',
+          },
           mode: {
             type: 'string',
             enum: ['workspace-write', 'read-only'],
@@ -329,6 +344,11 @@ export function listTools(models = [DEFAULT_MODEL]) {
         'conflict leaves conflict markers in the named files and is listed in `conflicts`.',
         '`dryRun` with `threeWay` predicts the conflicts without writing anything.',
         '',
+        'The result has a `status` ("success", "conflict" or "failed") and a `files` entry per file:',
+        '`applied`, `merged` (your tree had moved and the change was merged in), `conflict` (markers',
+        'left in the file) or `failed` (with a `reason`). If one file cannot be merged, nothing is written',
+        'and `status` is "failed"; `appliable` then names the files that can still go in with `files`.',
+        '',
         'The result\'s `drift` says how far your tree moved since the patch\'s base (`commitsBehind`)',
         'and which of the patch\'s own files you changed in the meantime (`filesChangedSince`); a',
         'non-empty file list also comes back as a warning before you apply.',
@@ -384,6 +404,10 @@ export function listTools(models = [DEFAULT_MODEL]) {
         'The result\'s `drift` says how far your tree has moved since the patch\'s base: `commitsBehind`',
         'and the patch\'s own files you changed since the worker\'s copy was made (`filesChangedSince`).',
         'It is on the page that starts at offset 0, and is `null` once the patch was applied.',
+        '',
+        'The first page also lists `overlaps`: other stored patches of this root that are not applied',
+        'and change some of the same files (`patchId`, `files`, `label`, `createdAt`). A patch that',
+        'continues from another (`basePatch`) is not an overlap. It is left out when there are none.',
       ].join('\n'),
       inputSchema: {
         type: 'object',
@@ -582,7 +606,7 @@ function usage() {
 Usage: flash-agents [serve] [options]           serve the MCP stdio protocol (the default)
        flash-agents doctor [--profile <id>] [--e2e] [--copy [--root <path>]]
                                                 check the prerequisites and print the fixes
-       flash-agents clean [--all] [--root <path>] [--state-base <path>]
+       flash-agents clean [--all] [--caches] [--root <path>] [--state-base <path>]
                                                 report the state directory per root and
                                                 remove dead trees and expired patches
 
@@ -758,6 +782,29 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
         'patch by the next server, and flash_apply can apply it by id.',
     )
 
+  /**
+   * A job the server no longer holds: its stored report, when the call finished and stored one,
+   * otherwise the unknown-job refusal. The report file outlives the process and the in-memory
+   * registry, so a restart or a lost context does not lose the review.
+   */
+  const storedReport = (tool, jobId) => {
+    const stored = service?.readReport?.(jobId)
+    if (stored === undefined) return unknownJob(tool, jobId)
+    return okResult({
+      jobId,
+      kind: stored.kind,
+      status: stored.status,
+      ...(stored.stopReason === undefined ? {} : { stopReason: stored.stopReason }),
+      ...(stored.finalMessageProblem === undefined ? {} : { finalMessageProblem: stored.finalMessageProblem }),
+      ...(stored.patchId === undefined ? {} : { patchId: stored.patchId }),
+      label: stored.label,
+      createdAt: stored.createdAt,
+      reportPath: stored.reportPath,
+      report: stored.report,
+      note: 'the job is no longer held in memory (the server restarted, or the job was evicted); this is the worker\'s whole report as stored on disk',
+    })
+  }
+
   const statusTool = (args) => {
     const jobId = args?.jobId
     if (jobId !== undefined) {
@@ -822,7 +869,7 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
         `flash_result failed: waitSeconds must be an integer between 0 and 600; got ${JSON.stringify(args?.waitSeconds)}`,
       )
     }
-    if (jobs.get(jobId) === undefined) return unknownJob('flash_result', jobId)
+    if (jobs.get(jobId) === undefined) return storedReport('flash_result', jobId)
     // Waiting is on the *request's* signal: cancelling this call stops the wait, and the job
     // is left untouched, still running. The answer says which of the three ended the wait,
     // because "the job is still running" alone cannot tell a timeout from a cancelled request.
@@ -842,7 +889,7 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
     } else {
       job = jobs.get(jobId)
     }
-    if (job === undefined) return unknownJob('flash_result', jobId)
+    if (job === undefined) return storedReport('flash_result', jobId)
     // Project the job already held rather than looking it up again by id: the sweep may have
     // evicted it while this request waited, and a second lookup that comes back undefined
     // used to throw a TypeError straight out of the dispatcher.
@@ -856,7 +903,7 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
         ...(wait === undefined ? {} : { wait }),
       })
     }
-    if (job.state === 'ok') {
+    if (job.error === undefined) {
       // The caller has the result now; the cap may reclaim the job under pressure, so the
       // one result it is allowed to drop is the one already delivered.
       job.collected = true
@@ -864,7 +911,7 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
       // the job's identity so the caller can tie it back to the id it holds.
       return okResult({
         ...job.result,
-        job: { jobId: job.jobId, state: 'ok', elapsedMs: status.elapsedMs },
+        job: { jobId: job.jobId, state: job.state, elapsedMs: status.elapsedMs },
         ...(wait === undefined ? {} : { wait }),
       })
     }
@@ -893,8 +940,13 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
     // from turning into a TypeError here.
     const { job: settledJob } = await jobs.waitFor(jobId, 30_000)
     const status = jobs.statusOf(settledJob ?? job)
+    // The salvage the call's own cancellation path ran: the copy's change stored as a patch
+    // before the copy was retired, or the plain statement that there was nothing to store.
+    const salvage = (settledJob ?? job).error?.salvage
     return okResult({
       ...status,
+      ...(salvage?.patchId === undefined ? {} : { patchId: salvage.patchId, diffstat: salvage.diffstat, filesChanged: salvage.filesChanged }),
+      ...(salvage?.patchId !== undefined || salvage?.note === undefined ? {} : { stored: false, storedNote: salvage.note }),
       note:
         status.state === 'running'
           ? 'the job is still running; its call has not settled yet'
@@ -1099,6 +1151,8 @@ function editDistance(a, b) {
  * from" line is enough. A file that cannot be read leaves `taskFile <path>` as the label,
  * which is at least the one fact a status reader can act on.
  *
+ * A `label` argument replaces the brief's first line altogether.
+ *
  * @param {string} kind - the tool name.
  * @param {object} args - the raw tool arguments.
  * @param {string} [defaultModel] - the service's default model.
@@ -1108,6 +1162,10 @@ function editDistance(a, b) {
 export function jobLabel(kind, args, defaultModel, root) {
   const chosen = typeof args?.model === 'string' && args.model.length > 0 && args.model !== defaultModel
   const prefix = chosen ? `[${args.model}] ` : ''
+  // The caller's own label wins over anything read from the brief. A bad one is left to the
+  // service to refuse, so it is ignored here rather than throwing before the refusal.
+  const named = typeof args?.label === 'string' ? args.label.trim() : ''
+  if (named.length > 0 && named.length <= 120) return `${prefix}${named}`
   if (kind === 'flash_batch') {
     const count = Array.isArray(args?.tasks) ? args.tasks.length : 0
     return `${prefix}${String(count)} tasks`
@@ -1560,11 +1618,26 @@ export async function runDoctor(
   const config = loadConfig({ env })
   const flags = doctorFlags(argv)
   let options
+  let stateBaseProblem
+  const parseEnv = flags.copy ? envWithProjectRoot(env) : env
   try {
-    options = parseOptions(flags.optionsArgv, flags.copy ? envWithProjectRoot(env) : env, config)
+    options = parseOptions(flags.optionsArgv, parseEnv, config)
   } catch (error) {
-    emit(`flash-agents: ${describeError(error)}\n\n${usage()}`)
-    return 2
+    // A bad `--state-base` flag is a mistyped option, reported like every other; a bad setting
+    // (FLASH_STATE_BASE) is what the plugin hands the server, so it becomes a failed row.
+    if (error?.code !== 'STATE_BASE_INVALID' || flags.optionsArgv.includes('--state-base')) {
+      emit(`flash-agents: ${describeError(error)}\n\n${usage()}`)
+      return 2
+    }
+    // The server would exit on this value; the report should show that as a failed row, and
+    // still check everything else, so it is parsed again without the unusable base.
+    stateBaseProblem = `the plugin setting "state_base" (FLASH_STATE_BASE) is ${JSON.stringify(configuredStateBase(flags.optionsArgv, parseEnv) ?? '')}, which cannot be used on ${process.platform} (${describeError(error)})`
+    try {
+      options = parseOptions(flags.optionsArgv, { ...parseEnv, FLASH_STATE_BASE: '' }, config)
+    } catch (second) {
+      emit(`flash-agents: ${describeError(second)}\n\n${usage()}`)
+      return 2
+    }
   }
   if (options.help) {
     emit(usage())
@@ -1586,6 +1659,8 @@ export async function runDoctor(
       root: options.root,
       ...(options.stateDir === undefined ? {} : { stateDir: options.stateDir }),
       ...(options.stateBase === undefined ? {} : { stateBase: options.stateBase }),
+      ...(stateBaseProblem === undefined ? {} : { stateBaseProblem }),
+      disk: true,
       ...(run === undefined ? {} : { run }),
       ...(probe === undefined ? {} : { probe }),
       ...(generate === undefined ? {} : { generate }),
@@ -2057,9 +2132,11 @@ function canonicalRoot(root) {
 
 const CLEAN_USAGE = `flash-agents clean — report and reclaim the flash-mcp state directory
 
-Usage: flash-agents clean [--all] [--root <path>] [--state-base <path>] [--patch-retention-days <n>]
+Usage: flash-agents clean [--all] [--caches] [--root <path>] [--state-base <path>] [--patch-retention-days <n>]
 
   --all                      also remove the slot trees of roots with no live server
+  --caches                   remove only build caches: the stored ones, and the cache of every dead
+                             server's slots; trees, patches and owners are left alone
   --root <path>              service root whose digest is swept (default: cwd)
   --state-base <path>        base directory of the default layout (default: $TMPDIR/flash-mcp,
                              or FLASH_STATE_BASE); it must be absolute and a leading ~ is
@@ -2068,7 +2145,9 @@ Usage: flash-agents clean [--all] [--root <path>] [--state-base <path>] [--patch
 
 The default removes what a server startup removes for --root: dead owners (salvaging
 their unfinished trees as patches), expired patches, and other roots' empty digest
-directories. Patches are never removed by --all.
+directories. Patches are never removed by --all. Build caches kept between servers are
+removed too (with --all, those of every root that has no live server); --caches removes
+nothing else.
 `
 
 /**
@@ -2096,6 +2175,7 @@ directories. Patches are never removed by --all.
 export async function runClean(argv = [], { env = process.env, write, baseDir, home = homedir(), now } = {}) {
   const emit = write ?? ((text) => process.stdout.write(text))
   let all = false
+  let cachesOnly = false
   let root = textFrom(env.FLASH_SERVICE_ROOT) ?? process.cwd()
   // The base the server's default layout sits under: `--state-base` overrides the
   // environment, and an injected base (tests) is the starting point so a flag can still
@@ -2111,6 +2191,7 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, h
       return argv[index]
     }
     if (flag === '--all') all = true
+    else if (flag === '--caches') cachesOnly = true
     else if (flag === '--root') root = next()
     else if (flag === '--state-base') base = next()
     else if (flag === '--patch-retention-days') retentionDays = numberFrom(next(), undefined)
@@ -2130,6 +2211,7 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, h
     ...(dataDir === undefined ? {} : { dataDir }),
     root: canonicalRoot(root),
     all,
+    cachesOnly,
     retentionDays: retentionDays ?? config.limits.patchRetentionDays,
     // The process exits right after this report, so every removal must be finished before
     // `cleanLayout` returns: a background deletion would be abandoned with the process
@@ -2146,10 +2228,15 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, h
     emit(
       `${entry.digest}${entry.own ? ' (this root)' : ''}  live pids: ${pids} | ` +
         `slot trees: ${String(entry.slotTrees)} (${formatMb(entry.slotBytes)}) | ` +
-        `patches: ${String(entry.patches)} (${formatMb(entry.patchBytes)})\n`,
+        `patches: ${String(entry.patches)} (${formatMb(entry.patchBytes)}) | ` +
+        `stored caches: ${String(entry.caches)} (${formatMb(entry.cacheBytes)})\n`,
     )
   }
   const { actions } = report
+  if (cachesOnly) {
+    emit(`removed: ${String(actions.cachesRemoved)} build cache(s) (stored, and of dead servers' slots); nothing else was touched\n`)
+    return 0
+  }
   emit(
     `removed: ${String(actions.deadOwnersRemoved)} dead owner(s), ${String(actions.patchesPruned)} expired patch(es), ` +
       `${String(actions.emptyDigestsRemoved)} empty digest(s)` +
@@ -2157,9 +2244,75 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, h
       // The trash a crash left between the rename and the delete is disk `clean` reclaimed
       // too; a summary that left it out named a smaller removal than actually happened.
       `, ${String(actions.trashRemoved)} trash director${actions.trashRemoved === 1 ? 'y' : 'ies'}` +
+      `, ${String(actions.cachesRemoved)} stored cache(s)` +
       '\n',
   )
   return 0
+}
+
+/**
+ * The state base a command line and environment name, as the server's option parsing reads it:
+ * `--state-base` wins over `FLASH_STATE_BASE`.
+ *
+ * @param {string[]} argv - arguments after the command name.
+ * @param {Record<string, string | undefined>} env - environment to read.
+ * @returns {string | undefined} the raw value.
+ */
+function configuredStateBase(argv, env) {
+  const at = argv.lastIndexOf('--state-base')
+  return at >= 0 && at + 1 < argv.length ? argv[at + 1] : textFrom(env.FLASH_STATE_BASE)
+}
+
+/**
+ * Where a server that cannot start writes why: the configured log file, else `flash.log` in the
+ * durable data directory.
+ *
+ * @param {string[]} argv - arguments after the command name.
+ * @param {Record<string, string | undefined>} env - environment to read.
+ * @returns {string} the log path.
+ */
+function startupLogPath(argv, env) {
+  const at = argv.lastIndexOf('--log-file')
+  const given = at >= 0 && at + 1 < argv.length ? argv[at + 1] : textFrom(env.FLASH_LOG_FILE)
+  return given ?? join(durableBaseDir(env), 'flash.log')
+}
+
+/**
+ * Say why the server is exiting because the configured state base is unusable: to stderr and to
+ * flash.log, naming the setting, its value and the platform.
+ *
+ * The log file's location is the plugin's own (`FLASH_LOG_FILE`) and does not depend on the state
+ * base. When none is configured, or it cannot be written, the line goes to `flash.log` in the data
+ * directory, and the message says where.
+ *
+ * @param {Error} error - the refusal `parseOptions` raised.
+ * @param {object} options - what the process was started with.
+ * @param {string[]} options.argv - arguments after the command name.
+ * @param {Record<string, string | undefined>} [options.env] - environment to read.
+ * @param {string} [options.platform] - the platform to name.
+ * @returns {string} the log file the reason was written to, or '' when none could be written.
+ */
+export function reportStateBaseRefusal(error, { argv, env = process.env, platform = process.platform }) {
+  const value = configuredStateBase(argv, env)
+  const message =
+    `cannot start: the plugin setting "state_base" (FLASH_STATE_BASE) is ${JSON.stringify(value ?? '')}, which cannot be used on ${platform} ` +
+    `(${describeError(error)}); clear the setting or give an absolute path for this platform`
+  const configured = startupLogPath(argv, env)
+  const fallback = join(durableBaseDir(env), 'flash.log')
+  let written = ''
+  for (const path of configured === fallback ? [configured] : [configured, fallback]) {
+    try {
+      mkdirSync(dirname(path), { recursive: true })
+      const where = path === configured ? '' : ` (written to ${path} because the configured log file could not be written)`
+      appendFileSync(path, `${new Date().toISOString()} [flash-mcp] ${message}${where}\n`)
+      written = path
+      break
+    } catch {
+      // The next candidate, then stderr alone.
+    }
+  }
+  process.stderr.write(`[flash-mcp] ${message}${written === '' ? '' : `; logged to ${written}`}\n`)
+  return written
 }
 
 /** Entry point: one subcommand, or the server when none is named. */
@@ -2185,6 +2338,9 @@ async function main() {
   try {
     options = parseOptions(argv)
   } catch (error) {
+    // Claude Code shows only "Connection closed" for a server that exits at once, so a state
+    // base the settings made unusable is written where the user can read it before exiting.
+    if (error?.code === 'STATE_BASE_INVALID') reportStateBaseRefusal(error, { argv })
     process.stderr.write(`flash-agents: ${describeError(error)}\n\n${usage()}`)
     process.exit(2)
   }

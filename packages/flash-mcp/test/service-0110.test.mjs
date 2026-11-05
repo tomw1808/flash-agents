@@ -451,7 +451,7 @@ test('an edit that failed three times and was then written succeeds as an edit o
     assert.equal(result.warnings.length, 1, JSON.stringify(result.warnings))
     assert.match(
       result.warnings[0],
-      /^"edit src\/a\.js" failed 3 times in this call \(last: tool error FsError, \d+m?\d*s ago\); a later edit of src\/a\.js succeeded \d+m?\d*s ago$/,
+      /^"edit src\/a\.js" failed 3 times in this call \(last: tool error FsError, \d+m?\d*s ago: [^)]*\); a later edit of src\/a\.js succeeded \d+m?\d*s ago$/,
     )
   } finally {
     await service.close()

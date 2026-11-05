@@ -33,6 +33,8 @@
  * @property {object} [settings] - the repository settings the call holding it leased with.
  * @property {string[]} [settingsWarnings] - what that call's result must say about them.
  * @property {boolean} [buildCacheEmpty] - whether the call started with a cold build cache.
+ * @property {'store' | 'retired-slot'} [buildCacheFrom] - where this call's prepare took the
+ *   slot's build cache from, when it took one: the per-root store or the retired tree.
  *
  * @typedef {object} Change
  * @property {boolean} available - whether a diff could be computed at all.
@@ -74,12 +76,14 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statfsSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { rm as removeTree } from 'node:fs/promises'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
 
@@ -314,6 +318,36 @@ const SETUP_KEEP_DIR = 'keep'
 
 /** Where setup stamps live, under `.flash-cache`. */
 const SETUP_STAMP_DIR = 'setup'
+
+/**
+ * The per-root directory, beside the pid directories, that keeps `.flash-cache` folders
+ * between servers: `<stateBase>/<rootDigest>/caches/<n>/`. Numeric entries only, so the
+ * dead-owner sweep (which visits numeric names under the digest, not this one) never
+ * mistakes it for an owner.
+ */
+const CACHE_STORE_DIR = 'caches'
+
+/**
+ * How many times a put into the cache store tries the next free number. Two servers
+ * stopping together can both pick the same lowest free `<n>`; the rename of the loser fails
+ * because the winner's cache is already there, and it takes the next number. Eight is far
+ * more servers than one root runs at once.
+ */
+const CACHE_STORE_PUT_ATTEMPTS = 8
+
+/**
+ * The free-space fraction of the state volume below which a call warns. A build copy of a
+ * large workspace is tens of GB, so a tenth of the volume is the point where one more
+ * copy can plausibly fill it; the user who prompted this saw a disk 99 % full unannounced.
+ */
+export const LOW_DISK_FREE_FRACTION = 0.1
+
+/**
+ * The absolute free space below which a call warns, whatever the volume's size. A fraction
+ * alone stays quiet on a 4 TB disk down to 400 GB, but a native build wants a few GB of
+ * headroom regardless; the warning fires on either condition.
+ */
+export const LOW_DISK_FREE_BYTES = 5 * 1024 ** 3
 
 /**
  * The one line a server started without `--allow-slot-setup` reports: in its startup log,
@@ -705,7 +739,9 @@ export function requireAbsoluteStateBase(value, home = homedir()) {
   const resolved = resolveStateBase(value, home)
   if (resolved === undefined) return undefined
   if (!isAbsolute(resolved)) {
-    throw new Error(`--state-base must be an absolute path (got ${JSON.stringify(String(value))})`)
+    throw Object.assign(new Error(`--state-base must be an absolute path (got ${JSON.stringify(String(value))})`), {
+      code: 'STATE_BASE_INVALID',
+    })
   }
   return resolved
 }
@@ -913,7 +949,7 @@ function directorySize(dir) {
 }
 
 /** A byte count in the unit a person reads it in. @param {number} bytes @returns {string} */
-function formatBytes(bytes) {
+export function formatBytes(bytes) {
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`
   if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`
   return `${String(Math.round(bytes / 1024))} KB`
@@ -933,6 +969,378 @@ function digestDirs(baseDir) {
   } catch {
     return []
   }
+}
+
+/**
+ * The directory that keeps one root's idle build caches between servers.
+ * @param {string} baseDir - the state base directory.
+ * @param {string} root - the canonical service root.
+ * @returns {string} `<baseDir>/<rootDigest>/caches`.
+ */
+export function cacheStoreDir(baseDir, root) {
+  return join(baseDir, rootDigest(root), CACHE_STORE_DIR)
+}
+
+/**
+ * The stored caches of one store, lowest number first.
+ * @param {string} storeDir - one root's cache store.
+ * @returns {string[]} the numeric directory names.
+ */
+function storedCacheNames(storeDir) {
+  try {
+    return readdirSync(storeDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name))
+      .map((entry) => entry.name)
+      .sort((a, b) => Number(a) - Number(b))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Take the lowest stored cache into a slot, by renaming it onto `target`.
+ *
+ * A rename is atomic, so two servers on one root can never take the same cache: the loser's
+ * rename finds the source gone (ENOENT) and moves on to the next number. Any other failure
+ * (an open handle on Windows, another device) is logged and the slot starts cold — copying
+ * tens of gigabytes would freeze the server, and a half-copied cache would be worse than none.
+ * The setup stamps are dropped for the reason `#moveRetiredCache` gives: what a step kept
+ * names the absolute path it was built at, so each step must run once at the new one.
+ *
+ * @param {string} storeDir - the root's cache store.
+ * @param {string} target - the slot's `.flash-cache`, which holds no file (the caller checked).
+ * @param {object} options - the rename and the log.
+ * @param {(from: string, to: string) => void} options.rename - the directory rename.
+ * @param {(message: string) => void} options.log - progress log.
+ * @returns {string | undefined} the number of the cache taken, or undefined for a cold start.
+ */
+function claimStoredCache(storeDir, target, { rename, log }) {
+  for (const name of storedCacheNames(storeDir)) {
+    const source = join(storeDir, name)
+    try {
+      // Only empty folders can be here, and a rename onto a directory with entries fails.
+      rmSync(target, { recursive: true, force: true })
+      rename(source, target)
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue
+      log(`could not claim stored build cache ${source} for ${target} (${messageOf(error)}); the slot starts cold`)
+      return undefined
+    }
+    rmSync(join(target, SETUP_STAMP_DIR), { recursive: true, force: true })
+    log(`claimed stored build cache ${source} for ${target}`)
+    return name
+  }
+  return undefined
+}
+
+/**
+ * The marker file that says a retired tree's runtimes were not shut down, so a process of it
+ * may still be writing into its build cache. It sits beside the `slots` folder, where a dead
+ * owner's sweep can read it after the server that wrote it is gone.
+ *
+ * @param {string} orphan - a retired slot tree.
+ * @returns {string} the marker's path.
+ */
+function liveOrphanMarker(orphan) {
+  return join(dirname(dirname(orphan)), `.live-${basename(orphan)}`)
+}
+
+/**
+ * Record that a tree was retired with its runtimes still running.
+ * @param {string} orphan - the retired tree.
+ * @param {(message: string) => void} log - progress log.
+ * @returns {void}
+ */
+function markLiveOrphan(orphan, log) {
+  try {
+    writeFileSync(liveOrphanMarker(orphan), '')
+  } catch (error) {
+    log(`could not mark ${orphan} as possibly still in use (${messageOf(error)})`)
+  }
+}
+
+/**
+ * Put a `.flash-cache` folder into the store, by renaming it to the lowest free number.
+ *
+ * A folder that holds no file is not a cache and is not stored. The stored folder's mtime is
+ * set to now: renaming a directory leaves its mtime alone, and a build changes files deep in
+ * the tree without touching the folder, so the stamp is when the cache went idle, which is
+ * what the retention window measures. A failed rename is logged and the cache goes with its
+ * tree, exactly as before the store existed.
+ *
+ * @param {string} source - a `.flash-cache` folder.
+ * @param {string} storeDir - the root's cache store.
+ * @param {object} options - the rename and the log.
+ * @param {(from: string, to: string) => void} options.rename - the directory rename.
+ * @param {(message: string) => void} options.log - progress log.
+ * @returns {string | undefined} the number it was stored under, or undefined when it was not.
+ */
+function putCacheInStore(source, storeDir, { rename, log }) {
+  if (!holdsAnyFile(source)) return undefined
+  try {
+    mkdirSync(storeDir, { recursive: true })
+  } catch (error) {
+    log(`could not create the cache store ${storeDir} (${messageOf(error)}); the build cache of ${source} is not kept`)
+    return undefined
+  }
+  const taken = new Set(readdirSync(storeDir))
+  let number = 0
+  let lastError
+  for (let attempt = 0; attempt < CACHE_STORE_PUT_ATTEMPTS; attempt += 1) {
+    while (taken.has(String(number))) number += 1
+    const destination = join(storeDir, String(number))
+    try {
+      rename(source, destination)
+    } catch (error) {
+      lastError = error
+      // A number a concurrent server filled first: try the next. Anything else will not
+      // improve with another number.
+      if (error?.code !== 'EEXIST' && error?.code !== 'ENOTEMPTY' && !(error?.code === 'EPERM' && existsSync(destination))) break
+      taken.add(String(number))
+      continue
+    }
+    try {
+      const now = new Date()
+      utimesSync(destination, now, now)
+    } catch (error) {
+      log(`could not stamp the stored build cache ${destination} (${messageOf(error)}); its age is when it was last changed`)
+    }
+    log(`stored the build cache of ${source} as ${destination}`)
+    return String(number)
+  }
+  log(`could not store the build cache of ${source} in ${storeDir} (${messageOf(lastError)}); it goes with its tree`)
+  return undefined
+}
+
+/**
+ * Remove stored caches by renaming them out of the store first, so they are gone from the
+ * accounting at once and the deletion of tens of gigabytes does not block the server.
+ *
+ * The rename target is a `trash-*` directory beside the store, which every sweep adopts and
+ * deletes if this process exits first (see `removeLeftoverTrash`). `removal: 'sync'` is what
+ * `clean` asks for, because it exits right after its report.
+ *
+ * @param {string} storeDir - the root's cache store.
+ * @param {string[]} names - the stored caches to remove.
+ * @param {object} options - how to delete and report.
+ * @param {'sync' | 'background'} options.removal - how the renamed trash is deleted.
+ * @param {Map<string, number>} [options.listed] - the mtime each name had when it was listed;
+ *   a cache whose mtime is different now was claimed and put back meanwhile, and is skipped.
+ * @param {(message: string) => void} options.log - progress log.
+ * @returns {number} how many stored caches were taken out of the store.
+ */
+function discardStoredCaches(storeDir, names, { removal, listed, log }) {
+  let removed = 0
+  const parent = dirname(storeDir)
+  for (const name of names) {
+    const source = join(storeDir, name)
+    if (listed?.has(name) === true) {
+      try {
+        if (statSync(source).mtimeMs !== listed.get(name)) {
+          log(`kept stored build cache ${source}: it changed since it was listed`)
+          continue
+        }
+      } catch {
+        continue
+      }
+    }
+    const trash = join(parent, `${TRASH_PREFIX}cache-${name}-${String(Date.now())}`)
+    try {
+      renameSync(source, trash)
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue
+      log(`could not rename stored build cache ${source} out of the way (${messageOf(error)}); removing it in place`)
+      try {
+        rmSync(source, { recursive: true, force: true })
+        removed += 1
+      } catch (rmError) {
+        log(`could not remove stored build cache ${source}: ${messageOf(rmError)}`)
+      }
+      continue
+    }
+    removed += 1
+    if (removal === 'sync') {
+      try {
+        rmSync(trash, { recursive: true, force: true, maxRetries: TRASH_RETRIES })
+      } catch (error) {
+        log(`could not remove ${trash}: ${messageOf(error)}`)
+      }
+    } else {
+      startTrashRemoval(trash, log)
+    }
+    log(`removed stored build cache ${source}`)
+  }
+  return removed
+}
+
+/**
+ * Keep a store to the newest `max` caches that are younger than the retention window.
+ *
+ * "Untouched longer than the window" is the stored folder's mtime (stamped when it went
+ * idle, see `putCacheInStore`) against the same window that ages out stored patches.
+ *
+ * @param {string} storeDir - the root's cache store.
+ * @param {object} options - the limits and how to report.
+ * @param {number} options.max - how many caches to keep: this root's configured slot count.
+ * @param {number} options.retentionDays - the patch retention window.
+ * @param {number} [options.now] - the current time, for tests.
+ * @param {'sync' | 'background'} [options.removal] - how removed caches are deleted.
+ * @param {(message: string) => void} options.log - progress log.
+ * @returns {number} how many caches were removed.
+ */
+function trimCacheStore(storeDir, { max, retentionDays, now = Date.now(), removal = 'background', log }) {
+  const windowMs = retentionDays * 24 * 60 * 60 * 1000
+  const entries = storedCacheNames(storeDir).map((name) => {
+    let mtimeMs = 0
+    try {
+      mtimeMs = statSync(join(storeDir, name)).mtimeMs
+    } catch {
+      // A cache that vanished is counted as old and its removal then finds nothing.
+    }
+    return { name, mtimeMs }
+  })
+  entries.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  const doomed = entries.filter((entry, index) => index >= max || now - entry.mtimeMs > windowMs)
+  const listed = new Map(doomed.map((entry) => [entry.name, entry.mtimeMs]))
+  return discardStoredCaches(storeDir, doomed.map((entry) => entry.name), { removal, listed, log })
+}
+
+/**
+ * Put every cache of a dead owner's slots into the store, then trim it.
+ *
+ * Runs before the owner is removed: the cache is not work to salvage, but it is the one
+ * thing in the dead tree worth keeping, and the owner's removal would delete it.
+ *
+ * @param {string} ownerDir - the dead owner's per-pid directory.
+ * @param {object} caches - the pool's store policy (see `WorkspaceIsolation#cachePolicy`).
+ * @param {(message: string) => void} log - progress log.
+ * @returns {number} how many caches were rescued.
+ */
+function rescueDeadCaches(ownerDir, caches, log) {
+  let rescued = 0
+  for (const { dir } of deadSlotsIn(ownerDir)) {
+    // A tree retired with its runtimes still running is marked (see `markLiveOrphan`); a
+    // process of it may outlive the dead server, so its cache is not moved from under it.
+    if (existsSync(liveOrphanMarker(dir))) {
+      if (holdsAnyFile(join(dir, SLOT_CACHE))) log(`not rescuing the build cache of ${dir}: its runtimes were not shut down when it was retired`)
+      continue
+    }
+    if (putCacheInStore(join(dir, SLOT_CACHE), caches.storeDir, { rename: caches.rename, log }) !== undefined) rescued += 1
+  }
+  if (rescued > 0) trimCacheStore(caches.storeDir, { max: caches.max, retentionDays: caches.retentionDays, log })
+  return rescued
+}
+
+/**
+ * The apparent size in bytes of the regular files below a directory.
+ *
+ * Symlinks are neither followed nor counted (`lstat`), so a link into the cache, or out of
+ * the tree, cannot count a file twice or walk outside; a hard-linked file counts once. The
+ * walk is as slow as the tree is big, so it belongs to `doctor` and `clean`, never to a call.
+ *
+ * @param {string} dir - the directory to size.
+ * @param {object} [options] - what to skip.
+ * @param {(name: string) => boolean} [options.skipTop] - top-level entry names to leave out.
+ * @param {Set<string>} [options.seen] - hard-linked files already counted.
+ * @returns {number} the sum of the file sizes, unreadable entries counted as zero.
+ */
+function treeBytes(dir, { skipTop = () => false, seen = new Set() } = {}) {
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  let total = 0
+  for (const entry of entries) {
+    if (skipTop(entry.name)) continue
+    const child = join(dir, entry.name)
+    try {
+      if (entry.isSymbolicLink()) continue
+      if (entry.isDirectory()) {
+        total += treeBytes(child, { seen })
+      } else if (entry.isFile()) {
+        const info = lstatSync(child)
+        if (info.nlink > 1) {
+          const key = `${String(info.dev)}:${String(info.ino)}`
+          if (seen.has(key)) continue
+          seen.add(key)
+        }
+        total += info.size
+      }
+    } catch {
+      // A file that vanished mid-walk contributes nothing.
+    }
+  }
+  return total
+}
+
+/**
+ * Free and total space of the volume holding a path.
+ * @param {string} path - any path on the volume; its nearest existing parent is asked.
+ * @param {(path: string) => {bsize: number, blocks: number, bavail: number}} statfs - `fs.statfsSync`.
+ * @returns {{path: string, freeBytes: number, totalBytes: number}} the space, for unprivileged users.
+ */
+function volumeSpace(path, statfs) {
+  let at = resolve(path)
+  while (!existsSync(at) && dirname(at) !== at) at = dirname(at)
+  const stats = statfs(at)
+  return { path: at, freeBytes: Number(stats.bavail) * Number(stats.bsize), totalBytes: Number(stats.blocks) * Number(stats.bsize) }
+}
+
+/**
+ * What the copies and caches of one root take on disk, and what is left of the volume.
+ *
+ * Every server's slot trees of the root are listed, live or dead, each with its copy size
+ * (the tree without its `.flash-cache`) and its cache size, then the cache store. The
+ * walks are slow on big trees, which is why only `doctor` and `clean` call this.
+ *
+ * @param {string} root - the canonical service root.
+ * @param {object} [options] - where the layout lives.
+ * @param {string} [options.baseDir] - the state base directory.
+ * @param {string} [options.stateDir] - a configured state directory, which replaces the
+ *   default layout (and has no cache store).
+ * @param {(path: string) => object} [options.statfs] - `fs.statfsSync`; injectable for tests.
+ * @returns {{root: string, baseDir: string, slots: {owner: string, live: boolean, label: string, dir: string,
+ *   copyBytes: number, cacheBytes: number}[], store: {dir: string, caches: {name: string, bytes: number}[],
+ *   bytes: number} | null, volume: {path: string, freeBytes: number, totalBytes: number} | null,
+ *   volumeError?: string}} the measurement.
+ */
+export function measureDisk(root, { baseDir = stateBaseDir(), stateDir, statfs = statfsSync } = {}) {
+  const slots = []
+  const measure = (owner, live, slot) => {
+    slots.push({
+      owner,
+      live,
+      label: slot.label,
+      dir: slot.dir,
+      copyBytes: treeBytes(slot.dir, { skipTop: (name) => name === SLOT_CACHE }),
+      cacheBytes: treeBytes(join(slot.dir, SLOT_CACHE)),
+    })
+  }
+  let store = null
+  let anchor
+  if (stateDir === undefined) {
+    const digestDir = join(baseDir, rootDigest(root))
+    for (const pid of ownerDirs(digestDir)) {
+      const live = processAlive(Number(pid))
+      for (const slot of deadSlotsIn(join(digestDir, pid))) measure(pid, live, slot)
+    }
+    const dir = cacheStoreDir(baseDir, root)
+    const caches = storedCacheNames(dir).map((name) => ({ name, bytes: treeBytes(join(dir, name)) }))
+    store = { dir, caches, bytes: caches.reduce((sum, cache) => sum + cache.bytes, 0) }
+    anchor = digestDir
+  } else {
+    for (const slot of deadSlotsIn(stateDir)) measure('configured', true, slot)
+    anchor = stateDir
+  }
+  const result = { root, baseDir, slots, store, volume: null }
+  try {
+    result.volume = volumeSpace(anchor, statfs)
+  } catch (error) {
+    result.volumeError = messageOf(error)
+  }
+  return result
 }
 
 /**
@@ -969,7 +1377,8 @@ function trashDirsIn(digestDir) {
  * @param {string[]} [extraPatchDirs] - further patch directories that belong to this
  *   digest, such as the durable store.
  * @returns {{slotTrees: number, slotBytes: number, trashDirs: number, trashBytes: number,
- *   patches: number, patchBytes: number}} the facts.
+ *   patches: number, patchBytes: number, caches: number, cacheBytes: number}} the facts,
+ *   `caches` being the build caches waiting in the root's store.
  */
 function digestStats(digestDir, extraPatchDirs = []) {
   let slotTrees = 0
@@ -1017,7 +1426,12 @@ function digestStats(digestDir, extraPatchDirs = []) {
       // No `patches/` directory: nothing stored for this root.
     }
   }
-  return { slotTrees, slotBytes: slotBytes + trashBytes, trashDirs, trashBytes, patches, patchBytes }
+  // The caches idle between servers are disk too; the walk is as slow as the caches are big,
+  // which `clean` accepts (it is an operator command) and a call never pays.
+  const storeDir = join(digestDir, CACHE_STORE_DIR)
+  const stored = storedCacheNames(storeDir)
+  const cacheBytes = stored.reduce((sum, name) => sum + treeBytes(join(storeDir, name)), 0)
+  return { slotTrees, slotBytes: slotBytes + trashBytes, trashDirs, trashBytes, patches, patchBytes, caches: stored.length, cacheBytes }
 }
 
 /**
@@ -1083,6 +1497,18 @@ export function prunePatches(patchDir, { retentionDays = PATCH_RETENTION_DAYS, n
       removed += 1
     } catch {
       // A patch that will not go away is retried by the next startup.
+    }
+  }
+  // A report outlives its patch's record by nothing: it ages out on its own file time,
+  // because a read-only or discarded call has no patch record to age it by.
+  for (const name of names) {
+    if (!name.endsWith(REPORT_SUFFIX)) continue
+    try {
+      if (statSync(join(patchDir, name)).mtimeMs >= cutoff) continue
+      rmSync(join(patchDir, name), { force: true })
+      removed += 1
+    } catch {
+      // A report that will not go away is retried by the next startup.
     }
   }
   // The ids that do have a record, read before the loop removed any: an artefact whose id is
@@ -1553,16 +1979,23 @@ async function salvageOwnerLater(ownerDir, { root, patchDir, log, pid, prior, st
  * @param {string} root - the canonical service root.
  * @param {object} [options] - where the layout lives and how to report.
  * @param {string} [options.baseDir] - the state base directory.
+ * @param {number} [options.retentionDays] - when given, the stored build caches of a root with
+ *   no live server are aged out by this window first (nobody trims an abandoned store), so a
+ *   digest they leave empty can go too.
+ * @param {number} [options.now] - the current time, for tests.
  * @param {(message: string) => void} [options.log] - progress log.
  * @returns {number} how many digest directories were removed.
  */
-function removeEmptyForeignDigests(root, { baseDir = stateBaseDir(), log = () => {} } = {}) {
+function removeEmptyForeignDigests(root, { baseDir = stateBaseDir(), retentionDays, now = Date.now(), log = () => {} } = {}) {
   const own = rootDigest(root)
   let removed = 0
   for (const digest of digestDirs(baseDir)) {
     if (digest === own) continue
     const dir = join(baseDir, digest)
     if (livePidsIn(dir).length > 0) continue
+    if (retentionDays !== undefined) {
+      trimCacheStore(join(dir, CACHE_STORE_DIR), { max: Infinity, retentionDays, now, removal: 'sync', log })
+    }
     if (treeHasFiles(dir)) continue
     try {
       rmSync(dir, { recursive: true, force: true })
@@ -1603,10 +2036,13 @@ function removeEmptyForeignDigests(root, { baseDir = stateBaseDir(), log = () =>
  * @param {string} [options.baseDir] - the state base directory.
  * @param {(message: string) => void} [options.log] - progress log.
  * @param {'sync' | 'background'} [options.removal] - how a dead owner's trash is deleted.
+ * @param {{storeDir: string, max: number, retentionDays: number, rename: Function}} [options.caches] -
+ *   the cache store policy; when given, each dead slot's `.flash-cache` is rescued into the
+ *   store before the owner is removed. `clean` omits it: it is removing caches, not keeping them.
  * @returns {{removed: number, kept: number, salvaged: number, patches: number,
  *   trashRemoved: number}} what the pass did.
  */
-function sweepDeadOwners(root, { patchDir, baseDir = stateBaseDir(), log = () => {}, removal = 'background' } = {}) {
+function sweepDeadOwners(root, { patchDir, baseDir = stateBaseDir(), log = () => {}, removal = 'background', caches } = {}) {
   const stats = { removed: 0, kept: 0, salvaged: 0, patches: 0, trashRemoved: 0 }
   const parent = join(baseDir, rootDigest(root))
   if (!existsSync(parent)) return stats
@@ -1633,6 +2069,7 @@ function sweepDeadOwners(root, { patchDir, baseDir = stateBaseDir(), log = () =>
     const salvage = salvageOwner(ownerDir, { root, patchDir, log, pid, salvaged: prior.salvaged })
     if (salvage.patches > 0) stats.salvaged += 1
     stats.patches += salvage.patches
+    if (caches !== undefined) rescueDeadCaches(ownerDir, caches, log)
     const result = finishDeadOwner(ownerDir, { parent, pid, log, prior, salvage, removal })
     if (result.status === 'removed') stats.removed += 1
     else stats.kept += 1
@@ -1655,10 +2092,11 @@ function sweepDeadOwners(root, { patchDir, baseDir = stateBaseDir(), log = () =>
  * @param {string} [options.baseDir] - the state base directory.
  * @param {(message: string) => void} [options.log] - progress log.
  * @param {() => boolean} [options.stopped] - whether the pool has closed.
+ * @param {object} [options.caches] - the cache store policy, as `sweepDeadOwners` takes it.
  * @returns {Promise<{salvaged: number, kept: number, removed: number, patches: number,
  *   stopped: boolean}>} what the pass did, for the one-line summary.
  */
-async function sweepDeadOwnersLater(root, { patchDir, baseDir = stateBaseDir(), log = () => {}, stopped = () => false } = {}) {
+async function sweepDeadOwnersLater(root, { patchDir, baseDir = stateBaseDir(), log = () => {}, stopped = () => false, caches } = {}) {
   const stats = { salvaged: 0, kept: 0, removed: 0, patches: 0, stopped: false }
   const parent = join(baseDir, rootDigest(root))
   if (!existsSync(parent)) return stats
@@ -1689,6 +2127,7 @@ async function sweepDeadOwnersLater(root, { patchDir, baseDir = stateBaseDir(), 
       stats.stopped = true
       return stats
     }
+    if (caches !== undefined) rescueDeadCaches(ownerDir, caches, log)
     const result = finishDeadOwner(ownerDir, { parent, pid, log, prior, salvage })
     if (result.status === 'removed') stats.removed += 1
     else stats.kept += 1
@@ -2014,6 +2453,9 @@ function writePatchMeta(record) {
     task,
     finalMessage,
     finalMessageTruncated,
+    reportPath,
+    cancelled,
+    basePatch,
   } = record
   const meta = { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt }
   // The parent commit is the caller's HEAD at copy time. It is persisted exactly when it
@@ -2033,7 +2475,46 @@ function writePatchMeta(record) {
   if (task !== undefined) meta.task = task
   if (typeof finalMessage === 'string') meta.finalMessage = finalMessage
   if (finalMessageTruncated === true) meta.finalMessageTruncated = true
+  // Where the whole report lives, and which cancelled job the patch was salvaged from.
+  if (typeof reportPath === 'string') meta.reportPath = reportPath
+  if (cancelled !== undefined) meta.cancelled = cancelled
+  // The patch this one continued from, so a later reader can tell the earlier patch is contained in it.
+  if (typeof basePatch === 'string') meta.basePatch = basePatch
   writeFileSync(record.metaPath, `${JSON.stringify(meta, null, 2)}\n`)
+}
+
+/** The suffix of a call's whole-report file, next to the patch records. */
+const REPORT_SUFFIX = '.report.json'
+
+/** The keys a report is stored under: a job id or a call's session id, never a path. */
+const REPORT_KEY = /^[A-Za-z0-9][A-Za-z0-9_-]*$/
+
+/**
+ * Where one call's whole report lives.
+ *
+ * @param {string} patchDir - the directory the patch records are stored in.
+ * @param {string} key - the job id, or the session id of a call that had no job.
+ * @returns {string} the report's path.
+ * @throws {Error} when the key could be a path.
+ */
+export function reportFilePath(patchDir, key) {
+  if (typeof key !== 'string' || !REPORT_KEY.test(key)) throw new Error(`${JSON.stringify(key)} is not a report key`)
+  return join(patchDir, `${key}${REPORT_SUFFIX}`)
+}
+
+/**
+ * Read one report file, or undefined when it is missing or not a report.
+ *
+ * @param {string} path - the report file.
+ * @returns {object | undefined} the parsed record.
+ */
+function readReportFile(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'))
+    return parsed !== null && typeof parsed === 'object' && typeof parsed.report === 'string' ? parsed : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -3911,6 +4392,49 @@ export function slotPathWarning(slotRoot, { platform = process.platform, limit =
 }
 
 /**
+ * Remove every cache stored for one root digest.
+ * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
+ * @param {object} options - how to delete and report.
+ * @param {'sync' | 'background'} options.removal - how the deletion runs.
+ * @param {(message: string) => void} options.log - progress log.
+ * @returns {number} how many stored caches were removed.
+ */
+function removeStoredCaches(digestDir, { removal, log }) {
+  const storeDir = join(digestDir, CACHE_STORE_DIR)
+  return discardStoredCaches(storeDir, storedCacheNames(storeDir), { removal, log })
+}
+
+/**
+ * Remove the build caches of one root digest that no live server can be using: the stored
+ * ones, and the `.flash-cache` of every slot of a dead owner. A live owner's slots are never
+ * touched.
+ *
+ * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
+ * @param {object} options - how to delete and report.
+ * @param {'sync' | 'background'} options.removal - how the deletion runs.
+ * @param {(message: string) => void} options.log - progress log.
+ * @returns {number} how many caches were removed.
+ */
+function removeCachesOf(digestDir, { removal, log }) {
+  let removed = removeStoredCaches(digestDir, { removal, log })
+  for (const pid of ownerDirs(digestDir)) {
+    if (Number(pid) === process.pid || processAlive(Number(pid))) continue
+    for (const { dir } of deadSlotsIn(join(digestDir, pid))) {
+      const cache = join(dir, SLOT_CACHE)
+      if (!existsSync(cache)) continue
+      try {
+        rmSync(cache, { recursive: true, force: true, maxRetries: TRASH_RETRIES })
+        removed += 1
+        log(`removed build cache ${cache} of dead owner ${pid}`)
+      } catch (error) {
+        log(`could not remove build cache ${cache}: ${messageOf(error)}`)
+      }
+    }
+  }
+  return removed
+}
+
+/**
  * Report and reclaim the default state base: one line of facts per root digest.
  *
  * This is what the `clean` CLI command runs. The default reclaims exactly what a
@@ -3933,13 +4457,16 @@ export function slotPathWarning(slotRoot, { platform = process.platform, limit =
  * @param {string} [options.dataDir] - the durable data directory; defaults to `durableBaseDir()`.
  * @param {string} options.root - the canonical service root of this invocation.
  * @param {boolean} [options.all] - also remove the trees of roots with no live server.
+ * @param {boolean} [options.cachesOnly] - remove only build caches: this root's stored ones and
+ *   the `.flash-cache` of its dead owners' slots (with `all`, every root's without a live server).
+ *   Trees, patches and owners are left alone.
  * @param {number} [options.retentionDays] - the patch retention window.
  * @param {number} [options.now] - the current time, for tests.
  * @param {'sync' | 'background'} [options.removal] - how dead owners' trash is deleted.
  * @param {(message: string) => void} [options.log] - progress log.
  * @returns {{baseDir: string, own: string, patchDir: string, legacyPatchDir?: string, stats: object[], actions: object}} the report.
  */
-export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = false, retentionDays = PATCH_RETENTION_DAYS, now = Date.now(), removal = 'sync', log = () => {} } = {}) {
+export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = false, cachesOnly = false, retentionDays = PATCH_RETENTION_DAYS, now = Date.now(), removal = 'sync', log = () => {} } = {}) {
   const own = rootDigest(root)
   const ownDir = join(baseDir, own)
   const patchDir = dataDir === undefined ? defaultPatchDir(root) : join(dataDir, own, 'patches')
@@ -3953,7 +4480,19 @@ export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = fal
     livePids: livePidsIn(join(baseDir, digest)),
     ...digestStats(join(baseDir, digest), digest === own ? [patchDir] : []),
   }))
-  const actions = { deadOwnersRemoved: 0, trashRemoved: 0, patchesPruned: 0, emptyDigestsRemoved: 0, foreignTreesRemoved: 0 }
+  const actions = { deadOwnersRemoved: 0, trashRemoved: 0, patchesPruned: 0, emptyDigestsRemoved: 0, foreignTreesRemoved: 0, cachesRemoved: 0 }
+  if (cachesOnly) {
+    // Same safety as the state: a root with a live server keeps what it may be claiming or
+    // writing, so only this root (whose live servers are this one's own concern, as for the
+    // owners below) and, with `all`, roots nobody is serving are touched.
+    for (const digest of digestDirs(baseDir)) {
+      if (digest !== own && !all) continue
+      const dir = join(baseDir, digest)
+      if (digest !== own && livePidsIn(dir).length > 0) continue
+      actions.cachesRemoved += removeCachesOf(dir, { removal, log })
+    }
+    return { baseDir, own, patchDir, stats, actions, ...(existsSync(legacyPatchDir) ? { legacyPatchDir } : {}) }
+  }
   if (existsSync(ownDir)) {
     // Leftover trash is removed first, the owners' trees are salvaged and removed, and all
     // of it synchronously: `clean` is an operator command that promises the disk back before
@@ -3964,6 +4503,9 @@ export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = fal
     actions.deadOwnersRemoved = swept.removed
     actions.trashRemoved = swept.trashRemoved
   }
+  // The dead owners' own caches went with their trees above (`clean` passes no store policy),
+  // and what the store holds goes now: `clean` is the operator asking for the disk back.
+  actions.cachesRemoved += removeStoredCaches(ownDir, { removal, log })
   actions.patchesPruned = prunePatches(patchDir, { retentionDays, now })
   if (resolve(legacyPatchDir) !== resolve(patchDir)) {
     // An upgrade can leave patches behind in the temp tree. Do not move them from `clean`
@@ -3977,6 +4519,7 @@ export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = fal
       const dir = join(baseDir, digest)
       if (livePidsIn(dir).length > 0) continue
       actions.foreignTreesRemoved += removeDeadOwnerDirs(dir, log)
+      actions.cachesRemoved += removeStoredCaches(dir, { removal, log })
     }
     actions.emptyDigestsRemoved += removeEmptyForeignDigests(root, { baseDir, log })
   }
@@ -4658,9 +5201,14 @@ function preimageEntries(repoDir, base, env = process.env) {
  * directory the merge's scratch repository borrows read-only through
  * `objects/info/alternates`.
  *
- * Best effort by design. A patch that cannot carry its blobs is still a patch, and a
- * three-way merge of it reports that the base is unavailable; failing the call over it
- * would lose work that plain apply can still deliver.
+ * Best effort by design. A patch that cannot carry its blobs is still a patch, and failing
+ * the call over it would lose work that plain apply can still deliver. The base entries are
+ * kept whatever happens to the blobs: they are read from the staged diff, and each names the
+ * blob id the patch's own `index` line names. A blob the copy cannot hand over — one the
+ * caller's repository holds and the copy does not — is left out of the pack and logged, and
+ * the merge looks it up in the caller's repository, file by file. Dropping every entry
+ * because one blob would not pack made a patch whose bases were all in the caller's
+ * repository read as "made before blob saving existed".
  *
  * @param {string} repoDir - the copy the patch was computed in.
  * @param {string} base - the base commit the patch was diffed against.
@@ -4669,7 +5217,7 @@ function preimageEntries(repoDir, base, env = process.env) {
  * @param {(message: string) => void} log - where a failure is named.
  * @param {NodeJS.ProcessEnv} [env] - environment for git, naming the staged index.
  * @returns {Array<{path: string, mode: string, blob: string}> | undefined} the base entries,
- *   or undefined when they could not be read or saved.
+ *   or undefined when they could not be read.
  */
 function savePreimageBlobs(repoDir, base, patchDir, patchId, log, env = process.env) {
   let entries
@@ -4679,17 +5227,38 @@ function savePreimageBlobs(repoDir, base, patchDir, patchId, log, env = process.
     log(`could not read the preimage of ${patchId} (${messageOf(error)}); a three-way merge of this patch will not be possible`)
     return undefined
   }
-  if (entries.blobs.length > 0) {
+  let blobs = entries.blobs
+  if (blobs.length > 0) {
+    try {
+      const checked = git(['cat-file', '--batch-check'], repoDir, process.env, `${blobs.join('\n')}\n`)
+      const missing = new Set(
+        checked
+          .split('\n')
+          .filter((line) => line.endsWith(' missing'))
+          .map((line) => line.slice(0, line.indexOf(' '))),
+      )
+      if (missing.size > 0) {
+        blobs = blobs.filter((blob) => !missing.has(blob))
+        log(
+          `the copy does not hold the base blob(s) ${[...missing].join(', ')} of ${patchId}; ` +
+            'a three-way merge looks for them in your repository instead',
+        )
+      }
+    } catch {
+      // The pack below fails the same way, and says why.
+    }
+  }
+  if (blobs.length > 0) {
     try {
       const dir = blobsDirectory(patchDir, patchId)
       mkdirSync(join(dir, 'pack'), { recursive: true })
-      git(['pack-objects', '-q', join(dir, 'pack', 'pack')], repoDir, process.env, `${entries.blobs.join('\n')}\n`)
+      git(['pack-objects', '-q', join(dir, 'pack', 'pack')], repoDir, process.env, `${blobs.join('\n')}\n`)
     } catch (error) {
       // A half-written pack is worse than none: the merge would read a truncated object
-      // store and could merge against a tree that is not the patch's base.
+      // store. The entries stay, so the merge asks the caller's repository for each blob
+      // and refuses, file by file, only those it cannot find.
       rmSync(blobsDirectory(patchDir, patchId), { recursive: true, force: true })
-      log(`could not save the base blobs of ${patchId} (${messageOf(error)}); a three-way merge of this patch will not be possible`)
-      return undefined
+      log(`could not save the base blobs of ${patchId} (${messageOf(error)}); a three-way merge of this patch looks for them in your repository`)
     }
   }
   return entries.preimage
@@ -4717,6 +5286,103 @@ function touchedPaths(record) {
   // record field, so it is taken as it stands.
   for (const entry of record.preimage ?? []) paths.add(entry.path)
   return [...paths]
+}
+
+/**
+ * The base entries a patch states about itself, for a record that saved none.
+ *
+ * Every section that changes or removes an existing file carries `index <old>..<new>`, and
+ * the old id is the blob the patch was computed against. The ids are abbreviated, and a
+ * section without an `index` line (a pure rename, a mode-only change) states no id at all:
+ * its `blob` is null, which is how a caller tells "this patch cannot name its base" from
+ * "its base is not here".
+ *
+ * @param {string} diff - the whole stored patch.
+ * @returns {Array<{path: string, mode: string, blob: string | null}>} the base entries.
+ */
+function patchBaseEntries(diff) {
+  const entries = []
+  for (const section of diffSections(diff)) {
+    if (!section.text.startsWith('diff --git ')) continue
+    const { from } = diffSectionPaths(section.text)
+    if (from === null) continue
+    // Only the header lines: below the first hunk a line is content, not a header.
+    const header = section.text.split('\n')
+    const hunk = header.findIndex((line) => line.startsWith('@@') || line.startsWith('GIT binary patch') || line.startsWith('Binary files '))
+    const head = (hunk < 0 ? header : header.slice(0, hunk)).join('\n')
+    if (/^new file mode /m.test(head)) continue
+    const index = /^index ([0-9a-f]+)\.\.[0-9a-f]+(?: (\d+))?$/m.exec(head)
+    const mode = index?.[2] ?? /^(?:old|deleted file) mode (\d+)$/m.exec(head)?.[1] ?? '100644'
+    entries.push({ path: from, mode, blob: index === null ? null : index[1] })
+  }
+  return entries
+}
+
+/**
+ * How many complete conflict-marker blocks a text holds.
+ *
+ * A block is a `<<<<<<< ` line, a later `=======` line and a later `>>>>>>> ` line, in
+ * that order. A lone `=======` is a Markdown heading underline or a table rule, not a
+ * conflict, so only the whole triple counts. Binary content holds none.
+ *
+ * @param {Buffer | string} content - the file's bytes.
+ * @returns {number} the number of blocks.
+ */
+function conflictMarkerCount(content) {
+  if (typeof content !== 'string') {
+    if (content.includes(0)) return 0
+    content = content.toString('utf8')
+  }
+  let count = 0
+  let seen = 0
+  for (const line of content.split(/\r?\n/)) {
+    if (seen === 0 && line.startsWith('<<<<<<< ')) seen = 1
+    else if (seen === 1 && line === '=======') seen = 2
+    else if (seen === 2 && line.startsWith('>>>>>>> ')) {
+      count += 1
+      seen = 0
+    }
+  }
+  return count
+}
+
+/**
+ * The files whose added lines hold a complete conflict-marker block.
+ *
+ * Only the patch is read: a `+` line of a hunk is text the worker wrote, so a block there
+ * was either meant (a test fixture) or left over from a merge in the worker's copy. Git's own
+ * conflicts are reported by the merge and are not looked for here.
+ *
+ * @param {string} patch - a patch's text.
+ * @returns {string[]} the files, by the name a caller selects them with.
+ */
+function patchMarkerFiles(patch) {
+  const files = []
+  for (const section of diffSections(patch)) {
+    const added = []
+    let inHunk = false
+    for (const line of section.text.split('\n')) {
+      if (line.startsWith('@@')) inHunk = true
+      else if (inHunk && line.startsWith('+')) added.push(line.slice(1))
+    }
+    if (conflictMarkerCount(added.join('\n')) === 0) continue
+    const names = diffSectionNames(section)
+    if (names.length > 0) files.push(names[names.length - 1])
+  }
+  return files
+}
+
+/**
+ * The warning for a patch that adds conflict markers to files.
+ *
+ * @param {string[]} names - the files.
+ * @returns {string} the warning.
+ */
+function patchMarkerWarning(names) {
+  return (
+    `WARNING: the patch itself adds conflict markers to ${names.join(', ')}; if they are not intended (a test fixture), ` +
+    'they are left over from a merge in the worker\'s copy'
+  )
 }
 
 /**
@@ -5483,6 +6149,37 @@ function workingTreeBlob(target, path) {
 }
 
 /**
+ * The ids of every patch in `record`'s line of work: the patches it continued from, however far
+ * back, and the patches that continued from it.
+ *
+ * @param {object} record - the patch record.
+ * @param {object[]} all - every stored record of the root.
+ * @returns {Set<string>} the related ids, `record` itself excluded.
+ */
+function patchLineage(record, all) {
+  const byId = new Map(all.map((entry) => [entry.patchId, entry]))
+  const related = new Set()
+  for (let id = record.basePatch; typeof id === 'string' && !related.has(id); id = byId.get(id)?.basePatch) related.add(id)
+  for (let grew = true; grew; ) {
+    grew = false
+    for (const entry of all) {
+      if (related.has(entry.patchId) || entry.patchId === record.patchId) continue
+      if (entry.basePatch === record.patchId || related.has(entry.basePatch)) {
+        related.add(entry.patchId)
+        grew = true
+      }
+    }
+  }
+  related.delete(record.patchId)
+  return related
+}
+
+/** The `overlaps` field of a patch page or a result: present only when there is an overlap. */
+export function overlapField(overlaps) {
+  return overlaps.length === 0 ? {} : { overlaps }
+}
+
+/**
  * The warning that a patch's files moved in the caller's tree while the worker ran.
  *
  * @param {string[]} files - the patch's files that changed since its base.
@@ -5534,6 +6231,11 @@ export class WorkspaceIsolation {
    * @param {string} [options.platform] - platform whose `platform` section applies, and
    *   whose environment-name case rule is used (default `process.platform`; injectable
    *   so a Windows section can be tested anywhere).
+   * @param {(from: string, to: string) => void} [options.renameDirectory] - the rename that
+   *   moves a build cache in and out of the per-root store; `fs.renameSync` unless given, so
+   *   a test can make it fail the way an open handle does on Windows.
+   * @param {(path: string) => object} [options.statfs] - `fs.statfsSync`, asked once per
+   *   leased slot for the free space of the state volume; injectable for tests.
    * @param {(message: string) => void} [options.log] - progress log.
    */
   constructor({
@@ -5549,6 +6251,8 @@ export class WorkspaceIsolation {
     sweepIntervalMs = SWEEP_INTERVAL_MS,
     deferStartupSweep = false,
     platform = process.platform,
+    renameDirectory = renameSync,
+    statfs = statfsSync,
     log = () => {},
   }) {
     this.root = resolve(root)
@@ -5567,6 +6271,14 @@ export class WorkspaceIsolation {
     this.patchDir = this.ownsStateDir ? defaultPatchDir(this.root) : join(this.stateDir, 'calls')
     this.patchRetentionDays = patchRetentionDays
     this.maxStateBytes = maxStateBytes
+    this.renameDirectory = renameDirectory
+    this.statfs = statfs
+    /**
+     * Where idle build caches wait between servers. Only the default layout has one: a
+     * configured state directory is the deployment's to manage, and a store beside it would
+     * be state the operator did not ask for.
+     */
+    this.cacheStore = this.ownsStateDir ? cacheStoreDir(this.baseDir, this.root) : undefined
     this.log = log
     /**
      * Whether the heavy start-up work was deferred to `startupSweep()`.
@@ -5914,6 +6626,85 @@ export class WorkspaceIsolation {
   }
 
   /**
+   * The cache store policy the sweeps and the store trim use, or undefined without a store.
+   *
+   * The store keeps at most as many caches as this root has slots: a cache beyond that can
+   * never be claimed by a server of this configuration at the same time as the others, so it
+   * is disk with no reader. The age limit is the patch retention window, which is the
+   * existing answer to "how long is idle state worth keeping".
+   *
+   * @returns {{storeDir: string, max: number, retentionDays: number, rename: Function} | undefined} the policy.
+   */
+  #cachePolicy() {
+    if (this.cacheStore === undefined) return undefined
+    return { storeDir: this.cacheStore, max: this.slotCount, retentionDays: this.patchRetentionDays, rename: this.renameDirectory }
+  }
+
+  /**
+   * Trim the cache store to the slot count and the retention window.
+   * @returns {void}
+   */
+  #trimCacheStore() {
+    const policy = this.#cachePolicy()
+    if (policy === undefined) return
+    trimCacheStore(policy.storeDir, { max: policy.max, retentionDays: policy.retentionDays, log: this.log })
+  }
+
+  /**
+   * Hand a retired tree's `.flash-cache` to the store, when `trim` is about to remove the tree
+   * and no slot could take it. Only a tree whose runtimes were shut down is touched, for the
+   * reason `#keepRetiredCache` gives.
+   *
+   * @param {Slot} slot - the slot the retired tree belonged to.
+   * @param {string} retired - the retired tree about to be removed.
+   * @returns {void}
+   */
+  #storeRetiredCache(slot, retired) {
+    const policy = this.#cachePolicy()
+    if (policy === undefined || !slot.stoppedOrphans.has(retired)) return
+    putCacheInStore(join(retired, SLOT_CACHE), policy.storeDir, { rename: policy.rename, log: this.log })
+    this.#trimCacheStore()
+  }
+
+  /**
+   * Take a stored cache into a slot that has none, before the copy is made.
+   *
+   * @param {Slot} slot - the slot being prepared.
+   * @returns {boolean} whether a stored cache was claimed.
+   */
+  #claimStoredCache(slot) {
+    if (this.cacheStore === undefined || holdsAnyFile(join(slot.dir, SLOT_CACHE))) return false
+    return claimStoredCache(this.cacheStore, join(slot.dir, SLOT_CACHE), { rename: this.renameDirectory, log: this.log }) !== undefined
+  }
+
+  /**
+   * The warning a call carries when the state volume is nearly full, or undefined.
+   *
+   * One `statfs`, which is cheap, so it runs at every lease; it never blocks the call. A
+   * failing `statfs` is logged and the call proceeds without a warning.
+   *
+   * @returns {string | undefined} the warning.
+   */
+  #lowDiskWarning() {
+    let space
+    try {
+      space = volumeSpace(this.stateDir, this.statfs)
+    } catch (error) {
+      this.log(`could not read the free space of the state volume: ${messageOf(error)}`)
+      return undefined
+    }
+    if (!(space.totalBytes > 0)) return undefined
+    if (space.freeBytes >= space.totalBytes * LOW_DISK_FREE_FRACTION && space.freeBytes >= LOW_DISK_FREE_BYTES) return undefined
+    const where = this.ownsStateDir ? this.baseDir : this.stateDir
+    return (
+      `only ${formatBytes(space.freeBytes)} of ${formatBytes(space.totalBytes)} is free on the volume holding the state ` +
+      `directory ${where}, where the worker copies and stored build caches live; a build can fill the rest. ` +
+      'Run `flash-agents clean` to remove dead servers\' copies and stored caches, and `flash-agents doctor` ' +
+      '(the state-disk row) to see what each slot and the cache store take'
+    )
+  }
+
+  /**
    * The heavy part of construction, unchanged: migrate the legacy store, salvage and
    * remove dead owners, drop empty foreign digests, prune expired patches.
    *
@@ -5927,8 +6718,9 @@ export class WorkspaceIsolation {
   #startupWorkSync() {
     if (this.ownsStateDir) {
       this.#migrateLegacyStore()
-      sweepDeadOwners(this.root, { patchDir: this.patchDir, baseDir: this.baseDir, log: this.log })
-      removeEmptyForeignDigests(this.root, { baseDir: this.baseDir, log: this.log })
+      sweepDeadOwners(this.root, { patchDir: this.patchDir, baseDir: this.baseDir, log: this.log, caches: this.#cachePolicy() })
+      this.#trimCacheStore()
+      removeEmptyForeignDigests(this.root, { baseDir: this.baseDir, retentionDays: this.patchRetentionDays, log: this.log })
     }
     prunePatches(this.patchDir, { retentionDays: this.patchRetentionDays })
   }
@@ -6016,10 +6808,12 @@ export class WorkspaceIsolation {
           baseDir: this.baseDir,
           log: this.log,
           stopped: () => this.closed,
+          caches: this.#cachePolicy(),
         })
         Object.assign(stats, { salvaged: swept.salvaged, kept: swept.kept, removed: swept.removed, patches: swept.patches })
         if (swept.stopped) return
-        removeEmptyForeignDigests(this.root, { baseDir: this.baseDir, log: this.log })
+        this.#trimCacheStore()
+        removeEmptyForeignDigests(this.root, { baseDir: this.baseDir, retentionDays: this.patchRetentionDays, log: this.log })
       }
       // Between every remaining step: a `close()` that ran during the sweep must not leave
       // pruning or a reload happening after it returned.
@@ -6079,7 +6873,7 @@ export class WorkspaceIsolation {
     if (!this.ownsStateDir) return
     if (!this.startupSweepDone) return
     const migrated = this.#retryLegacyMigration()
-    const swept = sweepDeadOwners(this.root, { patchDir: this.patchDir, baseDir: this.baseDir, log: this.log })
+    const swept = sweepDeadOwners(this.root, { patchDir: this.patchDir, baseDir: this.baseDir, log: this.log, caches: this.#cachePolicy() })
     // While a live old server keeps writing into the legacy store, the in-memory view is
     // refreshed from it too: the old server may have committed a patch since construction,
     // and the caller of this server must be able to list it. The reload is two small
@@ -6162,7 +6956,7 @@ export class WorkspaceIsolation {
       // user lost 35.6 GB of cargo target and seeded cargo home here, and the next call
       // compiled from cold for 65 minutes. It still leaves the measured state, because the
       // slot's own directory is not part of what the cap counts.
-      this.#keepRetiredCache(tree.slot, tree.dir)
+      if (!this.#keepRetiredCache(tree.slot, tree.dir)) this.#storeRetiredCache(tree.slot, tree.dir)
       rmSync(tree.dir, { recursive: true, force: true })
       tree.slot.orphans.splice(tree.slot.orphans.indexOf(tree.dir), 1)
       tree.slot.stoppedOrphans.delete(tree.dir)
@@ -6471,6 +7265,8 @@ export class WorkspaceIsolation {
       slot.settings = this.settings
       slot.settingsWarnings = []
     }
+    const lowDisk = this.#lowDiskWarning()
+    if (lowDisk !== undefined) slot.settingsWarnings = [...(slot.settingsWarnings ?? []), lowDisk]
   }
 
   /**
@@ -6596,7 +7392,10 @@ export class WorkspaceIsolation {
     // minutes take an hour, and a slow job should say why.
     // A slot replaced after a timeout takes the retired tree's warm cache first, so the
     // retry that usually follows does not build from cold.
-    this.#adoptRetiredCache(slot)
+    slot.buildCacheFrom = undefined
+    if (this.#adoptRetiredCache(slot)) slot.buildCacheFrom = 'retired-slot'
+    // A slot that is still cold after that claims a cache an earlier server left in the store.
+    else if (this.#claimStoredCache(slot)) slot.buildCacheFrom = 'store'
     slot.buildCacheEmpty = this.#buildCacheEmpty(slot, settings)
     if (slot.buildCacheEmpty) {
       this.log(
@@ -6672,6 +7471,8 @@ export class WorkspaceIsolation {
     slot.baseParent = null
     slot.baseReason = undefined
     slot.uncommitted = { count: 0, files: [] }
+    slot.headLeftOut = undefined
+    slot.basePatchId = undefined
     // The worker has nowhere legitimate to name outside its copy — the wall refuses
     // it — so it is given a scratch directory *inside* the copy and told about it in
     // its prompt. It is not handed over through TMPDIR: the runtime's sandbox derives
@@ -6707,6 +7508,11 @@ export class WorkspaceIsolation {
       }
       this.#createSlotEnv(slot)
       if (source === 'head') {
+        // What the reset is about to leave out, read first: a patch against the last commit
+        // may not apply on top of work the caller has not committed.
+        const headChanged = changedInCaller(original, repointed)
+        const leftOut = uncommittedIn(repoDir, new Set(repointed.filter((path) => !headChanged.has(path))))
+        if (leftOut.count > 0) slot.headLeftOut = leftOut
         // The copy starts from the last commit: tracked files return to HEAD and untracked,
         // non-ignored files are removed. `-x` is deliberately absent — ignored build output
         // and dependencies such as node_modules stay, which is the point of running this in
@@ -7439,6 +8245,7 @@ export class WorkspaceIsolation {
     slot.dir = nextDir
     slot.orphans.push(orphan)
     if (sessionStopped === true) slot.stoppedOrphans.add(orphan)
+    else markLiveOrphan(orphan, this.log)
     slot.base = null
     slot.baseReason = undefined
     slot.tmpDir = undefined
@@ -7606,6 +8413,7 @@ export class WorkspaceIsolation {
       createdAt: Date.now(),
       appliedAt: null,
     }
+    if (slot.basePatchId !== undefined) record.basePatch = slot.basePatchId
     if (preimage !== undefined) record.preimage = preimage
     // The task the copy was prepared for travels with the patch: after a crash or a
     // restart, the record itself says whose work this was.
@@ -7781,6 +8589,10 @@ export class WorkspaceIsolation {
                 : {}),
             })
       if (drift !== null && drift.filesChangedSince.length > 0) warnings.push(driftWarning(drift.filesChangedSince))
+      // The outcome's own warnings (markers nobody reported) come after the ones above and
+      // must not replace them.
+      const { warnings: outcomeWarnings = [], ...settled } = outcome
+      warnings.push(...outcomeWarnings)
       return {
         patchId: record.patchId,
         dryRun,
@@ -7790,7 +8602,7 @@ export class WorkspaceIsolation {
         drift,
         ...(warnings.length === 0 ? {} : { warnings }),
         ...(record.task === undefined ? {} : { task: record.task }),
-        ...outcome,
+        ...settled,
       }
     } finally {
       // Also on a refusal or a failed apply: the subset is a view of the stored patch, and
@@ -7872,9 +8684,17 @@ export class WorkspaceIsolation {
           `Pass source: "head" to start from the last commit instead, or apply patch ${record.patchId} to your tree with flash_apply first.`,
       )
     }
+    if (outcome.status === 'failed') {
+      throw new Error(
+        `${outcome.note}. Continuing from this patch is not possible in the copy. ` +
+          `Pass source: "head" to start from the last commit instead, or apply patch ${record.patchId} to your tree with flash_apply first.`,
+      )
+    }
     // The copy's state now includes the base patch's change, so what it started with changed
     // too: an ignored path the patch created is part of that state, not the worker's work.
     this.#recordIgnored(slot, target)
+    // This call's patch will contain the base patch's change, so the base is superseded by it.
+    slot.basePatchId = record.patchId
     // The copy holds the change whether the patch applied outright, the merge wrote something,
     // or the merge found the copy already equal to its result. Conflict markers are reported
     // as conflicts, and the worker is told to resolve them.
@@ -7930,6 +8750,8 @@ export class WorkspaceIsolation {
     const env = workTree ? undefined : { ...process.env, GIT_CEILING_DIRECTORIES: dirname(target) }
     const applyArgs = ['apply', '--whitespace=nowarn']
     const check = dryRun ? ['--check'] : []
+    // A three-way caller is told about every file, and about markers the patch itself adds.
+    const names = threeWay ? recordPaths(record.filesChanged) : []
     try {
       git([...applyArgs, ...check, record.patchPath], target, env)
     } catch (plainError) {
@@ -7941,7 +8763,17 @@ export class WorkspaceIsolation {
       return this.#threeWayMerge(record, target, { dryRun, plainError, mark, markRecord, markFiles })
     }
     if (!dryRun && mark) this.#markApplied(markRecord, markFiles)
-    return { applied: !dryRun, threeWay: false, conflicts: [], indexTouched: false }
+    if (!threeWay) return { applied: !dryRun, threeWay: false, conflicts: [], indexTouched: false }
+    const marked = patchMarkerFiles(readFileSync(record.patchPath, 'utf8'))
+    return {
+      applied: !dryRun,
+      threeWay: false,
+      conflicts: [],
+      indexTouched: false,
+      status: 'success',
+      files: names.map((path) => ({ path, status: 'applied' })),
+      ...(marked.length > 0 ? { warnings: [patchMarkerWarning(marked)] } : {}),
+    }
   }
 
   /**
@@ -7991,17 +8823,19 @@ export class WorkspaceIsolation {
    *   applied is a narrowed partial one.
    * @param {string[]} [options.markFiles] - the selected files' record spelling; omitted
    *   for a whole apply.
-   * @returns {{threeWay: true, applied: boolean, conflicts: string[], indexTouched: false, note?: string}} the outcome.
-   * @throws {Error} when the base is unavailable, git is too old, or the merge errors.
+   * @returns {{threeWay: true, applied: boolean, conflicts: string[], indexTouched: false, status: 'success' | 'conflict' | 'failed',
+   *   files: Array<{path: string, status: 'applied' | 'merged' | 'conflict' | 'failed', reason?: string}>,
+   *   appliable?: string[], note?: string, warnings?: string[]}} the outcome. When some files have no
+   *   base, nothing is written and `status` is `failed`, with the files that can still go in
+   *   `appliable`. A file whose merged content holds conflict markers its caller version
+   *   lacked is a `conflict`, and `warnings` says so.
+   * @throws {Error} when no file has a base, git is too old, or the merge errors.
    */
   #threeWayMerge(record, target, { dryRun, plainError, mark = false, markRecord = record, markFiles }) {
     const patchId = record.patchId
     const unavailable =
       `The base of patch ${patchId} is not available for a three-way merge ` +
       '(it was made before blob saving existed, or saving failed).'
-    if (!Array.isArray(record.preimage)) {
-      throw new Error(`${messageOf(plainError)}. ${unavailable} The patch is at ${patchMessagePath(record)}.`)
-    }
     requireMergeTree(target)
     const scratch = mkdtempSync(join(this.stateDir, 'merge-'))
     const env = { ...process.env }
@@ -8037,14 +8871,72 @@ export class WorkspaceIsolation {
         writeFileSync(join(scratch, '.git', 'objects', 'info', 'alternates'), `${alternates.join('\n')}\n`)
       }
       // Base B: the preimage entries of the patch, and only those. An addition contributes
-      // nothing, which is why an add-only patch merges against the empty tree.
+      // nothing, which is why an add-only patch merges against the empty tree. A record
+      // without a preimage (made before blob saving, or whose saving failed) falls back to
+      // what the patch itself states: its `index <old>..<new>` lines name the base blobs,
+      // and the caller's repository is asked for them.
+      const saved = Array.isArray(record.preimage)
+      const entries = saved
+        ? record.preimage.filter((entry) => entry !== null && typeof entry === 'object' && typeof entry.path === 'string')
+        : patchBaseEntries(readFileSync(record.patchPath, 'utf8'))
+      const noBase = 'patch record has no saved base (made before 0.1.x)'
+      /** @type {Map<string, string>} the reason per base path that cannot be found */
+      const missing = new Map()
+      const found = []
+      for (const entry of entries) {
+        // A gitlink is recorded by id alone; its commit lives in the submodule's repository.
+        if (entry.mode === GITLINK_MODE) {
+          found.push(entry)
+          continue
+        }
+        if (typeof entry.blob !== 'string') {
+          missing.set(entry.path, noBase)
+          continue
+        }
+        // The patch's own ids are abbreviated; the scratch repository resolves them through
+        // the same two object stores the lookup of a saved id uses.
+        const looked = saved
+          ? gitAllowFailure(['cat-file', '-e', entry.blob], scratch, env).status === 0 && { blob: entry.blob }
+          : this.#fullBlobId(entry.blob, scratch, env)
+        if (looked === false || looked === undefined) {
+          const absent = `base blob ${entry.blob} is not in this repository`
+          missing.set(entry.path, saved ? absent : `${noBase}, and ${absent}`)
+          continue
+        }
+        found.push({ ...entry, blob: looked.blob })
+      }
+      // Each patch file with its names: a rename is found by its old path (the base entry)
+      // and reported by its new one, the spelling `files` takes.
+      const patchFiles = (record.filesChanged ?? []).map((line) => ({ name: nameStatusEntry(line).path, paths: recordEntry(line).paths }))
+      const failed = new Map()
+      for (const [path, reason] of missing) {
+        const owner = patchFiles.find((file) => file.paths.includes(path))
+        const name = owner?.name ?? path
+        failed.set(name, failed.has(name) ? `${failed.get(name)}; ${reason}` : reason)
+      }
+      const failedPaths = new Set(patchFiles.filter((file) => failed.has(file.name)).flatMap((file) => file.paths))
+      const appliable = patchFiles.filter((file) => !failed.has(file.name))
+      if (failed.size > 0 && appliable.length === 0) {
+        const reasons = [...failed].map(([name, reason]) => `${name}: ${reason}`).join('; ')
+        throw new Error(`${messageOf(plainError)}. ${unavailable} ${reasons}. The patch is at ${patchMessagePath(record)}.`)
+      }
+      // A file that failed stops the whole write (all or nothing), but the others are still
+      // merged here, without writing, so each is reported with the status it would get.
+      const wholePatch = failed.size === 0
+      const writing = wholePatch && !dryRun
+      let patchFile = record.patchPath
+      if (!wholePatch) {
+        const keep = new Set(appliable.flatMap((file) => file.paths))
+        const sections = diffSections(readFileSync(record.patchPath, 'utf8')).filter((section) =>
+          diffSectionNames(section).some((name) => keep.has(name)),
+        )
+        patchFile = join(scratch, 'appliable.patch')
+        writeFileSync(patchFile, sections.map((section) => section.text).join(''))
+      }
       let baseTree
       try {
-        for (const entry of record.preimage) {
-          // A gitlink is recorded by id alone; its commit lives in the submodule's repository.
-          if (entry.mode !== GITLINK_MODE && gitAllowFailure(['cat-file', '-e', entry.blob], scratch, env).status !== 0) {
-            throw new Error(`blob ${entry.blob} for ${entry.path} is in neither the saved blobs nor ${target}`)
-          }
+        for (const entry of found) {
+          if (failedPaths.has(entry.path)) continue
           git(['update-index', '--add', '--cacheinfo', `${entry.mode},${entry.blob},${entry.path}`], scratch, env)
         }
         baseTree = git(['write-tree'], scratch, env).trim()
@@ -8054,12 +8946,13 @@ export class WorkspaceIsolation {
       const base = git([...COMMIT_CONFIG, 'commit-tree', baseTree, '-m', 'flash base'], scratch, env).trim()
       // Theirs W: the patch was computed against exactly this base, so it applies cleanly.
       git(['read-tree', baseTree], scratch, env)
-      git(['apply', '--cached', '--whitespace=nowarn', record.patchPath], scratch, env)
+      git(['apply', '--cached', '--whitespace=nowarn', patchFile], scratch, env)
       const theirsTree = git(['write-tree'], scratch, env).trim()
       const theirs = git([...COMMIT_CONFIG, 'commit-tree', theirsTree, '-p', base, '-m', 'flash worker'], scratch, env).trim()
       // Ours O: the caller's own files, at every path the patch touches, over the same base.
       git(['read-tree', baseTree], scratch, env)
-      for (const path of touchedPaths(record)) this.#stageCallerPath(scratch, target, path, env)
+      const touched = wholePatch ? touchedPaths(record) : appliable.flatMap((file) => file.paths)
+      for (const path of touched) this.#stageCallerPath(scratch, target, path, env)
       const oursTree = git(['write-tree'], scratch, env).trim()
       const ours = git([...COMMIT_CONFIG, 'commit-tree', oursTree, '-p', base, '-m', 'flash caller'], scratch, env).trim()
       const merged = gitAllowFailure(['merge-tree', '--write-tree', '--name-only', '--no-messages', ours, theirs], scratch, env)
@@ -8078,7 +8971,38 @@ export class WorkspaceIsolation {
         // conflict is reported with the name a caller can match against its own tree.
         conflicts.push(diffPathToken(line))
       }
-      const outcome = dryRun ? { written: false, submodules: [] } : this.#writeMergedTree(scratch, target, ours, resultTree, env)
+      // A status per file, from what git's merge reported. Markers the patch itself adds are
+      // not a conflict; they are a warning (see `patchMarkerFiles`).
+      const callerMoved = new Set(
+        git(['diff-tree', '-r', '--name-only', '-z', '--no-renames', baseTree, oursTree], scratch, env).split('\0').filter((name) => name !== ''),
+      )
+      const statuses = []
+      for (const file of appliable) {
+        const status = file.paths.some((path) => conflicts.includes(path)) ? 'conflict' : file.paths.some((path) => callerMoved.has(path)) ? 'merged' : 'applied'
+        statuses.push({ path: file.name, status })
+      }
+      for (const [name, reason] of failed) statuses.push({ path: name, status: 'failed', reason })
+      const order = new Map(patchFiles.map((file, at) => [file.name, at]))
+      statuses.sort((a, b) => (order.get(a.path) ?? 0) - (order.get(b.path) ?? 0))
+      const marked = patchMarkerFiles(readFileSync(patchFile, 'utf8'))
+      const warnings = marked.length === 0 ? [] : [patchMarkerWarning(marked)]
+      if (!wholePatch) {
+        const names = [...failed.keys()]
+        return {
+          threeWay: true,
+          conflicts,
+          indexTouched: false,
+          applied: false,
+          status: 'failed',
+          files: statuses,
+          appliable: appliable.map((file) => file.name),
+          note:
+            `nothing was written: ${names.join(', ')} could not be merged (${[...failed.values()].join('; ')}); ` +
+            `the other files can be applied with files: ${JSON.stringify(appliable.map((file) => file.name))}`,
+          ...(warnings.length === 0 ? {} : { warnings }),
+        }
+      }
+      const outcome = writing ? this.#writeMergedTree(scratch, target, ours, resultTree, env) : { written: false, submodules: [] }
       let note
       // The change is recorded as applied only when something was written. A merge whose
       // result already equals the caller's tree — because the caller already made the same
@@ -8106,11 +9030,29 @@ export class WorkspaceIsolation {
         conflicts,
         indexTouched: false,
         applied: !dryRun && outcome.written,
+        status: conflicts.length > 0 ? 'conflict' : 'success',
+        files: statuses,
         ...(note === undefined ? {} : { note }),
+        ...(warnings.length === 0 ? {} : { warnings }),
       }
     } finally {
       rmSync(scratch, { recursive: true, force: true })
     }
+  }
+
+  /**
+   * Resolve a patch's abbreviated base blob id to the full id, in the scratch repository.
+   *
+   * @param {string} abbreviated - the id from a patch's `index` line.
+   * @param {string} scratch - the scratch repository, with the caller's objects borrowed.
+   * @param {NodeJS.ProcessEnv} env - environment for git.
+   * @returns {{blob: string} | undefined} the full id, or undefined when no such blob is there
+   *   (or the abbreviation is ambiguous).
+   */
+  #fullBlobId(abbreviated, scratch, env) {
+    const resolved = gitAllowFailure(['rev-parse', '--verify', '-q', `${abbreviated}^{blob}`], scratch, env)
+    const blob = resolved.stdout.trim()
+    return resolved.status === 0 && /^[0-9a-f]{40,64}$/.test(blob) ? { blob } : undefined
   }
 
   /**
@@ -8387,6 +9329,7 @@ export class WorkspaceIsolation {
       // made a 300-file patch paged ten times cost tens of seconds, so it rides with the
       // worker's final message on the page that starts at offset 0 only.
       ...(page.offset === 0 ? { drift: patchDrift(record, this.root) } : {}),
+      ...(page.offset === 0 ? overlapField(this.overlapsOf(record.patchId)) : {}),
       totalChars: text.length,
       offset: page.offset,
       diff: page.diff,
@@ -8395,13 +9338,101 @@ export class WorkspaceIsolation {
       ...(record.task === undefined ? {} : { task: record.task }),
       // The worker's report is a preamble to the patch, not part of it: repeating ten
       // thousand characters on every page would be most of what a paging caller reads.
-      ...(page.offset === 0 && typeof record.finalMessage === 'string'
-        ? {
-            finalMessage: record.finalMessage,
-            ...(record.finalMessageTruncated === true ? { finalMessageTruncated: true } : {}),
-          }
-        : {}),
+      ...(page.offset === 0 ? this.#reportFields(record) : {}),
+      ...(record.cancelled === undefined ? {} : { cancelled: record.cancelled }),
     }
+  }
+
+  /**
+   * The other stored patches of this root that change a file this patch changes and are
+   * neither applied nor in this patch's lineage.
+   *
+   * Two jobs started from one tree can take the same next database schema number, and the clash
+   * showed only when the second patch was applied. A patch that continued from another
+   * (`basePatch`) contains it, so the two are one line of work and never overlap; a patch
+   * applied whole is in the tree already, and a partly applied one only counts for the files
+   * it has not applied.
+   *
+   * @param {string} patchId - a patch id of this root.
+   * @returns {Array<{patchId: string, files: string[], label: string, createdAt: number}>} newest first.
+   */
+  overlapsOf(patchId) {
+    const record = this.#lookupPatch(patchId)
+    const mine = new Set(recordPaths(record.filesChanged))
+    const related = patchLineage(record, [...this.patches.values()])
+    const found = []
+    for (const other of this.patches.values()) {
+      if (other.patchId === record.patchId || related.has(other.patchId)) continue
+      if (other.appliedAt !== null && other.appliedAt !== undefined) continue
+      if ((other.scope ?? '') !== (record.scope ?? '')) continue
+      const applied = new Set(Array.isArray(other.appliedFiles) ? other.appliedFiles : [])
+      const files = recordPaths(other.filesChanged).filter((name) => mine.has(name) && !applied.has(name))
+      if (files.length === 0) continue
+      found.push({
+        patchId: other.patchId,
+        files,
+        label: typeof other.task?.label === 'string' ? other.task.label : '',
+        createdAt: other.createdAt,
+      })
+    }
+    return found.sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0))
+  }
+
+  /**
+   * The report fields of a patch's first page: the whole report when its file is still
+   * there, otherwise the record's 8,000-character excerpt.
+   *
+   * @param {object} record - the patch record.
+   * @returns {object} `finalMessage` (and `finalMessageTruncated` for an excerpt), `reportPath`.
+   */
+  #reportFields(record) {
+    const whole = typeof record.reportPath === 'string' ? readReportFile(record.reportPath) : undefined
+    if (typeof whole?.report === 'string') return { finalMessage: whole.report, reportPath: record.reportPath }
+    if (typeof record.finalMessage !== 'string') return {}
+    return {
+      finalMessage: record.finalMessage,
+      ...(record.finalMessageTruncated === true ? { finalMessageTruncated: true } : {}),
+      ...(typeof record.reportPath === 'string' ? { reportPath: record.reportPath } : {}),
+    }
+  }
+
+  /**
+   * Drop a patch that holds no change: the record `collect` writes for an empty copy.
+   *
+   * @param {string} patchId - the full id of a patch this service stored.
+   * @returns {void}
+   */
+  forgetPatch(patchId) {
+    const record = this.#lookupPatch(patchId)
+    if ((record.filesChanged ?? []).length > 0) throw new Error(`patch ${record.patchId} holds a change and is not dropped`)
+    removeStoredPatch(record.storeDir ?? this.patchDir, record.patchId)
+    this.patches.delete(record.patchId)
+  }
+
+  /**
+   * Store the whole report of one finished call next to the patch records.
+   *
+   * @param {string} key - the job id, or the call's session id when it had no job.
+   * @param {object} record - what the report says: `report` (the whole text) and its context.
+   * @returns {string} the path written.
+   * @throws {Error} when the key is not a report key or the file cannot be written.
+   */
+  storeReport(key, record) {
+    const path = reportFilePath(this.patchDir, key)
+    mkdirSync(this.patchDir, { recursive: true })
+    writeFileSync(path, `${JSON.stringify({ key, ...record }, null, 2)}\n`)
+    return path
+  }
+
+  /**
+   * Read a stored report by its key.
+   *
+   * @param {string} key - the job id or session id it was stored under.
+   * @returns {object | undefined} the stored record, or undefined when there is none.
+   */
+  readReport(key) {
+    if (typeof key !== 'string' || !REPORT_KEY.test(key)) return undefined
+    return readReportFile(reportFilePath(this.patchDir, key))
   }
 
   /**
@@ -8417,12 +9448,17 @@ export class WorkspaceIsolation {
    * @param {object} [options] - what the worker said.
    * @param {string} [options.finalMessage] - the worker's final report; the first 8,000
    *   characters are kept, and `finalMessageTruncated` says when it was cut.
+   * @param {string} [options.reportPath] - where the whole report is stored.
+   * @param {{jobId?: string, at: string}} [options.cancelled] - the cancelled job the patch
+   *   was salvaged from.
    * @returns {void}
    * @throws {Error} when the id is malformed, unknown, or belongs to another root, exactly
    *   as `apply` refuses one.
    */
-  annotatePatch(patchId, { finalMessage } = {}) {
+  annotatePatch(patchId, { finalMessage, reportPath, cancelled } = {}) {
     const record = this.#lookupPatch(patchId)
+    if (typeof reportPath === 'string') record.reportPath = reportPath
+    if (cancelled !== undefined) record.cancelled = cancelled
     if (typeof finalMessage === 'string') {
       record.finalMessage = finalMessage.slice(0, FINAL_MESSAGE_MAX)
       if (finalMessage.length > FINAL_MESSAGE_MAX) record.finalMessageTruncated = true
@@ -8694,15 +9730,35 @@ export class WorkspaceIsolation {
   close() {
     this.closed = true
     if (this.sweepTimer !== undefined) clearInterval(this.sweepTimer)
+    const policy = this.#cachePolicy()
     for (const slot of this.slots) {
-      // No build cache is moved here, unlike in `trim`: the slot's own directory goes in the
-      // same pass, and a default state directory belongs to this process alone, so there is
-      // no later call that could find a cache kept for it.
+      // A cache is no longer lost with its tree: the next server on this root claims it from
+      // the store. A rename that fails is logged and the cache goes with the tree as before.
+      if (policy !== undefined) {
+        // The rule of `#storeRetiredCache`: a cache is moved only when nothing of the slot can
+        // still be writing into it. A retired tree whose runtimes were not shut down means a
+        // process of this slot may be alive, and a running call holds the slot's own tree.
+        const alive = slot.orphans.filter((orphan) => !slot.stoppedOrphans.has(orphan))
+        if (alive.length > 0 || slot.busy) {
+          const why = slot.busy ? `a call still holds slot ${String(slot.id)}` : `its runtimes were not shut down when ${alive.join(', ')} was retired`
+          this.log(`close: not storing the build cache of ${slot.dir}: ${why}`)
+        } else {
+          putCacheInStore(join(slot.dir, SLOT_CACHE), policy.storeDir, { rename: policy.rename, log: this.log })
+        }
+        for (const orphan of slot.orphans) {
+          if (slot.stoppedOrphans.has(orphan)) putCacheInStore(join(orphan, SLOT_CACHE), policy.storeDir, { rename: policy.rename, log: this.log })
+          else this.log(`close: not storing the build cache of retired tree ${orphan}: its runtimes were not shut down when it was retired`)
+        }
+      }
       rmSync(slot.dir, { recursive: true, force: true })
-      for (const orphan of slot.orphans) rmSync(orphan, { recursive: true, force: true })
+      for (const orphan of slot.orphans) {
+        rmSync(orphan, { recursive: true, force: true })
+        rmSync(liveOrphanMarker(orphan), { force: true })
+      }
     }
     // Belt and braces: everything above lives under `slots`, so this also catches any
     // orphan a slot no longer names.
     rmSync(join(this.stateDir, 'slots'), { recursive: true, force: true })
+    this.#trimCacheStore()
   }
 }

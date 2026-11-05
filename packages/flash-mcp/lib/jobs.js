@@ -40,7 +40,7 @@ export const JOB_TOOLS = [
     description: [
       'Report the state of a background flash_task or flash_batch call started with `background: true`.',
       '',
-      'With a jobId, returns that job\'s state ("running", "ok", "failed", or "cancelled"), its label,',
+      'With a jobId, returns that job\'s state ("running", "failed", "cancelled", or the status its result ended with: "ok", "partial", "error"), its label,',
       'when it started and (once ended) when it ended, how long it has run, and its most recent',
       'progress line. Without a jobId, lists jobs: the ones still running (newest first), then the',
       'most recently ended ones, up to `limit` of them (default 10), together with how many are',
@@ -49,7 +49,10 @@ export const JOB_TOOLS = [
       '',
       'A running job also shows what its workers are doing as of the last heartbeat: `current` lists',
       'each open tool call (tool, command, since, runningMs), and `warnings` names a command that',
-      'failed three or more times in the call — a worker repeating a step its sandbox cannot finish.',
+      'failed three or more times in the call — a worker repeating a step its sandbox cannot finish —',
+      'or a tool call whose process tree has used no CPU for minutes. A `current` entry carries `child`',
+      '(command, runningMs, cpuSeconds) when a process under the runtime has run longer than the command.',
+      '`info` lists failures the brief asked for (checks that fail before the change and pass after it).',
       'A job still waiting for a free tree shows `queue`: its place in line (`position` of `of`; trees go',
       'to the longest waiter first) and the calls holding the trees (`holders`: jobId when it is a job,',
       'label, runningMs).',
@@ -100,8 +103,9 @@ export const JOB_TOOLS = [
       'reading twice returns the same thing, but it is kept in memory only: an ended job is',
       'dropped six hours after it ended, and once more than 50 have ended, results you have',
       'already collected and failed or cancelled jobs may be evicted sooner. A successful result',
-      'you have not collected is never evicted by that count. None survives a restart — the',
-      'finished work is salvaged as a patch instead.',
+      'you have not collected is never evicted by that count. The result does not survive a restart,',
+      'but the worker\'s whole report does: for a job the server no longer holds, flash_result returns',
+      'the stored report with its status (and `reportPath`), and the finished work is a patch as well.',
     ].join('\n'),
     inputSchema: {
       type: 'object',
@@ -129,9 +133,10 @@ export const JOB_TOOLS = [
       '',
       'Aborts the job and waits up to 30 seconds for the call to settle. Cancellation follows the same',
       'path as cancelling a synchronous call: the service abandons the lease, or shuts the runtime down',
-      'and retires the tree. A cancelled writing call\'s tree is therefore retired and its partial work',
-      'is not returned — only a later salvage turns it into a patch. The state reported is "cancelled",',
-      'or whatever the call had already ended as if it finished first.',
+      'and retires the tree. A cancelled writing call\'s partial work is stored as a patch first (marked as',
+      'from a cancelled job); the answer names its `patchId` and `diffstat`, or says `stored: false` when the',
+      'copy held no change. The state reported is "cancelled", or whatever the call had already ended as if',
+      'it finished first.',
       '',
       'A job that has already ended is returned unchanged, with a note saying so. Cancelling does not',
       'undo a change that was already applied with `apply: "auto"`.',
@@ -383,7 +388,7 @@ export class JobRegistry {
     // retried, so those are evicted first, oldest first. An uncollected `ok` job is left to
     // the retention window above and is never removed by the cap.
     const evictable = ended
-      .filter((job) => job.collected === true || job.state !== 'ok')
+      .filter((job) => job.collected === true || job.error !== undefined)
       .sort((a, b) => a.endedMs - b.endedMs)
     const excess = ended.length - this.maxEnded
     for (const job of evictable.slice(0, excess)) this.jobs.delete(job.jobId)
@@ -436,7 +441,10 @@ export class JobRegistry {
     const endedMs = this.now()
     job.endedMs = endedMs
     job.endedAt = new Date(endedMs).toISOString()
-    if (job.error === undefined) job.state = 'ok'
+    // One source of truth: a call that returned a result is as good or as bad as that result
+    // says. The state used to be "ok" for any call that did not throw, so a result of status
+    // "error" sat beside a job that read "ok".
+    if (job.error === undefined) job.state = typeof job.result?.status === 'string' ? job.result.status : 'ok'
     else if (job.controller.signal.aborted || job.error?.code === 'CANCELLED') job.state = 'cancelled'
     else job.state = 'failed'
     this.log(`job ${job.jobId} ${job.kind} ended ${job.state} in ${formatMinutes(endedMs - job.startedMs)} min`)
@@ -456,6 +464,7 @@ export class JobRegistry {
     const current = detail?.current
     const warnings = detail?.warnings
     const queue = detail?.queue
+    const info = detail?.info
     return {
       jobId: job.jobId,
       kind: job.kind,
@@ -469,8 +478,9 @@ export class JobRegistry {
         : { lastProgress: { message: job.lastProgress.message, at: job.lastProgress.at } }),
       ...(Array.isArray(current) && current.length > 0 ? { current } : {}),
       ...(Array.isArray(warnings) && warnings.length > 0 ? { warnings } : {}),
+      ...(Array.isArray(info) && info.length > 0 ? { info } : {}),
       ...(queue !== null && typeof queue === 'object' && !Array.isArray(queue) ? { queue } : {}),
-      resultReady: job.state === 'ok',
+      resultReady: job.state !== 'running' && job.error === undefined,
     }
   }
 }

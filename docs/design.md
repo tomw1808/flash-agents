@@ -1334,6 +1334,13 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
 
 ## Known limits
 
+- **The process watcher sees only the runtime's own process tree.** It samples `ps` (PowerShell's
+  `Win32_Process` on Windows) from outside the sandbox, once a minute while a tool call is open, and
+  follows parent ids from the runtime's pid. A process that daemonises and is re-parented to init
+  leaves the tree and is not counted. The held-open-shell warning assumes the harness runs a shell
+  call as `bash -c "<cmd>"`, so the command text is visible; it is new in 0.1.11 and not yet checked
+  against a live worker.
+
 - **`flash_gauntlet` is not implemented over MCP.** The Ralph row stays disabled in the service
   profile: `flash_task` covers one task and `flash_batch` covers a pre-split fleet, and an iterative
   gauntlet has no external-agent use case yet. (The interactive preset keeps `ralph`.)

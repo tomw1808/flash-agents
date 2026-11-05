@@ -163,7 +163,7 @@ in rounds, and applies the patches it accepts.
 | `/flash-agents:gauntlet` | Several competing builders, cheap critics, and a blind A/B judged by Claude. For problems with more than one plausible approach and a result you can run. |
 | `/flash-agents:setup` | One-time install check and smoke test. |
 
-Pass `mode: "read-only"` for reviews and codebase maps: that call runs in a second process whose
+Pass `mode: "read-only"` (or `readOnly: true`) for reviews and codebase maps: that call runs in a second process whose
 sandbox refuses every write — including the writes a build or a test run makes. For a review that
 has to build or run tests, use a writing call with `apply: "none"` (the default): it runs in a
 throwaway copy and stores what it changed as a patch, so its test files can be applied later — a
@@ -177,9 +177,21 @@ ended, and for a running one says what its workers are doing: `current` holds ea
 (`tool`, `command`, `since`, `runningMs`, as of the last heartbeat) and `warnings` names a command
 that failed three or more times in the call. A worker waiting on a backgrounded command shows that
 command instead, with `background: <job id>` and the time since the shell call that started it; a
-background command that ends non-zero counts toward `warnings` like a foreground one. A job sent
-with `taskFile` is labelled with the brief's first line rather than `(untitled task)`, so a long
-brief's job is recognisable in the listing. A
+background command that ends non-zero counts toward `warnings` like a foreground one. The warning
+names the real command after a prefix such as `nice -n 19` or `timeout 600`, groups spellings of one
+command (`cargo test 2>&1 | tail -50` and `cargo test`), quotes the last output line, says when a
+later run passed, and reads an exit code above 128 as a signal (`exit 137 = killed by signal 9`). When
+the brief asks for tests that fail before a fix, those failures are an `info` line, not a warning.
+
+The service also watches each running worker's process tree from outside the sandbox (once a minute,
+only while a tool call is open). `current` names the longest-running child of an open command
+(`child: { command, runningMs, cpuSeconds }`, such as the `cmake` under a `cargo check`). A command
+whose whole tree used under a second of CPU for five minutes gets a warning that it may be waiting
+forever. A shell call whose script ended while processes it started (a test server, a browser) still
+hold it open gets one too. Nothing is stopped for you: `flash_cancel` keeps the change so far.
+
+A job is labelled with `label` when you pass one (up to 120 characters), else with the brief's first
+line, so jobs whose briefs start with the same shared rules still differ in the listing. A
 call still waiting for a free copy says where it stands and what it waits behind — `queued 1m10s: 2nd
 in line for a free tree (first come, first served); trees held by job-ab12cd34 (fix the parser,
 31m0s) and a foreground call (review it, 2m0s)` — and `flash_status` carries the same as
@@ -201,6 +213,13 @@ The result carries `retried` (the reason, and the first attempt's session, durat
 warning. A slow failure, and any attempt that left a change in the copy, is not retried: that is a
 verdict.
 
+A call that ends "ok" but whose final message is no report — empty, or the worker's next tool call
+written out as text (`<｜DSML｜ invoke name="edit">`, `invoke name="bash"`) — comes back as
+`status: "error"` with `finalMessageProblem: "empty"` or `"tool-call-markup"`. That planned call never
+ran, so checks the worker claims may not have run either. The change so far is still stored as a
+patch: verify it, and continue with `basePatch`. `flash_status` shows a job's state as its result's
+status (`ok`, `partial`, `error`), so the two never disagree.
+
 A long brief can be written to a file and sent with `taskFile` instead of `task` — exactly as
 written, once. When a worker stopped partway, `basePatch: <its patchId>` starts the next call
 from that work: the patch is applied to the new copy first (merged if your tree moved on), and
@@ -217,6 +236,15 @@ stored patch records the task that made it — the brief's first line, the job i
 the `taskFile` path — and, once the call finished, the worker's final report (first 8,000
 characters). `flash_patch` returns the task on every page and the report on the first; `flash_apply`
 returns the task. A patch salvaged after a crash still names its task.
+
+Every finished job's whole report is also stored on disk by job id, read-only and `discard` jobs
+included, and the result names it as `reportPath`; a result cut at 24,000 characters points there.
+`flash_result` for a job the server no longer holds (after a restart) returns that stored report with
+its status, and `flash_patch` returns the whole report rather than the excerpt. `flash_cancel` on a
+writing job stores the copy's change as a patch before the copy goes and returns its `patchId`, or
+says `stored: false` when there was none. `flash_patch` and a writing result list `overlaps`: other
+unapplied patches of the same root that change any of the same files, such as two jobs that both took
+the next schema number.
 
 A patch can also be applied a file at a time. `flash_apply` takes `files`, naming entries as
 `change.filesChanged` spells them (a rename by its old or by its new path), and records each applied
@@ -237,6 +265,14 @@ refused instead: `threeWay: true` merges it and keeps
 your edit (conflicts are marked in the file), and `force: true` applies it anyway and discards the
 edit. Before 0.1.8 such an apply removed the file without a word.
 
+A `threeWay` apply reports every file as `applied`, `merged`, `conflict` or `failed` (with the
+reason), under `files`, with an overall `status`. A file whose base the patch record lacks is merged
+from the base blob in your own repository, named by the patch's `index` line. Before 0.1.11 one such
+file refused the whole apply as "base not available". When a file still fails, nothing is written,
+and `appliable` lists the files that can be applied with `files`. A patch that itself adds conflict markers
+(left over from a merge in the worker's copy, or a test fixture that means them) gets a loud warning
+naming the files, on a `dryRun` too.
+
 A `threeWay` apply reads every merged file before it writes the first one, so one that fails
 writes nothing; only a disk error during the writes can stop it partway, and then its error names
 every file it already wrote or deleted. A merged file keeps the line endings it has in your tree
@@ -245,7 +281,8 @@ every file it already wrote or deleted. A merged file keeps the line endings it 
 
 Every result reports the tokens the call used (`usage`), and lists any uncommitted files the copy
 started with (`isolation.uncommittedAtStart`). If another session has uncommitted work in the same
-tree, `source: "head"` starts the copy from the last commit instead. `head` is a writing call's
+tree, `source: "head"` starts the copy from the last commit instead; the result then warns how many
+uncommitted files of your tree it left out, since the patch may not apply on top of them. `head` is a writing call's
 choice only: a read-only call runs in your tree rather than in a copy, and refuses it.
 
 Project facts every worker needs — layout, check commands, style rules — go in an `AGENTS.md` (or
@@ -388,6 +425,12 @@ checkout gets neither, because no `platform.linux` section names them.
   folders (and `slotSetup`'s `keep` paths) move to the replacement copy instead of being deleted, so
   the retry does not build from cold; each `slotSetup` step runs once more there. A result with
   `isolation.buildCacheEmpty: true` started with an empty cache, which explains a slow build.
+  Since 0.1.11 the `cache:` folders also outlive the server: when it shuts down, or when the next
+  one finds it dead, they go into a store for the repository (one per slot, kept 14 days), and a
+  new server's slots take them from there (`isolation.buildCacheFrom: "store"`). `flash-agents clean`
+  removes them with the rest, `clean --caches` removes only them, and `doctor` lists what each slot,
+  its cache and the store take on disk. A call warns when the volume holding the copies has under
+  10 % or under 5 GiB free.
   `port:<base>` gives each slot its own port base (`base + slot × 10`; `port:41000/100` for a
   stride of 100), for test servers that would otherwise share a fixed port. `value:<text>` sets a
   plain value in every slot, for a setting the whole project shares rather than one brief:
@@ -505,7 +548,13 @@ To watch workers live, set a log file and `tail -f` it — see
   it: Python 3.12.4+ and 3.13 create one for `os.mkdir(..., 0o700)`, `tempfile.mkdtemp()` and
   therefore pytest's `tmp_path`. Named pipes are blocked too, which stops `multiprocessing` and
   pytest-xdist, and may be the cause of Node's `spawn EPERM`, since libuv uses named pipes. Run
-  such tests yourself on the applied patch.
+  such tests yourself on the applied patch. A user traced the pipe block (thank you): a pipe made
+  without its own security descriptor gets a default that a sandboxed process cannot open for
+  writing, even its own. So ninja hangs forever (it does not check that open), and MSBuild with more
+  than one node fails with "0 errors"; CMake's Visual Studio generator with one node works. Cargo
+  also cannot reach crates.io inside the sandbox (TLS fails). Workers on Windows are told all three.
+  Native CMake dependencies are best built by a `slotSetup` step, which runs outside the sandbox,
+  into a `cache:` folder, which since 0.1.11 survives a restart.
 - macOS and Linux are what we test on. Windows 11 works in daily use by at least one user; directory
   junctions are recreated as junctions inside the copy.
 

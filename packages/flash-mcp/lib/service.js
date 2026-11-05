@@ -24,12 +24,15 @@ import {
   IsolationError,
   WorkspaceIsolation,
   canonicalTmpdir,
+  overlapField,
   recordPaths,
+  reportFilePath,
   slotPathWarning,
   slotRootPath,
 } from './isolation.js'
 import { estimateInstructions } from './instructions.js'
 import { HarnessSdkClient, DEFAULT_INITIALIZE_TIMEOUT_MS, resolveDshCommand } from './sdk.js'
+import { ProcessWatch, quietWarning, heldOpenWarning, longestChild } from './proctree.js'
 import { FLASH_MCP_VERSION, profileHonoursModelEnv, resolveDshHome } from './doctor.js'
 
 /** Route the service pins; callers can never change the provider. */
@@ -240,6 +243,8 @@ export class FlashTaskService {
    *   stamp read used for that re-read (injectable, so a test needs no real `~/.dsh`).
    * @param {Map<string, string | undefined> | Record<string, string | undefined>} [options.profileStampWarnings]
    *   the start-time verdict per profile, used until that profile's runtime boots.
+   * @param {() => Promise<object[]>} [options.processList] - reads the machine's process table
+   *   (default `listProcesses`; injectable so a test watches a fake table, never the real one).
    * @param {(message: string) => void} [options.log] - diagnostic sink (stderr).
    * @param {(profile: string, cwd: string, extraEnv?: object) => HarnessSdkClient} [options.clientFactory]
    *   runtime factory (tests).
@@ -272,6 +277,7 @@ export class FlashTaskService {
     profileStampReader,
     profileStampWarnings = new Map(),
     log = () => {},
+    processList,
     clientFactory,
     isolate = {},
   }) {
@@ -320,6 +326,8 @@ export class FlashTaskService {
     this.initTimeoutMs = initTimeoutMs
     this.env = env
     this.log = log
+    /** Reads runtimes' process trees for the stuck-command and held-open warnings, off the call path. */
+    this.procWatch = new ProcessWatch({ list: processList, log })
     // Kept for the worker's prompt: the shell a worker's commands run in differs by platform,
     // and a worker that writes bash for PowerShell spends its turns on syntax errors.
     this.platform = platform
@@ -390,6 +398,10 @@ export class FlashTaskService {
             // The stdio server defers the dead-owner sweep until the client has finished the
             // handshake; every other caller leaves this out and gets the constructor's sweep.
             ...(isolate.deferStartupSweep === undefined ? {} : { deferStartupSweep: isolate.deferStartupSweep }),
+            // Injectable so a test can stub the free space of the state volume and the rename
+            // that moves a build cache in and out of the store.
+            ...(isolate.statfs === undefined ? {} : { statfs: isolate.statfs }),
+            ...(isolate.renameDirectory === undefined ? {} : { renameDirectory: isolate.renameDirectory }),
             log,
           })
     this.stateDir = this.isolation?.stateDir ?? resolve(isolate.stateDir ?? join(canonicalTmpdir(), 'flash-mcp'))
@@ -947,7 +959,7 @@ export class FlashTaskService {
    *   the fleet's `INVALID_ARGUMENT` for a per-item model.
    */
   checkModel(args, toolName) {
-    const profileName = this.#profileForMode(args?.mode)
+    const profileName = this.#profileForMode(resolveMode(args))
     this.#resolveModel(args?.model, profileName)
     if (toolName === 'flash_batch' && Array.isArray(args?.tasks)) {
       for (const [index, entry] of args.tasks.entries()) refuseItemModel(entry, index)
@@ -981,8 +993,9 @@ export class FlashTaskService {
     }
     this.#resolveCwd(args?.cwd)
     optionalText(args?.acceptance)
+    resolveLabel(args?.label)
     this.#resolveApply(args?.apply)
-    const profileName = this.#profileForMode(args?.mode)
+    const profileName = this.#profileForMode(resolveMode(args))
     this.#resolveModel(args?.model, profileName)
     const pool = this.#isolationFor(profileName)
     this.#resolveSource(args?.source, pool)
@@ -1058,11 +1071,14 @@ export class FlashTaskService {
     const taskFile = typeof args?.taskFile === 'string' ? args.taskFile : undefined
     const rootCwd = this.#resolveCwd(args?.cwd)
     const acceptance = optionalText(args?.acceptance)
+    // The caller's own name for the call, when it gave one: it replaces the brief's first line
+    // wherever the call is named, because briefs that open with shared rules all got one label.
+    const callLabel = resolveLabel(args?.label)
     const apply = this.#resolveApply(args?.apply)
     warnAboutIgnoredArguments(args, 'flash_task', this.log)
 
     const sessionId = `flash-task-${randomUUID()}`
-    const profileName = this.#profileForMode(args?.mode)
+    const profileName = this.#profileForMode(resolveMode(args))
     // Before anything is leased or copied: a model the user did not allow, or one an
     // installed profile cannot run, is a refusal that starts nothing.
     const model = this.#resolveModel(args?.model, profileName)
@@ -1085,6 +1101,7 @@ export class FlashTaskService {
     // The heartbeat names the session the call is waiting on. A retry replaces that session,
     // so the id lives on the activity record instead of in this closure.
     activity.sessionId = sessionId
+    activity.expectsFailBefore = asksForFailBefore(task, acceptance)
     const stopProgress = startProgress({
       activity,
       progress,
@@ -1108,7 +1125,7 @@ export class FlashTaskService {
         const queuedSince = this.#noteQueue(pool, activity, background !== true, ticket)
         slot = await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal, ticket, {
           ...(jobId === undefined ? {} : { jobId }),
-          label: label ?? taskLabel(task, HOLDER_LABEL_CHARS),
+          label: label ?? callLabel ?? taskLabel(task, HOLDER_LABEL_CHARS),
         })
         queuedMs = this.#noteLeased(activity, queuedSince)
         if (queuedSince !== undefined) {
@@ -1128,7 +1145,7 @@ export class FlashTaskService {
             // work it belongs to even after a crash or a restart.
             task: {
               kind: 'flash_task',
-              label: taskLabel(task, TASK_LABEL_CHARS),
+              label: callLabel ?? taskLabel(task, TASK_LABEL_CHARS),
               sessionId,
               ...(jobId === undefined ? {} : { jobId }),
               ...(taskFile === undefined ? {} : { taskFile }),
@@ -1238,8 +1255,10 @@ export class FlashTaskService {
       this.#logToolTrace(state)
       change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars, store: apply !== 'discard' })
       const applied = change?.available === true && apply === 'auto' ? this.#applyChange(change) : undefined
+      const reportKey = jobId ?? attemptSessionId
       const result = this.#buildResult({
         state,
+        reportPath: this.#reportPathFor(reportKey),
         sessionId: attemptSessionId,
         started,
         profile: profileName,
@@ -1261,13 +1280,15 @@ export class FlashTaskService {
       // After the result is built, because the report it carries is the primary child's full
       // text (before the result's own clipping), and before the copy is emptied: the patch is
       // the record from here on.
+      const report = state.children.at(-1)?.result ?? ''
+      this.#storeReport(result, { key: reportKey, report, kind: 'flash_task', jobId, label: callLabel ?? taskLabel(task, TASK_LABEL_CHARS) })
       if (change?.patchId !== undefined && apply !== 'discard') {
-        this.#annotatePatch(pool, change.patchId, state.children.at(-1)?.result ?? '')
+        this.#annotatePatch(pool, change.patchId, report, result.reportPath)
       }
       return result
     } catch (error) {
       if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'IDLE' || error?.code === 'CANCELLED')) {
-        await this.#salvageOrphaned(pool, slot, error, profileName)
+        await this.#salvageOrphaned(pool, slot, error, profileName, jobId)
       }
       throw error
     } finally {
@@ -1331,8 +1352,10 @@ export class FlashTaskService {
    * @param {object} slot - the leased tree.
    * @param {Error} error - the failure error, whose message is extended in place.
    * @param {string} profileName - the profile the orphaned call ran on.
+   * @param {string} [jobId] - the background job serving the call, recorded on a patch
+   *   salvaged from a cancellation.
    */
-  async #salvageOrphaned(pool, slot, error, profileName) {
+  async #salvageOrphaned(pool, slot, error, profileName, jobId) {
     let note
     /** What the collect itself warned about, such as a nested repository it could not read. */
     let warnings = []
@@ -1350,9 +1373,22 @@ export class FlashTaskService {
         note = `no change could be collected from the tree (${change.reason})`
       } else if (change.filesChanged.length === 0) {
         note = 'the tree held no change when the call ended early'
+        // `collect` records an empty copy as a patch too; nothing to apply is nothing to keep.
+        if (change.patchId !== undefined) pool.forgetPatch(change.patchId)
       } else {
         const summary = change.diffstat.split('\n').pop()?.trim() ?? ''
         note = `the change so far (${String(change.filesChanged.length)} file(s)) is stored as patch ${change.patchId}: ${summary}`
+        // Read by whoever reports the failure (flash_cancel names the patch it saved).
+        error.salvage = { patchId: change.patchId, diffstat: change.diffstat, filesChanged: recordPaths(change.filesChanged) }
+        if (error.code === 'CANCELLED') {
+          try {
+            pool.annotatePatch(change.patchId, {
+              cancelled: { ...(jobId === undefined ? {} : { jobId }), at: new Date().toISOString() },
+            })
+          } catch (annotateError) {
+            this.log(`could not mark patch ${change.patchId} as from a cancelled job: ${messageOf(annotateError)}`)
+          }
+        }
       }
     } catch (collectError) {
       note = `no change could be collected from the tree (${collectError instanceof Error ? collectError.message : String(collectError)})`
@@ -1388,6 +1424,8 @@ export class FlashTaskService {
       }
     }
     pool.retire(slot, { sessionStopped })
+    // Nothing stored is an answer too: a cancel reports it instead of leaving the caller to guess.
+    error.salvage ??= { note }
     const warned = warnings.map((warning) => `; ${warning}`).join('')
     this.log(`salvage: ${note}${warned}${refusals}`)
     error.message = `${error.message}. ${note.charAt(0).toUpperCase()}${note.slice(1)}${warned}${refusals}`
@@ -1424,11 +1462,12 @@ export class FlashTaskService {
     })
     const rootCwd = this.#resolveCwd(args?.cwd)
     const acceptance = optionalText(args?.acceptance)
+    const callLabel = resolveLabel(args?.label)
     const apply = this.#resolveApply(args?.apply)
     warnAboutIgnoredArguments(args, 'flash_batch', this.log)
 
     const sessionId = `flash-batch-${randomUUID()}`
-    const profileName = this.#profileForMode(args?.mode)
+    const profileName = this.#profileForMode(resolveMode(args))
     // One fleet is one dsh process, so one model for the dispatcher and every member.
     const model = this.#resolveModel(args?.model, profileName)
     // A fleet is one call and therefore one tree: its members share a working
@@ -1443,6 +1482,7 @@ export class FlashTaskService {
     // As in flashTask: the heartbeat reads the session id from the activity record, so a
     // retry's new session is named without restarting the timer.
     activity.sessionId = sessionId
+    activity.expectsFailBefore = tasks.some((entry) => asksForFailBefore(entry.task, entry.acceptance, acceptance))
     const stopProgress = startProgress({
       activity,
       progress,
@@ -1467,7 +1507,7 @@ export class FlashTaskService {
         slot = await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal, ticket, {
           ...(jobId === undefined ? {} : { jobId }),
           // The same words a fleet's job label uses, so the two never name one call differently.
-          label: label ?? `${String(tasks.length)} tasks`,
+          label: label ?? callLabel ?? `${String(tasks.length)} tasks`,
         })
         queuedMs = this.#noteLeased(activity, queuedSince)
         if (queuedSince !== undefined) {
@@ -1485,7 +1525,7 @@ export class FlashTaskService {
             // order, so the patch says what the fleet was asked to do.
             task: {
               kind: 'flash_batch',
-              label: batchTaskLabel(tasks),
+              label: callLabel ?? batchTaskLabel(tasks),
               sessionId,
               ...(jobId === undefined ? {} : { jobId }),
             },
@@ -1596,8 +1636,10 @@ export class FlashTaskService {
       this.#logToolTrace(state)
       change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars, store: apply !== 'discard' })
       const applied = change?.available === true && apply === 'auto' ? this.#applyChange(change) : undefined
+      const reportKey = jobId ?? attemptSessionId
       const result = this.#buildBatchResult({
         state,
+        reportPath: this.#reportPathFor(reportKey),
         tasks,
         sessionId: attemptSessionId,
         started,
@@ -1618,13 +1660,15 @@ export class FlashTaskService {
       })
       // The fleet's record carries one paragraph per member: the patch outlives the call,
       // and the workers' own accounts are the only explanation of it.
+      const report = result.fullReport ?? batchFinalMessage(result)
+      this.#storeReport(result, { key: reportKey, report, kind: 'flash_batch', jobId, label: callLabel ?? batchTaskLabel(tasks) })
       if (change?.patchId !== undefined && apply !== 'discard') {
-        this.#annotatePatch(pool, change.patchId, batchFinalMessage(result))
+        this.#annotatePatch(pool, change.patchId, report, result.reportPath)
       }
       return result
     } catch (error) {
       if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'IDLE' || error?.code === 'CANCELLED')) {
-        await this.#salvageOrphaned(pool, slot, error, profileName)
+        await this.#salvageOrphaned(pool, slot, error, profileName, jobId)
       }
       throw error
     } finally {
@@ -1726,15 +1770,77 @@ export class FlashTaskService {
    * @param {WorkspaceIsolation | undefined} pool - the pool that stored the patch.
    * @param {string} patchId - the patch to annotate.
    * @param {string} finalMessage - the worker's own account; an empty one is not written.
+   * @param {string} [reportPath] - where the whole report is stored, when it was.
    * @returns {void}
    */
-  #annotatePatch(pool, patchId, finalMessage) {
-    if (pool === undefined || typeof finalMessage !== 'string' || finalMessage.length === 0) return
+  #annotatePatch(pool, patchId, finalMessage, reportPath) {
+    if (pool === undefined || typeof finalMessage !== 'string' || (finalMessage.length === 0 && reportPath === undefined)) return
     try {
-      pool.annotatePatch(patchId, { finalMessage })
+      pool.annotatePatch(patchId, {
+        ...(finalMessage.length === 0 ? {} : { finalMessage }),
+        ...(reportPath === undefined ? {} : { reportPath }),
+      })
     } catch (error) {
       this.log(`could not attach the worker's report to patch ${patchId}: ${messageOf(error)}`)
     }
+  }
+
+  /**
+   * Where a call's whole report will be stored, or undefined when this service keeps no
+   * records (`--isolate none`). Read-only and discarding calls store one too: it is keyed by
+   * the job, not by a patch.
+   *
+   * @param {string} key - the job id, or the session id of a call that had no job.
+   * @returns {string | undefined} the path.
+   */
+  #reportPathFor(key) {
+    return this.isolation === undefined ? undefined : reportFilePath(this.isolation.patchDir, key)
+  }
+
+  /**
+   * Write a finished call's whole report beside the patch records, and say so on its result.
+   * A failed write is not a failed call: the result drops `reportPath` and carries a warning.
+   *
+   * @param {object} result - the call's result, completed in place.
+   * @param {object} options - what to store.
+   * @param {string} options.key - the job id, or the session id of a call that had no job.
+   * @param {string} options.report - the worker's whole final message.
+   * @param {'flash_task' | 'flash_batch'} options.kind - the tool.
+   * @param {string} [options.jobId] - the background job, when there was one.
+   * @param {string} options.label - the brief's first line.
+   * @returns {void}
+   */
+  #storeReport(result, { key, report, kind, jobId, label }) {
+    if (result.reportPath === undefined) return
+    try {
+      this.isolation.storeReport(key, {
+        kind,
+        ...(jobId === undefined ? {} : { jobId }),
+        sessionId: result.sessionId,
+        label,
+        status: result.status,
+        ...(result.stopReason === undefined ? {} : { stopReason: result.stopReason }),
+        ...(result.finalMessageProblem === undefined ? {} : { finalMessageProblem: result.finalMessageProblem }),
+        ...(result.change?.patchId === undefined ? {} : { patchId: result.change.patchId }),
+        createdAt: new Date().toISOString(),
+        report,
+      })
+    } catch (error) {
+      this.log(`could not store the whole report ${result.reportPath}: ${messageOf(error)}`)
+      delete result.reportPath
+      result.warnings = [...(result.warnings ?? []), `the worker's whole report could not be stored (${messageOf(error)})`]
+    }
+  }
+
+  /**
+   * A finished call's stored report, for a job the server no longer holds in memory.
+   *
+   * @param {string} key - the job id.
+   * @returns {object | undefined} the stored record, with its `reportPath`; undefined when none.
+   */
+  readReport(key) {
+    const record = this.isolation?.readReport(key)
+    return record === undefined ? undefined : { ...record, reportPath: reportFilePath(this.isolation.patchDir, key) }
   }
 
   /**
@@ -1905,6 +2011,10 @@ export class FlashTaskService {
     try {
       run = await this.#ensureRuntime(profile, cwd, extraEnv, model)
       const client = run.client
+      // The heartbeat reads this runtime's process tree for as long as the session runs; the
+      // runtime's pid is the root every tool call's processes hang below.
+      activity.runtimePid = client.pid
+      activity.procWatch = this.procWatch
       run.sessions += 1
       unsubscribe = client.onNotification((method, params) => {
         observe(state, method, params, sessionId, completion, this.log)
@@ -1936,6 +2046,9 @@ export class FlashTaskService {
       // The runtime's own count is what `#retireOtherModels` reads; it falls with the
       // session, on every path out of this method.
       if (run !== undefined) run.sessions = Math.max(0, run.sessions - 1)
+      activity.procWatch?.forget(activity.runtimePid)
+      delete activity.runtimePid
+      delete activity.proc
       this.#releaseRuntime(key)
       unsubscribe()
       offExit()
@@ -2172,6 +2285,9 @@ export class FlashTaskService {
         // Only when it is true: a warm slot is the normal case and says nothing, while a cold
         // one explains why a build that usually takes minutes took an hour.
         ...(slot?.buildCacheEmpty === true ? { buildCacheEmpty: true } : {}),
+        // Where this call's slot took its build cache from, when this call took one: the
+        // per-root store of an earlier server, or the retired tree of a timed-out call.
+        ...(slot?.buildCacheFrom === undefined ? {} : { buildCacheFrom: slot.buildCacheFrom }),
       },
       ...basePatchFields(basePatch),
     }
@@ -2206,6 +2322,24 @@ export class FlashTaskService {
     }
   }
 
+  /**
+   * The `overlaps` field of a writing result: stored patches of this root, not applied, that
+   * change a file this call's patch changes. Absent when there are none or nothing was stored.
+   *
+   * @param {object | undefined} change - the call's collected change.
+   * @returns {object} fields to spread into the result.
+   */
+  #overlapFields(change) {
+    if (change?.patchId === undefined || this.isolation === undefined) return {}
+    try {
+      return overlapField(this.isolation.overlapsOf(change.patchId))
+    } catch (error) {
+      // A result must not fail because a neighbour's record could not be read.
+      this.log(`could not look for patches overlapping ${change.patchId}: ${messageOf(error)}`)
+      return {}
+    }
+  }
+
   /** Assemble the compact per-task fleet result. */
   #buildBatchResult({
     state,
@@ -2226,6 +2360,7 @@ export class FlashTaskService {
     background = false,
     retried,
     activity,
+    reportPath,
   }) {
     const envelope = extractWorkflowValue(state.workflowText)
     const payload = envelope.value
@@ -2236,6 +2371,7 @@ export class FlashTaskService {
     if (basePatch?.warning !== undefined) warnings.push(basePatch.warning)
     // Nested repositories whose edits the patch could not carry.
     warnings.push(...(change?.warnings ?? []))
+    if (slot?.headLeftOut !== undefined) warnings.push(headLeftOutWarning(slot.headLeftOut))
     // Operational breadcrumb: enough to tell an unreadable value from a
     // mis-shaped one without ever returning the workflow's raw text.
     const header = parseWorkflowHeader(state.workflowText)
@@ -2252,6 +2388,9 @@ export class FlashTaskService {
       if (match !== null) members.set(Number(match[1]) - 1, agent)
     }
     const childById = new Map(state.children.map((child) => [child.childSessionId, child]))
+    // Each member's whole message, by task index: the entry's text is cut by the script and
+    // again by the result budget, the worker's own message is neither.
+    const fullTexts = new Map()
     // A member's refusals, attributed through the engine's own label mapping. The
     // engine reports the child under the label this service generated, so the
     // attribution is read, never guessed.
@@ -2295,7 +2434,12 @@ export class FlashTaskService {
           warnings.push(`task ${String(index + 1)} has no worker entry in the workflow return value`)
           return { index, status: 'unknown', result: '', resultTruncated: false, ...memberFields(member, childById), ...refusals(index), ...usageFields(index) }
         }
-        const clipped = truncate(typeof found.result === 'string' ? found.result : '', this.maxResultChars)
+        const memberChild = member?.childId === undefined ? undefined : childById.get(String(member.childId))
+        // The script cut the entry at perItemChars; only then is the worker's own message longer.
+        const entryText = typeof found.result === 'string' ? found.result : ''
+        const whole = entryText.length >= this.perItemChars && memberChild !== undefined ? memberChild.result : entryText
+        fullTexts.set(index, whole)
+        const clipped = truncate(typeof found.result === 'string' ? found.result : '', this.maxResultChars, reportPath)
         return {
           index,
           status: found.ok === true ? 'ok' : 'error',
@@ -2314,7 +2458,8 @@ export class FlashTaskService {
       results = tasks.map((entry, index) => {
         const member = members.get(index)
         const child = member?.childId === undefined ? undefined : childById.get(String(member.childId))
-        const clipped = truncate(child?.result ?? '', this.maxResultChars)
+        fullTexts.set(index, child?.result ?? '')
+        const clipped = truncate(child?.result ?? '', this.maxResultChars, reportPath)
         return {
           index,
           status: member?.outcome === 'completed' ? 'ok' : 'error',
@@ -2338,11 +2483,14 @@ export class FlashTaskService {
     // is computed from the corrected entries, so a silent member makes the fleet partial
     // or failed rather than quietly ok.
     if (results !== null) {
-      results = results.map((entry) =>
-        entry.status === 'ok' && entry.result.trim().length === 0
-          ? { ...entry, status: 'error', emptyResult: true }
-          : entry,
-      )
+      results = results.map((entry) => {
+        if (entry.status !== 'ok') return entry
+        const whole = fullTexts.get(entry.index) ?? entry.result
+        const problem = finalMessageProblem(whole)
+        if (problem === null) return entry
+        warnings.push(`task ${String(entry.index + 1)}: ${finalMessageWarning(problem, whole, { patchId: change?.patchId, changed: (change?.filesChanged ?? []).length > 0 })}`)
+        return { ...entry, status: 'error', finalMessageProblem: problem, ...(problem === 'empty' ? { emptyResult: true } : {}) }
+      })
     }
     const ok = results === null ? 0 : results.filter((entry) => entry.status === 'ok').length
     const failed = results === null ? 0 : results.length - ok
@@ -2399,7 +2547,7 @@ export class FlashTaskService {
     // weighing a fleet against doing the work itself needs to compare.
     const usage = usageTotal(state)
 
-    return {
+    const result = {
       status,
       requested: tasks.length,
       agentsStarted: typeof header.agentsStarted === 'number' ? header.agentsStarted : state.subagentStarts,
@@ -2427,9 +2575,19 @@ export class FlashTaskService {
       ...(setup === undefined || setup.length === 0 ? {} : { setup }),
       ...(retried === undefined ? {} : { retried }),
       runtime: this.#runtimeInfo(profile, cwd, model),
+      ...(reportPath === undefined ? {} : { reportPath }),
       ...this.#changeFields({ profileName: profile, slot, change, applied, basePatch }),
+      ...this.#overlapFields(change),
       ...(warnings.length === 0 ? {} : { warnings }),
+      ...(activityNotes(activity).length === 0 ? {} : { info: activityNotes(activity) }),
     }
+    // The whole reports, for the record on disk; not part of what the caller is sent.
+    Object.defineProperty(result, 'fullReport', {
+      value: (results ?? [])
+        .map((entry) => `task ${String(entry.index + 1)} (${String(entry.status)}): ${fullTexts.get(entry.index) ?? entry.result}`)
+        .join('\n\n'),
+    })
+    return result
   }
 
   /**
@@ -2487,9 +2645,10 @@ export class FlashTaskService {
     background = false,
     retried,
     activity,
+    reportPath,
   }) {
     const children = state.children.map((child) => {
-      const clipped = truncate(child.result, this.maxResultChars)
+      const clipped = truncate(child.result, this.maxResultChars, reportPath)
       return {
         status: child.status,
         stopReason: child.stopReason,
@@ -2509,11 +2668,19 @@ export class FlashTaskService {
     // what it was asked, and a caller that reads the status alone would accept it. Only an
     // empty message is reclassified — a short one is the worker's business, not ours.
     const changed = change?.available === true && (change.filesChanged ?? []).length > 0
-    const emptyResult = primary.result.trim().length === 0
+    const fullResult = state.children.at(-1).result
+    const emptyResult = fullResult.trim().length === 0
+    // An "ok" call whose last message is no report — empty, or the next tool call written out
+    // as text — is not a finished call either, whatever the worker's own stop reason says.
+    const problem = primary.status === 'ok' ? finalMessageProblem(fullResult) : null
     const warnings = []
     if (children.length > 1) warnings.push(`the orchestrator delegated ${String(children.length)} times; the last child is reported as the result`)
     if (primary.status !== 'ok') warnings.push(`the worker ended with status "${String(primary.status)}"`)
-    if (emptyResult && !changed) {
+    if (problem !== null) {
+      primary.status = 'error'
+      warnings.push(finalMessageWarning(problem, fullResult, { patchId: change?.patchId, changed }))
+    // Reachable only for a status other than "ok": an "ok" empty message is already `problem`.
+    } else if (emptyResult && !changed) {
       primary.status = 'error'
       warnings.push('the worker ended with an empty final message and changed nothing; treat the call as failed and send the task again')
     } else if (emptyResult) {
@@ -2523,6 +2690,7 @@ export class FlashTaskService {
     if (basePatch?.warning !== undefined) warnings.push(basePatch.warning)
     // Nested repositories whose edits the patch could not carry.
     warnings.push(...(change?.warnings ?? []))
+    if (slot?.headLeftOut !== undefined) warnings.push(headLeftOutWarning(slot.headLeftOut))
     if ((change?.ignored ?? []).length > 0) {
       warnings.push(
         `the worker created ${String(change.ignored.length)} path(s) that git ignores, so the patch cannot carry them: ${change.ignored.slice(0, 5).join(', ')}`,
@@ -2560,6 +2728,8 @@ export class FlashTaskService {
       result: primary.result,
       resultTruncated: primary.resultTruncated,
       ...(emptyResult ? { emptyResult: true } : {}),
+      ...(problem === null ? {} : { finalMessageProblem: problem }),
+      ...(reportPath === undefined ? {} : { reportPath }),
       childSessionId: primary.childSessionId,
       sessionId,
       mode: profile.endsWith('-readonly') ? 'read-only' : 'workspace-write',
@@ -2572,7 +2742,9 @@ export class FlashTaskService {
       ...(retried === undefined ? {} : { retried }),
       runtime: this.#runtimeInfo(profile, cwd, model),
       ...this.#changeFields({ profileName: profile, slot, change, applied, basePatch }),
+      ...this.#overlapFields(change),
       ...(warnings.length === 0 ? {} : { warnings }),
+      ...(activityNotes(activity).length === 0 ? {} : { info: activityNotes(activity) }),
       ...(children.length === 1 ? {} : { children }),
     }
   }
@@ -2687,6 +2859,70 @@ export function firstTaskLine(text) {
     if (trimmed.length > 0) return trimmed
   }
   return ''
+}
+
+/** How many of the left-out uncommitted files the `source: "head"` warning names. */
+const HEAD_WARNING_FILES = 5
+
+/**
+ * The warning a `source: "head"` call carries when the caller's tree held uncommitted work.
+ *
+ * @param {{count: number, files: string[]}} leftOut - what the reset to the last commit left out.
+ * @returns {string} the warning.
+ */
+function headLeftOutWarning(leftOut) {
+  const names = leftOut.files.slice(0, HEAD_WARNING_FILES).join(', ')
+  return (
+    `source "head" left out ${String(leftOut.count)} uncommitted files of your tree (${names}${leftOut.count > HEAD_WARNING_FILES ? ', …' : ''}); ` +
+    'the patch is against the last commit and may not apply on top of them'
+  )
+}
+
+/** The longest `label` a caller may give a call. */
+const CALL_LABEL_CHARS = 120
+
+/**
+ * The `label` argument: the caller's own name for a call.
+ *
+ * @param {unknown} value - the raw argument.
+ * @returns {string | undefined} the trimmed label, or undefined when none was given.
+ * @throws {FlashTaskError} `INVALID_ARGUMENT` when it is not a string of 1 to 120 characters once trimmed.
+ */
+export function resolveLabel(value) {
+  if (value === undefined || value === null) return undefined
+  const trimmed = typeof value === 'string' ? value.trim() : ''
+  if (typeof value !== 'string' || trimmed.length === 0 || trimmed.length > CALL_LABEL_CHARS) {
+    throw new FlashTaskError(
+      `label must be a string of 1 to ${String(CALL_LABEL_CHARS)} characters once trimmed; got ${typeof value === 'string' ? `${String(trimmed.length)} characters` : JSON.stringify(value)}`,
+      'INVALID_ARGUMENT',
+    )
+  }
+  return trimmed
+}
+
+/**
+ * The mode a call asks for, with the `readOnly` alias folded in: `readOnly: true` is
+ * `mode: "read-only"`, `readOnly: false` changes nothing, and `readOnly: true` beside a
+ * writing mode is a contradiction the caller must settle.
+ *
+ * @param {object | undefined} args - the raw tool arguments.
+ * @returns {unknown} the mode to resolve.
+ * @throws {FlashTaskError} `INVALID_ARGUMENT` for a non-boolean `readOnly`, `MODE_UNAVAILABLE` for the conflict.
+ */
+export function resolveMode(args) {
+  const readOnly = args?.readOnly
+  const mode = args?.mode
+  if (readOnly === undefined || readOnly === null || readOnly === false) return mode
+  if (readOnly !== true) {
+    throw new FlashTaskError(`readOnly must be a boolean; got ${JSON.stringify(readOnly)}`, 'INVALID_ARGUMENT')
+  }
+  if (mode !== undefined && mode !== null && mode !== 'read-only') {
+    throw new FlashTaskError(
+      `readOnly: true conflicts with mode ${JSON.stringify(mode)}; pass one of them, or mode "read-only"`,
+      'MODE_UNAVAILABLE',
+    )
+  }
+  return 'read-only'
 }
 
 /**
@@ -3055,8 +3291,30 @@ function noteToolResult(activity, session, event, log) {
   countFailure(activity, call, {
     exitCode,
     name: typeof failure?.name === 'string' ? failure.name : undefined,
+    output: lastOutputLine(text),
     log,
   })
+}
+
+/** How much of a failure's last output line a warning keeps. */
+const FAILURE_LINE_CHARS = 200
+
+/**
+ * The last non-empty line of a result's output, without the harness's own `[exit code: N]`
+ * marker: what the failing command printed last is usually why it failed.
+ *
+ * @param {string} text - the result's text.
+ * @returns {string | undefined} the line, at most `FAILURE_LINE_CHARS` characters.
+ */
+function lastOutputLine(text) {
+  if (typeof text !== 'string') return undefined
+  const lines = text.split(/\r?\n/).map((line) => line.trim())
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]
+    if (line.length === 0 || /^\[exit code:\s*-?\d+\]$/.test(line)) continue
+    return line.length <= FAILURE_LINE_CHARS ? line : `${line.slice(0, FAILURE_LINE_CHARS - 1)}…`
+  }
+  return undefined
 }
 
 /**
@@ -3200,10 +3458,11 @@ function exitCodeInStatus(text) {
  * @param {object} options - what the failure was.
  * @param {number | undefined} options.exitCode - the exit code, when there was one.
  * @param {string | undefined} [options.name] - the tool error's name, when there was one.
+ * @param {string | undefined} [options.output] - the last line the failing command printed.
  * @param {(message: string) => void} options.log - diagnostic sink.
  * @returns {void}
  */
-function countFailure(activity, call, { exitCode, name, log }) {
+function countFailure(activity, call, { exitCode, name, output, log }) {
   if (exitCode === 1 && name === undefined && exitOneIsAnAnswer(call.command)) return
   const key = failureKeyOf(call)
   if (key.length === 0) return
@@ -3214,6 +3473,7 @@ function countFailure(activity, call, { exitCode, name, log }) {
   record.lastSeq = activity.resultSeq
   record.lastExitCode = exitCode
   record.lastName = name
+  record.lastLine = output
   if (call.file !== undefined) {
     record.file = call.file
   } else {
@@ -3279,7 +3539,7 @@ const EXIT_ONE_ANSWERS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'diff', 'cmp']
  * @returns {boolean} true for `grep`, `rg`, `git grep`, `diff` or `cmp` as the last stage.
  */
 function exitOneIsAnAnswer(command) {
-  const line = shellLineOf(withoutSetup(command))
+  const line = shellLineOf(withoutPrefixes(command))
   // A line whose quoting does not close is not one this can read; it stays counted.
   if (line === undefined || line.chained) return false
   const words = (line.stages.at(-1) ?? '').trim().split(/\s+/)
@@ -3434,7 +3694,7 @@ function describeToolCall(tool, args) {
  * @returns {string} the key, or `''` when nothing but setup segments was there.
  */
 function failureKey(command) {
-  return withoutSetup(command)
+  return normalizedCommand(command)
     .replace(/\s+/g, ' ')
     .trim()
     .split(' ')
@@ -3453,7 +3713,79 @@ function failureKey(command) {
  * @returns {string} the normalized command.
  */
 function exactCommandOf(command) {
-  return withoutSetup(command).replace(/\s+/g, ' ').trim()
+  return normalizedCommand(command).replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * The wrappers that only change how a command runs, each matched at the start of a command:
+ * `nice [-n N]`, `ionice …`, `time`, `/usr/bin/time [-p|-v]`, `timeout [opts] DURATION`,
+ * `env [VAR=val…]`, `stdbuf …` and `sudo`. A warning named `"nice -n" failed 4 times` for
+ * `nice -n 19 cargo test`, because the first two words were the wrapper's.
+ */
+const COMMAND_PREFIXES = [
+  /^nice(?:\s+-n\s*-?\d+|\s+--adjustment=-?\d+|\s+-\d+)?\s+/,
+  /^ionice(?:\s+(?:-[cnt]\s*\d+|--class(?:data)?(?:=|\s+)\S+|-p\s*\d+))*\s+/,
+  /^(?:\/usr\/bin\/)?time(?:\s+-[pvl]+)*\s+/,
+  /^timeout(?:\s+(?:--(?:signal|kill-after)(?:=|\s+)\S+|--[\w-]+|-[ks]\s*\S+|-[pv]))*\s+\d+(?:\.\d+)?[smhd]?\s+/,
+  /^env(?:\s+(?:-[iu]\S*(?:\s+\S+)?|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)))*\s+(?=\S)/,
+  /^stdbuf(?:\s+(?:-[ioe]\s*\S+|--(?:input|output|error)=\S+))*\s+/,
+  /^sudo(?:\s+-\S+)*\s+/,
+]
+
+/**
+ * The output plumbing a command may end with, matched at its end: `2>&1`, `| tail -n N`,
+ * `| head …`, `| tee …` and `; echo $?`. None of it changes which command ran or whether it
+ * passed, so `cargo test 2>&1 | tail -50` and `cargo test` are one command.
+ */
+const COMMAND_PLUMBING = [
+  /\s*;\s*echo\b[^;|&]*\$\?[^;|&]*$/,
+  /\s*\|\s*(?:tail|head|tee)\b[^|;&]*$/,
+  /\s+2>&1$/,
+]
+
+/**
+ * A command line without what does not say which command it is: leading setup (`cd`,
+ * assignments), the wrappers of `COMMAND_PREFIXES`, and the plumbing of `COMMAND_PLUMBING`
+ * at its end. Whitespace is not collapsed here.
+ *
+ * @param {string} command - the command line.
+ * @returns {string} what is left.
+ */
+function normalizedCommand(command) {
+  let text = withoutPrefixes(command)
+  for (let again = true; again; ) {
+    again = false
+    for (const pattern of COMMAND_PLUMBING) {
+      const next = text.replace(pattern, '')
+      if (next !== text) {
+        text = next
+        again = true
+      }
+    }
+  }
+  return text.trim()
+}
+
+/**
+ * A command line without its leading setup and its wrappers (see `COMMAND_PREFIXES`), so the
+ * program that really ran is first.
+ *
+ * @param {string} command - the command line.
+ * @returns {string} what is left.
+ */
+function withoutPrefixes(command) {
+  let text = withoutSetup(command)
+  for (let again = true; again; ) {
+    again = false
+    for (const pattern of COMMAND_PREFIXES) {
+      const next = text.replace(pattern, '')
+      if (next !== text && next.trim().length > 0) {
+        text = withoutSetup(next)
+        again = true
+      }
+    }
+  }
+  return text
 }
 
 /**
@@ -3530,11 +3862,44 @@ function exitCodeOf(text) {
  * @returns {string} `exit code 101, 40s ago`, or the tool error's name.
  */
 function failureSummary(record, now) {
+  const signal = record.lastExitCode === undefined ? undefined : signalExplanation(record.lastExitCode)
   const reason =
     record.lastExitCode !== undefined
-      ? `exit code ${String(record.lastExitCode)}`
+      ? signal === undefined
+        ? `exit code ${String(record.lastExitCode)}`
+        : `exit ${String(record.lastExitCode)} = ${signal}`
       : `tool error${record.lastName === undefined ? '' : ` ${record.lastName}`}`
-  return `${reason}, ${formatElapsed(now - record.lastAt)} ago`
+  const line = record.lastLine === undefined ? '' : `: ${record.lastLine}`
+  return `${reason}, ${formatElapsed(now - record.lastAt)} ago${line}`
+}
+
+/** The signals a shell reports as `128 + N`, with what each usually means. */
+const SIGNAL_EXPLANATIONS = new Map([
+  [1, 'SIGHUP — the terminal or parent went away'],
+  [2, 'SIGINT — interrupted'],
+  [3, 'SIGQUIT'],
+  [6, 'SIGABRT — the program aborted itself'],
+  [7, 'SIGBUS — a crash on a bad memory access'],
+  [9, 'SIGKILL — often the out-of-memory killer or a timeout'],
+  [11, 'SIGSEGV — a crash on a bad memory access'],
+  [13, 'SIGPIPE — a reader closed the pipe'],
+  [14, 'SIGALRM'],
+  [15, 'SIGTERM — asked to stop, often by a timeout or a cancel'],
+])
+
+/**
+ * What an exit code of 129 to 192 means: a shell reports a process that a signal ended as
+ * 128 plus the signal's number. Codes above that range (Windows status codes, say) are not
+ * signals and get no explanation.
+ *
+ * @param {number} code - the exit code.
+ * @returns {string | undefined} `killed by signal 9 (SIGKILL — …)`, or undefined.
+ */
+function signalExplanation(code) {
+  if (!Number.isInteger(code) || code < 129 || code > 192) return undefined
+  const signal = code - 128
+  const name = SIGNAL_EXPLANATIONS.get(signal)
+  return `killed by signal ${String(signal)}${name === undefined ? '' : ` (${name})`}`
 }
 
 /**
@@ -3587,13 +3952,77 @@ function laterSuccess(record, activity) {
  * @param {number} [now] - the clock to measure against.
  * @returns {string[]} the warnings, in the order the commands first failed.
  */
-function activityWarnings(activity, now = Date.now()) {
+export function activityWarnings(activity, now = Date.now()) {
   const warnings = []
   for (const [key, record] of activity?.failures ?? []) {
     if (record.count < REPEATED_FAILURE_THRESHOLD) continue
+    if (isExpectedFailure(record, activity)) continue
     warnings.push(repeatedFailureWarning(key, record, now, activity))
   }
+  // The process findings hold only while the call they were made about is still open.
+  const quiet = activity?.proc?.quiet
+  if (quiet !== undefined && activity.openCalls?.has(quiet.callKey)) warnings.push(quietWarning(quiet))
+  const held = activity?.proc?.held
+  if (held !== undefined && activity.openCalls?.has(held.callKey)) warnings.push(heldOpenWarning(held))
   return warnings
+}
+
+/**
+ * Whether a failed command is one the brief asked to fail first: a task that wants checks
+ * shown to fail before the fix and pass after it makes "failed N times, then passed" the
+ * expected shape, not a worker stuck in a loop.
+ *
+ * @param {object} record - the failure record.
+ * @param {object} [activity] - the call's activity record.
+ * @returns {boolean} true when the brief asked for it and a later run of the command passed.
+ */
+function isExpectedFailure(record, activity) {
+  return activity?.expectsFailBefore === true && laterSuccess(record, activity)?.kind === 'run'
+}
+
+/**
+ * Whether a brief asks for checks that fail before the change and pass after it.
+ *
+ * @param {...(string | undefined)} texts - the task and acceptance texts.
+ * @returns {boolean} true when any says "fails before", "fail before" or "fails without".
+ */
+export function asksForFailBefore(...texts) {
+  return texts.some((text) => typeof text === 'string' && /\bfails? before\b|\bfails without\b/i.test(text))
+}
+
+/**
+ * The information lines of a call: commands that failed on purpose and then passed.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @param {number} [now] - the clock to measure against.
+ * @returns {string[]} the lines.
+ */
+export function activityNotes(activity, now = Date.now()) {
+  const notes = []
+  for (const [key, record] of activity?.failures ?? []) {
+    if (record.count < REPEATED_FAILURE_THRESHOLD || !isExpectedFailure(record, activity)) continue
+    const later = laterSuccess(record, activity)
+    notes.push(
+      `"${key}" failed ${String(record.count)} times and then passed ${formatElapsed(now - later.at)} ago, ` +
+        'as the brief asked (checks that fail before the change and pass after it)',
+    )
+  }
+  return notes
+}
+
+/**
+ * The longest-running process under the runtime that is not the open command itself, as the
+ * last process sample saw it: `cargo check` open, `cmake --build … ninja` the child.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @param {string} command - the open call's command.
+ * @param {number} now - the clock.
+ * @returns {{command: string, runningMs: number, cpuSeconds: number} | undefined} the child.
+ */
+function childOf(activity, command, now) {
+  const tree = activity?.proc?.tree
+  if (!Array.isArray(tree) || tree.length === 0) return undefined
+  return longestChild(tree, command, now)
 }
 
 /**
@@ -3609,11 +4038,12 @@ function activityWarnings(activity, now = Date.now()) {
  *
  * @param {object} [activity] - the call's activity record.
  * @param {number} [now] - the clock to measure against.
- * @returns {{tool: string, command: string, since: string, runningMs: number, background?: string}[]} the calls.
+ * @returns {{tool: string, command: string, since: string, runningMs: number, background?: string, child?: {command: string, runningMs: number, cpuSeconds: number}}[]} the calls.
  */
 export function openCommands(activity, now = Date.now()) {
   const current = []
   for (const call of activity?.openCalls?.values() ?? []) {
+    const child = childOf(activity, call.command, now)
     const job =
       call.jobId === undefined ? undefined : activity?.backgroundJobs?.get(backgroundJobKey(call.session, call.jobId))
     if (job !== undefined) {
@@ -3623,6 +4053,7 @@ export function openCommands(activity, now = Date.now()) {
         since: new Date(job.since).toISOString(),
         runningMs: Math.max(0, now - job.since),
         background: job.jobId,
+        ...(child === undefined ? {} : { child }),
       })
       continue
     }
@@ -3631,6 +4062,7 @@ export function openCommands(activity, now = Date.now()) {
       command: call.command,
       since: new Date(call.since).toISOString(),
       runningMs: Math.max(0, now - call.since),
+      ...(child === undefined ? {} : { child }),
     })
   }
   return current.sort((a, b) => b.runningMs - a.runningMs)
@@ -4174,6 +4606,9 @@ function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs
       // The session id comes from the activity record, not this closure: a retried first
       // attempt runs under a new session, and the heartbeat must name the live one.
       const current = activity?.sessionId ?? sessionId
+      // Ask for a fresh look at the runtime's processes; the answer lands in a later beat, so
+      // nothing here waits for the machine.
+      activity?.procWatch?.refresh(activity).catch((error) => log(`could not watch the process tree: ${messageOf(error)}`))
       progress({
         progress: Math.round(elapsedMs) / 1000,
         ...(budgetMs === undefined || budgetMs === null ? {} : { total: Math.round(budgetMs / 1000) }),
@@ -4185,6 +4620,7 @@ function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs
         detail: {
           current: openCommands(activity, now),
           warnings: activityWarnings(activity, now),
+          ...(activityNotes(activity, now).length === 0 ? {} : { info: activityNotes(activity, now) }),
           ...(activity?.queuedSince !== undefined && typeof activity?.queueView === 'function'
             ? { queue: activity.queueView(now) }
             : {}),
@@ -4491,6 +4927,11 @@ export const WORKER_INSTRUCTIONS = [
   'Run a command bare so its exit code shows; do not hide it behind `; echo` or `|| true`, which makes a failing command look like a success.',
   'In the report, list anything you removed or left out that existed before (a menu item, an option, a test, a check), each with why.',
   'In the report, name every file you changed outside the files the task named, and why.',
+  'The sandbox has no camera, microphone, display or GPU: do not search for devices, and never search the whole disk (`find /`).',
+  'Every decision in the brief is either done or named in the report as not done. Name each changed file you never ran; when you change a function, name the callers you did not touch; when you add stored data, say what existing records get for the new field.',
+  'A check named in the report is one you ran after your last edit; give the time beside it. A comment that states a measured fact must agree with the measurement. Do not call a failure "pre-existing" or "the sandbox\'s" without checking.',
+  "When the brief spans a protocol another job writes, take the shape from the other side's code and say where it came from. A workaround that hides a fault from the tests needs the caller's word, not only a line in the report.",
+  'Do not rewrite lines you do not mean to change; keep a file\'s encoding and characters (a worker turned "…" into `â€¦` on Windows).',
   'If a change touches code beside a stated rule (an "only", a "never", a "one place", a design note the task quotes), list it in the report under its own heading "Rules crossed", with the reason.',
 ]
 
@@ -4504,6 +4945,13 @@ export const WORKER_INSTRUCTIONS = [
  */
 export const WINDOWS_SHELL_INSTRUCTION =
   'Commands run in PowerShell here, not bash (PowerShell 7 when it is installed, otherwise Windows PowerShell 5.1): bash syntax does not work, `&&` works only in PowerShell 7, and a program in the current folder needs `.\\` in front of it.'
+
+/**
+ * What else a Windows worker reads about its sandbox: three things that cost workers turns
+ * there. The second is the profile's own limit: ninja and parallel MSBuild hang or fail inside it.
+ */
+export const WINDOWS_TOOLING_INSTRUCTION =
+  'On Windows, `$env:X = value` does not carry over to the next command: set it in the same command. Ninja and parallel MSBuild (`/m` above 1, `cmake --build --parallel N` with N above 1) hang or fail in the sandbox: use the Visual Studio generator and one build node. Cargo has no network here (TLS fails): use `--offline` with what is there.'
 
 /** How many of the copy's uncommitted paths are worth naming in the prompt. */
 const PROMPT_UNCOMMITTED_LIMIT = 20
@@ -4543,8 +4991,8 @@ function promptBasePatch(basePatch) {
 /**
  * The worker-facing task text.
  *
- * `platform` is the server's platform, which is the worker's: on win32 one more line names
- * the shell its commands run in. Omitted, no platform line is added.
+ * `platform` is the server's platform, which is the worker's: on win32 lines name
+ * the shell its commands run in and what breaks there. Omitted, no platform line is added.
  */
 export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slotEnv, slotPorts, slotValues, slotSetup, discard, basePatch, platform }) {
   const started = Number(uncommitted?.count) > 0
@@ -4565,7 +5013,7 @@ export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slo
     `Working directory: ${cwd}`,
     '',
     ...WORKER_INSTRUCTIONS,
-    ...(platform === 'win32' ? [WINDOWS_SHELL_INSTRUCTION] : []),
+    ...(platform === 'win32' ? [WINDOWS_SHELL_INSTRUCTION, WINDOWS_TOOLING_INSTRUCTION] : []),
     ...(copy === true
       ? [
           '',
@@ -4731,12 +5179,109 @@ export function textOfContentBlocks(blocks) {
 }
 
 /** Clip a child message to the returned-result budget. */
-function truncate(text, maxChars) {
+function truncate(text, maxChars, reportPath) {
   if (text.length <= maxChars) return { text, truncated: false }
+  const whole = reportPath === undefined ? '' : `; the whole report is stored at ${reportPath}`
   return {
-    text: `${text.slice(0, maxChars)}\n… [truncated ${String(text.length - maxChars)} of ${String(text.length)} characters]`,
+    text: `${text.slice(0, maxChars)}\n… [truncated ${String(text.length - maxChars)} of ${String(text.length)} characters${whole}]`,
     truncated: true,
   }
+}
+
+/**
+ * Tool-call markup a worker wrote as text: the DeepSeek DSML tokens (with the fullwidth bar
+ * U+FF5C or an ASCII one), an `<invoke name=` element, `invoke name="` (with or without the
+ * `<`), `<function_calls>`, `<tool_call>`, and `<|tool▁call…` style tokens.
+ *
+ * Every pattern matches only at the start of a line, after optional whitespace: a worker that
+ * writes its next call as text puts it on a line of its own, while a review report that
+ * mentions `<tool_call>` mid-sentence is a report.
+ */
+const TOOL_CALL_MARKUP = [
+  /^[ \t]*<\/?\s*[|｜]\s*DSML\s*[|｜]/im,
+  /^[ \t]*<invoke\s+name\s*=/im,
+  /^[ \t]*<?[ \t]*invoke\s+name\s*=\s*["']/im,
+  /^[ \t]*<function_calls>/im,
+  /^[ \t]*<tool_call>/im,
+  /^[ \t]*<\s*[|｜]\s*tool[▁_ ]calls?/im,
+]
+
+/**
+ * Whether a worker's last message is a report at all.
+ *
+ * A worker that writes its next tool call as text ends its run with that text as the final
+ * message, and the run still says it completed. Fenced blocks and inline code are removed
+ * before matching, as are indented code blocks, so a report that merely quotes such markup is not
+ * taken for it.
+ *
+ * @param {unknown} text - the worker's final message.
+ * @returns {null | 'empty' | 'tool-call-markup'} null for a report, else what is wrong with it.
+ */
+export function finalMessageProblem(text) {
+  if (typeof text !== 'string' || text.trim().length === 0) return 'empty'
+  const prose = withoutCode(text)
+  return TOOL_CALL_MARKUP.some((pattern) => pattern.test(prose)) ? 'tool-call-markup' : null
+}
+
+/**
+ * A message without its fenced blocks (an unclosed one runs to the end), its indented code
+ * blocks (lines of four spaces or a tab that follow a blank line, or the block before them)
+ * and inline code.
+ *
+ * @param {string} text - the message.
+ * @returns {string} the prose between the code.
+ */
+function withoutCode(text) {
+  const kept = []
+  let fence
+  let afterBlank = true
+  let indented = false
+  for (const line of text.split('\n')) {
+    const mark = /^[ \t]*(`{3,}|~{3,})/.exec(line)
+    if (fence === undefined) {
+      if (line.trim() === '') {
+        afterBlank = true
+        kept.push(line)
+      } else if ((afterBlank || indented) && /^(?: {4}|\t)/.test(line) && mark === null) {
+        indented = true
+        afterBlank = false
+      } else {
+        indented = false
+        afterBlank = false
+        if (mark === null) kept.push(line)
+        else fence = mark[1]
+      }
+    } else if (mark !== null && mark[1][0] === fence[0] && mark[1].length >= fence.length) {
+      fence = undefined
+    }
+  }
+  return kept.join('\n').replace(/(`+)[^\n]*?\1/g, '')
+}
+
+/**
+ * The warning for a final message that is no report.
+ *
+ * @param {'empty' | 'tool-call-markup'} problem - what `finalMessageProblem` found.
+ * @param {string} text - the message.
+ * @param {{patchId?: string, changed: boolean}} change - what the call left behind.
+ * @returns {string} one warning.
+ */
+function finalMessageWarning(problem, text, { patchId, changed }) {
+  const shown = text.trim().replace(/\s+/g, ' ')
+  const what =
+    problem === 'empty'
+      ? 'it was empty'
+      : `it was tool-call markup, not a report: ${JSON.stringify(shown.slice(0, 200))}${shown.length > 200 ? '…' : ''}`
+  const kept =
+    patchId !== undefined
+      ? `the change so far is stored as patch ${patchId}`
+      : changed
+        ? 'the change so far was not stored as a patch'
+        : 'the copy holds no change, so send the task again'
+  return (
+    `the worker's last message was not a report (${what}); its last planned tool call never ran. ${kept[0].toUpperCase()}${kept.slice(1)}. ` +
+    'Checks it claims may not have run: verify them, and continue with basePatch if needed'
+  )
 }
 
 /** Explain a non-delegating orchestrator in the error message. */

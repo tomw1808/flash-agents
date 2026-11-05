@@ -1723,8 +1723,9 @@ test('apply "discard" reports the change, stores nothing, and empties the tree',
   assert.deepEqual(result.change.filesChanged, ['discard.txt'])
   assert.match(result.change.diff, /written by the worker/)
   assert.equal(existsSync(join(root, 'discard.txt')), false, 'discard still writes only in the copy')
-  // Nothing was kept: no patch file, no record, no in-memory patch.
-  assert.deepEqual(readdirSync(join(stateDir, 'calls')), [])
+  // No patch was kept: no patch file, no record, no in-memory patch. Only the worker's
+  // report, which every finished call stores.
+  assert.deepEqual(readdirSync(join(stateDir, 'calls')).filter((name) => !name.endsWith('.report.json')), [])
   assert.equal(service.isolation.patches.size, 0)
   // The tree is emptied exactly as after a stored change.
   assert.deepEqual(readdirSync(service.isolation.slots[0].dir), [])

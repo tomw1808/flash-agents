@@ -252,6 +252,14 @@ round's "fails before and passes after" needs, and the fix round then makes them
   eight hex digits, with or without `flash-`, and refuse an ambiguous one with the matches named.
 - `emptyResult: true` with `status: "error"`: the worker ended without a report and without a
   change. Treat it as failed and send the task again.
+- `finalMessageProblem: "tool-call-markup"` (or `"empty"`) with `status: "error"`: the worker wrote
+  its next tool call as text and the run ended there, so that call never ran. Its patch holds the
+  work so far: check it and continue with `basePatch`; do not trust the checks it reports.
+- Pass `label` with a short title when briefs start with the same shared rules, so the jobs differ
+  in `flash_status`. A `flash_status` warning that a command used no CPU for minutes usually means
+  it waits forever (ninja on Windows); `current[].child` names what it is waiting in.
+- `overlaps` on a writing result names other unapplied patches that touch the same files: decide
+  which one wins before applying either.
 - Refusals appear in the result's `denials` and in the log with their reason; a worker that hit
   the wall says so in its reply.
 - The result's `change.diff` is clipped at a file boundary when it is long; `change.diffOmitted`

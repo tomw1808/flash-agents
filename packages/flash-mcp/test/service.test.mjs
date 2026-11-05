@@ -1693,21 +1693,22 @@ test('an ok call with an empty message and no change is reported as failed', asy
   assert.equal(result.retried.reason, 'EMPTY_RESULT')
   assert.equal(result.retried.firstSessionId, client.prompts[0].sessionId)
   assert.deepEqual(result.warnings, [
-    'the worker ended with an empty final message and changed nothing; treat the call as failed and send the task again',
+    "the worker's last message was not a report (it was empty); its last planned tool call never ran. The copy holds no change, so send the task again. Checks it claims may not have run: verify them, and continue with basePatch if needed",
     'the first attempt ended early with no result (EMPTY_RESULT) and was retried once',
   ])
 })
 
-test('an empty message with a change keeps the status but warns that the account is missing', async () => {
+test('an empty message with a change is an error that names the stored patch', async () => {
   const { root, service } = makeIsolatedService({ script: 'empty-result', file: 'quiet.txt' })
   const result = await service.flashTask({ task: 'write one file', cwd: root })
 
   assert.equal(result.change.available, true)
   assert.deepEqual(result.change.filesChanged, ['quiet.txt'])
-  assert.equal(result.status, 'ok')
+  assert.equal(result.status, 'error')
+  assert.equal(result.finalMessageProblem, 'empty')
   assert.equal(result.emptyResult, true)
   assert.deepEqual(result.warnings, [
-    'the worker ended with an empty final message, so its account of the change is missing; review the diff before applying it',
+    `the worker's last message was not a report (it was empty); its last planned tool call never ran. The change so far is stored as patch ${result.change.patchId}. Checks it claims may not have run: verify them, and continue with basePatch if needed`,
   ])
   await service.close()
 })
@@ -1733,8 +1734,9 @@ test('prompt builders keep the dispatcher on a single delegation', () => {
 test('every child prompt carries the standing worker instructions, in order', () => {
   // The first two are the originals; the next three exist so a caller reading the report
   // (never the transcript) learns about a deviation, a wrong contract, or an unfinished task.
-  // The twelfth, "Rules crossed", is pinned in service-0110.test.mjs.
-  assert.equal(WORKER_INSTRUCTIONS.length, 12)
+  // "Rules crossed" stays last and is pinned in service-0110.test.mjs; the five before it are
+  // pinned in small-0111.test.mjs.
+  assert.equal(WORKER_INSTRUCTIONS.length, 17)
   assert.match(WORKER_INSTRUCTIONS[0], /^Do not commit unless the task explicitly asks/)
   assert.match(WORKER_INSTRUCTIONS[1], /^If the work reaches for an escape hatch/)
   assert.equal(
@@ -3084,7 +3086,7 @@ test('a command that keeps failing is warned about at three failures, by folded 
   assert.equal(result.warnings.length, 1)
   assert.match(
     result.warnings[0],
-    /^"cargo build" failed 3 times in this call \(last: exit code 101, \d+m?\d?s ago\); a worker repeating a step its sandbox cannot finish keeps its tree busy — check its report or cancel the call$/,
+    /^"cargo build" failed 3 times in this call \(last: exit code 101, \d+m?\d?s ago: error: linker failed\); a worker repeating a step its sandbox cannot finish keeps its tree busy — check its report or cancel the call$/,
   )
   // The log gets the same line when the key reaches three.
   assert.equal(logs.filter((line) => line.includes('"cargo build" failed 3 times')).length, 1)
@@ -3149,7 +3151,7 @@ test('a tool result carrying an error counts as a failure without a shell exit c
     { command: 'npm run build', error: { name: 'ToolError', code: 'TOOL_ERROR' }, text: 'the tool refused' },
   ]
   const result = await service.flashTask({ task: 'build', cwd: root })
-  assert.match(result.warnings[0], /^"npm run" failed 3 times in this call \(last: tool error ToolError, \d+m?\d?s ago\)/)
+  assert.match(result.warnings[0], /^"npm run" failed 3 times in this call \(last: tool error ToolError, \d+m?\d?s ago: the tool refused\)/)
 })
 
 // ── retrying an early, empty failure ───────────────────────────────────────
@@ -3289,7 +3291,7 @@ test('a second early failure is never a third attempt, and still names the retry
   assert.equal(result.retried.firstSessionId, empty.client.prompts[0].sessionId)
   assert.equal(result.status, 'error')
   assert.deepEqual(result.warnings, [
-    'the worker ended with an empty final message and changed nothing; treat the call as failed and send the task again',
+    "the worker's last message was not a report (it was empty); its last planned tool call never ran. The copy holds no change, so send the task again. Checks it claims may not have run: verify them, and continue with basePatch if needed",
     'the first attempt ended early with no result (EMPTY_RESULT) and was retried once',
   ])
 })
@@ -3432,7 +3434,7 @@ test('the stored patch keeps the worker’s full report, not the clipped result'
   assert.equal(result.resultTruncated, true)
 
   // The result is clipped for the caller; the patch keeps the report the worker wrote.
-  assert.match(result.result, /\[truncated \d+ of \d+ characters\]/)
+  assert.match(result.result, /\[truncated \d+ of \d+ characters; the whole report is stored at .+\.report\.json\]/)
   const record = service.flashPatch({ patchId: result.change.patchId })
   // The stub's worker answers "worker result 0" plus the first ten characters of the
   // dispatch prompt; the patch keeps all of it, where the caller's result kept eleven.

@@ -18,7 +18,16 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { canonicalTmpdir, defaultStateDir, resolveStateBase, slotPathWarning } from './isolation.js'
+import {
+  canonicalTmpdir,
+  defaultStateDir,
+  formatBytes,
+  LOW_DISK_FREE_BYTES,
+  LOW_DISK_FREE_FRACTION,
+  measureDisk,
+  resolveStateBase,
+  slotPathWarning,
+} from './isolation.js'
 import { resolveDshCommand } from './sdk.js'
 
 /** The check ids in the order they run. Model rows expand to `model:<id>` per allowed model. */
@@ -37,6 +46,18 @@ export const CHECK_IDS = Object.freeze([
   'git',
   'zstd',
 ])
+
+/**
+ * The id of the disk row `runChecks` adds when asked (`disk: true`). It is not in
+ * `CHECK_IDS` because it walks every slot tree and cache of the root, which is slow on
+ * the multi-gigabyte trees it exists to report, so only the command line asks for it.
+ */
+export const DISK_CHECK_ID = 'state-disk'
+
+/** A byte count for the disk row: exact under a kilobyte, where `formatBytes` would round to 0 KB. */
+function sizeText(bytes) {
+  return bytes < 1024 ? `${String(bytes)} B` : formatBytes(bytes)
+}
 
 /**
  * The release of this server, read from its own package manifest.
@@ -447,6 +468,41 @@ function firstLine(text) {
   return (text ?? '').split(/\r?\n/).find((line) => line.trim().length > 0)?.trim() ?? ''
 }
 
+/**
+ * Whether the profile is installed: its directory, or the patch file inside it, is there.
+ *
+ * @param {string} dshHome - the harness home holding `profiles/`.
+ * @param {string} profile - the profile name.
+ * @param {object} fs - the injectable filesystem probe.
+ * @returns {boolean} true when the directory is there.
+ */
+function profileInstalled(dshHome, profile, fs) {
+  try {
+    const dir = join(dshHome, 'profiles', profile)
+    return fs.exists(dir) === true || fs.exists(join(dir, 'cordis.patch.yml')) === true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The message of a failed composition, not the stack location Node prints in front of it.
+ *
+ * An uncaught error prints `file.js:974`, the source line, a caret, then `Error: message`; the
+ * first line alone named a place in dsh's code and none of the cause. The first error line wins,
+ * then the first line that is not a location, a caret or a stack frame.
+ *
+ * @param {string | undefined} stderr - what dsh wrote.
+ * @returns {string} the message, or '' when stderr was empty.
+ */
+function composeFailureMessage(stderr) {
+  const lines = (stderr ?? '').split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0)
+  const error = lines.find((line) => /^(?:[A-Za-z]*Error|dsh)\b.*:/.test(line))
+  if (error !== undefined) return error
+  const plain = lines.find((line) => !/^at\s/.test(line) && !/^\^+$/.test(line) && !/\.(?:[cm]?js|ts):\d+(?::\d+)?\)?$/.test(line))
+  return plain ?? lines[0] ?? ''
+}
+
 /** The message of a thrown value, for a warning that has to name its reason. */
 function reasonOf(error) {
   return error instanceof Error ? error.message : String(error)
@@ -784,6 +840,12 @@ function checkStateBasePermissions({ base, env, fs, run }) {
  *        default slot layout in the Windows path-length row.
  * @param {string} [options.stateBase] - the base of the default slot layout
  *        (default `$TMPDIR/flash-mcp`), so the row measures the base a server would use.
+ * @param {string} [options.stateBaseProblem] - why the configured state base is unusable, when
+ *        the options could not be parsed with it; the report then fails a `state-base` row.
+ * @param {boolean} [options.disk] - add the `state-disk` row: what each slot copy and cache and
+ *        the cache store take, and the free space of the state volume. Off by default because it
+ *        walks the trees; the command line turns it on.
+ * @param {(path: string) => object} [options.statfs] - `fs.statfsSync` for that row; injectable.
  * @param {string} [options.platform] - platform whose node-pty prebuild to inspect (default process.platform).
  * @param {string} [options.arch] - architecture whose node-pty prebuild to inspect (default process.arch).
  * @param {string} [options.nodePath] - Node executable that runs the pty probe (default process.execPath).
@@ -916,6 +978,17 @@ export async function runChecks(options = {}) {
     record('dsh-native', 'dsh native modules', native.status, native.detail, native.fix)
   }
 
+  // A state base the server would refuse at start-up: the same value, the same sentence.
+  if (config.stateBaseProblem !== undefined) {
+    record(
+      'state-base',
+      'state base',
+      'fail',
+      `the server would not start: ${config.stateBaseProblem}`,
+      'clear the plugin option "state_base" (or FLASH_STATE_BASE), or set it to an absolute path on this platform',
+    )
+  }
+
   if (!dshRuns) {
     record('profile', 'service profile', 'warn', `dsh did not start, so the ${profile} profile could not be composed`, 'node install.mjs')
   } else {
@@ -925,8 +998,18 @@ export async function runChecks(options = {}) {
     const complaint = (dump.stderr ?? '').split(/\r?\n/).find((line) => line.startsWith('dsh:'))?.trim() ?? ''
     if (dump.status === 0 && complaint === '') {
       record('profile', 'service profile', 'ok', `the ${profile} profile composes`, '')
+    } else if (!profileInstalled(dshHome, profile, fs)) {
+      // Composing a profile that is not there only prints a stack location; the missing
+      // profile and the command that installs it are the whole answer.
+      record(
+        'profile',
+        'service profile',
+        'fail',
+        `the ${profile} profile is not installed (${join(dshHome, 'profiles', profile)}); run node install.mjs in the plugin folder (${REPO_ROOT})`,
+        'node install.mjs',
+      )
     } else {
-      const why = complaint || firstLine(dump.stderr)
+      const why = complaint || composeFailureMessage(dump.stderr)
       record('profile', 'service profile', 'fail', `the ${profile} profile did not compose${why === '' ? '' : `: ${why}`}`, 'node install.mjs')
     }
   }
@@ -1007,6 +1090,50 @@ export async function runChecks(options = {}) {
       run,
     })
     record('state-base-permissions', 'state base permissions', permission.status, permission.detail, permission.fix)
+  }
+
+  // The disk the copies take. A walk over every tree of the root, so only on request; it is
+  // a warning when the volume is as low as the call-path warning's thresholds, because the
+  // doctor and the call must agree on what "low" means.
+  if (config.disk === true) {
+    const serviceRoot = resolve(config.root ?? process.cwd())
+    const base = resolveStateBase(config.stateBase, config.home ?? homedir()) ?? join(canonicalTmpdir(), 'flash-mcp')
+    try {
+      const report = measureDisk(serviceRoot, {
+        baseDir: base,
+        ...(config.stateDir === undefined ? {} : { stateDir: config.stateDir }),
+        ...(config.statfs === undefined ? {} : { statfs: config.statfs }),
+      })
+      const copies = report.slots.reduce((sum, slot) => sum + slot.copyBytes, 0)
+      const caches = report.slots.reduce((sum, slot) => sum + slot.cacheBytes, 0)
+      const parts = report.slots.map(
+        (slot) =>
+          `${slot.owner}/${slot.label}${slot.live ? '' : ' (dead server)'}: copy ${sizeText(slot.copyBytes)}, cache ${sizeText(slot.cacheBytes)}`,
+      )
+      const sentences = [
+        `${String(report.slots.length)} slot copy(ies) take ${sizeText(copies)} plus ${sizeText(caches)} of build cache${parts.length === 0 ? '' : ` (${parts.join('; ')})`}`,
+      ]
+      if (report.store !== null) {
+        sentences.push(`the cache store ${report.store.dir} holds ${String(report.store.caches.length)} cache(s), ${sizeText(report.store.bytes)}`)
+      }
+      let low = false
+      if (report.volume !== null) {
+        const { freeBytes, totalBytes } = report.volume
+        low = totalBytes > 0 && (freeBytes < totalBytes * LOW_DISK_FREE_FRACTION || freeBytes < LOW_DISK_FREE_BYTES)
+        sentences.push(`${formatBytes(freeBytes)} of ${formatBytes(totalBytes)} is free on the volume holding ${report.volume.path}`)
+      } else {
+        sentences.push(`the free space of the volume could not be read (${report.volumeError ?? 'unknown'})`)
+      }
+      record(
+        DISK_CHECK_ID,
+        'state disk',
+        low || report.volume === null ? 'warn' : 'ok',
+        `${sentences.join('; ')}`,
+        low ? 'flash-agents clean (or flash-agents clean --caches to drop only the build caches)' : '',
+      )
+    } catch (error) {
+      record(DISK_CHECK_ID, 'state disk', 'warn', `could not measure the state directory: ${error instanceof Error ? error.message : String(error)}`, '')
+    }
   }
 
   const daemonUp = await safeProbe(OLLAMA_TAGS_URL)
