@@ -21,7 +21,9 @@
  * instead of the working tree is useless to whoever is mid-edit.
  *
  * @typedef {object} Slot
- * @property {number} id - slot number, stable for the life of the pool.
+ * @property {number} id - slot number, stable for the life of the pool. In the default
+ *   layout it is the number the pool's lock file claimed, so a second server on one root
+ *   starts at the first number no live server holds.
  * @property {string} dir - the disposable tree the worker runs in.
  * @property {number} dirIndex - how many times the slot has been moved to a fresh path.
  * @property {string[]} orphans - trees left in place by `retire`, removed when the pool closes.
@@ -49,7 +51,8 @@
  * @property {string} diff - the patch itself, clipped to whole file sections by the service.
  * @property {number} diffChars - the patch length before clipping.
  * @property {string[]} diffOmitted - paths whose section is absent from `diff`, or cut part-way.
- * @property {boolean} stored - whether the patch was written to disk; false for apply "discard".
+ * @property {boolean} stored - whether the patch was written to disk; false for apply "discard"
+ *   and for a call that changed no tracked file, which stores no patch.
  * @property {string} [patchId] - id a later `flash_apply` can refer to.
  * @property {string} [patchPath] - where the patch was stored.
  * @property {string[]} [nestedUnread] - nested repositories (relative to the copied
@@ -65,6 +68,8 @@ import {
   constants,
   copyFileSync,
   existsSync,
+  fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -131,6 +136,129 @@ const SLOT_HOME = '.flash-home'
  * remove them with everything else.
  */
 const SLOT_CACHE = '.flash-cache'
+
+/**
+ * The folder that holds one root's stable slot directories: `<stateBase>/<rootDigest>/slots`.
+ *
+ * A slot of the default layout sits at a path that depends only on the root and the slot
+ * number, so the build cache `prepare` leaves in it is under the same absolute path the next
+ * server after a restart gives the same slot. Build tools write absolute paths into their
+ * output — SwiftPM's `.build`, CMake's caches, cargo's fingerprints of path dependencies — so
+ * a cache that came back at a different path was rebuilt from cold: a user with ten Swift
+ * workers lost 20-30 minutes per copy at load 100+. A configured `stateDir` keeps the older
+ * `<stateDir>/slots/slot-<id>` layout, which belongs to the deployment that named it.
+ */
+const SLOTS_DIRECTORY = 'slots'
+
+/**
+ * The suffix of the lock file that claims one stable slot: `slots/<n>.lock`.
+ *
+ * A server takes a slot number by writing a complete lock in a temp file beside it and
+ * linking it into place (`link` fails with `EEXIST` and never replaces), so two servers on
+ * one root never claim one directory and no reader sees an empty or half-written lock. The
+ * file carries the pid, the owner's command line and the per-pool nonce (see
+ * `SLOT_LOCK_FORMAT`). The pid and command line decide liveness by the rule `slotHolder`
+ * uses, so a lock whose owner is dead, or whose pid was reused by an unrelated process, is
+ * taken over by the next server after a log line. A normal shutdown removes the lock and
+ * leaves the directory, `.flash-cache` included, for whoever claims the number next.
+ */
+const SLOT_LOCK_SUFFIX = '.lock'
+
+/**
+ * The shape of a slot lock's JSON, one line: `{format, pid, command, instance}`.
+ *
+ * `command` is the owner *process's* own command line (`process.argv` joined by spaces and
+ * normalised, see `normalizeCommandLine`), not the moment the slot was claimed: two servers'
+ * pids differ, but a pid reused by an unrelated process runs a different command and must
+ * not inherit the dead server's slot. A command line is the same on every restart and in
+ * every time zone, unlike a start time that `ps` printed as local time. A lock is written to
+ * a unique temp file and `link`ed into place, so a reader never sees an empty or half-written
+ * one; a lock that cannot be read as this shape is treated as held within `SLOT_LOCK_GRACE_MS`
+ * of its mtime and as dead after that, which is what an older build's `wx` write or a crash
+ * between write and close leaves.
+ */
+export const SLOT_LOCK_FORMAT = 1
+
+/**
+ * How long an empty or unparseable slot lock is treated as a live claim.
+ *
+ * Such a file comes from a crash between creating and completing the write, or from an
+ * older build that wrote the lock in place. Sixty seconds is far longer than any legitimate
+ * write of one short line and far shorter than the minutes a dead server's slot may sit
+ * before the next one looks, so a crash costs at most one wait and never a stolen tree.
+ */
+const SLOT_LOCK_GRACE_MS = 60_000
+
+/**
+ * How much of an owner's command line a slot lock records.
+ *
+ * `argv` may carry a whole task text, so the recorded line is capped rather than copied
+ * into every lock: 4 KB is far longer than a Node server's own invocation and short enough
+ * that a lock stays one small line. The recorded value and every live value are capped the
+ * same way, so a long command still compares equal to itself.
+ */
+const SLOT_COMMAND_LINE_LIMIT = 4 * 1024
+
+/**
+ * How long a liveness answer is reused for one `(pid, recorded command line)` pair.
+ *
+ * Reading another process's command line is one file read on Linux and one `ps` or
+ * PowerShell child process elsewhere. A sweep asks about every lock in a folder, and
+ * `sweepStableSlots`, `lease` and `close` ask again seconds apart; a minute of reuse saves
+ * those spawns without ever letting a dead server look alive past the grace an empty lock
+ * already has.
+ */
+const SLOT_LIVENESS_CACHE_MS = 60_000
+
+/**
+ * The errors `link` gives on a filesystem that has no hard links.
+ *
+ * exFAT and FAT32 are common on Windows removable drives, and some SMB shares refuse links
+ * too; EPERM is what Windows reports, ENOTSUP/EOPNOTSUPP the Unix mounts, and EXDEV a link
+ * across filesystems. On any of them the lock is created with an exclusive `open` instead
+ * (see `createSlotLock`).
+ */
+const SLOT_LOCK_NO_LINK_CODES = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'EXDEV'])
+
+/**
+ * The suffix of the temp file a lock is written to before it is linked into place.
+ * It sits beside the lock, so `link` stays within one filesystem and is atomic.
+ */
+const SLOT_LOCK_TEMP_MARKER = '.tmp-'
+
+/**
+ * How many slot numbers a pool scans at most while claiming its slots. Every number below
+ * the limit that a live server holds is skipped, so it has to cover the servers one root runs
+ * at once; reaching it stops the scan rather than loop forever on a directory full of live
+ * locks, and the pool then falls back to its private state directory (see the constructor).
+ */
+const SLOT_CLAIM_SCAN_LIMIT = 1024
+
+/**
+ * What a retired tree's directory name carries after its slot number:
+ * `slots/<n>.retired-<instance>`, and `-<generation>` for a later retire in one pool. The
+ * name keeps the tree out of the stable slot's path, whose warm cache the next server of the
+ * root still wants, and the generation keeps two retired trees of one slot apart.
+ */
+const RETIRED_SLOT_MARKER = '.retired-'
+
+/**
+ * What a dead server's slot directory is renamed to when its lock is taken over, or when a
+ * claim finds a leftover copy under a free number: `slots/<n>.dead-<pid>-<ms>`. Its copy is
+ * left for the sweep, which stores whatever the dead worker left uncommitted and then
+ * deletes the tree, so the stable name is free.
+ */
+const DEAD_SLOT_MARKER = '.dead-'
+
+/**
+ * What a taken-over lock file is renamed to: `<lock>.stale-<pid>-<ms>`.
+ *
+ * The rename is what makes the takeover one atomic step: a second server that renamed the
+ * same lock finds nothing, and one that got there first leaves the loser with `EEXIST` when
+ * it links its own lock. The stale file is removed only after the winner's own lock exists;
+ * if the winner lost, it is left where it is rather than put back over the winner's lock.
+ */
+const SLOT_LOCK_STALE_MARKER = '.stale-'
 
 /**
  * The per-repository settings file, read when a pool is constructed and again when a
@@ -808,8 +936,11 @@ export function canonicalTmpdir() {
  * path to a different worker, whose patch could carry their work.
  *
  * The pid level is kept as its own directory so a dead process's copies can be swept as
- * a unit, and the nonce lives below it: `<base>/<digest>/<pid>/<instance>`, with the
- * server's slots in `<stateDir>/slots/<name>`.
+ * a unit, and the nonce lives below it: `<base>/<digest>/<pid>/<instance>`. A default pool's
+ * slot trees are not under it: they are the stable per-root directories
+ * `<base>/<digest>/slots/<n>` (see `stableSlotDirectory`), so a slot keeps one path across
+ * restarts. This directory holds the pool's scratch files and, with a configured `stateDir`,
+ * the older `<stateDir>/slots/<name>` slot layout.
  *
  * `baseDir`, `pid` and `instance` exist so a test can name a place under an injected base
  * without writing into the real temp state base, and so a test can lay out a dead owner
@@ -872,6 +1003,120 @@ function processAlive(pid) {
 }
 
 /**
+ * One command line in the form a slot lock records and compares.
+ *
+ * A process's own `argv` is joined by spaces, and the answer read back from the operating
+ * system is folded the same way: runs of whitespace become one space, the ends are trimmed,
+ * and the line is capped at `SLOT_COMMAND_LINE_LIMIT`. Only then can the two be compared,
+ * because `/proc/<pid>/cmdline` separates arguments with NUL bytes and `ps` pads its columns.
+ *
+ * @param {string} value - an `argv` joined by spaces, or a command line read from the system.
+ * @returns {string} the normalised, capped line.
+ */
+function normalizeCommandLine(value) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  return text.length > SLOT_COMMAND_LINE_LIMIT ? text.slice(0, SLOT_COMMAND_LINE_LIMIT) : text
+}
+
+/**
+ * The part of a command line two readings of one process always agree on.
+ *
+ * The program token is left out: a process's own `process.argv[0]` is Node's absolute path
+ * (`/opt/homebrew/…/bin/node`), while `ps`, `/proc/<pid>/cmdline` and Windows report it as
+ * it was invoked (`node`, or a quoted `"C:\Program Files\nodejs\node.exe"`). Quotes are
+ * removed for the same reason: Windows reports a command line with the quoting that started
+ * it and `argv` has none. What is left — the script and its arguments — is what tells one
+ * server from an unrelated process that reused its pid.
+ *
+ * @param {string} value - a recorded or a live command line.
+ * @returns {string} the comparable remainder.
+ */
+function commandIdentity(value) {
+  const unquoted = normalizeCommandLine(String(value ?? '').replace(/["']/g, ' '))
+  const space = unquoted.indexOf(' ')
+  return space === -1 ? '' : unquoted.slice(space + 1)
+}
+
+/** This process's command line as the operating system reports it, read once. */
+let ownCommandLine
+
+/**
+ * The command line of a process, normalised as `normalizeCommandLine` describes.
+ *
+ * An owner's command line is what a slot lock records instead of a start time: it is the
+ * same in every time zone and across a DST change, and a pid the operating system reused
+ * belongs to a process started with a different command. Each platform asks its one
+ * source: Linux reads `/proc/<pid>/cmdline` (NUL-separated), macOS and the BSDs run
+ * `ps -o args=`, Windows one PowerShell `Get-CimInstance` call. Every failure — a gone
+ * process, a permission error, an unreadable answer — is null, and callers then fall back
+ * to asking only whether the pid is alive. This process's own pid is answered from
+ * `process.argv` without starting anything, so recording a lock and checking our own lock
+ * never spawn a child.
+ *
+ * @param {number} pid - the process to ask about.
+ * @returns {string | null} its command line, or null when it cannot be read.
+ */
+export function processCommandLine(pid) {
+  if (pid === process.pid) {
+    // Read through the same source another server will use to check this lock, once, so the
+    // recorded line and a later live reading come from one place; `argv` only when the
+    // system will not answer.
+    ownCommandLine ??= systemCommandLine(pid) ?? normalizeCommandLine(process.argv.join(' '))
+    return ownCommandLine
+  }
+  return systemCommandLine(pid)
+}
+
+/**
+ * One process's command line from the operating system, normalised, or null.
+ *
+ * @param {number} pid - the process to ask about.
+ * @returns {string | null} its command line, or null when it cannot be read.
+ */
+function systemCommandLine(pid) {
+  try {
+    if (process.platform === 'linux') {
+      const raw = readFileSync(`/proc/${String(pid)}/cmdline`, 'utf8')
+      // `/proc/<pid>/cmdline` ends every argument with NUL, and an empty or zombie process
+      // has no argument at all: both give an empty line, which is not a readable identity.
+      const line = raw.split('\0').filter((part) => part !== '').join(' ')
+      const normalised = normalizeCommandLine(line)
+      return normalised === '' ? null : normalised
+    }
+    if (process.platform === 'win32') {
+      const output = execFileSync(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${String(pid)}").CommandLine`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+      )
+      const normalised = normalizeCommandLine(output)
+      return normalised === '' ? null : normalised
+    }
+    // `-ww`: never cut the line to a terminal width, or a long invocation compares unequal.
+    const output = execFileSync('ps', ['-ww', '-o', 'args=', '-p', String(pid)], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    const normalised = normalizeCommandLine(output)
+    return normalised === '' ? null : normalised
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Liveness answers already obtained, keyed by `(pid, recorded command line)`.
+ *
+ * One `ps` or PowerShell call per lock per sweep would add up on a machine with many
+ * servers, and the answer cannot meaningfully change inside `SLOT_LIVENESS_CACHE_MS`: a pid
+ * alive with one command line for a minute is the same process. The pid's existence is
+ * always asked afresh (`processAlive`), so an entry can never outlive its process.
+ *
+ * @type {Map<string, {live: boolean, at: number}>}
+ */
+const slotLivenessCache = new Map()
+
+/**
  * The numeric per-pid owner directories of one root digest.
  *
  * Only numeric names count: a `patches/` directory, a lock file or a `trash-*` directory
@@ -897,6 +1142,48 @@ function ownerDirs(digestDir) {
  */
 function livePidsIn(digestDir) {
   return ownerDirs(digestDir).map(Number).filter(processAlive)
+}
+
+/**
+ * Whether a root digest still has a live server, by either sign it leaves.
+ *
+ * A server of the default layout may already have removed its per-pid directory yet still
+ * hold a stable slot's lock, or it may never have had an owner directory in this digest at
+ * all. Treating only the pid directories as life removed such a root — and the live slot's
+ * tree — out from under it. A lock that cannot be read counts as life until its grace
+ * expires, the same rule `slotHolder` uses.
+ *
+ * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
+ * @param {object} [options] - how liveness is judged.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @param {number} [options.exceptPid] - a pid whose own owner directory and locks are not
+ *   evidence of another server, because they are the caller's own.
+ * @returns {boolean} true when some live owner or live slot lock exists.
+ */
+function digestHasLiveOwner(digestDir, { commandLineOf = processCommandLine, exceptPid } = {}) {
+  if (livePidsIn(digestDir).some((pid) => pid !== exceptPid)) return true
+  return slotTreesIn(digestDir, { commandLineOf }).some((tree) => tree.live && tree.pid !== exceptPid)
+}
+
+/**
+ * Whether one root digest's `slots` folder holds any slot lock file.
+ *
+ * A lock is the root's own claim on a number, and a fresh one names a server that may be
+ * between creating the lock and its directory. A dead or unreadable one is still that
+ * root's to sweep. Either way another root must not remove the digest under it: the
+ * question here is only whether a lock file exists, not whether its owner is alive.
+ *
+ * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
+ * @returns {boolean} true when `slots/` holds a `*.lock` file.
+ */
+function digestHasSlotLockFiles(digestDir) {
+  let entries
+  try {
+    entries = readdirSync(join(digestDir, SLOTS_DIRECTORY), { withFileTypes: true })
+  } catch {
+    return false
+  }
+  return entries.some((entry) => entry.isFile() && entry.name.endsWith(SLOT_LOCK_SUFFIX))
 }
 
 /**
@@ -1326,6 +1613,10 @@ export function measureDisk(root, { baseDir = stateBaseDir(), stateDir, statfs =
       const live = processAlive(Number(pid))
       for (const slot of deadSlotsIn(join(digestDir, pid))) measure(pid, live, slot)
     }
+    // The stable layout's slots sit directly under the digest and name no pid directory, so
+    // they are listed separately: a live server's are measured like a dead one's, and the
+    // lock's pid is what the report calls their owner.
+    for (const tree of stableSlotTreesIn(digestDir)) measure(tree.pid === undefined ? 'stable' : String(tree.pid), tree.live, tree)
     const dir = cacheStoreDir(baseDir, root)
     const caches = storedCacheNames(dir).map((name) => ({ name, bytes: treeBytes(join(dir, name)) }))
     store = { dir, caches, bytes: caches.reduce((sum, cache) => sum + cache.bytes, 0) }
@@ -1377,13 +1668,14 @@ function trashDirsIn(digestDir) {
  * @param {string[]} [extraPatchDirs] - further patch directories that belong to this
  *   digest, such as the durable store.
  * @returns {{slotTrees: number, slotBytes: number, trashDirs: number, trashBytes: number,
- *   patches: number, patchBytes: number, caches: number, cacheBytes: number}} the facts,
- *   `caches` being the build caches waiting in the root's store.
+ *   patches: number, patchBytes: number, reports: number, reportBytes: number,
+ *   caches: number, cacheBytes: number}} the facts, `caches` being the build caches waiting
+ *   in the root's store, and `reports` the whole-call reports this root still has.
  */
 function digestStats(digestDir, extraPatchDirs = []) {
   let slotTrees = 0
   let slotBytes = 0
-  // `deadSlotsIn` knows both layouts: `<pid>/<instance>/slots/<name>` from a current
+  // `deadSlotsIn` knows both per-pid layouts: `<pid>/<instance>/slots/<name>` from a current
   // server and `<pid>/slots/<name>` from an older one. Counting only the older one made
   // `clean` report zero slot trees for every root a current server had written.
   for (const pid of ownerDirs(digestDir)) {
@@ -1391,6 +1683,13 @@ function digestStats(digestDir, extraPatchDirs = []) {
       slotTrees += 1
       slotBytes += directorySize(slot.dir)
     }
+  }
+  // The stable layout keeps its slots directly under the digest, not under a pid, so the
+  // owner loop above never sees them. Without this `clean` would report a dead stable slot's
+  // copy as free disk while its bytes are still there.
+  for (const tree of stableSlotTreesIn(digestDir)) {
+    slotTrees += 1
+    slotBytes += directorySize(tree.dir)
   }
   // A trash directory is a dead tree whose deletion has not finished. It is disk in use,
   // so it is counted with the slot trees' bytes — but it is not a slot (no slot-tree
@@ -1403,6 +1702,8 @@ function digestStats(digestDir, extraPatchDirs = []) {
   }
   let patches = 0
   let patchBytes = 0
+  let reports = 0
+  let reportBytes = 0
   const seen = new Set()
   for (const patchesDir of [join(digestDir, 'patches'), ...extraPatchDirs]) {
     const key = resolve(patchesDir)
@@ -1420,18 +1721,53 @@ function digestStats(digestDir, extraPatchDirs = []) {
         } else if (entry.isDirectory() && entry.name.endsWith('.blobs')) {
           // The preimage blobs stored beside a patch are part of what that patch costs.
           patchBytes += directorySize(join(patchesDir, entry.name))
+        } else if (entry.isFile() && entry.name.endsWith(REPORT_SUFFIX)) {
+          // A whole report is call state beside the patch records; it is pruned on the same
+          // window and counted here so `clean` can show it rather than leave it invisible.
+          reports += 1
+          try {
+            reportBytes += statSync(join(patchesDir, entry.name)).size
+          } catch {
+            // A report that vanished mid-walk contributes nothing.
+          }
         }
       }
     } catch {
       // No `patches/` directory: nothing stored for this root.
     }
   }
+  // A server started with isolation off keeps this root's reports under the state base
+  // instead of beside a patch store, because it has no patch store.
+  try {
+    for (const entry of readdirSync(join(digestDir, 'reports'), { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(REPORT_SUFFIX)) continue
+      reports += 1
+      try {
+        reportBytes += statSync(join(digestDir, 'reports', entry.name)).size
+      } catch {
+        // A report that vanished mid-walk contributes nothing.
+      }
+    }
+  } catch {
+    // No `reports/` directory: this root was only used with a copy pool.
+  }
   // The caches idle between servers are disk too; the walk is as slow as the caches are big,
   // which `clean` accepts (it is an operator command) and a call never pays.
   const storeDir = join(digestDir, CACHE_STORE_DIR)
   const stored = storedCacheNames(storeDir)
   const cacheBytes = stored.reduce((sum, name) => sum + treeBytes(join(storeDir, name)), 0)
-  return { slotTrees, slotBytes: slotBytes + trashBytes, trashDirs, trashBytes, patches, patchBytes, caches: stored.length, cacheBytes }
+  return {
+    slotTrees,
+    slotBytes: slotBytes + trashBytes,
+    trashDirs,
+    trashBytes,
+    patches,
+    patchBytes,
+    reports,
+    reportBytes,
+    caches: stored.length,
+    cacheBytes,
+  }
 }
 
 /**
@@ -1452,6 +1788,50 @@ function patchExpired(record, cutoff) {
   const salvagedAt = Number(record?.salvagedFrom?.sweptAt)
   if (Number.isFinite(salvagedAt) && salvagedAt >= cutoff) return false
   return true
+}
+
+/**
+ * Remove the whole-call reports in one directory that are past the retention window, and the
+ * temporary files a crashed write left behind.
+ *
+ * A report is keyed by a job or session id and is never read again once its job is gone, so
+ * it ages out by its own file time: a read-only or discarded call has no patch record to
+ * age it by. The same window as patches applies, because both are call state an operator
+ * expects `clean` to reclaim together.
+ *
+ * A report write goes through `.<key>.<uuid>.tmp` in the same directory and is renamed into
+ * place. A crash between the write and the rename leaves that file forever, and nothing else
+ * would ever remove it; it goes once it is old enough that no live writer can still own it.
+ *
+ * @param {string} dir - a reports directory: beside the patch records, or
+ *   `<stateBase>/<rootDigest>/reports` for a server with isolation off.
+ * @param {object} [options] - the window and the clock.
+ * @param {number} [options.retentionDays] - how long a report survives.
+ * @param {number} [options.now] - the current time, for tests.
+ * @returns {number} how many report files and leftover temporary files were removed.
+ */
+export function pruneReports(dir, { retentionDays = PATCH_RETENTION_DAYS, now = Date.now() } = {}) {
+  const cutoff = now - retentionDays * DAY_MS
+  const tempCutoff = now - REPORT_TEMP_MAX_AGE_MS
+  let names
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return 0
+  }
+  let removed = 0
+  for (const name of names) {
+    const report = name.endsWith(REPORT_SUFFIX)
+    if (!report && !REPORT_TEMP_NAME.test(name)) continue
+    try {
+      if (statSync(join(dir, name)).mtimeMs >= (report ? cutoff : tempCutoff)) continue
+      rmSync(join(dir, name), { force: true })
+      removed += 1
+    } catch {
+      // A report that will not go away is retried by the next startup.
+    }
+  }
+  return removed
 }
 
 /**
@@ -1501,16 +1881,7 @@ export function prunePatches(patchDir, { retentionDays = PATCH_RETENTION_DAYS, n
   }
   // A report outlives its patch's record by nothing: it ages out on its own file time,
   // because a read-only or discarded call has no patch record to age it by.
-  for (const name of names) {
-    if (!name.endsWith(REPORT_SUFFIX)) continue
-    try {
-      if (statSync(join(patchDir, name)).mtimeMs >= cutoff) continue
-      rmSync(join(patchDir, name), { force: true })
-      removed += 1
-    } catch {
-      // A report that will not go away is retried by the next startup.
-    }
-  }
+  removed += pruneReports(patchDir, { retentionDays, now })
   // The ids that do have a record, read before the loop removed any: an artefact whose id is
   // in this set is somebody's patch, not an orphan.
   const recorded = new Set(names.filter((name) => name.endsWith('.json')).map((name) => name.slice(0, -'.json'.length)))
@@ -1545,11 +1916,19 @@ export function prunePatches(patchDir, { retentionDays = PATCH_RETENTION_DAYS, n
  * digest's `trash-*` directories are not touched here: `clean` removes those for this
  * root only, and `ownerDirs` never mistakes one for an owner.
  *
+ * The stable layout's slot trees are removed too, and only the ones no lock holds: a
+ * foreign digest can still have a live server if its pid directory was already cleaned, and
+ * its slot must not go under it.
+ *
  * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
- * @param {(message: string) => void} [log] - progress log.
- * @returns {number} how many owners were removed.
+ * @param {object} [options] - how to report and which lock identity to use.
+ * @param {(message: string) => void} [options.log] - progress log.
+ * @param {{pid: number, instance: string, command: string}} options.owner - this
+ *   `clean`'s lock identity.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @returns {number} how many owners and stable slot trees were removed.
  */
-function removeDeadOwnerDirs(digestDir, log = () => {}) {
+function removeDeadOwnerDirs(digestDir, { log = () => {}, owner, commandLineOf = processCommandLine, linkLock = linkSync } = {}) {
   let removed = 0
   for (const pid of ownerDirs(digestDir)) {
     if (processAlive(Number(pid))) continue
@@ -1558,6 +1937,22 @@ function removeDeadOwnerDirs(digestDir, log = () => {}) {
       removed += 1
     } catch (error) {
       log(`could not remove dead owner ${pid} in ${digestDir}: ${messageOf(error)}`)
+    }
+  }
+  for (const tree of slotTreesIn(digestDir, { commandLineOf })) {
+    if (tree.live) continue
+    // A tree is removed only while `clean` holds its lock: another server may claim the
+    // same number between the plan and this loop, and its tree must not go under it.
+    const acquired = acquireSlotTreeLock(tree.dir, { owner, log, commandLineOf, linkLock })
+    if (!acquired.ok || !holdsSlotLock(tree.dir, owner)) {
+      releaseSlotTreeLock(tree.dir, owner, acquired.lock, log, linkLock)
+      continue
+    }
+    if (removeTreeViaTrash(tree.dir, { parent: digestDir, name: basename(tree.dir), what: `dead slot tree ${tree.dir}`, log, removal: 'sync' })) {
+      releaseOwnSlotLock(tree.dir, owner, log)
+      removed += 1
+    } else {
+      releaseSlotTreeLock(tree.dir, owner, acquired.lock, log, linkLock)
     }
   }
   return removed
@@ -1678,26 +2073,43 @@ function removeTrashSync(digestDir, log = () => {}) {
  * @returns {boolean} whether the owner was taken out of the accounting.
  */
 function removeDeadOwnerDir(ownerDir, { parent, pid, log, removal = 'background' }) {
-  const trashDir = join(parent, `${TRASH_PREFIX}${String(pid)}-${String(Date.now())}`)
+  return removeTreeViaTrash(ownerDir, { parent, name: String(pid), what: `dead owner ${String(pid)}`, log, removal })
+}
+
+/**
+ * Rename one dead tree to a fresh `trash-*` name and delete it there, now or in the
+ * background; `removeDeadOwnerDir` and the stable-slot sweep share this.
+ *
+ * @param {string} dir - the tree to take out of the accounting.
+ * @param {object} options - where its trash belongs and how to report.
+ * @param {string} options.parent - the digest directory that holds the tree.
+ * @param {string} options.name - what the trash name carries after the prefix.
+ * @param {string} options.what - the tree as a log line names it.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {'sync' | 'background'} [options.removal] - how the renamed trash is deleted.
+ * @returns {boolean} whether the tree was taken out of the accounting.
+ */
+function removeTreeViaTrash(dir, { parent, name, what, log, removal = 'background' }) {
+  const trashDir = join(parent, `${TRASH_PREFIX}${name}-${String(Date.now())}`)
   try {
-    renameSync(ownerDir, trashDir)
+    renameSync(dir, trashDir)
   } catch (error) {
     log(
-      `could not rename dead owner ${String(pid)} out of the way (${messageOf(error)}); ` +
+      `could not rename ${what} out of the way (${messageOf(error)}); ` +
         'removing it in place, which can block the server while it runs',
     )
     try {
-      rmSync(ownerDir, { recursive: true, force: true })
+      rmSync(dir, { recursive: true, force: true })
       return true
     } catch (rmError) {
       // A tree that will not go away is retried by the next sweep; refusing to start over
       // it would be the wedge this function exists to prevent.
-      log(`could not remove dead owner ${String(pid)}: ${messageOf(rmError)}`)
+      log(`could not remove ${what}: ${messageOf(rmError)}`)
       return false
     }
   }
   if (removal === 'sync') {
-    log(`renamed dead owner ${String(pid)} to ${trashDir}; removing it now`)
+    log(`renamed ${what} to ${trashDir}; removing it now`)
     try {
       rmSync(trashDir, { recursive: true, force: true, maxRetries: TRASH_RETRIES })
     } catch (error) {
@@ -1706,7 +2118,7 @@ function removeDeadOwnerDir(ownerDir, { parent, pid, log, removal = 'background'
     }
     return true
   }
-  log(`renamed dead owner ${String(pid)} to ${trashDir}; removing it in the background`)
+  log(`renamed ${what} to ${trashDir}; removing it in the background`)
   startTrashRemoval(trashDir, log)
   return true
 }
@@ -1809,6 +2221,9 @@ function writeSalvageAttempts(ownerDir, record, log) {
  * The label is unique within the owner — `<instance>/slots/<name>` or `slots/<name>` —
  * because the attempts file records which slots were already stored and two instances
  * may each have a `slot-0`.
+ *
+ * A default pool's slots are not here at all: they are the stable per-root directories
+ * `<digest>/slots/<n>`, which `stableSlotTreesIn` enumerates with their locks.
  *
  * @param {string} ownerDir - the dead owner's per-pid directory.
  * @returns {{label: string, dir: string}[]} the slot trees, in a stable order.
@@ -1986,13 +2401,18 @@ async function salvageOwnerLater(ownerDir, { root, patchDir, log, pid, prior, st
  * @param {(message: string) => void} [options.log] - progress log.
  * @returns {number} how many digest directories were removed.
  */
-function removeEmptyForeignDigests(root, { baseDir = stateBaseDir(), retentionDays, now = Date.now(), log = () => {} } = {}) {
+function removeEmptyForeignDigests(root, { baseDir = stateBaseDir(), retentionDays, now = Date.now(), log = () => {}, commandLineOf = processCommandLine } = {}) {
   const own = rootDigest(root)
   let removed = 0
   for (const digest of digestDirs(baseDir)) {
     if (digest === own) continue
     const dir = join(baseDir, digest)
-    if (livePidsIn(dir).length > 0) continue
+    if (digestHasLiveOwner(dir, { commandLineOf })) continue
+    // A lock in the root's `slots` folder is that root's own protocol, live, dead or
+    // unreadable: only its servers sweep it, and this root never removes a number another
+    // root may be about to claim. The folder holding one keeps its digest even when it
+    // holds nothing else.
+    if (digestHasSlotLockFiles(dir)) continue
     if (retentionDays !== undefined) {
       trimCacheStore(join(dir, CACHE_STORE_DIR), { max: Infinity, retentionDays, now, removal: 'sync', log })
     }
@@ -2005,6 +2425,396 @@ function removeEmptyForeignDigests(root, { baseDir = stateBaseDir(), retentionDa
     }
   }
   return removed
+}
+
+/**
+ * What one pass over this root's slot trees has to do, or undefined when the next attempt is
+ * not due yet.
+ *
+ * A tree is dead when its directory has no lock, an unreadable lock past the grace, or a
+ * lock whose owner is gone or whose pid was reused — the rule `slotHolder` uses. A live
+ * server's trees are never candidates, and neither are its retired trees, which carry a lock
+ * of their own while that pool runs (see `retire`).
+ *
+ * The sweep of a running server leaves the stable `slots/<n>` directories alone even when
+ * their owner is dead: each holds the warm `.flash-cache` the next server of the root wants.
+ * It salvages and removes only the trees no stable number names — `slots/<n>.dead-*` and
+ * `slots/<n>.retired-*`. `clean` asks for `includeStable` because it is the operator
+ * reclaiming the disk, and then follows the same lock protocol for the stable directories.
+ *
+ * The attempt record for the salvage failures lives in the `slots` folder itself, because a
+ * stable slot has no per-pid owner directory to keep it in; its labels have the shape
+ * `slots/<name>`, which `slotLabelIsSafe` accepts.
+ *
+ * @param {string} root - the canonical service root.
+ * @param {string} baseDir - the state base directory.
+ * @param {(message: string) => void} log - progress log.
+ * @param {object} [options] - what to consider and how to test liveness.
+ * @param {boolean} [options.includeStable] - also take dead stable slot directories.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @returns {{slotsDir: string, dead: object[], prior: {attempts: number, salvaged: string[],
+ *   lastAttemptAt: number}, sweptAt: number} | undefined} the dead trees to work through.
+ */
+function stableSlotSweepPlan(root, baseDir, log, { includeStable = false, commandLineOf = processCommandLine } = {}) {
+  const digestDir = join(baseDir, rootDigest(root))
+  const slotsDir = join(digestDir, SLOTS_DIRECTORY)
+  const dead = slotTreesIn(digestDir, { commandLineOf })
+    .filter((tree) => includeStable || tree.kind !== 'stable')
+    .filter((tree) => !tree.live)
+  if (dead.length === 0) return undefined
+  const prior = readSalvageAttempts(slotsDir)
+  const now = Date.now()
+  if (!salvageAttemptDue(prior, now)) {
+    // No git work and no attempt counted: the failure is recent, and burning the remaining
+    // attempts seconds apart would delete the work far too soon.
+    const ageSeconds = Math.round((now - prior.lastAttemptAt) / 1000)
+    log(
+      `skipping ${String(dead.length)} dead slot tree(s) in ${slotsDir}: the last salvage attempt failed ${String(ageSeconds)}s ago, ` +
+        `and the next is due after ${String(Math.round(SWEEP_INTERVAL_MS / 1000))}s`,
+    )
+    return undefined
+  }
+  return { slotsDir, dead, prior, sweptAt: now }
+}
+
+/**
+ * Acquire the lock of a tree the sweep is about to touch, by creating it or taking over a
+ * dead owner's.
+ *
+ * The dead lock is moved aside and read back, and this pool's lock is created complete; when
+ * another server created one in between, the number or tree is theirs and this pass leaves
+ * it alone. The stale file is removed only once our own lock exists.
+ *
+ * @param {string} dir - the tree to lock.
+ * @param {object} options - who takes it, and how to report and test liveness.
+ * @param {{pid: number, instance: string, command: string}} options.owner - this pool.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @param {(from: string, to: string) => void} [options.linkLock] - `linkSync`, injectable.
+ * @returns {{ok: boolean, lock?: object}} whether this pass now holds the tree.
+ */
+function acquireSlotTreeLock(dir, { owner, log, commandLineOf = processCommandLine, linkLock = linkSync }) {
+  const created = createSlotLock(slotLockPath(dir), owner, { link: linkLock, log })
+  if (created.kind === 'created') return { ok: true }
+  if (created.kind !== 'exists') {
+    log(`not sweeping ${dir}: its lock could not be created (${messageOf(created.error)})`)
+    return { ok: false }
+  }
+  const holder = slotHolder(dir, { commandLineOf })
+  if (holder.live) return { ok: false }
+  const taken = takeOverDeadLock(dir, owner, { log, commandLineOf, linkLock })
+  if (!taken.ok) return { ok: false }
+  if (taken.stale !== undefined) rmSync(taken.stale, { force: true })
+  return { ok: true, lock: taken.lock }
+}
+
+/**
+ * Give up a sweep's lock on one tree, putting a dead owner's lock back when there was one.
+ *
+ * The dead lock is recreated complete with `createSlotLock`, so it never overwrites a lock
+ * another server created first.
+ *
+ * @param {string} dir - the tree.
+ * @param {{pid: number, instance: string}} owner - this pool.
+ * @param {object} [prior] - the dead owner's lock, when the sweep took one over.
+ * @param {(message: string) => void} log - progress log.
+ * @param {(from: string, to: string) => void} [linkLock] - `linkSync`, injectable.
+ * @returns {void}
+ */
+function releaseSlotTreeLock(dir, owner, prior, log, linkLock = linkSync) {
+  releaseOwnSlotLock(dir, owner, log)
+  if (prior !== undefined) createSlotLock(slotLockPath(dir), prior, { link: linkLock, log })
+}
+
+/**
+ * Salvage one dead slot tree and take it out of the way, or say why it stays.
+ *
+ * The tree is touched only while this pass holds its lock: acquired first, and re-checked
+ * immediately before the removal, so a number another server claimed in between is left
+ * untouched. The cache is rescued into the store first, as for a dead owner, because the tree
+ * that holds it is about to be removed; a tree retired with its runtimes still running is
+ * marked (see `markLiveOrphan`), and a process of it may outlive the dead server, so its
+ * cache is not moved from under it.
+ *
+ * @param {{label: string, dir: string, pid?: number}} tree - one dead slot tree.
+ * @param {object} options - where to store and how to report.
+ * @param {string} options.root - the canonical service root.
+ * @param {string} options.patchDir - the root's patch directory.
+ * @param {{sweptAt: number}} options.plan - this pass's plan.
+ * @param {Set<string>} options.alreadySalvaged - labels an earlier attempt already stored.
+ * @param {{storeDir: string, max: number, retentionDays: number, rename: Function}} [options.caches] -
+ *   the cache store policy, when caches are to be kept.
+ * @param {string} options.parent - the digest directory the trash belongs in.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {'sync' | 'background'} options.removal - how the removed tree is deleted.
+ * @param {{pid: number, instance: string, command: string}} options.owner - this pool.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @param {(tree: object) => void} [options.beforeSweep] - called after the plan and before
+ *   the lock is taken; injectable so a test can claim the tree in that window.
+ * @returns {{patchId?: string, failed?: object, removed?: boolean, rescued?: boolean,
+ *   skipped?: boolean}} the outcome.
+ */
+function sweepStableTree(
+  tree,
+  { root, patchDir, plan, alreadySalvaged, caches, parent, log, removal, owner, commandLineOf = processCommandLine, linkLock = linkSync, beforeSweep },
+) {
+  beforeSweep?.(tree)
+  const acquired = acquireSlotTreeLock(tree.dir, { owner, log, commandLineOf, linkLock })
+  if (!acquired.ok) return { skipped: true }
+  const deadPid = tree.pid ?? acquired.lock?.pid ?? 0
+  const outcome = salvageSlotStep(tree.label, tree.dir, {
+    root,
+    patchDir,
+    pid: deadPid,
+    sweptAt: plan.sweptAt,
+    log,
+    alreadySalvaged,
+  })
+  if (outcome.failed !== undefined) {
+    releaseSlotTreeLock(tree.dir, owner, acquired.lock, log, linkLock)
+    return { failed: outcome.failed }
+  }
+  let rescued = false
+  if (caches !== undefined) {
+    if (existsSync(liveOrphanMarker(tree.dir))) {
+      // Same rule, and the same sentence, as `rescueDeadCaches` for the older layout.
+      if (holdsAnyFile(join(tree.dir, SLOT_CACHE))) log(`not rescuing the build cache of ${tree.dir}: its runtimes were not shut down when it was retired`)
+    } else {
+      rescued = putCacheInStore(join(tree.dir, SLOT_CACHE), caches.storeDir, { rename: caches.rename, log }) !== undefined
+    }
+  }
+  if (!holdsSlotLock(tree.dir, owner)) {
+    log(`not removing ${tree.dir}: another server claimed it while the sweep was salvaging it`)
+    return { patchId: outcome.patchId, rescued, skipped: true }
+  }
+  const removed = removeTreeViaTrash(tree.dir, { parent, name: basename(tree.dir), what: `dead slot tree ${tree.dir}`, log, removal })
+  if (removed) {
+    releaseOwnSlotLock(tree.dir, owner, log)
+    // The "a runtime may still write here" mark describes this tree and nothing else, and it
+    // lives beside the tree rather than in it: leaving it behind would mark a later tree that
+    // happens to get the same name, and keep that one's cache out of the store.
+    rmSync(liveOrphanMarker(tree.dir), { force: true })
+  } else {
+    releaseSlotTreeLock(tree.dir, owner, acquired.lock, log, linkLock)
+  }
+  return { patchId: outcome.patchId, removed, rescued }
+}
+
+/**
+ * Record a stable-slot sweep's outcome and keep the trees whose work could not be read.
+ *
+ * The record is written only while something is left to retry; once every dead tree is
+ * stored and removed it is deleted, so a later failure starts with its full
+ * `SALVAGE_MAX_ATTEMPTS` rather than inheriting this pass's count.
+ *
+ * @param {{slotsDir: string, prior: {attempts: number, salvaged: string[], lastAttemptAt: number}}} plan -
+ *   this pass's plan.
+ * @param {object} outcome - what the pass found.
+ * @param {string[]} outcome.stored - labels whose patch was stored.
+ * @param {{name: string, slotDir: string, message: string}[]} outcome.failed - trees that could not be read.
+ * @param {object[]} outcome.stuck - the dead trees that could not be removed.
+ * @param {object} options - where the trash belongs and how to report and delete.
+ * @param {string} options.parent - the digest directory.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {'sync' | 'background'} options.removal - how a removed tree is deleted.
+ * @param {{pid: number, instance: string, command: string}} options.owner - this pass.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @returns {void}
+ */
+function finishStableSlotSweep(plan, { stored, failed, stuck }, { parent, log, removal, owner, commandLineOf = processCommandLine, linkLock = linkSync }) {
+  const { slotsDir, prior } = plan
+  let attempts = prior.attempts
+  const salvaged = [...new Set([...prior.salvaged, ...stored])]
+  if (failed.length > 0) {
+    attempts = prior.attempts + 1
+    if (attempts < SALVAGE_MAX_ATTEMPTS) {
+      writeSalvageAttempts(slotsDir, { attempts, salvaged, lastAttemptAt: Date.now() }, log)
+      log(
+        `keeping ${String(failed.length)} dead slot tree(s) in ${slotsDir}: salvage attempt ${String(attempts)} of ` +
+          `${String(SALVAGE_MAX_ATTEMPTS)} could not read ${failed.map((entry) => entry.slotDir).join(', ')}; ` +
+          `the next attempt is due in ${String(Math.round(SWEEP_INTERVAL_MS / 60000))} minutes`,
+      )
+      return
+    }
+    log(
+      `removing ${String(failed.length)} dead slot tree(s) in ${slotsDir} after ${String(attempts)} failed salvage attempts: ` +
+        `the work in ${failed.map((entry) => entry.slotDir).join(', ')} could not be salvaged and is lost`,
+    )
+    for (const entry of failed) {
+      // Even an unreadable tree is removed only while this pass holds its lock.
+      const acquired = acquireSlotTreeLock(entry.slotDir, { owner, log, commandLineOf, linkLock })
+      if (!acquired.ok || !holdsSlotLock(entry.slotDir, owner)) {
+        releaseSlotTreeLock(entry.slotDir, owner, acquired.lock, log, linkLock)
+        stuck.push({ dir: entry.slotDir })
+        continue
+      }
+      const removed = removeTreeViaTrash(entry.slotDir, { parent, name: basename(entry.slotDir), what: `dead slot tree ${entry.slotDir}`, log, removal })
+      if (removed) releaseOwnSlotLock(entry.slotDir, owner, log)
+      else {
+        releaseSlotTreeLock(entry.slotDir, owner, acquired.lock, log, linkLock)
+        stuck.push({ dir: entry.slotDir })
+      }
+    }
+    failed.length = 0
+  }
+  if (stuck.length > 0) {
+    // The trees were salvaged (or skipped as already salvaged); only their deletion is
+    // still in flight or failed. Keeping the record stops a second patch for the same work,
+    // and leaving `lastAttemptAt` alone lets the next pass retry the removal at once.
+    writeSalvageAttempts(slotsDir, { attempts, salvaged, lastAttemptAt: prior.lastAttemptAt }, log)
+    return
+  }
+  rmSync(join(slotsDir, SALVAGE_ATTEMPTS_FILE), { force: true })
+}
+
+/**
+ * Salvage and remove the dead slot trees of one root, synchronously.
+ *
+ * A running server's pass takes only the trees no stable number names — `slots/<n>.dead-*`
+ * and `slots/<n>.retired-*` — because `slots/<n>` itself holds the warm cache the next server
+ * of the root wants. `clean` sets `includeStable` and takes the dead stable directories too,
+ * each under its own lock.
+ *
+ * The older layout — `<pid>/<instance>/slots/<name>`, and `<pid>/slots/<name>` before that —
+ * is swept by `sweepDeadOwners`' owner pass exactly as before, so a machine that upgrades
+ * with a crashed 0.1.11 server still keeps that server's work.
+ *
+ * @param {string} root - the canonical service root.
+ * @param {object} options - where to store and how to report.
+ * @param {string} options.patchDir - the root's patch directory.
+ * @param {string} [options.baseDir] - the state base directory.
+ * @param {(message: string) => void} [options.log] - progress log.
+ * @param {'sync' | 'background'} [options.removal] - how a removed tree is deleted.
+ * @param {object} [options.caches] - the cache store policy, as `sweepDeadOwners` takes it.
+ * @param {{pid: number, instance: string, command: string}} options.owner - this pass.
+ * @param {boolean} [options.includeStable] - also take dead stable slot directories (`clean`).
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @param {(tree: object) => void} [options.beforeSweep] - a test hook between plan and lock.
+ * @returns {{removed: number, kept: number, patches: number, rescued: number}} what the pass did.
+ */
+function sweepStableSlots(
+  root,
+  { patchDir, baseDir = stateBaseDir(), log = () => {}, removal = 'background', caches, owner, includeStable = false, commandLineOf = processCommandLine, linkLock = linkSync, beforeSweep },
+) {
+  removeLeakedSlotLocks(join(baseDir, rootDigest(root), SLOTS_DIRECTORY), { commandLineOf, log })
+  const stats = { removed: 0, kept: 0, patches: 0, rescued: 0 }
+  const plan = stableSlotSweepPlan(root, baseDir, log, { includeStable, commandLineOf })
+  if (plan === undefined) return stats
+  const parent = join(baseDir, rootDigest(root))
+  const alreadySalvaged = new Set(plan.prior.salvaged)
+  const stored = []
+  const failed = []
+  const stuck = []
+  for (const tree of plan.dead) {
+    const outcome = sweepStableTree(tree, {
+      root,
+      patchDir,
+      plan,
+      alreadySalvaged,
+      caches,
+      parent,
+      log,
+      removal,
+      owner,
+      commandLineOf,
+      linkLock,
+      beforeSweep,
+    })
+    if (outcome.patchId !== undefined) {
+      stored.push(tree.label)
+      stats.patches += 1
+    }
+    if (outcome.rescued === true) stats.rescued += 1
+    if (outcome.failed !== undefined) {
+      failed.push(outcome.failed)
+      continue
+    }
+    if (outcome.removed === true) stats.removed += 1
+    else stuck.push(tree)
+  }
+  finishStableSlotSweep(plan, { stored, failed, stuck }, { parent, log, removal, owner, commandLineOf, linkLock })
+  stats.kept = plan.dead.length - stats.removed
+  if (stats.rescued > 0 && caches !== undefined) {
+    trimCacheStore(caches.storeDir, { max: caches.max, retentionDays: caches.retentionDays, log })
+  }
+  return stats
+}
+
+/**
+ * The deferred sweep's form of `sweepStableSlots`: the same decisions, yielding between trees.
+ *
+ * A server that answered `initialize` before its sweep must keep answering while a salvage
+ * runs `git add -A` over a dead worker's tree; the yield is what keeps the event loop free.
+ * A stop request (the pool closed) ends the pass at the next tree, and what was already
+ * stored is recorded before returning.
+ *
+ * @param {string} root - the canonical service root.
+ * @param {object} options - where to store and how to report.
+ * @param {string} options.patchDir - the root's patch directory.
+ * @param {string} [options.baseDir] - the state base directory.
+ * @param {(message: string) => void} [options.log] - progress log.
+ * @param {object} [options.caches] - the cache store policy.
+ * @param {object} options.owner - this pass's lock identity.
+ * @param {boolean} [options.includeStable] - also take dead stable slot directories.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @param {(tree: object) => void} [options.beforeSweep] - a test hook between plan and lock.
+ * @param {() => boolean} [options.stopped] - whether the pool has closed.
+ * @returns {Promise<{removed: number, kept: number, patches: number, rescued: number,
+ *   stopped: boolean}>} what the pass did.
+ */
+async function sweepStableSlotsLater(
+  root,
+  { patchDir, baseDir = stateBaseDir(), log = () => {}, caches, owner, includeStable = false, commandLineOf = processCommandLine, linkLock = linkSync, beforeSweep, stopped = () => false },
+) {
+  removeLeakedSlotLocks(join(baseDir, rootDigest(root), SLOTS_DIRECTORY), { commandLineOf, log })
+  const stats = { removed: 0, kept: 0, patches: 0, rescued: 0, stopped: false }
+  const plan = stableSlotSweepPlan(root, baseDir, log, { includeStable, commandLineOf })
+  if (plan === undefined) return stats
+  const parent = join(baseDir, rootDigest(root))
+  const alreadySalvaged = new Set(plan.prior.salvaged)
+  const stored = []
+  const failed = []
+  const stuck = []
+  for (const tree of plan.dead) {
+    // Yield first, then check: a `close()` during the yield must stop the pass before
+    // another tree's git work starts, not after it.
+    await new Promise((resolveTick) => setImmediate(resolveTick))
+    if (stopped()) {
+      stats.stopped = true
+      break
+    }
+    const outcome = sweepStableTree(tree, {
+      root,
+      patchDir,
+      plan,
+      alreadySalvaged,
+      caches,
+      parent,
+      log,
+      removal: 'background',
+      owner,
+      commandLineOf,
+      linkLock,
+      beforeSweep,
+    })
+    if (outcome.patchId !== undefined) {
+      stored.push(tree.label)
+      stats.patches += 1
+    }
+    if (outcome.rescued === true) stats.rescued += 1
+    if (outcome.failed !== undefined) {
+      failed.push(outcome.failed)
+      continue
+    }
+    if (outcome.removed === true) stats.removed += 1
+    else stuck.push(tree)
+  }
+  finishStableSlotSweep(plan, { stored, failed, stuck }, { parent, log, removal: 'background', owner, commandLineOf, linkLock })
+  stats.kept = plan.dead.length - stats.removed
+  if (stats.rescued > 0 && caches !== undefined) {
+    trimCacheStore(caches.storeDir, { max: caches.max, retentionDays: caches.retentionDays, log })
+  }
+  return stats
 }
 
 /**
@@ -2030,6 +2840,10 @@ function removeEmptyForeignDigests(root, { baseDir = stateBaseDir(), retentionDa
  * right after the sweep — `clean` — asks for `removal: 'sync'` instead, so the deletion
  * is not abandoned with the process.
  *
+ * Both layouts are swept: the per-pid one above, and the stable `<digest>/slots/<n>`
+ * directories of the default layout, whose dead trees are found by their locks (see
+ * `sweepStableSlots`).
+ *
  * @param {string} root - the canonical service root.
  * @param {object} options - where to put salvaged patches and how to report.
  * @param {string} options.patchDir - the root's patch directory.
@@ -2039,10 +2853,18 @@ function removeEmptyForeignDigests(root, { baseDir = stateBaseDir(), retentionDa
  * @param {{storeDir: string, max: number, retentionDays: number, rename: Function}} [options.caches] -
  *   the cache store policy; when given, each dead slot's `.flash-cache` is rescued into the
  *   store before the owner is removed. `clean` omits it: it is removing caches, not keeping them.
+ * @param {{pid: number, instance: string, command: string}} options.owner - this
+ *   pass's lock identity for the stable layout.
+ * @param {boolean} [options.includeStable] - also take dead stable slot directories.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @param {(tree: object) => void} [options.beforeSweep] - a test hook between plan and lock.
  * @returns {{removed: number, kept: number, salvaged: number, patches: number,
  *   trashRemoved: number}} what the pass did.
  */
-function sweepDeadOwners(root, { patchDir, baseDir = stateBaseDir(), log = () => {}, removal = 'background', caches } = {}) {
+function sweepDeadOwners(
+  root,
+  { patchDir, baseDir = stateBaseDir(), log = () => {}, removal = 'background', caches, owner, includeStable = false, commandLineOf = processCommandLine, linkLock = linkSync, beforeSweep } = {},
+) {
   const stats = { removed: 0, kept: 0, salvaged: 0, patches: 0, trashRemoved: 0 }
   const parent = join(baseDir, rootDigest(root))
   if (!existsSync(parent)) return stats
@@ -2074,6 +2896,14 @@ function sweepDeadOwners(root, { patchDir, baseDir = stateBaseDir(), log = () =>
     if (result.status === 'removed') stats.removed += 1
     else stats.kept += 1
   }
+  // The stable layout: a default-layout server's slots, and the trees it retired, are not
+  // under a pid directory at all, so the dead ones are found by their locks instead. A live
+  // server's slots and retired trees hold a lock of their own and are skipped there.
+  const stable = sweepStableSlots(root, { patchDir, baseDir, log, removal, caches, owner, includeStable, commandLineOf, linkLock, beforeSweep })
+  stats.removed += stable.removed
+  stats.kept += stable.kept
+  stats.patches += stable.patches
+  if (stable.patches > 0) stats.salvaged += 1
   return stats
 }
 
@@ -2093,10 +2923,18 @@ function sweepDeadOwners(root, { patchDir, baseDir = stateBaseDir(), log = () =>
  * @param {(message: string) => void} [options.log] - progress log.
  * @param {() => boolean} [options.stopped] - whether the pool has closed.
  * @param {object} [options.caches] - the cache store policy, as `sweepDeadOwners` takes it.
+ * @param {{pid: number, instance: string, command: string}} options.owner - this
+ *   pass's lock identity for the stable layout.
+ * @param {boolean} [options.includeStable] - also take dead stable slot directories.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @param {(tree: object) => void} [options.beforeSweep] - a test hook between plan and lock.
  * @returns {Promise<{salvaged: number, kept: number, removed: number, patches: number,
  *   stopped: boolean}>} what the pass did, for the one-line summary.
  */
-async function sweepDeadOwnersLater(root, { patchDir, baseDir = stateBaseDir(), log = () => {}, stopped = () => false, caches } = {}) {
+async function sweepDeadOwnersLater(
+  root,
+  { patchDir, baseDir = stateBaseDir(), log = () => {}, stopped = () => false, caches, owner, includeStable = false, commandLineOf = processCommandLine, linkLock = linkSync, beforeSweep } = {},
+) {
   const stats = { salvaged: 0, kept: 0, removed: 0, patches: 0, stopped: false }
   const parent = join(baseDir, rootDigest(root))
   if (!existsSync(parent)) return stats
@@ -2134,6 +2972,12 @@ async function sweepDeadOwnersLater(root, { patchDir, baseDir = stateBaseDir(), 
     // Between dead owners too: one owner with many slots must not monopolise the loop.
     await new Promise((resolveTick) => setImmediate(resolveTick))
   }
+  const stable = await sweepStableSlotsLater(root, { patchDir, baseDir, log, caches, stopped, owner, includeStable, commandLineOf, linkLock, beforeSweep })
+  stats.removed += stable.removed
+  stats.kept += stable.kept
+  stats.patches += stable.patches
+  if (stable.patches > 0) stats.salvaged += 1
+  if (stable.stopped) stats.stopped = true
   return stats
 }
 
@@ -2488,6 +3332,25 @@ const REPORT_SUFFIX = '.report.json'
 
 /** The keys a report is stored under: a job id or a call's session id, never a path. */
 const REPORT_KEY = /^[A-Za-z0-9][A-Za-z0-9_-]*$/
+
+/**
+ * The temporary name a report write uses before its rename: `.<key>.<uuid>.tmp`.
+ *
+ * Nothing else in a report directory matches it, so a prune can tell a half-written report
+ * from a stored one and from any other file a reader may have put there.
+ */
+const REPORT_TEMP_NAME = /^\.[A-Za-z0-9][A-Za-z0-9_-]*\.[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\.tmp$/
+
+/**
+ * How long a report write's temporary file may sit before a prune removes it.
+ *
+ * A report is written to `.<key>.<uuid>.tmp` in the same directory and renamed into place;
+ * a crash between the two leaves the temporary file behind forever, because no reader opens
+ * it and nothing else knows its name. An hour is far longer than any write takes, so a prune
+ * only ever removes a temporary file whose writer died, never one a live server is about to
+ * rename into place.
+ */
+const REPORT_TEMP_MAX_AGE_MS = 60 * 60 * 1000
 
 /**
  * Where one call's whole report lives.
@@ -2858,13 +3721,37 @@ function isGitWorkTree(dir) {
 }
 
 /**
+ * Which copy-on-write clone a platform's filesystem offers, as Node names it.
+ *
+ * Linux's Btrfs and XFS clone a file with a reflink; Node's `COPYFILE_FICLONE_FORCE` asks
+ * for exactly that and nothing else. Windows has neither, and a forced clone there fails
+ * once per file before the plain copy runs — so it starts as a plain copy and never asks.
+ * macOS also starts as a plain copy: APFS's `clonefile` exists, but Node answers
+ * `COPYFILE_FICLONE_FORCE` with `ENOSYS` even there, so asking would only log a fallback
+ * on every single copy. Linux is the only platform where the flag can succeed.
+ *
+ * There is no `cp` in this path at all: the copy is Node's own, so a platform without the
+ * flag cannot print an option error and no child's stderr can reach the caller. A failed
+ * clone is reported through `onCloneFallback`, once per server by the pool.
+ *
+ * @param {string} platform - `process.platform`, or an injected one in tests.
+ * @returns {'clone' | 'copy'} the mechanism the first file attempt uses.
+ */
+function copyMechanism(platform) {
+  return platform === 'linux' ? 'clone' : 'copy'
+}
+
+/**
  * Copy the contents of one directory into another.
  *
  * The clone is attempted first: on a filesystem with reflink support (Btrfs, XFS) a
  * cloned file shares every block with the source until one side writes, so a large
  * repository copies instantly and costs nothing. The first file that cannot be cloned
- * switches the rest of the tree to a plain copy, which is correct and slower. On macOS
- * Node answers the forced clone with ENOSYS even on APFS, so there it is always a copy.
+ * switches the rest of the tree to a plain copy, which is correct and slower; the switch
+ * is reported once through `options.onCloneFallback`, naming `COPYFILE_FICLONE_FORCE`
+ * and the error code, never on standard error. On macOS Node answers the forced clone
+ * with ENOSYS even on APFS, so there it is a plain copy from the first file.
+ * Windows starts as a plain copy (see `copyMechanism`).
  *
  * This is Node's own copy rather than `cp`, which Windows does not have. It is not
  * `fs.cpSync` either: that rewrites a relative symlink into an absolute one pointing
@@ -2909,7 +3796,11 @@ function isGitWorkTree(dir) {
  *   symlinkSync, mkdirSync, statSync, realpathSync). Used by tests to make an entry vanish
  *   deterministically, and to observe the link calls.
  * @param {string} [options.platform] - `process.platform`; tests pass `'win32'` to exercise
- *   the junction fallback.
+ *   the junction fallback, and another platform to choose the clone mechanism.
+ * @param {(platform: string, code: string) => void} [options.onCloneFallback] - called once,
+ *   when the first clone attempt fails and the rest of the tree is copied plainly, with the
+ *   platform and the error code (`ENOSYS`, `EXDEV`, …). The pool turns it into one log line
+ *   per server.
  * @param {string[]} [options.exclude] - normalized exclude entries (see `normalizeExclude`).
  * @param {(relPath: string) => {omit: boolean, reason?: string}} [options.consider] - asked once
  *   per matched path whether it may be left out; the git-safety decision lives with the caller.
@@ -2922,7 +3813,7 @@ function isGitWorkTree(dir) {
  *   recreated for the copy, and the nested directories with their own `.git` directory that
  *   were copied (relative to `from`, with `/` separators, parents before children).
  */
-export function copyTree(from, to, { fs = {}, exclude = [], consider, platform = process.platform } = {}) {
+export function copyTree(from, to, { fs = {}, exclude = [], consider, platform = process.platform, onCloneFallback } = {}) {
   // FICLONE_FORCE refuses rather than silently copying when the filesystem cannot
   // clone, which is what makes the returned mechanism honest.
   const readdir = fs.readdirSync ?? readdirSync
@@ -2934,7 +3825,10 @@ export function copyTree(from, to, { fs = {}, exclude = [], consider, platform =
   // The native realpath: Node's JavaScript one keeps whatever case it was given, so on a
   // case-insensitive volume two spellings of one directory would still compare unequal.
   const realpath = fs.realpathSync ?? realpathSync.native
-  let mechanism = 'clone'
+  let mechanism = copyMechanism(platform)
+  // The first file that cannot be cloned is the one fact worth reporting; the hundreds
+  // after it are the same fallback, and the pool logs it once per server.
+  let fallbackReported = false
   const skipped = []
   const excluded = []
   const kept = []
@@ -2952,6 +3846,10 @@ export function copyTree(from, to, { fs = {}, exclude = [], consider, platform =
         // retrying it without reflink would only throw ENOENT again, at the wrong layer.
         if (isGone(error)) throw error
         mechanism = 'copy'
+        if (!fallbackReported) {
+          fallbackReported = true
+          onCloneFallback?.(platform, error?.code ?? 'unknown')
+        }
       }
     }
     write(source, target)
@@ -3215,6 +4113,10 @@ function readSettingsObject(parsed, label, log) {
         continue
       }
       settings.copyExcludeDefaults = value
+    } else if (key === 'stateBase') {
+      // Read at start-up by index.js to choose the state base; it is a valid key of the
+      // local file but is not a copy setting, so the pool neither applies nor warns about it.
+      continue
     } else if (key === 'slotEnv') {
       // `null` is accepted here because a later layer uses it to remove an earlier entry;
       // the merge drops it. A pool option, which has no earlier layers, does not accept it.
@@ -3533,7 +4435,9 @@ function normalizeRepoPath(raw) {
  *   lowest first.
  * @param {unknown} fromOptions - the `slotEnv` pool option, if any.
  * @param {(message: string) => void} log - where to name a rejected entry.
- * @param {number} slotCount - how many slots the pool has, for the highest-port check.
+ * @param {number} slotCount - one past the highest slot number the pool holds (its slot
+ *   count, unless another server on the root already holds the lower numbers), for the
+ *   highest-port check.
  * @param {object} [options] - platform details, injected by tests.
  * @param {string} [options.platform] - `process.platform`; decides the name case rule.
  * @returns {Record<string, {kind: 'home' | 'cache', segment: string} |
@@ -4351,6 +5255,783 @@ function slotDirectory(stateDir, id, index) {
 }
 
 /**
+ * The one path slot `<id>` of a root always has: `<stateBase>/<rootDigest>/slots/<id>`.
+ *
+ * The path depends on the root and the slot number alone, so the copy of the last server on
+ * this root is exactly where the next one's copy will be, which is what keeps a build
+ * cache's absolute paths valid across a restart. It is also shorter than the older
+ * `<pid>/<instance>/slots/slot-<id>`, which matters for Windows' 260-character limit.
+ *
+ * `baseDir` and `id` exist so a test can name a slot's directory without constructing the
+ * pool, the way `defaultStateDir` lets it lay out a dead owner.
+ *
+ * @param {string} root - the canonical service root.
+ * @param {object} [options] - where the layout sits and which slot.
+ * @param {string} [options.baseDir] - the state base directory, usually `$TMPDIR/flash-mcp`.
+ * @param {number} [options.id] - the slot number (default 0, the first slot).
+ * @returns {string} the stable directory of that slot.
+ */
+export function stableSlotDirectory(root, { baseDir = stateBaseDir(), id = 0 } = {}) {
+  return join(baseDir, rootDigest(root), SLOTS_DIRECTORY, String(id))
+}
+
+/**
+ * The lock file that claims one stable slot: `<slot dir>.lock`.
+ * @param {string} slotDir - a stable slot directory, or a retired tree's directory.
+ * @returns {string} the lock's path.
+ */
+export function slotLockPath(slotDir) {
+  return `${slotDir}${SLOT_LOCK_SUFFIX}`
+}
+
+/**
+ * The one line a slot lock file holds.
+ * @param {{pid: number, instance: string, command: string}} owner - who holds the slot.
+ * @returns {string} the file's content, ready to write.
+ */
+function slotLockJson({ pid, instance, command }) {
+  return `${JSON.stringify({ format: SLOT_LOCK_FORMAT, pid, command: normalizeCommandLine(command), instance })}\n`
+}
+
+/**
+ * Read and validate the JSON of one slot lock file.
+ *
+ * A missing file, unreadable JSON, or a pid that is not a positive integer all give
+ * `undefined`; `slotHolder` then decides whether an unreadable file is young enough to be a
+ * live server's write in progress or old enough to be a dead one's. A lock that has no
+ * `command` is one an older build wrote with a start time instead: its owner is judged by
+ * the pid alone, exactly as when the platform cannot answer.
+ *
+ * @param {string} lockPath - the lock file, as `slotLockPath` names it.
+ * @returns {{format: number, pid: number, command: string, instance: string} | undefined}
+ *   the lock, or undefined when it cannot be read as one.
+ */
+function readSlotLock(lockPath) {
+  let parsed
+  try {
+    parsed = JSON.parse(readFileSync(lockPath, 'utf8'))
+  } catch {
+    return undefined
+  }
+  const pid = Number(parsed?.pid)
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined
+  const command = typeof parsed?.command === 'string' ? normalizeCommandLine(parsed.command) : ''
+  const instance = typeof parsed?.instance === 'string' ? parsed.instance : ''
+  return { format: Number(parsed?.format), pid, command, instance }
+}
+
+/**
+ * Whether a lock's owner is still running the process that wrote it.
+ *
+ * Signal 0 says a pid exists; the recorded command line says it is the *same* process. A
+ * pid the operating system reused belongs to a process started with a different command,
+ * so the lock is a dead server's even though its pid is alive. The comparison is on the
+ * normalised line (`normalizeCommandLine`), so no clock, time zone or DST change can make a
+ * live lock look dead. When the recorded command is missing (an older lock) or the live
+ * command cannot be read (a platform or a permission that will not answer) the check falls
+ * back to the pid alone, as `livePidsIn` does.
+ *
+ * An answer is cached for `SLOT_LIVENESS_CACHE_MS` per `(pid, recorded command)`, so a
+ * sweep that asks about the same lock twice does not spawn a second `ps` or PowerShell.
+ * This process's own pid is never looked up through the cache or a child process: its
+ * command line is `process.argv` itself.
+ *
+ * @param {{pid: number, command: string}} lock - the parsed lock.
+ * @param {(pid: number) => string | null} commandLineOf - `processCommandLine`, injectable.
+ * @returns {boolean} true when the owner is alive and is the process that wrote the lock.
+ */
+function lockOwnerIsLive(lock, commandLineOf = processCommandLine) {
+  if (!processAlive(lock.pid)) return false
+  if (lock.command === '') return true
+  if (lock.pid === process.pid) return commandIdentity(processCommandLine(process.pid)) === commandIdentity(lock.command)
+  const key = `${String(lock.pid)}\u0000${lock.command}`
+  const now = Date.now()
+  const cached = slotLivenessCache.get(key)
+  if (cached !== undefined && now - cached.at <= SLOT_LIVENESS_CACHE_MS) return cached.live
+  const liveCommand = commandLineOf(lock.pid)
+  const live = typeof liveCommand !== 'string' || liveCommand === '' || commandIdentity(liveCommand) === commandIdentity(lock.command)
+  slotLivenessCache.set(key, { live, at: now })
+  return live
+}
+
+/**
+ * Whether a slot is held, and by what.
+ *
+ * The liveness rule is `lockOwnerIsLive`: alive, and the process that recorded that same
+ * command line. A lock file that exists but cannot be read counts as held until its mtime
+ * is older than `SLOT_LOCK_GRACE_MS`: a crash between creating the file and writing the
+ * line, or an older build that wrote it in place, must not let two workers into one
+ * directory, but it must not keep the number forever either.
+ *
+ * @param {string} slotDir - a stable slot directory, or a retired tree's directory.
+ * @param {object} [options] - the command-line source, injectable for tests.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @returns {{live: boolean, lock?: {pid: number, command: string, instance: string},
+ *   unreadable?: boolean}} the holder.
+ */
+function slotHolder(slotDir, { commandLineOf = processCommandLine } = {}) {
+  const lockPath = slotLockPath(slotDir)
+  let info
+  try {
+    info = statSync(lockPath)
+  } catch {
+    return { live: false }
+  }
+  const lock = readSlotLock(lockPath)
+  if (lock === undefined) return { live: Date.now() - info.mtimeMs <= SLOT_LOCK_GRACE_MS, unreadable: true }
+  return { live: lockOwnerIsLive(lock, commandLineOf), lock }
+}
+
+/**
+ * What a directory in one `slots` folder is: a stable slot, a moved-aside dead tree, or a
+ * retired tree. `<n>.lock`, salvage records and temp files are not directories and are not
+ * classified.
+ *
+ * @param {string} name - a directory name inside `slots`.
+ * @returns {'stable' | 'dead' | 'retired' | undefined} the kind, or undefined for a name
+ *   this layout does not use.
+ */
+function slotTreeKind(name) {
+  const match = /^(\d+)(.*)$/.exec(name)
+  if (match === null) return undefined
+  if (match[2] === '') return 'stable'
+  if (match[2].startsWith(DEAD_SLOT_MARKER)) return 'dead'
+  if (match[2].startsWith(RETIRED_SLOT_MARKER)) return 'retired'
+  return undefined
+}
+
+/**
+ * Every slot tree of one root digest, live or dead, with the lock that holds it.
+ *
+ * Only directories count: the `<n>.lock` files sit beside them, and a stale lock left by an
+ * interrupted takeover is a file too. Retired and moved-aside dead trees live in the same
+ * folder and are included, because a sweep has to salvage them; `kind` says which one a
+ * directory is, so a caller can leave the stable slots (and their warm caches) alone.
+ *
+ * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
+ * @param {object} [options] - the command-line source, injectable for tests.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @returns {{label: string, dir: string, kind: 'stable' | 'dead' | 'retired', pid?: number,
+ *   live: boolean, lock?: object}[]} the slot trees, in readdir order.
+ */
+function slotTreesIn(digestDir, { commandLineOf = processCommandLine } = {}) {
+  let entries
+  try {
+    entries = readdirSync(join(digestDir, SLOTS_DIRECTORY), { withFileTypes: true })
+  } catch {
+    // No stable slots for this root (or an unreadable folder): nothing to report or sweep.
+    return []
+  }
+  const trees = []
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const kind = slotTreeKind(entry.name)
+    if (kind === undefined) continue
+    const dir = join(digestDir, SLOTS_DIRECTORY, entry.name)
+    const holder = slotHolder(dir, { commandLineOf })
+    trees.push({ label: `${SLOTS_DIRECTORY}/${entry.name}`, dir, kind, pid: holder.lock?.pid, live: holder.live, lock: holder.lock })
+  }
+  return trees
+}
+
+/**
+ * Remove the lock files a crash left in one `slots` folder.
+ *
+ * Three kinds of lock outlive the thing they described and used to accumulate forever: a
+ * moved-aside tree's lock (`<n>.dead-*.lock`) after the tree was salvaged, the file a
+ * takeover renamed out of the way (`<n>.lock.stale-*`), and a temp file whose writer died
+ * before linking it into place (`<n>.lock.tmp-*`). They are swept here, in one pass before
+ * a claim or a sweep reads the folder.
+ *
+ * Only regular files are ever removed, never a directory; a stale or temp file younger than
+ * `SLOT_LOCK_GRACE_MS` may belong to another server's write in progress and is left. A
+ * `<n>.dead-*`/`<n>.retired-*` lock goes only once its tree is gone, because while the tree
+ * exists the lock is what names its dead owner in the salvage record. A plain `<n>.lock` is
+ * removed only when its tree is gone too and its owner is not live: a live server's number is
+ * never freed by the sweep, and an unreadable young lock keeps its grace.
+ *
+ * @param {string} slotsDir - `<stateBase>/<rootDigest>/slots`.
+ * @param {object} [options] - the clock, the command-line source and the log.
+ * @param {number} [options.now] - the current time, for tests.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
+ * @param {(message: string) => void} [options.log] - progress log.
+ * @returns {number} how many leaked lock files were removed.
+ */
+function removeLeakedSlotLocks(slotsDir, { now = Date.now(), commandLineOf = processCommandLine, log = () => {} } = {}) {
+  let entries
+  try {
+    entries = readdirSync(slotsDir, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  let removed = 0
+  for (const entry of entries) {
+    if (!entry.isFile()) continue
+    const lockPath = join(slotsDir, entry.name)
+    const isTemp = entry.name.includes(`${SLOT_LOCK_SUFFIX}${SLOT_LOCK_TEMP_MARKER}`)
+    const isStale = entry.name.includes(`${SLOT_LOCK_SUFFIX}${SLOT_LOCK_STALE_MARKER}`)
+    if (isTemp || isStale) {
+      let age
+      try {
+        age = now - statSync(lockPath).mtimeMs
+      } catch {
+        continue
+      }
+      if (age <= SLOT_LOCK_GRACE_MS) continue
+    } else {
+      if (!entry.name.endsWith(SLOT_LOCK_SUFFIX)) continue
+      const base = entry.name.slice(0, -SLOT_LOCK_SUFFIX.length)
+      const kind = slotTreeKind(base)
+      if (kind === undefined) continue
+      const tree = join(slotsDir, base)
+      if (existsSync(tree)) continue
+      // No tree and a live owner: the server may be between the claim and its tree, or
+      // merely died holding a number whose copy is already gone. Only a dead one frees it.
+      if (kind === 'stable' && slotHolder(tree, { commandLineOf }).live) continue
+    }
+    try {
+      rmSync(lockPath, { force: true })
+      removed += 1
+      log(`removed leaked slot lock ${lockPath}`)
+    } catch (error) {
+      log(`could not remove leaked slot lock ${lockPath}: ${messageOf(error)}`)
+    }
+  }
+  return removed
+}
+
+/**
+ * Every slot tree of one root digest, the form the doctor and `clean`'s report use.
+ * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
+ * @param {object} [options] - the command-line source, injectable for tests.
+ * @returns {object[]} the trees, as `slotTreesIn` describes them.
+ */
+function stableSlotTreesIn(digestDir, options = {}) {
+  return slotTreesIn(digestDir, options)
+}
+
+/**
+ * The directory a slot's retired tree gets: `slots/<n>.retired-<instance>`.
+ *
+ * The name cannot collide with the stable slot `slots/<n>` of the same number, so a later
+ * server of the root claims the stable path and its warm cache while the retired tree waits
+ * to be adopted or removed. The second retire in one pool adds the generation, so its tree
+ * gets a name of its own too.
+ *
+ * @param {string} slotsDir - `<stateBase>/<rootDigest>/slots`.
+ * @param {number} id - the slot number that was retired.
+ * @param {string} instance - the per-pool nonce.
+ * @param {number} index - the slot's directory generation (at least 1).
+ * @returns {string} the retired tree's directory.
+ */
+function retiredSlotDirectory(slotsDir, id, instance, index) {
+  const generation = index > 1 ? `-${String(index)}` : ''
+  return join(slotsDir, `${String(id)}${RETIRED_SLOT_MARKER}${instance}${generation}`)
+}
+
+/**
+ * Remove the lock of one slot this pool owns, so the next server may claim the number.
+ *
+ * A lock that will not go away is only logged: it names this pid, so the next server treats
+ * it as a dead server's once this process is gone and takes the slot over.
+ *
+ * @param {string} slotDir - the slot's directory (or a retired tree's).
+ * @param {(message: string) => void} log - progress log.
+ * @returns {void}
+ */
+function removeSlotLock(slotDir, log) {
+  try {
+    rmSync(slotLockPath(slotDir), { force: true })
+  } catch (error) {
+    log(`could not remove the slot lock ${slotLockPath(slotDir)} (${messageOf(error)}); the next server takes the slot over as a dead one`)
+  }
+}
+
+/**
+ * Which method created this pool's locks, so the choice is named once rather than per lock.
+ *
+ * A filesystem without hard links is a property of the machine, not of a call, so one line
+ * is enough; the pool's own `log` function is the key, which keeps two pools in one process
+ * from logging for each other. A second method for the same pool (a configured state
+ * directory on another volume) is named once too.
+ *
+ * @type {WeakMap<Function, string>}
+ */
+const slotLockMethodsLogged = new WeakMap()
+
+/**
+ * Say once per pool which way its locks are created.
+ * @param {((message: string) => void) | undefined} log - the pool's progress log.
+ * @param {'link' | 'exclusive'} method - the way a lock was just created.
+ * @returns {void}
+ */
+function noteSlotLockMethod(log, method) {
+  if (typeof log !== 'function') return
+  if (slotLockMethodsLogged.get(log) === method) return
+  slotLockMethodsLogged.set(log, method)
+  if (method === 'link') {
+    log('slot locks are created with hard links')
+  } else {
+    log('slot locks are created with an exclusive create: this filesystem does not support hard links')
+  }
+}
+
+/**
+ * Create one lock with an exclusive `open`, for a filesystem that has no hard links.
+ *
+ * `open(…, 'wx')` is the same one-step claim `link` gives: it fails with `EEXIST` when the
+ * lock exists and never replaces it. The whole line is written and `fsync`ed before the
+ * handle is closed, so a crash between the create and the write leaves the empty file that
+ * `SLOT_LOCK_GRACE_MS` already covers. A failure after the file was created removes this
+ * process's partial lock; an `EEXIST` names another server's and is left alone.
+ *
+ * @param {string} lockPath - the lock to create.
+ * @param {string} line - the complete content, newline included.
+ * @param {((message: string) => void) | undefined} log - the pool's progress log.
+ * @returns {{kind: 'created' | 'exists' | 'failed', error?: Error}} the outcome.
+ */
+function createSlotLockExclusively(lockPath, line, log) {
+  let fd
+  try {
+    fd = openSync(lockPath, 'wx')
+    writeFileSync(fd, line)
+    fsyncSync(fd)
+    closeSync(fd)
+    noteSlotLockMethod(log, 'exclusive')
+    return { kind: 'created' }
+  } catch (error) {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd)
+      } catch {
+        // Already closed by the failing write.
+      }
+      rmSync(lockPath, { force: true })
+    }
+    return { kind: fd === undefined && error?.code === 'EEXIST' ? 'exists' : 'failed', error }
+  }
+}
+
+/**
+ * Create a slot lock complete, in one atomic step.
+ *
+ * The JSON goes to a unique temp file beside the lock and is then `link`ed into place: `link`
+ * fails with `EEXIST` when the lock already exists and never replaces it, and the lock path
+ * itself never holds a half-written or empty file. The temp file is removed in every case.
+ *
+ * A filesystem without hard links — exFAT and FAT32, some SMB shares — refuses `link` with
+ * one of `SLOT_LOCK_NO_LINK_CODES`; there the lock is created with the exclusive `open` of
+ * `createSlotLockExclusively` instead, which is still one atomic claim. Every other `link`
+ * failure is reported as before.
+ *
+ * @param {string} lockPath - the lock to create, as `slotLockPath` names it.
+ * @param {{pid: number, instance: string, command: string}} lock - what it says.
+ * @param {object} [options] - how to create it and where to report.
+ * @param {(from: string, to: string) => void} [options.link] - `linkSync`, injectable so a
+ *   test can run on a filesystem that refuses hard links.
+ * @param {(message: string) => void} [options.log] - progress log; the method is named once.
+ * @returns {{kind: 'created' | 'exists' | 'failed', error?: Error}} the outcome.
+ */
+function createSlotLock(lockPath, lock, { link = linkSync, log } = {}) {
+  const temp = `${lockPath}${SLOT_LOCK_TEMP_MARKER}${String(process.pid)}-${randomUUID().slice(0, 8)}`
+  const line = slotLockJson(lock)
+  try {
+    mkdirSync(dirname(lockPath), { recursive: true })
+  } catch (error) {
+    return { kind: 'failed', error }
+  }
+  try {
+    writeFileSync(temp, line, { flag: 'wx' })
+    try {
+      link(temp, lockPath)
+      noteSlotLockMethod(log, 'link')
+      return { kind: 'created' }
+    } catch (error) {
+      if (!SLOT_LOCK_NO_LINK_CODES.has(error?.code)) {
+        return { kind: error?.code === 'EEXIST' ? 'exists' : 'failed', error }
+      }
+    }
+    return createSlotLockExclusively(lockPath, line, log)
+  } catch (error) {
+    return { kind: error?.code === 'EEXIST' ? 'exists' : 'failed', error }
+  } finally {
+    rmSync(temp, { force: true })
+  }
+}
+
+/**
+ * Put a moved-away lock back into its place, exclusively.
+ *
+ * `link` is the one-step way; on a filesystem without hard links the stale file's bytes are
+ * written through the exclusive `open` instead, so a restore is never silently lost there.
+ *
+ * @param {string} from - the stale lock file.
+ * @param {string} to - the lock path it belongs at.
+ * @param {object} [options] - how to create it and where to report.
+ * @param {(from: string, to: string) => void} [options.link] - `linkSync`, injectable.
+ * @param {(message: string) => void} [options.log] - progress log.
+ * @returns {'linked' | 'exists' | 'failed'} the outcome; `exists` means another server holds it.
+ */
+function linkSlotLock(from, to, { link = linkSync, log } = {}) {
+  try {
+    link(from, to)
+    noteSlotLockMethod(log, 'link')
+    return 'linked'
+  } catch (error) {
+    if (error?.code === 'EEXIST') return 'exists'
+    if (!SLOT_LOCK_NO_LINK_CODES.has(error?.code)) return 'failed'
+  }
+  try {
+    const created = createSlotLockExclusively(to, readFileSync(from, 'utf8'), log)
+    if (created.kind === 'created') return 'linked'
+    return created.kind === 'exists' ? 'exists' : 'failed'
+  } catch {
+    return 'failed'
+  }
+}
+
+/**
+ * Whether a slot's lock is the one this owner just created.
+ * @param {string} slotDir - the slot (or retired tree).
+ * @param {{pid: number, instance: string}} owner - this pool's identity.
+ * @returns {boolean} true when the lock names this owner.
+ */
+function holdsSlotLock(slotDir, owner) {
+  const lock = readSlotLock(slotLockPath(slotDir))
+  return lock !== undefined && lock.pid === owner.pid && lock.instance === owner.instance
+}
+
+/**
+ * Release this owner's lock, and only if it is still this owner's.
+ * @param {string} slotDir - the slot (or retired tree).
+ * @param {{pid: number, instance: string}} owner - this pool's identity.
+ * @param {(message: string) => void} log - progress log.
+ * @returns {void}
+ */
+function releaseOwnSlotLock(slotDir, owner, log) {
+  if (holdsSlotLock(slotDir, owner)) removeSlotLock(slotDir, log)
+}
+
+/**
+ * Put a dead server's lock back after a failed takeover, without ever overwriting a lock
+ * another server created in the meantime.
+ *
+ * The link is exclusive; when it finds a lock, that server claimed the number first and
+ * nothing is put back — the stale file is left where it is rather than touched.
+ *
+ * @param {string} slotDir - the slot the lock belongs to.
+ * @param {string} stale - the moved-away lock file.
+ * @param {(message: string) => void} log - progress log.
+ * @param {(from: string, to: string) => void} [linkLock] - `linkSync`, injectable.
+ * @returns {void}
+ */
+function restoreStaleLock(slotDir, stale, log, linkLock = linkSync) {
+  const result = linkSlotLock(stale, slotLockPath(slotDir), { link: linkLock, log })
+  if (result === 'linked') {
+    rmSync(stale, { force: true })
+    return
+  }
+  if (result === 'exists') {
+    log(`not taking slot ${slotDir}: another server claimed it first`)
+    return
+  }
+  log(`could not put the dead lock of ${slotDir} back from ${stale}; the next server creates a fresh one`)
+}
+
+/**
+ * Keep a dead server's lock beside the tree it described, so the sweep that salvages the
+ * work names the pid that wrote it in the patch record.
+ *
+ * @param {string} aside - the moved-aside tree.
+ * @param {object} prior - the dead lock's parsed content.
+ * @param {string} stale - the moved-away lock file.
+ * @param {(message: string) => void} log - progress log.
+ * @param {(from: string, to: string) => void} [linkLock] - `linkSync`, injectable.
+ * @returns {void}
+ */
+function keepLockBesideAside(aside, prior, stale, log, linkLock = linkSync) {
+  try {
+    renameSync(stale, slotLockPath(aside))
+    return
+  } catch {
+    // The stale file vanished or the aside already has a lock: recreate one from the content.
+  }
+  const created = createSlotLock(slotLockPath(aside), prior, { link: linkLock, log })
+  if (created.kind === 'failed') log(`could not keep the lock of dead server ${String(prior.pid)} beside ${aside} (${messageOf(created.error)})`)
+  rmSync(stale, { force: true })
+}
+
+/**
+ * Lock a directory of the stable layout with its pool's own lock, so no other sweep takes it
+ * for a dead one.
+ *
+ * A retired tree sits in the same `slots` folder as the stable slots but no longer under a
+ * slot number, so nothing claims it by name; a slot that has just retired has a fresh
+ * directory that does not exist yet. While the pool that owns it runs, the tree may still
+ * have a session writing into it; when the pool exits or crashes, the lock names a dead pid
+ * and the next sweep salvages and removes the tree as usual.
+ *
+ * A lock this pool already holds — the stable slot's claim lock, which `retire` leaves in
+ * place — is not a collision: the tree simply keeps the lock it had, and no false "could not
+ * lock" is logged.
+ *
+ * @param {string} dir - the retired tree's directory.
+ * @param {object} options - who owns it and where to report.
+ * @param {number} options.pid - this process's pid.
+ * @param {string} options.instance - this pool's nonce.
+ * @param {string} options.command - this process's normalised command line.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {(from: string, to: string) => void} [options.linkLock] - `linkSync`, injectable.
+ * @returns {void}
+ */
+function writeRetiredSlotLock(dir, { pid, instance, command, log, linkLock = linkSync }) {
+  const created = createSlotLock(slotLockPath(dir), { pid, instance, command }, { link: linkLock, log })
+  if (created.kind === 'created') return
+  if (created.kind === 'failed') {
+    log(`could not lock ${dir} (${messageOf(created.error)}); another server's sweep may salvage or remove it`)
+    return
+  }
+  const holder = readSlotLock(slotLockPath(dir))
+  if (holder !== undefined && holder.pid === pid && holder.instance === instance) return
+  log(`could not lock ${dir}: another server holds it, and its sweep may salvage or remove the tree`)
+}
+
+/**
+ * Claim one number of the stable layout, taking over a dead server's lock.
+ *
+ * The lock is taken first, either by creating it complete (step 1's `link`) or by the
+ * takeover below; only then is the tree looked at. A leftover copy is moved aside, never
+ * emptied, and when it cannot be moved the fresh lock is released and the number skipped:
+ * moving a tree without holding its lock is what loses a dead worker's work.
+ *
+ * @param {string} slotDir - the directory of the number being claimed.
+ * @param {object} options - who claims and where to report.
+ * @param {number} options.pid - this process's pid.
+ * @param {string} options.instance - this pool's nonce.
+ * @param {string} options.command - this process's normalised command line, for the lock.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`, injectable.
+ * @param {(from: string, to: string) => void} [options.renameDirectory] - the tree move,
+ *   injectable so a test can make it fail the way an open handle does on Windows.
+ * @param {(from: string, to: string) => void} [options.linkLock] - `linkSync`, injectable.
+ * @returns {'claimed' | 'busy' | 'failed'} the outcome for this number.
+ */
+function claimSlotLock(
+  slotDir,
+  { pid, instance, command, log, commandLineOf = processCommandLine, renameDirectory = renameSync, linkLock = linkSync },
+) {
+  const owner = { pid, instance, command }
+  const lockPath = slotLockPath(slotDir)
+  const created = createSlotLock(lockPath, owner, { link: linkLock, log })
+  let prior
+  let stale
+  if (created.kind === 'failed') {
+    log(`could not claim the slot lock ${lockPath} (${messageOf(created.error)}); this pool runs with fewer slots`)
+    return 'failed'
+  }
+  if (created.kind === 'exists') {
+    const holder = slotHolder(slotDir, { commandLineOf })
+    if (holder.live) return 'busy'
+    const taken = takeOverDeadLock(slotDir, owner, { log, commandLineOf, linkLock })
+    if (!taken.ok) return 'busy'
+    prior = taken.lock
+    stale = taken.stale
+  }
+  const moved = moveDeadSlotAside(slotDir, { pid: prior?.pid ?? pid, log, renameDirectory })
+  if (!moved.ok) {
+    // The lock is ours, the tree is not: give the number back, with the dead owner's lock
+    // where it was, and leave the tree exactly as it is for a later pass.
+    releaseOwnSlotLock(slotDir, owner, log)
+    if (stale !== undefined) restoreStaleLock(slotDir, stale, log, linkLock)
+    return 'busy'
+  }
+  if (stale !== undefined) {
+    if (moved.aside !== undefined && prior !== undefined) keepLockBesideAside(moved.aside, prior, stale, log, linkLock)
+    else rmSync(stale, { force: true })
+  }
+  return 'claimed'
+}
+
+/**
+ * Take a dead server's slot over: move its lock away, and then create this pool's lock.
+ *
+ * The rename is what makes the takeover one step: a second server that renamed the same lock
+ * finds nothing, and one that got there first leaves the loser with `EEXIST` on `link`. In
+ * that case nothing is put back — the number now belongs to the winner — and the stale file
+ * is left untouched, because removing it is only safe once our own lock exists.
+ *
+ * What was renamed is read back before our lock is created: between the liveness read and
+ * the rename another server may have replaced the dead lock with its own live one, and that
+ * one is put back rather than stolen. The dead lock travels back to the caller, which keeps
+ * it beside a tree moved aside so the salvage names the pid that wrote the work.
+ *
+ * @param {string} slotDir - the dead server's slot directory.
+ * @param {{pid: number, instance: string, command: string}} owner - this pool.
+ * @param {object} options - where to report and how to test liveness.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`, injectable.
+ * @param {(from: string, to: string) => void} [options.linkLock] - `linkSync`, injectable.
+ * @returns {{ok: boolean, lock?: object, stale?: string}} whether this pool now holds the
+ *   number, the dead lock's content, and where its lock file was moved.
+ */
+function takeOverDeadLock(slotDir, { pid, instance, command }, { log, commandLineOf = processCommandLine, linkLock = linkSync }) {
+  const lockPath = slotLockPath(slotDir)
+  const stale = `${lockPath}${SLOT_LOCK_STALE_MARKER}${String(pid)}-${String(Date.now())}-${randomUUID().slice(0, 8)}`
+  try {
+    renameSync(lockPath, stale)
+  } catch (error) {
+    // ENOENT: another server took the lock over between the read and the rename.
+    if (error?.code !== 'ENOENT') log(`not taking slot ${slotDir}: its dead lock could not be moved aside (${messageOf(error)})`)
+    return { ok: false }
+  }
+  const moved = readSlotLock(stale)
+  let dead
+  if (moved === undefined) {
+    try {
+      dead = Date.now() - statSync(stale).mtimeMs > SLOT_LOCK_GRACE_MS
+    } catch {
+      dead = true
+    }
+  } else {
+    dead = !lockOwnerIsLive(moved, commandLineOf)
+  }
+  if (!dead) {
+    // What the rename moved is someone else's live lock after all: put it back, or leave it
+    // untouched when a third server claimed the number while it was out of the way.
+    restoreStaleLock(slotDir, stale, log, linkLock)
+    return { ok: false }
+  }
+  const created = createSlotLock(lockPath, { pid, instance, command }, { link: linkLock, log })
+  if (created.kind !== 'created') {
+    // Another server created its lock while the stale one was out of the way, or this one
+    // could not be written. Either way the number is not ours: put nothing back, touch
+    // nothing, and leave the stale file for the holder to ignore.
+    if (created.kind === 'failed') log(`not taking slot ${slotDir}: could not create a lock (${messageOf(created.error)})`)
+    else log(`not taking slot ${slotDir}: another server claimed it first`)
+    return { ok: false }
+  }
+  // Our lock exists now, so the stale file is safe to remove; the caller keeps the content.
+  if (moved === undefined) log(`took over slot ${slotDir} from a dead server whose lock was unreadable`)
+  else log(`took over slot ${slotDir} from dead server ${String(moved.pid)}${moved.instance === '' ? '' : ` (instance ${moved.instance})`}`)
+  return { ok: true, lock: moved, stale }
+}
+
+/**
+ * Move a dead server's copy out of a stable slot's path, keeping its build cache there.
+ *
+ * The tree keeps its old contents under `slots/<n>.dead-<pid>-<ms>` for the sweep, which
+ * stores the dead worker's uncommitted work and then deletes it; the stable path is recreated
+ * and the `.flash-cache` moved back into it, so the next build is still warm. `prepare` never
+ * empties a tree it did not create: a copy that cannot be moved (an open handle on Windows
+ * gives EPERM/EBUSY) leaves the number to a later pass.
+ *
+ * Only `.flash-cache` in the directory is the normal shutdown's leftover; anything else is a
+ * worker's tree and is moved aside, never erased.
+ *
+ * @param {string} slotDir - the dead server's slot directory.
+ * @param {object} options - which dead server, where to report, and the injected rename.
+ * @param {number} options.pid - the dead server's pid, kept in the aside name.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {(from: string, to: string) => void} [options.renameDirectory] - the tree move.
+ * @returns {{ok: boolean, aside?: string}} whether the stable path is free, and where the copy
+ *   went when it held anything.
+ */
+function moveDeadSlotAside(slotDir, { pid, log, renameDirectory = renameSync }) {
+  let entries
+  try {
+    entries = readdirSync(slotDir)
+  } catch {
+    // No directory: the dead server held the lock but had not created its tree yet.
+    return { ok: true }
+  }
+  if (entries.every((name) => name === SLOT_CACHE)) return { ok: true }
+  const aside = join(dirname(slotDir), `${basename(slotDir)}${DEAD_SLOT_MARKER}${String(pid)}-${String(Date.now())}`)
+  try {
+    renameDirectory(slotDir, aside)
+    // A retired tree's "a runtime may still write here" mark (see `markLiveOrphan`) is a
+    // sibling of the tree, so it has to travel with it: a sweep of the moved tree must still
+    // keep its cache out of the store while a process of the dead server may be running.
+    try {
+      renameDirectory(liveOrphanMarker(slotDir), liveOrphanMarker(aside))
+    } catch {
+      // No mark: the tree was not retired with its runtimes still running.
+    }
+  } catch (error) {
+    log(`not taking slot ${slotDir}: its dead tree could not be moved aside (${messageOf(error)}); the tree is left exactly as it is`)
+    return { ok: false }
+  }
+  const cache = join(aside, SLOT_CACHE)
+  try {
+    mkdirSync(slotDir, { recursive: true })
+    if (existsSync(cache)) {
+      renameDirectory(cache, join(slotDir, SLOT_CACHE))
+      log(`kept the build cache of the dead server in ${join(slotDir, SLOT_CACHE)}`)
+    }
+  } catch (error) {
+    log(`could not keep the build cache of dead server ${String(pid)} in ${slotDir} (${messageOf(error)}); the tree stays at ${aside}`)
+    // Put the tree back when the cache could not leave it, so a failed claim touches nothing.
+    try {
+      rmSync(slotDir, { recursive: true, force: true })
+      renameDirectory(aside, slotDir)
+    } catch {
+      // The tree is still at `aside`: the sweep salvages it there rather than erasing it.
+    }
+    return { ok: false, aside }
+  }
+  return { ok: true, aside }
+}
+
+/**
+ * Take `count` slot numbers of one root by creating their lock files.
+ *
+ * Numbers are taken from 0 up, skipping every number a live server holds, so two servers on
+ * one root get disjoint numbers: the second starts at the first free one. The scan is bounded
+ * by `SLOT_CLAIM_SCAN_LIMIT`; a pool that cannot take a single slot keeps the older
+ * per-instance layout instead (see the constructor), which needs no lock.
+ *
+ * @param {string} slotsDir - `<stateBase>/<rootDigest>/slots`.
+ * @param {object} options - who claims, how many, and where to report.
+ * @param {number} options.count - how many slots the pool runs with.
+ * @param {number} options.pid - this process's pid.
+ * @param {string} options.instance - this pool's nonce.
+ * @param {string} options.command - this process's normalised command line, for the lock.
+ * @param {(message: string) => void} options.log - progress log.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`, injectable.
+ * @param {(from: string, to: string) => void} [options.renameDirectory] - the tree move.
+ * @param {(from: string, to: string) => void} [options.linkLock] - `linkSync`, injectable.
+ * @returns {number[]} the numbers it claimed, ascending.
+ */
+function claimSlots(
+  slotsDir,
+  { count, pid, instance, command, log, commandLineOf = processCommandLine, renameDirectory = renameSync, linkLock = linkSync },
+) {
+  try {
+    mkdirSync(slotsDir, { recursive: true })
+  } catch (error) {
+    log(`could not create the slot directory ${slotsDir} (${messageOf(error)}); this pool keeps its slots in its own state directory`)
+    return []
+  }
+  const claimed = []
+  for (let number = 0; claimed.length < count && number < SLOT_CLAIM_SCAN_LIMIT; number += 1) {
+    const outcome = claimSlotLock(join(slotsDir, String(number)), {
+      pid,
+      instance,
+      command,
+      log,
+      commandLineOf,
+      renameDirectory,
+      linkLock,
+    })
+    if (outcome === 'claimed') claimed.push(number)
+    if (outcome === 'failed') break
+  }
+  if (claimed.length < count) {
+    log(`took only ${String(claimed.length)} of ${String(count)} free slot(s) below ${join(slotsDir, String(SLOT_CLAIM_SCAN_LIMIT))}: every other number found is held`)
+  }
+  return claimed
+}
+
+/**
  * The root path of one slot's disposable tree, as a warning and the doctor name it.
  *
  * The trailing separator is part of a directory's own path for a Windows tool counting
@@ -4406,16 +6087,19 @@ function removeStoredCaches(digestDir, { removal, log }) {
 
 /**
  * Remove the build caches of one root digest that no live server can be using: the stored
- * ones, and the `.flash-cache` of every slot of a dead owner. A live owner's slots are never
- * touched.
+ * ones, the `.flash-cache` of every slot of a dead owner, and of every dead stable slot. A
+ * live server's slots are never touched.
  *
  * @param {string} digestDir - one `$TMPDIR/flash-mcp/<digest>` directory.
  * @param {object} options - how to delete and report.
  * @param {'sync' | 'background'} options.removal - how the deletion runs.
  * @param {(message: string) => void} options.log - progress log.
+ * @param {{pid: number, instance: string, command: string}} options.owner - this
+ *   `clean`'s lock identity.
+ * @param {(pid: number) => string | null} [options.commandLineOf] - `processCommandLine`.
  * @returns {number} how many caches were removed.
  */
-function removeCachesOf(digestDir, { removal, log }) {
+function removeCachesOf(digestDir, { removal, log, owner, commandLineOf = processCommandLine, linkLock = linkSync }) {
   let removed = removeStoredCaches(digestDir, { removal, log })
   for (const pid of ownerDirs(digestDir)) {
     if (Number(pid) === process.pid || processAlive(Number(pid))) continue
@@ -4431,7 +6115,48 @@ function removeCachesOf(digestDir, { removal, log }) {
       }
     }
   }
+  // A dead stable slot keeps its tree until the sweep removes it, but its cache is exactly
+  // what `--caches` is for. A slot a live server holds keeps its warm cache, and one another
+  // server claims between the check and the removal is skipped: the lock says whose it is.
+  for (const tree of slotTreesIn(digestDir, { commandLineOf })) {
+    if (tree.live) continue
+    const cache = join(tree.dir, SLOT_CACHE)
+    if (!existsSync(cache)) continue
+    const acquired = acquireSlotTreeLock(tree.dir, { owner, log, commandLineOf, linkLock })
+    if (!acquired.ok) continue
+    try {
+      rmSync(cache, { recursive: true, force: true, maxRetries: TRASH_RETRIES })
+      removed += 1
+      log(`removed build cache ${cache} of dead slot ${tree.label}`)
+    } catch (error) {
+      log(`could not remove build cache ${cache}: ${messageOf(error)}`)
+    } finally {
+      releaseSlotTreeLock(tree.dir, owner, acquired.lock, log, linkLock)
+    }
+  }
   return removed
+}
+
+/**
+ * The root as this machine's file system spells it.
+ *
+ * The service keys every layout by the digest of the *real* root: a server started on
+ * `/tmp/x` on macOS, where `/tmp` is a symlink to `/private/tmp`, writes under the digest of
+ * `/private/tmp/x`. A digest taken from the raw `--root` string would name a different
+ * directory, so `clean` would report that root's state as empty and prune none of its
+ * patches or reports. A root that no longer exists has no real path; its resolved spelling is
+ * then what the server that created it used.
+ *
+ * @param {string} root - the root as the caller named it.
+ * @returns {string} its real path when it exists, else the resolved path.
+ */
+function canonicalRootPath(root) {
+  const absolute = resolve(root)
+  try {
+    return realpathSync(absolute)
+  } catch {
+    return absolute
+  }
 }
 
 /**
@@ -4455,7 +6180,8 @@ function removeCachesOf(digestDir, { removal, log }) {
  * @param {object} options - what to report and reclaim.
  * @param {string} [options.baseDir] - the state base directory, usually `$TMPDIR/flash-mcp`.
  * @param {string} [options.dataDir] - the durable data directory; defaults to `durableBaseDir()`.
- * @param {string} options.root - the canonical service root of this invocation.
+ * @param {string} options.root - the service root of this invocation, as the caller named it;
+ *    it is resolved to its real path before its digest is taken, as the service does.
  * @param {boolean} [options.all] - also remove the trees of roots with no live server.
  * @param {boolean} [options.cachesOnly] - remove only build caches: this root's stored ones and
  *   the `.flash-cache` of its dead owners' slots (with `all`, every root's without a live server).
@@ -4464,13 +6190,38 @@ function removeCachesOf(digestDir, { removal, log }) {
  * @param {number} [options.now] - the current time, for tests.
  * @param {'sync' | 'background'} [options.removal] - how dead owners' trash is deleted.
  * @param {(message: string) => void} [options.log] - progress log.
+ * @param {(pid: number) => string | null} [options.processCommandLine] - `processCommandLine`,
+ *   injectable for tests.
+ * @param {(from: string, to: string) => void} [options.linkLock] - `linkSync`, injectable for
+ *   a test that runs on a filesystem without hard links.
+ * @param {(tree: object) => void} [options.beforeSweep] - called after a dead tree is planned
+ *   and before its lock is taken; injectable so a test can claim it in that window.
  * @returns {{baseDir: string, own: string, patchDir: string, legacyPatchDir?: string, stats: object[], actions: object}} the report.
  */
-export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = false, cachesOnly = false, retentionDays = PATCH_RETENTION_DAYS, now = Date.now(), removal = 'sync', log = () => {} } = {}) {
-  const own = rootDigest(root)
+export function cleanLayout({
+  baseDir = stateBaseDir(),
+  dataDir,
+  root,
+  all = false,
+  cachesOnly = false,
+  retentionDays = PATCH_RETENTION_DAYS,
+  now = Date.now(),
+  removal = 'sync',
+  log = () => {},
+  processCommandLine: commandLineOf = processCommandLine,
+  linkLock = linkSync,
+  beforeSweep,
+} = {}) {
+  // This root's own spelling, fixed once: the digest, the durable patch store and the salvage
+  // of its dead owners all have to name the same root the service itself would have used.
+  const rootPath = canonicalRootPath(root)
+  const own = rootDigest(rootPath)
   const ownDir = join(baseDir, own)
-  const patchDir = dataDir === undefined ? defaultPatchDir(root) : join(dataDir, own, 'patches')
+  const patchDir = dataDir === undefined ? defaultPatchDir(rootPath) : join(dataDir, own, 'patches')
   const legacyPatchDir = join(ownDir, 'patches')
+  // `clean` is one process with no pool, so it takes a lock identity of its own: a tree it
+  // removes is touched while that lock is held, never merely because its plan said "dead".
+  const owner = { pid: process.pid, instance: `clean-${randomUUID().slice(0, 8)}`, command: commandLineOf(process.pid) }
   // Facts are read before anything is removed, so the report describes what was found.
   // This root's durable store is part of its footprint even though it does not live under
   // the temp base, so it is counted on this root's line alongside any legacy copy.
@@ -4480,7 +6231,15 @@ export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = fal
     livePids: livePidsIn(join(baseDir, digest)),
     ...digestStats(join(baseDir, digest), digest === own ? [patchDir] : []),
   }))
-  const actions = { deadOwnersRemoved: 0, trashRemoved: 0, patchesPruned: 0, emptyDigestsRemoved: 0, foreignTreesRemoved: 0, cachesRemoved: 0 }
+  const actions = {
+    deadOwnersRemoved: 0,
+    trashRemoved: 0,
+    patchesPruned: 0,
+    reportsPruned: 0,
+    emptyDigestsRemoved: 0,
+    foreignTreesRemoved: 0,
+    cachesRemoved: 0,
+  }
   if (cachesOnly) {
     // Same safety as the state: a root with a live server keeps what it may be claiming or
     // writing, so only this root (whose live servers are this one's own concern, as for the
@@ -4488,8 +6247,8 @@ export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = fal
     for (const digest of digestDirs(baseDir)) {
       if (digest !== own && !all) continue
       const dir = join(baseDir, digest)
-      if (digest !== own && livePidsIn(dir).length > 0) continue
-      actions.cachesRemoved += removeCachesOf(dir, { removal, log })
+      if (digest !== own && digestHasLiveOwner(dir, { commandLineOf })) continue
+      actions.cachesRemoved += removeCachesOf(dir, { removal, log, owner, commandLineOf, linkLock })
     }
     return { baseDir, own, patchDir, stats, actions, ...(existsSync(legacyPatchDir) ? { legacyPatchDir } : {}) }
   }
@@ -4498,8 +6257,20 @@ export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = fal
     // of it synchronously: `clean` is an operator command that promises the disk back before
     // it exits, and it has no protocol connection whose event loop a background deletion
     // would protect. Salvage goes to the durable store too, exactly as a startup sweep
-    // would, and the counts come back from the same pass (see `sweepDeadOwners`).
-    const swept = sweepDeadOwners(root, { patchDir, baseDir, removal, log })
+    // would, and the counts come back from the same pass (see `sweepDeadOwners`). Unlike a
+    // server's sweep, `clean` takes dead stable slots as well: it is the operator asking for
+    // the disk back, and it takes each one's lock before touching it.
+    const swept = sweepDeadOwners(rootPath, {
+      patchDir,
+      baseDir,
+      removal,
+      log,
+      owner,
+      includeStable: true,
+      commandLineOf,
+      linkLock,
+      beforeSweep,
+    })
     actions.deadOwnersRemoved = swept.removed
     actions.trashRemoved = swept.trashRemoved
   }
@@ -4507,21 +6278,25 @@ export function cleanLayout({ baseDir = stateBaseDir(), dataDir, root, all = fal
   // and what the store holds goes now: `clean` is the operator asking for the disk back.
   actions.cachesRemoved += removeStoredCaches(ownDir, { removal, log })
   actions.patchesPruned = prunePatches(patchDir, { retentionDays, now })
+  // A server with isolation off stores its reports under the state base, not beside a patch
+  // store; they age out on the same window and are reclaimed by the same command.
+  actions.reportsPruned = pruneReports(join(ownDir, 'reports'), { retentionDays, now })
   if (resolve(legacyPatchDir) !== resolve(patchDir)) {
     // An upgrade can leave patches behind in the temp tree. Do not move them from `clean`
     // (a pool migrates on construction); just age out the ones that are already due.
     actions.patchesPruned += prunePatches(legacyPatchDir, { retentionDays, now })
   }
-  actions.emptyDigestsRemoved = removeEmptyForeignDigests(root, { baseDir, log })
+  actions.emptyDigestsRemoved = removeEmptyForeignDigests(rootPath, { baseDir, log, commandLineOf })
   if (all) {
     for (const digest of digestDirs(baseDir)) {
       if (digest === own) continue
       const dir = join(baseDir, digest)
-      if (livePidsIn(dir).length > 0) continue
-      actions.foreignTreesRemoved += removeDeadOwnerDirs(dir, log)
+      if (digestHasLiveOwner(dir, { commandLineOf })) continue
+      actions.foreignTreesRemoved += removeDeadOwnerDirs(dir, { log, owner, commandLineOf, linkLock })
+      actions.reportsPruned += pruneReports(join(dir, 'reports'), { retentionDays, now })
       actions.cachesRemoved += removeStoredCaches(dir, { removal, log })
     }
-    actions.emptyDigestsRemoved += removeEmptyForeignDigests(root, { baseDir, log })
+    actions.emptyDigestsRemoved += removeEmptyForeignDigests(rootPath, { baseDir, log, commandLineOf })
   }
   const report = { baseDir, own, patchDir, stats, actions }
   if (existsSync(legacyPatchDir)) report.legacyPatchDir = legacyPatchDir
@@ -4588,7 +6363,16 @@ function recordPathField(path) {
  * @throws {Error} when git cannot produce the list.
  */
 function nameStatusRecords(repoDir, base, env = process.env) {
-  const raw = git(['diff', '--cached', '--name-status', '-z', base], repoDir, env)
+  return decodeNameStatus(git(['diff', '--cached', '--name-status', '-z', base], repoDir, env))
+}
+
+/**
+ * Turn one `--name-status -z` stream into this service's `STATUS<TAB>path` records.
+ *
+ * @param {string} raw - git's NUL-separated output.
+ * @returns {string[]} the decoded records, in git's order.
+ */
+function decodeNameStatus(raw) {
   const fields = raw.split('\0')
   const lines = []
   let at = 0
@@ -5316,6 +7100,112 @@ function patchBaseEntries(diff) {
     entries.push({ path: from, mode, blob: index === null ? null : index[1] })
   }
   return entries
+}
+
+/**
+ * The `STATUS<TAB>path` records between two trees in a scratch repository.
+ *
+ * `excludeBase` compares the state a base patch produced with the state the cumulative
+ * patch produced; both are trees, so the records come from a plain tree diff rather than a
+ * staged index.
+ *
+ * @param {string} dir - the scratch repository.
+ * @param {string} from - the earlier tree.
+ * @param {string} to - the later tree.
+ * @param {NodeJS.ProcessEnv} env - environment for git.
+ * @returns {string[]} the decoded records, in git's order.
+ */
+function nameStatusBetween(dir, from, to, env) {
+  return decodeNameStatus(git(['diff', '--name-status', '-z', from, to], dir, env))
+}
+
+/**
+ * The base entries of a diff between two trees, keyed by each path's state in the first.
+ *
+ * This is what a three-way merge of the `excludeBase` diff rebuilds its base from: every
+ * path the own change touches, with the mode and blob the base patch's result had. A path
+ * a rename leaves behind is included too, because that is the base side of the rename.
+ *
+ * @param {string} dir - the scratch repository.
+ * @param {string} from - the earlier tree.
+ * @param {string} to - the later tree.
+ * @param {NodeJS.ProcessEnv} env - environment for git.
+ * @returns {Array<{path: string, mode: string, blob: string}>} the entries.
+ */
+function preimageBetween(dir, from, to, env) {
+  const paths = new Set()
+  for (const line of nameStatusBetween(dir, from, to, env)) {
+    for (const path of recordEntry(line).paths) paths.add(path)
+  }
+  const entries = []
+  for (const item of git(['ls-tree', '-r', '-z', from], dir, env).split('\0')) {
+    if (item === '') continue
+    const tab = item.indexOf('\t')
+    if (tab < 0) continue
+    const [mode, , blob] = item.slice(0, tab).split(' ')
+    const path = item.slice(tab + 1)
+    if (!paths.has(path)) continue
+    entries.push({ path, mode, blob })
+  }
+  return entries
+}
+
+/**
+ * The note a cumulative patch with no own work is read or applied with.
+ *
+ * Such a patch equals its base patch; there is no diff to page and nothing to apply. The
+ * note names the base patch so a caller can tell "the worker changed nothing" from "the
+ * patch could not be separated".
+ *
+ * @param {object} record - a patch record whose `basePatch` is recorded.
+ * @returns {string} the note.
+ */
+function noOwnWorkNote(record) {
+  return `this patch holds no work beyond its base patch ${record.basePatch}; nothing to apply`
+}
+
+/**
+ * Rebuild the base tree a stored patch was diffed against, in a scratch repository.
+ *
+ * The base commit lived only in the disposable copy, so the merge and `excludeBase` both
+ * rebuild the tree from the record's saved preimage entries; a record that saved none states
+ * its base in its own `index` lines (see `patchBaseEntries`). Blobs are resolved through the
+ * scratch repository's alternates, which borrow the patch store's saved blobs and the
+ * caller's objects read-only.
+ *
+ * @param {object} record - the patch record whose base is wanted.
+ * @param {string} dir - the scratch repository.
+ * @param {NodeJS.ProcessEnv} env - environment for git.
+ * @param {string} unavailable - the sentence a missing base is refused with.
+ * @returns {string} the base tree id.
+ * @throws {Error} when an entry's blob cannot be found.
+ */
+function baseTreeOf(record, dir, env, unavailable) {
+  const saved = Array.isArray(record.preimage)
+  const entries = saved
+    ? record.preimage.filter((entry) => entry !== null && typeof entry === 'object' && typeof entry.path === 'string')
+    : patchBaseEntries(readFileSync(record.patchPath, 'utf8'))
+  const missing = []
+  for (const entry of entries) {
+    if (entry.mode === GITLINK_MODE) {
+      git(['update-index', '--add', '--cacheinfo', `${entry.mode},${entry.blob},${entry.path}`], dir, env)
+      continue
+    }
+    if (typeof entry.blob !== 'string') {
+      missing.push(`${entry.path}: the record has no base blob`)
+      continue
+    }
+    const looked = gitAllowFailure(['rev-parse', '--verify', `${entry.blob}^{blob}`], dir, env)
+    if (looked.status !== 0) {
+      missing.push(`${entry.path}: base blob ${entry.blob} is not in this repository`)
+      continue
+    }
+    git(['update-index', '--add', '--cacheinfo', `${entry.mode},${looked.stdout.trim()},${entry.path}`], dir, env)
+  }
+  if (missing.length > 0) {
+    throw new Error(`${unavailable} ${missing.join('; ')}.`)
+  }
+  return git(['write-tree'], dir, env).trim()
 }
 
 /**
@@ -6232,8 +8122,14 @@ export class WorkspaceIsolation {
    *   whose environment-name case rule is used (default `process.platform`; injectable
    *   so a Windows section can be tested anywhere).
    * @param {(from: string, to: string) => void} [options.renameDirectory] - the rename that
-   *   moves a build cache in and out of the per-root store; `fs.renameSync` unless given, so
-   *   a test can make it fail the way an open handle does on Windows.
+   *   moves a build cache in and out of the per-root store, a dead slot's tree aside, and a
+   *   timed-out slot's tree to a retired name; `fs.renameSync` unless given, so a test can
+   *   make it fail the way an open handle does on Windows.
+   * @param {(pid: number) => string | null} [options.processCommandLine] - `processCommandLine`,
+   *   which slot locks use to tell a live owner from a reused pid; injectable for tests.
+   * @param {(from: string, to: string) => void} [options.linkLock] - `fs.linkSync`, the atomic
+   *   step that creates a slot lock; a filesystem that refuses hard links falls back to an
+   *   exclusive create. Injectable so a test can run as such a filesystem.
    * @param {(path: string) => object} [options.statfs] - `fs.statfsSync`, asked once per
    *   leased slot for the free space of the state volume; injectable for tests.
    * @param {(message: string) => void} [options.log] - progress log.
@@ -6252,6 +8148,8 @@ export class WorkspaceIsolation {
     deferStartupSweep = false,
     platform = process.platform,
     renameDirectory = renameSync,
+    processCommandLine: commandLineOf = processCommandLine,
+    linkLock = linkSync,
     statfs = statfsSync,
     log = () => {},
   }) {
@@ -6260,7 +8158,13 @@ export class WorkspaceIsolation {
     this.ownsStateDir = stateDir === undefined || stateDir === null || stateDir === ''
     /** The base every default-layout directory of this root sits under. */
     this.baseDir = baseDir === undefined || baseDir === null || baseDir === '' ? stateBaseDir() : resolve(baseDir)
-    this.stateDir = this.ownsStateDir ? defaultStateDir(this.root, { baseDir: this.baseDir }) : resolve(stateDir)
+    /**
+     * The nonce that names this pool: its instance directory, its slot locks and its
+     * retired trees. Read here rather than inside `defaultStateDir` so a slot lock and the
+     * state directory of the same pool carry the same value.
+     */
+    this.instance = randomUUID().slice(0, 8)
+    this.stateDir = this.ownsStateDir ? defaultStateDir(this.root, { baseDir: this.baseDir, instance: this.instance }) : resolve(stateDir)
     /**
      * Where patches are stored. With a private state directory they live in the durable
      * per-root store (`FLASH_DATA_DIR` or the platform data directory), not beside this
@@ -6272,7 +8176,17 @@ export class WorkspaceIsolation {
     this.patchRetentionDays = patchRetentionDays
     this.maxStateBytes = maxStateBytes
     this.renameDirectory = renameDirectory
+    this.linkLock = linkLock
     this.statfs = statfs
+    /** How this pool reads a process's command line, so a slot lock can name its owner. */
+    this.commandLineOf = commandLineOf
+    /**
+     * This process's own command line, recorded in every slot lock the pool writes. It is
+     * what tells a later server that a live pid is this pool and not an unrelated process
+     * that happened to receive the same number.
+     * @type {string}
+     */
+    this.commandLine = processCommandLine(process.pid)
     /**
      * Where idle build caches wait between servers. Only the default layout has one: a
      * configured state directory is the deployment's to manage, and a store beside it would
@@ -6280,6 +8194,49 @@ export class WorkspaceIsolation {
      */
     this.cacheStore = this.ownsStateDir ? cacheStoreDir(this.baseDir, this.root) : undefined
     this.log = log
+    /**
+     * Where this root's stable slot directories live, or undefined when a configured state
+     * directory keeps the older `<stateDir>/slots/slot-<id>` layout. A stable slot's path
+     * depends only on the root and the slot number, which is what lets the build cache of
+     * one server be the build cache of the next server after a restart.
+     * @type {string | undefined}
+     */
+    this.slotsBaseDir = this.ownsStateDir ? join(this.baseDir, rootDigest(this.root), SLOTS_DIRECTORY) : undefined
+    /**
+     * How many trees the pool wanted, and the numbers it actually holds. The numbers are
+     * taken from the locks (`claimSlots`): two servers on one root get disjoint ones, the
+     * second starting at the first number no live server holds. A default pool that cannot
+     * take a single number — an unwritable state base — falls back to its private state
+     * directory, which is the older layout and needs no lock; that is logged, never silent.
+     */
+    this.slotCount = Math.max(1, slots)
+    /** The slot numbers this pool holds, ascending. @type {number[]} */
+    this.slotIds = Array.from({ length: this.slotCount }, (_, id) => id)
+    /** Whether `slot.dir` is the stable per-root path or the older per-instance one. */
+    this.stableSlots = false
+    if (this.slotsBaseDir !== undefined) {
+      const claimed = claimSlots(this.slotsBaseDir, {
+        count: this.slotCount,
+        pid: process.pid,
+        instance: this.instance,
+        command: this.commandLine,
+        log: this.log,
+        commandLineOf: this.commandLineOf,
+        renameDirectory: this.renameDirectory,
+        linkLock: this.linkLock,
+      })
+      if (claimed.length === 0) {
+        this.log(`no stable slot could be claimed under ${this.slotsBaseDir}; this pool keeps its slots in ${this.stateDir}, which costs the next server the build cache`)
+      } else {
+        this.stableSlots = true
+        this.slotIds = claimed
+      }
+    }
+    /**
+     * One past the highest slot number this pool holds, for a `port:` range's upper check:
+     * the second server on a root starts at a higher number than its own slot count.
+     */
+    this.slotHighest = this.slotIds.reduce((max, id) => Math.max(max, id), 0) + 1
     /**
      * Whether the heavy start-up work was deferred to `startupSweep()`.
      * @type {boolean}
@@ -6339,7 +8296,6 @@ export class WorkspaceIsolation {
     /** The pool options that are layered over the files on every (re)read. */
     this.optionCopyExclude = Array.isArray(copyExclude) ? copyExclude : []
     this.optionSlotEnv = slotEnv
-    this.slotCount = Math.max(1, slots)
     /** Whether the settings files' `slotSetup` steps may run on the host. */
     this.slotSetupAllowed = allowSlotSetup === true
     /**
@@ -6349,6 +8305,8 @@ export class WorkspaceIsolation {
     this.settings = this.#buildSettings(layered)
     if (this.settings.slotSetupWarning !== undefined) this.log(SETUP_NOT_ALLOWED_WARNING)
     this.clones = 0
+    /** Whether the one-off "no copy-on-write clone here" line was already logged. */
+    this.copyFallbackLogged = false
     /** Patches kept for a later `flash_apply`. @type {Map<string, object>} */
     this.patches = new Map()
     /**
@@ -6361,11 +8319,12 @@ export class WorkspaceIsolation {
     this.legacyPatchDir = undefined
     /** Callers waiting for a slot, oldest first. @type {Function[]} */
     this.waiting = []
-    this.slots = Array.from({ length: this.slotCount }, (_, id) => ({
+    this.slots = this.slotIds.map((id) => ({
       id,
       dirIndex: 0,
-      dir: slotDirectory(this.stateDir, id, 0),
+      dir: this.#slotDirectory(id, 0),
       base: null,
+      cacheFromRetired: false,
       busy: false,
       orphans: [],
       stoppedOrphans: new Set(),
@@ -6546,7 +8505,7 @@ export class WorkspaceIsolation {
      * no directory and a `value` entry is plain text, so neither makes the copy name
      * `.flash-home` or `.flash-cache`.
      */
-    const slotEnv = mergeSlotEnv(layered.slotEnvLayers, this.optionSlotEnv, this.log, this.slotCount, { platform: this.platform })
+    const slotEnv = mergeSlotEnv(layered.slotEnvLayers, this.optionSlotEnv, this.log, this.slotHighest, { platform: this.platform })
     // The setup steps that passed validation, in configuration order. A kept path that the
     // caller's own git does not ignore — or that it tracks — is refused here, so the step
     // still runs but cannot move tracked source out of the copy.
@@ -6628,16 +8587,18 @@ export class WorkspaceIsolation {
   /**
    * The cache store policy the sweeps and the store trim use, or undefined without a store.
    *
-   * The store keeps at most as many caches as this root has slots: a cache beyond that can
-   * never be claimed by a server of this configuration at the same time as the others, so it
-   * is disk with no reader. The age limit is the patch retention window, which is the
-   * existing answer to "how long is idle state worth keeping".
+   * The store keeps at most as many caches as this root has slot numbers: a cache beyond that
+   * can never be claimed by a server of this root at the same time as the others, so it is
+   * disk with no reader. Slot numbers are shared by the servers of one root, so the bound is
+   * one past the highest number this pool holds, not its own slot count alone. The age limit
+   * is the patch retention window, which is the existing answer to "how long is idle state
+   * worth keeping".
    *
    * @returns {{storeDir: string, max: number, retentionDays: number, rename: Function} | undefined} the policy.
    */
   #cachePolicy() {
     if (this.cacheStore === undefined) return undefined
-    return { storeDir: this.cacheStore, max: this.slotCount, retentionDays: this.patchRetentionDays, rename: this.renameDirectory }
+    return { storeDir: this.cacheStore, max: this.slotHighest, retentionDays: this.patchRetentionDays, rename: this.renameDirectory }
   }
 
   /**
@@ -6718,11 +8679,27 @@ export class WorkspaceIsolation {
   #startupWorkSync() {
     if (this.ownsStateDir) {
       this.#migrateLegacyStore()
-      sweepDeadOwners(this.root, { patchDir: this.patchDir, baseDir: this.baseDir, log: this.log, caches: this.#cachePolicy() })
+      sweepDeadOwners(this.root, {
+        patchDir: this.patchDir,
+        baseDir: this.baseDir,
+        log: this.log,
+        caches: this.#cachePolicy(),
+        owner: { pid: process.pid, instance: this.instance, command: this.commandLine },
+        commandLineOf: this.commandLineOf,
+        linkLock: this.linkLock,
+      })
       this.#trimCacheStore()
-      removeEmptyForeignDigests(this.root, { baseDir: this.baseDir, retentionDays: this.patchRetentionDays, log: this.log })
+      removeEmptyForeignDigests(this.root, {
+        baseDir: this.baseDir,
+        retentionDays: this.patchRetentionDays,
+        log: this.log,
+        commandLineOf: this.commandLineOf,
+      })
     }
     prunePatches(this.patchDir, { retentionDays: this.patchRetentionDays })
+    // A server of this root started with isolation off keeps its reports under the state
+    // base; they are call state too and age out on the patch window.
+    pruneReports(join(this.baseDir, rootDigest(this.root), 'reports'), { retentionDays: this.patchRetentionDays })
   }
 
   /**
@@ -6741,12 +8718,22 @@ export class WorkspaceIsolation {
   #migrateLegacyStore() {
     const digestDir = join(this.baseDir, rootDigest(this.root))
     const legacyDir = join(digestDir, 'patches')
+    // A live slot lock is a running server of this root just as a live pid directory is:
+    // this process's own lock does not count against itself.
     const otherPids = livePidsIn(digestDir).filter((pid) => pid !== process.pid)
+    const lockedSlot = slotTreesIn(digestDir, { commandLineOf: this.commandLineOf }).some(
+      (tree) => tree.live && tree.pid !== process.pid,
+    )
     if (otherPids.length > 0) {
       this.legacyPatchDir = legacyDir
       this.log(
         `deferred moving stored patches from ${legacyDir} to ${this.patchDir}: ` +
           `process(es) ${otherPids.join(', ')} still use the old store`,
+      )
+    } else if (lockedSlot) {
+      this.legacyPatchDir = legacyDir
+      this.log(
+        `deferred moving stored patches from ${legacyDir} to ${this.patchDir}: a live server still holds a slot lock under this root`,
       )
     } else {
       migrateLegacyPatches(legacyDir, this.patchDir, { log: this.log })
@@ -6809,17 +8796,26 @@ export class WorkspaceIsolation {
           log: this.log,
           stopped: () => this.closed,
           caches: this.#cachePolicy(),
+          owner: { pid: process.pid, instance: this.instance, command: this.commandLine },
+          commandLineOf: this.commandLineOf,
+          linkLock: this.linkLock,
         })
         Object.assign(stats, { salvaged: swept.salvaged, kept: swept.kept, removed: swept.removed, patches: swept.patches })
         if (swept.stopped) return
         this.#trimCacheStore()
-        removeEmptyForeignDigests(this.root, { baseDir: this.baseDir, retentionDays: this.patchRetentionDays, log: this.log })
+        removeEmptyForeignDigests(this.root, {
+          baseDir: this.baseDir,
+          retentionDays: this.patchRetentionDays,
+          log: this.log,
+          commandLineOf: this.commandLineOf,
+        })
       }
       // Between every remaining step: a `close()` that ran during the sweep must not leave
       // pruning or a reload happening after it returned.
       if (this.closed) return
       prunePatches(this.patchDir, { retentionDays: this.patchRetentionDays })
       if (this.closed) return
+      pruneReports(join(this.baseDir, rootDigest(this.root), 'reports'), { retentionDays: this.patchRetentionDays })
       this.#loadPatches()
     } catch (error) {
       // Never reject: the pool is already serving, and the timer or the next `prepare`
@@ -6873,7 +8869,15 @@ export class WorkspaceIsolation {
     if (!this.ownsStateDir) return
     if (!this.startupSweepDone) return
     const migrated = this.#retryLegacyMigration()
-    const swept = sweepDeadOwners(this.root, { patchDir: this.patchDir, baseDir: this.baseDir, log: this.log, caches: this.#cachePolicy() })
+    const swept = sweepDeadOwners(this.root, {
+      patchDir: this.patchDir,
+      baseDir: this.baseDir,
+      log: this.log,
+      caches: this.#cachePolicy(),
+      owner: { pid: process.pid, instance: this.instance, command: this.commandLine },
+      commandLineOf: this.commandLineOf,
+      linkLock: this.linkLock,
+    })
     // While a live old server keeps writing into the legacy store, the in-memory view is
     // refreshed from it too: the old server may have committed a patch since construction,
     // and the caller of this server must be able to list it. The reload is two small
@@ -6899,7 +8903,14 @@ export class WorkspaceIsolation {
     const legacyDir = this.legacyPatchDir
     if (legacyDir === undefined) return false
     const others = livePidsIn(join(this.baseDir, rootDigest(this.root))).filter((pid) => pid !== process.pid)
-    if (others.length > 0) return false
+    if (
+      others.length > 0 ||
+      slotTreesIn(join(this.baseDir, rootDigest(this.root)), { commandLineOf: this.commandLineOf }).some(
+        (tree) => tree.live && tree.pid !== process.pid,
+      )
+    ) {
+      return false
+    }
     const moved = migrateLegacyPatches(legacyDir, this.patchDir, { log: this.log })
     // A fully migrated store is gone. Forgetting the flag then keeps later sweeps from
     // probing a directory that no longer exists; anything still in it was incomplete and
@@ -6958,6 +8969,12 @@ export class WorkspaceIsolation {
       // slot's own directory is not part of what the cap counts.
       if (!this.#keepRetiredCache(tree.slot, tree.dir)) this.#storeRetiredCache(tree.slot, tree.dir)
       rmSync(tree.dir, { recursive: true, force: true })
+      // The retired tree carried a lock and possibly a live-runtime mark of this pool's own
+      // (see `retire`); neither may outlive the tree and describe a later one.
+      if (this.stableSlots) {
+        removeSlotLock(tree.dir, this.log)
+        rmSync(liveOrphanMarker(tree.dir), { force: true })
+      }
       tree.slot.orphans.splice(tree.slot.orphans.indexOf(tree.dir), 1)
       tree.slot.stoppedOrphans.delete(tree.dir)
       total -= tree.bytes
@@ -7391,11 +9408,15 @@ export class WorkspaceIsolation {
     // makes the empty `cache:` folders: a fresh or replaced slot can make a build that took
     // minutes take an hour, and a slow job should say why.
     // A slot replaced after a timeout takes the retired tree's warm cache first, so the
-    // retry that usually follows does not build from cold.
+    // retry that usually follows does not build from cold. `retire` may already have carried
+    // it into the stable path on POSIX (see the class's `retire`), which is the same
+    // hand-over one step earlier: the call still says where the cache came from.
     slot.buildCacheFrom = undefined
     if (this.#adoptRetiredCache(slot)) slot.buildCacheFrom = 'retired-slot'
+    else if (slot.cacheFromRetired === true && holdsAnyFile(join(slot.dir, SLOT_CACHE))) slot.buildCacheFrom = 'retired-slot'
     // A slot that is still cold after that claims a cache an earlier server left in the store.
     else if (this.#claimStoredCache(slot)) slot.buildCacheFrom = 'store'
+    slot.cacheFromRetired = false
     slot.buildCacheEmpty = this.#buildCacheEmpty(slot, settings)
     if (slot.buildCacheEmpty) {
       this.log(
@@ -7420,10 +9441,21 @@ export class WorkspaceIsolation {
     try {
       copied = copyTree(original, repoDir, {
         fs,
+        platform: this.platform,
         exclude: settings.copyExclude,
         // The safety of leaving a matched path out needs git, so the decision stays here
         // rather than in the walk. It runs once per matched path, not once per file.
         consider: (relPath) => this.#excludeDecision(original, relPath),
+        // One line per server, not one per file and never on stderr: a filesystem without
+        // reflink support is a property of the machine, not of this call.
+        onCloneFallback: (platform, code) => {
+          if (this.copyFallbackLogged) return
+          this.copyFallbackLogged = true
+          this.log(
+            'the copy-on-write clone flag COPYFILE_FICLONE_FORCE is not supported on this filesystem ' +
+              `(${code} on ${platform}); the copy of ${original} is a plain copy`,
+          )
+        },
       })
     } catch (error) {
       // A raw ENOENT names a hashed build artefact and teaches the caller nothing. Say
@@ -7435,6 +9467,14 @@ export class WorkspaceIsolation {
       )
     }
     const { mechanism, skipped, vanished, excluded, kept, linksRepointed, repointed, linksSkipped, repositories } = copied
+    // What the copy itself left out, and the rules it was left out by. The ignored-path
+    // notice asks both when `collect` runs: build output the copy never carried is not a
+    // path the worker created, even when a build then makes it inside the copy.
+    slot.copyExcluded = excluded.map((path) => path.split(sep).join('/'))
+    // The full exclude list, defaults included: the ignored-path notice filters by it, and a
+    // default such as `.env` is a rule the copy applied even when the path did not exist yet
+    // and so never appears in `excluded`.
+    slot.copyExcludeNames = settings.copyExclude
     if (vanished > 0) {
       this.log(`skipped ${String(vanished)} file(s) that vanished while the copy was made (a build was writing in ${original})`)
     }
@@ -7620,6 +9660,41 @@ export class WorkspaceIsolation {
     const paths = ignoredPaths(repoDir)
     slot.ignoredBase = paths
     slot.ignoredFiles = ignoredFileStats(repoDir, paths)
+  }
+
+  /**
+   * The git-ignored paths the worker created that are worth telling the caller about.
+   *
+   * Build output is meant to stay behind, so it is not a path the worker created just
+   * because a build made it inside the copy. A path is left out of the notice when the copy
+   * itself excluded it — by `copyExclude`, by the defaults, or because git ignores the
+   * directory and the copy walked around it — or when the same path exists in the caller's
+   * tree, where the copy did not carry it from. What remains is a genuinely new ignored path
+   * elsewhere, such as a worker writing its result into an ignored `out/`.
+   *
+   * The base comparison first removes anything the copy started with; this rule then
+   * removes what the copy never had for a reason other than the worker's own work. Without
+   * it, every Rust job said "created 1 path git ignores: target" for a build directory the
+   * caller already had and the copy had deliberately not brought along.
+   *
+   * @param {object} slot - the slot being collected, carrying what its copy excluded.
+   * @param {string} repoDir - the copy's git work tree.
+   * @param {string} scope - the nested repository the call was scoped to, or `''`.
+   * @returns {string[]} the new ignored paths worth reporting, sorted.
+   */
+  #createdIgnored(slot, repoDir, scope) {
+    const original = scope === '' ? this.root : join(this.root, scope)
+    const excluded = new Set(slot.copyExcluded ?? [])
+    const rules = slot.copyExcludeNames ?? []
+    return ignoredPaths(repoDir).filter((entry) => {
+      if ((slot.ignoredBase ?? []).includes(entry)) return false
+      if (excluded.has(entry)) return false
+      const name = entry.split('/').pop() ?? entry
+      if (matchesExclude(entry, name, rules)) return false
+      // The caller still has the path: the copy either left it out or never carried the
+      // build output's files, so the worker did not create it in the caller's world.
+      return !existsSync(join(original, ...entry.split('/')))
+    })
   }
 
   /**
@@ -8209,22 +10284,57 @@ export class WorkspaceIsolation {
   }
 
   /**
+   * The directory one slot uses at a given generation.
+   *
+   * Generation 0 is the slot's own directory: the stable per-root `slots/<id>` of the default
+   * layout, or `<stateDir>/slots/slot-<id>` with a configured state directory. Every later
+   * generation is a retired tree, which must not take the stable path: the next server of
+   * this root claims that one and its warm cache. A configured state directory keeps the
+   * older `<id>-<generation>` names beside it, exactly as before.
+   *
+   * @param {number} id - the slot number.
+   * @param {number} index - the slot's directory generation.
+   * @returns {string} the slot directory for that generation.
+   */
+  #slotDirectory(id, index) {
+    if (!this.stableSlots) return slotDirectory(this.stateDir, id, index)
+    if (index === 0) return join(this.slotsBaseDir, String(id))
+    return retiredSlotDirectory(this.slotsBaseDir, id, this.instance, index)
+  }
+
+  /**
+   * Whether a slot's directory is the path the next server of this root claims.
+   *
+   * Only that path keeps its build cache through `close`: the next server's build looks for
+   * the cache exactly there, so leaving it is what makes the first build warm. A slot that
+   * retired its directory away sits under a name of its own (`slots/<id>.retired-<instance>`),
+   * which nobody will claim; its cache goes into the store instead, and the tree is removed.
+   *
+   * @param {Slot} slot - the slot to ask about.
+   * @returns {boolean} true when the slot's own directory is the stable one.
+   */
+  #cacheStaysInPlace(slot) {
+    return this.stableSlots && slot.dirIndex === 0
+  }
+
+  /**
    * Take a tree out of service after its call lost track of the worker. The session that
    * ran there cannot be stopped, so it may still write; recycling the directory would
    * hand its late edits to the next call as that call's own work.
    *
-   * The tree therefore keeps its name and stays exactly where it is. The Harness session
-   * and the build processes it spawned hold that path as an absolute string, so renaming
-   * the tree away only redirects their writes into the fresh empty directory left at the
-   * old name — observed as `ENOTEMPTY` when the next call tried to empty it. The slot is
-   * moved instead: it is given a path it has never used, created empty, and the orphaned
-   * tree is remembered so `close()` still removes it.
+   * A stable slot keeps its stable path. The tree is renamed aside to
+   * `slots/<n>.retired-<instance>[-<gen>]` first, which on POSIX moves the inode a process
+   * still has open along with it, and the live slot is then given a fresh, empty
+   * `slots/<n>`. Its `.flash-cache` is handed over to that fresh directory in the same step
+   * when `sessionStopped` says nothing can be writing into it, which is what the next
+   * `prepare`'s `#adoptRetiredCache` would otherwise do (see `#adoptRetiredCache` and
+   * `#keepRetiredCache`); a cache that cannot move stays with the retired tree for `trim`.
+   * The retired tree gets its own lock, created before the tree appears under the name.
    *
-   * Its `.flash-cache` stays with it, but is not lost with it: the next `prepare` in the slot
-   * moves it into the new directory, and `trim` tries again before removing the tree (see
-   * `#adoptRetiredCache` and `#keepRetiredCache`). Both only do so when the caller says the
-   * runtimes rooted at the tree were shut down first, because "may still be writing" above
-   * is otherwise exactly true of the cache.
+   * When the rename fails — Windows refuses one while a handle is open — the older layout
+   * is kept: the orphan stays at `slots/<n>` and the slot moves to
+   * `slots/<n>.retired-<instance>[-<gen>]`. That step is logged, and the slot stays there
+   * for the rest of its life because its stable path is now occupied by the orphan.
    *
    * @param {Slot} slot - the slot whose call timed out.
    * @param {object} [options] - what the caller did before retiring the tree.
@@ -8233,28 +10343,127 @@ export class WorkspaceIsolation {
    */
   retire(slot, { sessionStopped = false } = {}) {
     const orphan = slot.dir
+    const owner = { pid: process.pid, instance: this.instance, command: this.commandLine }
+    if (this.stableSlots && slot.dirIndex === 0) {
+      const generation = slot.orphans.length + 1
+      const retired = retiredSlotDirectory(this.slotsBaseDir, slot.id, this.instance, generation)
+      if (existsSync(orphan)) {
+        // The retired tree is locked *before* it exists under that name. A concurrent
+        // `clean` that saw an unlocked directory there would take it for a dead server's and
+        // delete it while this pool's runtimes still write into it.
+        writeRetiredSlotLock(retired, { ...owner, log: this.log, linkLock: this.linkLock })
+        try {
+          this.renameDirectory(orphan, retired)
+        } catch (error) {
+          // POSIX lets a process keep writing into a renamed tree, and every session of this
+          // pool follows the inode; Windows refuses the rename while a handle is open. Then
+          // the tree keeps the stable path and the slot moves to a retired name of its own,
+          // which is the older layout. The failure is named, never silent.
+          releaseOwnSlotLock(retired, owner, this.log)
+          this.log(`could not move the tree of slot ${String(slot.id)} aside (${messageOf(error)}); keeping the older layout`)
+          this.#retireToRetiredName(slot, orphan, retired, sessionStopped)
+          return
+        }
+        try {
+          // The slot's own lock at `slots/<n>.lock` is already ours, so the fresh directory
+          // exists only after its lock does.
+          mkdirSync(slot.dir, { recursive: true })
+        } catch (error) {
+          this.log(`could not recreate the stable directory ${slot.dir} (${messageOf(error)}); the next call makes it`)
+        }
+        slot.orphans.push(retired)
+        if (sessionStopped === true) {
+          slot.stoppedOrphans.add(retired)
+          // The 0.1.10 hand-over, one step earlier than `prepare` would do it: the cache is
+          // warm only at the stable path, and nothing can be writing into it any more.
+          const cache = join(retired, SLOT_CACHE)
+          if (holdsAnyFile(cache) && !holdsAnyFile(join(slot.dir, SLOT_CACHE))) {
+            try {
+              this.renameDirectory(cache, join(slot.dir, SLOT_CACHE))
+              slot.cacheFromRetired = true
+              this.log(`handed the build cache of ${retired} over to ${slot.dir}`)
+            } catch (error) {
+              this.log(`could not hand the build cache of ${retired} over to ${slot.dir} (${messageOf(error)}); the next call tries again`)
+            }
+          }
+        } else {
+          markLiveOrphan(retired, this.log)
+        }
+        this.#resetSlotAfterRetire(slot)
+        this.log(`retired ${orphan} to ${retired}; the slot keeps its stable path ${slot.dir}`)
+        return
+      }
+      // Nothing sat at the stable path, so there is no orphan to move; the slot keeps it.
+      try {
+        mkdirSync(slot.dir, { recursive: true })
+      } catch (error) {
+        this.log(`could not make the stable directory ${slot.dir} (${messageOf(error)}); the next call makes it`)
+      }
+      this.#resetSlotAfterRetire(slot)
+      this.log(`slot ${String(slot.id)} had no tree to retire; it keeps its stable path ${slot.dir}`)
+      return
+    }
     const nextIndex = slot.dirIndex + 1
-    const nextDir = slotDirectory(this.stateDir, slot.id, nextIndex)
+    this.#retireToRetiredName(slot, orphan, this.#slotDirectory(slot.id, nextIndex), sessionStopped)
+  }
+
+  /**
+   * Move a slot to a retired name of its own: the older layout `retire` keeps as a fallback.
+   *
+   * Used by a configured state directory, whose slots have no locks, and by a stable slot
+   * whose tree could not be renamed aside. The fresh directory's lock is created before the
+   * directory exists, so a concurrent `clean` cannot take it between the two steps; the
+   * orphan keeps its own lock, which the sweep that later salvages it needs to name the dead
+   * pid. `slot.dirIndex` records that the slot no longer sits at the stable path.
+   *
+   * @param {Slot} slot - the slot whose call timed out.
+   * @param {string} orphan - the tree left at the slot's old path.
+   * @param {string} nextDir - the retired name the live slot moves to.
+   * @param {boolean} sessionStopped - whether its runtimes were shut down.
+   * @returns {void}
+   */
+  #retireToRetiredName(slot, orphan, nextDir, sessionStopped) {
+    const owner = { pid: process.pid, instance: this.instance, command: this.commandLine }
+    if (this.stableSlots) writeRetiredSlotLock(nextDir, { ...owner, log: this.log, linkLock: this.linkLock })
     try {
       mkdirSync(nextDir, { recursive: true })
     } catch (error) {
+      // The lock of a directory that was never made would keep the number from a later
+      // retire of this slot, so it goes again.
+      if (this.stableSlots) releaseOwnSlotLock(nextDir, owner, this.log)
       this.log(`could not move slot ${String(slot.id)} to a fresh directory: ${messageOf(error)}`)
       return
     }
-    slot.dirIndex = nextIndex
+    slot.dirIndex = this.stableSlots ? slot.orphans.length + 1 : slot.dirIndex + 1
     slot.dir = nextDir
     slot.orphans.push(orphan)
     if (sessionStopped === true) slot.stoppedOrphans.add(orphan)
     else markLiveOrphan(orphan, this.log)
+    if (this.stableSlots) {
+      // The orphan is not the stable slot any more, so nothing claims it by name; its own
+      // lock says this pool still owns it, and the sweep must leave it while the pool runs.
+      writeRetiredSlotLock(orphan, { ...owner, log: this.log, linkLock: this.linkLock })
+    }
+    this.#resetSlotAfterRetire(slot)
+    this.log(`retired ${orphan} in place: its session may still be writing there; the slot moved to ${nextDir}`)
+  }
+
+  /**
+   * Forget the per-call state of a slot whose tree was just retired.
+   * @param {Slot} slot - the slot that moved on.
+   * @returns {void}
+   */
+  #resetSlotAfterRetire(slot) {
     slot.base = null
     slot.baseReason = undefined
     slot.tmpDir = undefined
     slot.ignoredBase = undefined
     slot.ignoredFiles = undefined
+    slot.copyExcluded = undefined
+    slot.copyExcludeNames = undefined
     slot.scope = undefined
     slot.repoDir = undefined
     slot.task = undefined
-    this.log(`retired ${orphan} in place: its session may still be writing there; the slot moved to ${nextDir}`)
   }
 
   /**
@@ -8360,7 +10569,7 @@ export class WorkspaceIsolation {
     // whole build directory has been misled, not informed. A path that already
     // existed at the base is not new, so it is compared against the recorded facts
     // instead: a rewritten or deleted ignored file is just as invisible to the patch.
-    const ignored = ignoredPaths(repoDir).filter((entry) => !(slot.ignoredBase ?? []).includes(entry))
+    const ignored = this.#createdIgnored(slot, repoDir, scope)
     const ignoredChanged = ignoredChangedFiles(repoDir, slot.ignoredFiles)
     // The diff is clipped at a file boundary: a caller can read every line it holds,
     // and `diffOmitted` names what is not there. The whole patch is what `apply` uses.
@@ -8380,6 +10589,12 @@ export class WorkspaceIsolation {
     // emptied afterwards, so writing a patch (or a record) here would be the only
     // remaining copy of work nobody asked to keep.
     if (!store) return change
+    // No tracked change means no patch: an empty file with an id is not something a later
+    // `flash_apply` can carry, and every writing job that did nothing used to leave one
+    // behind. `available` stays true — the diff was computed, it is simply empty — and the
+    // result must not name a patch nothing can apply. Ignored-only work still reports its
+    // warnings above; the patch cannot carry it either way.
+    if (filesChanged.length === 0) return { ...change, stored: false }
     // The record travels with the patch, so a restarted service can still tell which
     // repository the patch was computed for and whether it has already been applied.
     const patchId = `flash-${randomUUID()}`
@@ -8426,6 +10641,113 @@ export class WorkspaceIsolation {
   }
 
   /**
+   * The job's own change: a cumulative patch's diff relative to the base patch it continued from.
+   *
+   * A call started with `basePatch` stores a patch that holds the base patch's change and
+   * the new work together (`prepare` records its base before the base patch is applied).
+   * When the caller has since committed the base, they want only the second half. Both
+   * halves are rebuilt as trees in a scratch repository: the cumulative patch's own base
+   * (from its saved preimage), the base patch applied to it, and this patch applied to it.
+   * The diff between the last two is the work this call added.
+   *
+   * The caller's index and repository are never used as an index: the scratch repository
+   * borrows the patch stores' saved blobs and the caller's objects read-only through
+   * `objects/info/alternates`, exactly as the three-way merge does.
+   *
+   * @param {object} record - a patch record whose `basePatch` names a stored patch.
+   * @returns {{patchPath: string, filesChanged: string[], diffstat: string,
+   *   preimage: Array<{path: string, mode: string, blob: string}>, dir: string,
+   *   objects: string, basePatchId: string}} the own change, in a
+   *   temporary directory beside the patch store (`dir`, to be removed by the caller).
+   * @throws {Error} when the record has no base patch, that base patch is no longer stored,
+   *   or git cannot rebuild the two states.
+   */
+  #changeWithoutBase(record) {
+    const basePatchId = record.basePatch
+    if (typeof basePatchId !== 'string' || basePatchId.length === 0) {
+      throw new Error(`patch ${record.patchId} was not started from another patch, so there is no base patch to exclude`)
+    }
+    let baseRecord
+    try {
+      baseRecord = this.#lookupPatch(basePatchId)
+    } catch (error) {
+      throw new Error(
+        `patch ${record.patchId} was started from base patch ${basePatchId}, which is no longer stored (${messageOf(error)}); ` +
+          "the job's own change cannot be separated from it",
+      )
+    }
+    if (!existsSync(baseRecord.patchPath)) {
+      throw new Error(
+        `patch ${record.patchId} was started from base patch ${basePatchId}, whose patch file is no longer stored ` +
+          `(${baseRecord.patchPath}); the job's own change cannot be separated from it`,
+      )
+    }
+    const unavailable =
+      `The base of patch ${record.patchId} is not available (it was made before blob saving existed, or saving failed).`
+    const dir = mkdtempSync(join(this.stateDir, 'exclude-base-'))
+    const env = { ...process.env }
+    // The scratch repository is selected by its working directory, not by the caller's
+    // environment: an inherited GIT_DIR or object directory would point it elsewhere.
+    for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) {
+      delete env[name]
+    }
+    try {
+      git(['init', '-q'], dir, env)
+      const alternates = [
+        blobsDirectory(record.storeDir ?? this.patchDir, record.patchId),
+        blobsDirectory(baseRecord.storeDir ?? this.patchDir, baseRecord.patchId),
+      ].filter((path) => existsSync(path))
+      const scope = record.scope ?? ''
+      const repo = scope === '' ? this.root : join(this.root, scope)
+      if (isGitWorkTree(repo)) {
+        const commonDir = resolve(repo, git(['rev-parse', '--git-common-dir'], repo).trim())
+        alternates.push(join(commonDir, 'objects'))
+      }
+      if (alternates.length > 0) {
+        writeFileSync(join(dir, '.git', 'objects', 'info', 'alternates'), `${alternates.join('\n')}\n`)
+      }
+      const baseTree = baseTreeOf(record, dir, env, unavailable)
+      // The cumulative patch applied to its own base: the state the worker finished in.
+      git(['read-tree', baseTree], dir, env)
+      git(['apply', '--cached', '--whitespace=nowarn', record.patchPath], dir, env)
+      const finishedTree = git(['write-tree'], dir, env).trim()
+      // The base patch applied to the same base: the state the worker started from.
+      git(['read-tree', baseTree], dir, env)
+      try {
+        git(['apply', '--cached', '--whitespace=nowarn', baseRecord.patchPath], dir, env)
+      } catch {
+        // The caller's tree may have moved on since the base patch was collected, which is
+        // why planting it in a copy goes through a merge. `--3way` uses the same saved base
+        // blobs; a conflict leaves unmerged entries, which `write-tree` then refuses.
+        try {
+          git(['apply', '--cached', '--3way', '--whitespace=nowarn', baseRecord.patchPath], dir, env)
+        } catch (error) {
+          throw new Error(
+            `${unavailable} The recorded base patch ${basePatchId} does not apply to that base ` +
+              `(${messageOf(error)}), so the job's own change cannot be separated from it.`,
+          )
+        }
+      }
+      const startedTree = git(['write-tree'], dir, env).trim()
+      const patchPath = join(dir, 'own.patch')
+      const diff = git(['diff', '--binary', '--no-color', '--no-ext-diff', startedTree, finishedTree], dir, env)
+      writeFileSync(patchPath, diff)
+      return {
+        patchPath,
+        filesChanged: nameStatusBetween(dir, startedTree, finishedTree, env),
+        diffstat: git(['diff', '--stat', '--no-color', startedTree, finishedTree], dir, env).trim(),
+        preimage: preimageBetween(dir, startedTree, finishedTree, env),
+        dir,
+        objects: join(dir, '.git', 'objects'),
+        basePatchId,
+      }
+    } catch (error) {
+      rmSync(dir, { recursive: true, force: true })
+      throw error
+    }
+  }
+
+  /**
    * Apply a stored patch to the caller's repository.
    *
    * This is the only path by which a worker's work reaches the caller's tree, which
@@ -8463,13 +10785,17 @@ export class WorkspaceIsolation {
    * @param {boolean} [options.threeWay] - merge it in a scratch repository, rather than
    *   plain-applying it, when the plain apply fails or would remove a path the caller
    *   changed. The merge keeps that edit and marks a conflict in the file.
+   * @param {boolean} [options.excludeBase] - apply only the change this patch made on top
+   *   of the base patch it continued from, not the base patch's work as well. Computed in a
+   *   scratch repository, never in the caller's index.
    * @returns {{patchId: string, applied: boolean, dryRun: boolean, root: string, filesChanged: string[], diffstat: string, threeWay: boolean, conflicts: string[], indexTouched: boolean, drift: {commitsBehind: number | null, filesChangedSince: string[]} | null, warnings?: string[], note?: string, task?: object}} the outcome, with the full id, how far the tree moved since the patch's base, the task that made the patch when the record has one, and a warning when the tree touched the patch's files. `drift` and the refusal name paths from the service root. A partial apply reports only the selected files.
    * @throws {Error} when the patch is unknown, belongs to another repository, was already
    *   applied, `files` names no file or one the patch lacks, would delete or rename a path
-   *   the caller changed since the base without `threeWay` or `force`, does not apply, or
-   *   its base is not available for a three-way merge.
+   *   the caller changed since the base without `threeWay` or `force`, does not apply, its
+   *   base is not available for a three-way merge, or `excludeBase` names a patch with no
+   *   recorded base patch or a base patch that is no longer stored.
    */
-  apply({ patchId, files, dryRun = false, force = false, threeWay = false }) {
+  apply({ patchId, files, dryRun = false, force = false, threeWay = false, excludeBase = false }) {
     if (files !== undefined && (!Array.isArray(files) || files.length === 0)) {
       throw new Error('files must name at least one file of the patch')
     }
@@ -8484,27 +10810,63 @@ export class WorkspaceIsolation {
         `patch ${record.patchId} was already applied to ${this.root} at ${new Date(record.appliedAt).toISOString()}; pass force: true to apply it again`,
       )
     }
-    /** @type {string | undefined} */
-    let tempDir
-    // The record the pipeline runs on: the stored one for a whole apply, a narrowed copy
-    // with a temporary patch for a partial one. `record` stays the record to mark, so a
-    // partial apply's bookkeeping lands next to the stored patch.
-    let patchRecord = record
+    /** Temporary directories made for this apply, removed in the `finally` below. @type {string[]} */
+    const tempDirs = []
+    // The record the pipeline runs on: the stored one for a whole apply, the job's own
+    // change for `excludeBase`, and a narrowed copy with a temporary patch for a partial
+    // one. `record` stays the record to mark, so the bookkeeping lands next to the stored
+    // patch.
+    let view = record
+    /** The scratch repository a three-way merge of the own change looks into. */
+    let extraAlternates
     // The record spelling of the selected files: what `appliedFiles` stores. A whole
     // apply passes undefined, which `#markApplied` reads as "every file".
     /** @type {string[] | undefined} */
     let selectedFiles
     try {
+      if (excludeBase) {
+        const own = this.#changeWithoutBase(record)
+        tempDirs.push(own.dir)
+        // The cumulative patch holds exactly its base patch's change: there is no own diff
+        // to apply, and `git apply` of an empty patch fails with "No valid patches in input"
+        // in both the plain and the three-way path. Say what this is instead of applying it.
+        if (own.filesChanged.length === 0) {
+          return {
+            patchId: record.patchId,
+            dryRun,
+            root: record.scope ? join(this.root, record.scope) : this.root,
+            filesChanged: [],
+            diffstat: '',
+            drift: null,
+            threeWay: false,
+            conflicts: [],
+            indexTouched: false,
+            applied: false,
+            note: noOwnWorkNote(record),
+            ...(record.task === undefined ? {} : { task: record.task }),
+          }
+        }
+        view = {
+          ...record,
+          patchPath: own.patchPath,
+          storedPatchPath: record.patchPath,
+          filesChanged: own.filesChanged,
+          diffstat: own.diffstat,
+          preimage: own.preimage,
+        }
+        extraAlternates = [own.objects]
+      }
+      let patchRecord = view
       if (files !== undefined) {
-        const sections = diffSections(readFileSync(record.patchPath, 'utf8'))
-        const chosen = selectedPatchSections(record.patchId, sections, files)
+        const sections = diffSections(readFileSync(view.patchPath, 'utf8'))
+        const chosen = selectedPatchSections(view.patchId, sections, files)
         const names = new Set()
         for (const section of chosen) {
           for (const name of diffSectionNames(section)) names.add(name)
         }
         // The record's own lines, so `filesChanged` keeps the spelling every other result
         // uses; a rename's line carries both paths, either of which may have selected it.
-        const lines = (record.filesChanged ?? []).filter((line) => {
+        const lines = (view.filesChanged ?? []).filter((line) => {
           const { path, oldPath } = nameStatusEntry(line)
           return names.has(path) || (oldPath !== undefined && names.has(oldPath))
         })
@@ -8516,15 +10878,19 @@ export class WorkspaceIsolation {
             `patch ${record.patchId}: ${repeated.join(', ')} already applied to ${this.root}; pass force: true to apply them again`,
           )
         }
-        tempDir = mkdtempSync(join(this.stateDir, 'partial-'))
+        const tempDir = mkdtempSync(join(this.stateDir, 'partial-'))
+        tempDirs.push(tempDir)
         const patchPath = join(tempDir, 'patch')
         writeFileSync(patchPath, chosen.map((section) => section.text).join(''))
         // The diffstat is git's own spelling of the selected change, so a partial result
         // describes what it applied rather than quoting the whole patch's summary.
         const diffstat = git(['apply', '--stat', patchPath], this.stateDir).trim()
-        patchRecord = partialPatchRecord(record, { patchPath, filesChanged: lines, sections: chosen, diffstat })
+        patchRecord = partialPatchRecord(view, { patchPath, filesChanged: lines, sections: chosen, diffstat })
+        // `excludeBase` narrows the record to the own change, whose temporary patch is
+        // removed with the apply; a failure message must still name the stored one.
+        if (excludeBase) patchRecord.storedPatchPath = record.patchPath
       } else {
-        const patchFiles = recordPaths(record.filesChanged)
+        const patchFiles = recordPaths(view.filesChanged)
         const alreadyApplied = new Set(appliedFileNames(record))
         const repeated = patchFiles.filter((name) => alreadyApplied.has(name))
         // Some of the patch reached this tree, but not all of it. Applying the whole patch
@@ -8583,7 +10949,14 @@ export class WorkspaceIsolation {
               threeWay,
               mark: !dryRun,
               markRecord: record,
-              markFiles: selectedFiles,
+              // A whole `excludeBase` apply records only the own files it put in: the base
+              // patch's work is not in the caller's tree just because this half was.
+              markFiles: selectedFiles ?? (excludeBase ? recordPaths(view.filesChanged) : undefined),
+              // "Every file" means every own file for `excludeBase`: the stored record's
+              // `filesChanged` also holds the base patch's files, which this apply never puts
+              // in, so it would otherwise never count as applied.
+              markOwnFiles: excludeBase ? recordPaths(view.filesChanged) : undefined,
+              extraAlternates,
               ...(destructiveMessage !== undefined && threeWay
                 ? { skipPlain: true, plainError: new Error(destructiveMessage) }
                 : {}),
@@ -8605,9 +10978,9 @@ export class WorkspaceIsolation {
         ...settled,
       }
     } finally {
-      // Also on a refusal or a failed apply: the subset is a view of the stored patch, and
-      // the stored patch itself is never rewritten.
-      if (tempDir !== undefined) rmSync(tempDir, { recursive: true, force: true })
+      // Also on a refusal or a failed apply: the subset and the own change are views of the
+      // stored patch, and the stored patch itself is never rewritten.
+      for (const path of tempDirs) rmSync(path, { recursive: true, force: true })
     }
   }
 
@@ -8725,15 +11098,20 @@ export class WorkspaceIsolation {
    *   `appliedFiles` describes the whole patch rather than the temporary subset.
    * @param {string[]} [options.markFiles] - the selected files' record spelling. Omitted
    *   for a whole apply, which marks every file of `markRecord`.
+   * @param {string[]} [options.markOwnFiles] - the files this apply may put in when they are
+   *   fewer than `markRecord`'s: an `excludeBase` apply marks the stored cumulative record,
+   *   but only its own files (not the base patch's) are applied.
    * @param {boolean} [options.skipPlain] - go straight to the three-way merge, without
    *   trying the plain apply. An apply of a destructive patch uses this because a pure
    *   rename would succeed plainly and discard the caller's edit on the old path.
    * @param {Error} [options.plainError] - the reason the plain apply was skipped, folded
    *   into a merge failure the same way a real plain failure is.
+   * @param {string[]} [options.extraAlternates] - object directories a merge may borrow
+   *   read-only, such as the scratch repository an `excludeBase` diff was built in.
    * @returns {{applied: boolean, threeWay: boolean, conflicts: string[], indexTouched: false, note?: string}} the outcome.
    * @throws {Error} when the patch does not apply, or its base is unavailable for a merge.
    */
-  #applyTo(record, { target, dryRun = false, threeWay = false, mark = false, markRecord = record, markFiles, skipPlain = false, plainError }) {
+  #applyTo(record, { target, dryRun = false, threeWay = false, mark = false, markRecord = record, markFiles, markOwnFiles, skipPlain = false, plainError, extraAlternates }) {
     if (skipPlain) {
       return this.#threeWayMerge(record, target, {
         dryRun,
@@ -8741,6 +11119,8 @@ export class WorkspaceIsolation {
         mark,
         markRecord,
         markFiles,
+        markOwnFiles,
+        extraAlternates,
       })
     }
     // Without `--index` the caller's index is left alone; only the working tree moves.
@@ -8760,9 +11140,9 @@ export class WorkspaceIsolation {
           `${messageOf(plainError)}. The patch is at ${patchMessagePath(record)}; retry with threeWay: true to merge it.`,
         )
       }
-      return this.#threeWayMerge(record, target, { dryRun, plainError, mark, markRecord, markFiles })
+      return this.#threeWayMerge(record, target, { dryRun, plainError, mark, markRecord, markFiles, markOwnFiles, extraAlternates })
     }
-    if (!dryRun && mark) this.#markApplied(markRecord, markFiles)
+    if (!dryRun && mark) this.#markApplied(markRecord, markFiles, markOwnFiles)
     if (!threeWay) return { applied: !dryRun, threeWay: false, conflicts: [], indexTouched: false }
     const marked = patchMarkerFiles(readFileSync(record.patchPath, 'utf8'))
     return {
@@ -8783,20 +11163,22 @@ export class WorkspaceIsolation {
    * `files` is the partial apply's selection in record spelling. A whole apply passes
    * none and records every file too: a later partial apply then knows exactly which files
    * are already here, and a record keeps one shape after either kind of apply. The
-   * whole-patch timestamp is set once every file is recorded, which is also what a whole
-   * apply does today.
+   * whole-patch timestamp is set once every file this apply may put in is recorded, which
+   * is also what a whole apply does today. `ownFiles` narrows that set for an
+   * `excludeBase` apply, whose stored record also names the base patch's files.
    *
    * @param {object} record - the stored patch record to mark and store.
    * @param {string[]} [files] - the applied files' record spelling; omitted for a whole apply.
+   * @param {string[]} [ownFiles] - the files this apply may put in; every file of the record
+   *   unless an `excludeBase` apply names the own half.
    * @returns {void}
    */
-  #markApplied(record, files) {
+  #markApplied(record, files, ownFiles = recordPaths(record.filesChanged)) {
     const already = new Set(appliedFileNames(record))
     if (files === undefined) for (const name of recordPaths(record.filesChanged)) already.add(name)
     else for (const name of files) already.add(name)
     record.appliedFiles = [...already].sort()
-    const everyFile = recordPaths(record.filesChanged)
-    if (files === undefined || everyFile.every((name) => already.has(name))) record.appliedAt = Date.now()
+    if (files === undefined || ownFiles.every((name) => already.has(name))) record.appliedAt = Date.now()
     this.#writeMeta(record)
     this.patches.set(record.patchId, record)
   }
@@ -8823,6 +11205,10 @@ export class WorkspaceIsolation {
    *   applied is a narrowed partial one.
    * @param {string[]} [options.markFiles] - the selected files' record spelling; omitted
    *   for a whole apply.
+   * @param {string[]} [options.markOwnFiles] - the own files of an `excludeBase` apply, the
+   *   set that decides whether every file this apply may put in is now in the tree.
+   * @param {string[]} [options.extraAlternates] - object directories to borrow read-only
+   *   besides the patch's saved blobs and the caller's repository.
    * @returns {{threeWay: true, applied: boolean, conflicts: string[], indexTouched: false, status: 'success' | 'conflict' | 'failed',
    *   files: Array<{path: string, status: 'applied' | 'merged' | 'conflict' | 'failed', reason?: string}>,
    *   appliable?: string[], note?: string, warnings?: string[]}} the outcome. When some files have no
@@ -8831,7 +11217,7 @@ export class WorkspaceIsolation {
    *   lacked is a `conflict`, and `warnings` says so.
    * @throws {Error} when no file has a base, git is too old, or the merge errors.
    */
-  #threeWayMerge(record, target, { dryRun, plainError, mark = false, markRecord = record, markFiles }) {
+  #threeWayMerge(record, target, { dryRun, plainError, mark = false, markRecord = record, markFiles, markOwnFiles, extraAlternates = [] }) {
     const patchId = record.patchId
     const unavailable =
       `The base of patch ${patchId} is not available for a three-way merge ` +
@@ -8863,6 +11249,9 @@ export class WorkspaceIsolation {
       const alternates = []
       const blobs = blobsDirectory(record.storeDir ?? this.patchDir, patchId)
       if (existsSync(blobs)) alternates.push(blobs)
+      for (const path of extraAlternates) {
+        if (existsSync(path)) alternates.push(path)
+      }
       if (isGitWorkTree(target)) {
         const commonDir = resolve(target, git(['rev-parse', '--git-common-dir'], target).trim())
         alternates.push(join(commonDir, 'objects'))
@@ -9013,7 +11402,7 @@ export class WorkspaceIsolation {
         // Only the caller's tree is recorded: a base patch planted in a copy reached a
         // throwaway tree, and marking it applied would refuse the apply it still deserves.
         if (mark) {
-          this.#markApplied(markRecord, markFiles)
+          this.#markApplied(markRecord, markFiles, markOwnFiles)
           if (conflicts.length > 0) {
             note =
               'the three-way merge left conflict markers in the working tree; the change is recorded as applied so a second apply is refused'
@@ -9295,51 +11684,97 @@ export class WorkspaceIsolation {
    *   named by its old or its new path.
    * @param {number} [options.offset] - character offset into the selected text.
    * @param {number} options.maxChars - the page budget.
-   * @returns {{patchId: string, patchPath: string, applied: boolean, appliedFiles?: string[], filesChanged: string[], diffstat: string, drift?: {commitsBehind: number | null, filesChangedSince: string[]} | null, totalChars: number, offset: number, diff: string, files: string[], nextOffset: number | null, task?: object, finalMessage?: string, finalMessageTruncated?: true}} the page; `task` rides on every page, while the worker's final message, the applied files and the drift are only on the page that starts at offset 0. `drift.filesChangedSince` is named relative to the service root; `filesChanged` keeps the record's own spelling, as `files` expects it.
-   * @throws {Error} when the patch is unknown, belongs to another repository, is gone, or
-   *   `files` names a file the patch does not contain.
+   * @param {boolean} [options.excludeBase] - page the change this patch made on top of the
+   *   base patch it continued from, not the base patch's work as well.
+   * @returns {{patchId: string, patchPath: string, applied: boolean, appliedFiles?: string[], filesChanged: string[], diffstat: string, drift?: {commitsBehind: number | null, filesChangedSince: string[]} | null, totalChars: number, offset: number, diff: string, files: string[], nextOffset: number | null, note?: string, task?: object, finalMessage?: string, finalMessageTruncated?: true}} the page; `task` rides on every page, while the worker's final message, the applied files and the drift are only on the page that starts at offset 0. An `excludeBase` page with no own change is empty and carries `note`. `drift.filesChangedSince` is named relative to the service root; `filesChanged` keeps the record's own spelling, as `files` expects it.
+   * @throws {Error} when the patch is unknown, belongs to another repository, is gone,
+   *   `files` names a file the patch does not contain, or `excludeBase` names a patch with
+   *   no recorded base patch or a base patch that is no longer stored.
    */
-  readPatch({ patchId, files, offset = 0, maxChars }) {
+  readPatch({ patchId, files, offset = 0, maxChars, excludeBase = false }) {
     const record = this.#lookupPatch(patchId)
     if (!existsSync(record.patchPath)) throw new Error(`the patch file for ${record.patchId} is gone (${record.patchPath})`)
-    const diff = readFileSync(record.patchPath, 'utf8')
-    const sections = diffSections(diff)
-    const selected = files === undefined ? sections : selectedPatchSections(record.patchId, sections, files)
-    // Offsets are computed on the selected text, so a page and its `nextOffset` mean the
-    // same thing whether one file or the whole patch was asked for.
-    let at = 0
-    const rebased = selected.map((section) => {
-      const start = at
-      at += section.text.length
-      return { start, end: at, path: section.path, text: section.text }
-    })
-    const text = rebased.map((section) => section.text).join('')
-    const page = pageSections(rebased, text, offset, maxChars)
-    const appliedFiles = Array.isArray(record.appliedFiles) ? record.appliedFiles : []
-    return {
-      patchId: record.patchId,
-      patchPath: record.patchPath,
-      applied: record.appliedAt !== null && record.appliedAt !== undefined,
-      // A whole apply records every file too, so this is the record of what is already in
-      // the caller's tree. It is on the first page only, beside the drift and the report.
-      ...(page.offset === 0 && appliedFiles.length > 0 ? { appliedFiles: [...appliedFiles].sort() } : {}),
-      filesChanged: recordPaths(record.filesChanged),
-      diffstat: (record.diffstat ?? '').trim(),
-      // Drift costs one `git hash-object` spawn per patch file. Computing it on every page
-      // made a 300-file patch paged ten times cost tens of seconds, so it rides with the
-      // worker's final message on the page that starts at offset 0 only.
-      ...(page.offset === 0 ? { drift: patchDrift(record, this.root) } : {}),
-      ...(page.offset === 0 ? overlapField(this.overlapsOf(record.patchId)) : {}),
-      totalChars: text.length,
-      offset: page.offset,
-      diff: page.diff,
-      files: page.files,
-      nextOffset: page.nextOffset,
-      ...(record.task === undefined ? {} : { task: record.task }),
-      // The worker's report is a preamble to the patch, not part of it: repeating ten
-      // thousand characters on every page would be most of what a paging caller reads.
-      ...(page.offset === 0 ? this.#reportFields(record) : {}),
-      ...(record.cancelled === undefined ? {} : { cancelled: record.cancelled }),
+    let own
+    try {
+      let view = record
+      if (excludeBase) {
+        own = this.#changeWithoutBase(record)
+        // The cumulative patch is exactly its base patch: the own page is empty, and saying
+        // so is more useful than a page whose diff is the empty string for no stated reason.
+        if (own.filesChanged.length === 0) {
+          return {
+            patchId: record.patchId,
+            patchPath: record.patchPath,
+            applied: false,
+            filesChanged: [],
+            diffstat: '',
+            drift: null,
+            totalChars: 0,
+            offset: 0,
+            diff: '',
+            files: [],
+            nextOffset: null,
+            note: noOwnWorkNote(record),
+            ...(record.task === undefined ? {} : { task: record.task }),
+            ...(record.cancelled === undefined ? {} : { cancelled: record.cancelled }),
+          }
+        }
+        view = {
+          ...record,
+          patchPath: own.patchPath,
+          filesChanged: own.filesChanged,
+          diffstat: own.diffstat,
+          preimage: own.preimage,
+        }
+      }
+      const diff = readFileSync(view.patchPath, 'utf8')
+      const sections = diffSections(diff)
+      const selected = files === undefined ? sections : selectedPatchSections(record.patchId, sections, files)
+      // Offsets are computed on the selected text, so a page and its `nextOffset` mean the
+      // same thing whether one file or the whole patch was asked for.
+      let at = 0
+      const rebased = selected.map((section) => {
+        const start = at
+        at += section.text.length
+        return { start, end: at, path: section.path, text: section.text }
+      })
+      const text = rebased.map((section) => section.text).join('')
+      const page = pageSections(rebased, text, offset, maxChars)
+      const appliedFiles = Array.isArray(record.appliedFiles) ? record.appliedFiles : []
+      const ownFiles = recordPaths(view.filesChanged)
+      // For `excludeBase`, "applied" asks about the own files only: applying the own half
+      // does not put the base patch's change into the caller's tree.
+      const applied = excludeBase
+        ? ownFiles.length > 0 && ownFiles.every((name) => appliedFileNames(record).includes(name))
+        : record.appliedAt !== null && record.appliedAt !== undefined
+      return {
+        patchId: record.patchId,
+        // The stored cumulative patch: the own diff is a view removed with this call.
+        patchPath: record.patchPath,
+        applied,
+        // A whole apply records every file too, so this is the record of what is already in
+        // the caller's tree. It is on the first page only, beside the drift and the report.
+        ...(page.offset === 0 && appliedFiles.length > 0 ? { appliedFiles: [...appliedFiles].sort() } : {}),
+        filesChanged: ownFiles,
+        diffstat: (view.diffstat ?? '').trim(),
+        // Drift costs one `git hash-object` spawn per patch file. Computing it on every page
+        // made a 300-file patch paged ten times cost tens of seconds, so it rides with the
+        // worker's final message on the page that starts at offset 0 only.
+        ...(page.offset === 0 ? { drift: patchDrift(view, this.root) } : {}),
+        ...(page.offset === 0 ? overlapField(this.overlapsOf(record.patchId)) : {}),
+        totalChars: text.length,
+        offset: page.offset,
+        diff: page.diff,
+        files: page.files,
+        nextOffset: page.nextOffset,
+        ...(record.task === undefined ? {} : { task: record.task }),
+        // The worker's report is a preamble to the patch, not part of it: repeating ten
+        // thousand characters on every page would be most of what a paging caller reads.
+        ...(page.offset === 0 ? this.#reportFields(record) : {}),
+        ...(record.cancelled === undefined ? {} : { cancelled: record.cancelled }),
+      }
+    } finally {
+      if (own !== undefined) rmSync(own.dir, { recursive: true, force: true })
     }
   }
 
@@ -9412,6 +11847,9 @@ export class WorkspaceIsolation {
   /**
    * Store the whole report of one finished call next to the patch records.
    *
+   * The write is atomic: a temporary file in the same directory is renamed into place, so a
+   * reader on another server never sees half a report.
+   *
    * @param {string} key - the job id, or the call's session id when it had no job.
    * @param {object} record - what the report says: `report` (the whole text) and its context.
    * @returns {string} the path written.
@@ -9420,7 +11858,18 @@ export class WorkspaceIsolation {
   storeReport(key, record) {
     const path = reportFilePath(this.patchDir, key)
     mkdirSync(this.patchDir, { recursive: true })
-    writeFileSync(path, `${JSON.stringify({ key, ...record }, null, 2)}\n`)
+    // A report can be read by another server while this one writes it, so the file appears
+    // atomically: the whole record goes to a temporary file in the same directory, then the
+    // rename makes it visible. The temporary name does not end in `.report.json`, so a prune
+    // or a reader never mistakes a half-written file for a report.
+    const temp = join(this.patchDir, `.${key}.${randomUUID()}.tmp`)
+    writeFileSync(temp, `${JSON.stringify({ key, ...record }, null, 2)}\n`)
+    try {
+      renameSync(temp, path)
+    } catch (error) {
+      rmSync(temp, { force: true })
+      throw error
+    }
     return path
   }
 
@@ -9721,6 +12170,13 @@ export class WorkspaceIsolation {
    * Remove the slot trees and every orphan they left in place. Stored patches stay: an
    * apply may still be coming.
    *
+   * A stable slot is not removed: its directory is the path the next server of this root
+   * claims, and the `.flash-cache` in it is what makes that server's first build warm. Only
+   * the copy is emptied, and the lock is removed last, so the server after this one finds a
+   * free slot with a cache in place. A tree that cannot stay where it is — a retired tree,
+   * and a slot that retired its directory away — is removed whole, and its cache is moved into
+   * the store first when it may still be read.
+   *
    * A deferred start-up sweep still in flight stops at its next yield point: the event
    * loop is single-threaded, so setting the flag here is enough to keep it from starting
    * another slot or owner after this method returns. A background removal of a tree that
@@ -9728,36 +12184,78 @@ export class WorkspaceIsolation {
    * the next sweep adopts it if this process exits first.
    */
   close() {
+    // A second close has nothing left to give back, and the locks of a slot already emptied
+    // are gone: without this, the ownership check below would report a takeover of our own
+    // finished work.
+    if (this.closed) return
     this.closed = true
     if (this.sweepTimer !== undefined) clearInterval(this.sweepTimer)
     const policy = this.#cachePolicy()
+    const owner = { pid: process.pid, instance: this.instance, command: this.commandLine }
+    // A slot this pool no longer holds is not ours to empty, not ours to take the cache out
+    // of, and not ours to unlock: another server has claimed the number and may be writing
+    // into the tree right now. The stable layout writes locks; a configured state directory
+    // has none and its slots are this pool's alone.
+    const stillOurs = (dir) => !this.stableSlots || holdsSlotLock(dir, owner)
     for (const slot of this.slots) {
+      const ownsDir = stillOurs(slot.dir)
+      if (!ownsDir) this.log(`close: not touching ${slot.dir}: another server took the slot over`)
       // A cache is no longer lost with its tree: the next server on this root claims it from
       // the store. A rename that fails is logged and the cache goes with the tree as before.
-      if (policy !== undefined) {
+      if (policy !== undefined && ownsDir) {
         // The rule of `#storeRetiredCache`: a cache is moved only when nothing of the slot can
         // still be writing into it. A retired tree whose runtimes were not shut down means a
         // process of this slot may be alive, and a running call holds the slot's own tree.
         const alive = slot.orphans.filter((orphan) => !slot.stoppedOrphans.has(orphan))
-        if (alive.length > 0 || slot.busy) {
+        // A slot that still sits at the path the next server claims (`slots/<n>`) keeps its
+        // cache there: moving it out and back would be a rename for nothing, and a cached
+        // build is only warm when it is at the path it was compiled for. A slot that retired
+        // its directory away, like the older layout's slot, is removed whole, so its cache
+        // goes into the store first.
+        if (this.#cacheStaysInPlace(slot)) {
+          // Nothing to move. The cache is the point of the stable path.
+        } else if (alive.length > 0 || slot.busy) {
           const why = slot.busy ? `a call still holds slot ${String(slot.id)}` : `its runtimes were not shut down when ${alive.join(', ')} was retired`
           this.log(`close: not storing the build cache of ${slot.dir}: ${why}`)
         } else {
           putCacheInStore(join(slot.dir, SLOT_CACHE), policy.storeDir, { rename: policy.rename, log: this.log })
         }
-        for (const orphan of slot.orphans) {
+      }
+      if (ownsDir) {
+        if (this.#cacheStaysInPlace(slot)) {
+          // The copy goes, the cache stays, and the directory itself stays with it. The
+          // directory is emptied only while this pool still holds the lock checked above.
+          try {
+            emptyDirectory(slot.dir)
+          } catch (error) {
+            this.log(`close: could not empty ${slot.dir} (${messageOf(error)}); the next call in this slot empties it`)
+          }
+          releaseOwnSlotLock(slot.dir, owner, this.log)
+        } else {
+          rmSync(slot.dir, { recursive: true, force: true })
+          if (this.stableSlots) {
+            releaseOwnSlotLock(slot.dir, owner, this.log)
+            rmSync(liveOrphanMarker(slot.dir), { force: true })
+          }
+        }
+      }
+      for (const orphan of slot.orphans) {
+        if (!stillOurs(orphan)) {
+          this.log(`close: not touching ${orphan}: another server took the retired tree over`)
+          continue
+        }
+        if (policy !== undefined) {
           if (slot.stoppedOrphans.has(orphan)) putCacheInStore(join(orphan, SLOT_CACHE), policy.storeDir, { rename: policy.rename, log: this.log })
           else this.log(`close: not storing the build cache of retired tree ${orphan}: its runtimes were not shut down when it was retired`)
         }
-      }
-      rmSync(slot.dir, { recursive: true, force: true })
-      for (const orphan of slot.orphans) {
         rmSync(orphan, { recursive: true, force: true })
         rmSync(liveOrphanMarker(orphan), { force: true })
+        if (this.stableSlots) releaseOwnSlotLock(orphan, owner, this.log)
       }
     }
     // Belt and braces: everything above lives under `slots`, so this also catches any
-    // orphan a slot no longer names.
+    // orphan a slot no longer names. The stable layout's own slots are not under this
+    // directory, and are deliberately left in place.
     rmSync(join(this.stateDir, 'slots'), { recursive: true, force: true })
     this.#trimCacheStore()
   }

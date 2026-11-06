@@ -14,6 +14,7 @@ import { PassThrough } from 'node:stream'
 
 import { startServer, SERVER_INFO } from '../lib/index.js'
 import { HarnessSdkClient, resolveDshCommand } from '../lib/sdk.js'
+import { assertTemporaryDataDir, temporaryDataDir } from '../test-support/data-dir.mjs'
 
 const FAKE_DSH = resolve(import.meta.dirname, '..', 'test-support', 'fake-dsh.mjs')
 
@@ -34,6 +35,13 @@ for (const profile of ['flash-service', 'flash-service-readonly']) {
   )
 }
 
+/**
+ * The pool behind this service has no explicit state directory, so its patches and reports
+ * would otherwise go to the real durable data directory, which a sandbox refuses. Point
+ * `FLASH_DATA_DIR` at a throwaway directory, as the other service tests do.
+ */
+const DATA_DIR = temporaryDataDir('flash-mcp-integration-data-')
+
 /** A running server plus a frame-level MCP client over it. */
 async function connect({ env = {}, root } = {}) {
   const input = new PassThrough()
@@ -53,6 +61,17 @@ async function connect({ env = {}, root } = {}) {
     }
   })
   const cwd = root ?? mkdtempSync(join(tmpdir(), 'flash-mcp-integration-'))
+  const environment = {
+    ...process.env,
+    DSH_HOME: STAMP_HOME,
+    FLASH_DSH_BIN: FAKE_DSH,
+    FLASH_DATA_DIR: DATA_DIR,
+    ...env,
+  }
+  // A helper that builds a service without a temp data directory must fail here, not in
+  // the sandbox as an EPERM from the real `~/Library/Application Support/flash-agents`.
+  // The pool's default patch directory reads `process.env`, so that is what is checked.
+  assertTemporaryDataDir()
   const server = startServer(
     {
       root: cwd,
@@ -64,7 +83,7 @@ async function connect({ env = {}, root } = {}) {
       // NO-DELEGATE scenario below is exactly such an attempt, and this harness gives a
       // tools/call two seconds. The wait is injectable for this reason.
       earlyRetryDelayMs: 0,
-      env: { ...process.env, DSH_HOME: STAMP_HOME, FLASH_DSH_BIN: FAKE_DSH, ...env },
+      env: environment,
     },
     input,
     output,

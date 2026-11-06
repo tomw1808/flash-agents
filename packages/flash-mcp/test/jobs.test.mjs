@@ -685,7 +685,9 @@ test('the three job tools are descriptors in the service style', () => {
     assert.equal(typeof tool.description, 'string')
     assert.equal(JSON.stringify(tool.inputSchema).match(/provider|model|reasoning/i), null)
   }
-  assert.deepEqual(JOB_TOOLS[1].inputSchema.required, ['jobId'])
+  // flash_result takes either one id or a group: neither is required by the schema, and the
+  // dispatcher refuses a call that names both (jobs-0112 tests cover the group form).
+  assert.equal(JOB_TOOLS[1].inputSchema.required, undefined)
   assert.deepEqual(JOB_TOOLS[2].inputSchema.required, ['jobId'])
   assert.match(JOB_TOOLS[1].description, /waiting in chunks.*waitSeconds: 300/)
   // A listing is a page with filters, not the server's whole history.
@@ -781,4 +783,43 @@ test('a job label reads the brief its taskFile names', async () => {
   // The job and the patch a background call stores name the brief identically: the heading's
   // `#` markers are stripped by the helper both read.
   assert.equal(started.label, 'Port the parser')
+})
+
+test('a status listing keeps the first non-empty line and cuts at 160 code points with an ellipsis', async () => {
+  const { service, registry, call } = harness()
+  const cases = [
+    // A message that starts with newlines shows its text, not "".
+    { message: `\n\n${'x'.repeat(160)}`, expected: 'x'.repeat(160) },
+    // Exactly 160 code points stay whole; 161 are cut and marked.
+    { message: 'y'.repeat(161), expected: `${'y'.repeat(160)}…` },
+    // `\r` alone ends a line, like `\n` and `\r\n`.
+    { message: `first\r${'z'.repeat(170)}`, expected: 'first' },
+    // 160 code points end with a surrogate pair: the cut never splits it.
+    { message: `${'a'.repeat(159)}😀b`, expected: `${'a'.repeat(159)}😀…` },
+  ]
+  for (const [index, { message, expected }] of cases.entries()) {
+    const jobId = await start(call, 'flash_task', { task: `progress ${String(index)}` })
+    service.calls.at(-1).progress({ message })
+    service.calls.at(-1).gate.resolve({ status: 'ok' })
+    await registry.get(jobId).settled
+    await call('flash_result', { jobId }, {})
+    const listed = payloadOf(await call('flash_status', {}, {}))
+    const entry = listed.jobs.find((job) => job.jobId === jobId)
+    assert.equal(entry.lastProgress.message, expected, JSON.stringify(message))
+  }
+})
+
+test('flash_status by id includes an ended result’s timing, and a listing leaves it out', async () => {
+  const { service, registry, call } = harness()
+  const jobId = await start(call, 'flash_task', { task: 'timed' })
+  const timing = { queuedMs: 1, prepareMs: 2, workerMs: 3, totalMs: 6 }
+  service.calls[0].gate.resolve({ status: 'ok', timing })
+  await registry.get(jobId).settled
+
+  const one = payloadOf(await call('flash_status', { jobId }, {}))
+  assert.equal(one.state, 'ok')
+  assert.deepEqual(one.timing, timing)
+
+  const listed = payloadOf(await call('flash_status', {}, {}))
+  assert.equal('timing' in listed.jobs.find((job) => job.jobId === jobId), false)
 })

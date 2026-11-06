@@ -753,6 +753,7 @@ test('runs one task through one child and returns a compact result', async () =>
     'mode',
     'provider',
     'queuedMs',
+    'reportPath',
     'result',
     'resultTruncated',
     'route',
@@ -760,6 +761,7 @@ test('runs one task through one child and returns a compact result', async () =>
     'sessionId',
     'status',
     'stopReason',
+    'timing',
   ])
   // A call that never waited for a tree says so, and its run time is the session's own.
   assert.equal(result.queuedMs, 0)
@@ -1734,9 +1736,9 @@ test('prompt builders keep the dispatcher on a single delegation', () => {
 test('every child prompt carries the standing worker instructions, in order', () => {
   // The first two are the originals; the next three exist so a caller reading the report
   // (never the transcript) learns about a deviation, a wrong contract, or an unfinished task.
-  // "Rules crossed" stays last and is pinned in service-0110.test.mjs; the five before it are
-  // pinned in small-0111.test.mjs.
-  assert.equal(WORKER_INSTRUCTIONS.length, 17)
+  // "Rules crossed" stays last and is pinned in service-0110.test.mjs; the five rules it
+  // groups are pinned in small-0111.test.mjs.
+  assert.equal(WORKER_INSTRUCTIONS.length, 19)
   assert.match(WORKER_INSTRUCTIONS[0], /^Do not commit unless the task explicitly asks/)
   assert.match(WORKER_INSTRUCTIONS[1], /^If the work reaches for an escape hatch/)
   assert.equal(
@@ -1991,6 +1993,9 @@ test('read-only is the only selectable narrowing, and it runs its own process', 
       clients.push(client)
       return client
     },
+    // The pool's trees and reports go in this test's own temporary directory, not the
+    // real temp state base.
+    isolate: { stateDir: mkdtempSync(join(tmpdir(), 'flash-service-state-')) },
     log: () => {},
   })
 
@@ -2679,14 +2684,18 @@ test('a waited-on background job names the command it started, from the commandâ
     `expected the background start near ${String(startedAt)}, saw ${first.since}`,
   )
 
-  // A read that still says running closes this wait without forgetting the job.
+  // A read that still says running closes this wait without forgetting the job. The wait is
+  // gone, but the job is still running, so `current` keeps showing it as a background job.
   await new Promise((resolve) => setTimeout(resolve, 40))
   event('tool/result', {
     id: 'call_wait_1',
     name: 'job_output',
     message: { content: [{ type: 'text', text: 'still working\n[status: running]' }] },
   })
-  assert.deepEqual(openCommands(state.activity), [], 'a wait that returned is no longer open')
+  const afterWait = openCommands(state.activity)
+  assert.equal(afterWait.length, 1, 'a wait that returned is no longer open, but its job is still running')
+  assert.equal(afterWait[0].background, 'bash-2')
+  assert.equal(afterWait[0].tool, 'bash', 'the job, not the wait, is listed')
   wait('call_wait_2')
   const [second] = openCommands(state.activity)
   assert.equal(second.command, 'sleep 300')
@@ -3959,7 +3968,8 @@ test('a long Windows slot root warns once in every call result, and only on win3
     const warnings = result.warnings.filter((line) => line.startsWith('slot copies live at '))
     assert.equal(warnings.length, 1, `expected one path warning, saw ${JSON.stringify(result.warnings)}`)
     assert.ok(warnings[0].includes(base), warnings[0])
-    assert.ok(warnings[0].includes('slot-0'), warnings[0])
+    // The stable slot layout (0.1.12) measures the slot the pool holds: `<base>/<digest>/slots/0`.
+    assert.match(warnings[0], /[\\/]slots[\\/]0[\\/]/, warnings[0])
     assert.match(warnings[0], /Windows tools without long-path support \(MSVC cl\.exe among them\) fail past 260 characters/)
     assert.match(warnings[0], /A short base leaves more room: set the plugin option "state_base" \(or FLASH_STATE_BASE\) to a folder such as C:\\fm/)
   } finally {

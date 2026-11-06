@@ -15,7 +15,7 @@
  * @module flash-mcp/service
  */
 
-import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -27,12 +27,13 @@ import {
   overlapField,
   recordPaths,
   reportFilePath,
+  rootDigest,
   slotPathWarning,
   slotRootPath,
 } from './isolation.js'
 import { estimateInstructions } from './instructions.js'
 import { HarnessSdkClient, DEFAULT_INITIALIZE_TIMEOUT_MS, resolveDshCommand } from './sdk.js'
-import { ProcessWatch, quietWarning, heldOpenWarning, longestChild } from './proctree.js'
+import { ProcessWatch, quietWarning, childOfCall } from './proctree.js'
 import { FLASH_MCP_VERSION, profileHonoursModelEnv, resolveDshHome } from './doctor.js'
 
 /** Route the service pins; callers can never change the provider. */
@@ -65,6 +66,18 @@ export const DEFAULT_IDLE_TIMEOUT_MS = 600_000
 
 /** How often the idle check looks at the last activity. */
 const IDLE_CHECK_INTERVAL_MS = 15_000
+
+/**
+ * How long a runtime may sit with no call using it before this service shuts it down.
+ *
+ * A runtime is keyed by profile, tree and model, and nothing but a model switch on the same
+ * tree, a slot's own lifecycle or `close` used to end it. A read-only runtime belongs to no
+ * slot at all, so a review's `dsh --profile flash-service-readonly` process outlived its job
+ * by a day. This reuses the call idle window: ten minutes is long enough that a burst of
+ * calls reuses one warm process, and short enough that an idle server does not hold one
+ * overnight.
+ */
+export const DEFAULT_RUNTIME_IDLE_TIMEOUT_MS = DEFAULT_IDLE_TIMEOUT_MS
 
 /** Default wall-clock budget for one fleet of delegated tasks. */
 const DEFAULT_BATCH_TIMEOUT_MS = 900_000
@@ -108,6 +121,15 @@ const DEFAULT_PROGRESS_INTERVAL_MS = 20_000
  * tool's call is a name and a JSON blob, and a short prefix is enough to recognise it.
  */
 const ACTIVITY_COMMAND_CHARS = 300
+
+/**
+ * How much of a shell command is kept for matching against process command lines. The
+ * display keeps `ACTIVITY_COMMAND_CHARS`; matching needs the rest too, because a process's
+ * line is what is matched whole and a command that runs past the cut (`cargo test --workspace
+ * --exclude …` with dozens of excludes) would otherwise be looked for nowhere. 16 KB is far
+ * above any real shell invocation and still bounds what one activity record holds.
+ */
+const ACTIVITY_MATCH_COMMAND_CHARS = 16 * 1024
 const ACTIVITY_TOOL_CHARS = 120
 
 /**
@@ -117,12 +139,27 @@ const ACTIVITY_TOOL_CHARS = 120
  */
 const REPEATED_FAILURE_THRESHOLD = 3
 
+/**
+ * How much of a shell invocation's script a repeated-failure warning names and groups by.
+ * `bash -c '<script>'`, `sh -c` and `pwsh -Command` otherwise read as the first two words
+ * (`bash -c`), and three failures of three different scripts looked like one repeated step.
+ */
+const SCRIPT_CHARS = 60
+
 /** How much of a task a stored patch's task record keeps for each kind of call. */
 const TASK_LABEL_CHARS = 160
 const BATCH_TASK_LABEL_CHARS = 200
 
 /** How much of a brief names a tree's holder in a queued call's status: a job label's width. */
 const HOLDER_LABEL_CHARS = 80
+
+/**
+ * How long a tree holder must have shown no activity before the queue line calls it idle.
+ * A heartbeat lands every few seconds while a worker is doing anything, so a minute of
+ * silence is the first sign a probe waiting in line would notice; below it, an "idle 12s"
+ * part would be noise on every healthy call.
+ */
+const HOLDER_IDLE_VISIBLE_MS = 60_000
 
 /**
  * The window in which an empty, unproductive first attempt is read as a start-up hiccup
@@ -220,6 +257,10 @@ export class FlashTaskService {
    *   against (default the process's; injectable so no test reads the real home).
    * @param {number} [options.maxTokens] - optional output cap for SDK agents.
    * @param {number} [options.taskTimeoutMs] - per-task wall-clock budget.
+   * @param {number} [options.idleTimeoutMs] - how long a call may go without an event before
+   *   it is treated as stuck.
+   * @param {number} [options.runtimeIdleTimeoutMs] - how long a runtime may sit with no call
+   *   using it before it is shut down (default `DEFAULT_RUNTIME_IDLE_TIMEOUT_MS`).
    * @param {number} [options.maxResultChars] - returned child-message budget.
    * @param {number} [options.batchTimeoutMs] - per-fleet wall-clock budget.
    * @param {number} [options.maxTasks] - ceiling on tasks in one fleet call.
@@ -262,6 +303,7 @@ export class FlashTaskService {
     maxTokens,
     taskTimeoutMs = DEFAULT_TASK_TIMEOUT_MS,
     idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
+    runtimeIdleTimeoutMs = DEFAULT_RUNTIME_IDLE_TIMEOUT_MS,
     maxResultChars = DEFAULT_MAX_RESULT_CHARS,
     batchTimeoutMs = DEFAULT_BATCH_TIMEOUT_MS,
     maxTasks = DEFAULT_MAX_TASKS,
@@ -317,6 +359,7 @@ export class FlashTaskService {
     this.maxTokens = maxTokens
     this.taskTimeoutMs = taskTimeoutMs
     this.idleTimeoutMs = idleTimeoutMs
+    this.runtimeIdleTimeoutMs = runtimeIdleTimeoutMs
     this.maxResultChars = maxResultChars
     this.batchTimeoutMs = batchTimeoutMs
     this.maxTasks = maxTasks
@@ -326,7 +369,7 @@ export class FlashTaskService {
     this.initTimeoutMs = initTimeoutMs
     this.env = env
     this.log = log
-    /** Reads runtimes' process trees for the stuck-command and held-open warnings, off the call path. */
+    /** Reads runtimes' process trees for the stuck-command warning and the `child` of `current`, off the call path. */
     this.procWatch = new ProcessWatch({ list: processList, log })
     // Kept for the worker's prompt: the shell a worker's commands run in differs by platform,
     // and a worker that writes bash for PowerShell spends its turns on syntax errors.
@@ -404,7 +447,21 @@ export class FlashTaskService {
             ...(isolate.renameDirectory === undefined ? {} : { renameDirectory: isolate.renameDirectory }),
             log,
           })
-    this.stateDir = this.isolation?.stateDir ?? resolve(isolate.stateDir ?? join(canonicalTmpdir(), 'flash-mcp'))
+    // Without a pool, the configured state directory is the layout, and failing one the
+    // configured base (`--state-base` / FLASH_STATE_BASE) is the base the pool itself would
+    // use. An empty string means "not configured", exactly as `WorkspaceIsolation` reads it.
+    this.stateDir =
+      this.isolation?.stateDir ??
+      resolve(isolate.stateDir || isolate.baseDir || join(canonicalTmpdir(), 'flash-mcp'))
+    /**
+     * Where whole call reports are stored. A pool keeps them beside its patch records; with
+     * `--isolate none` there is no pool, so they go in the server's state directory, under
+     * the root's own digest (the default state directory is shared by every root). Never the
+     * caller's repository: a report is server state, not part of the change.
+     *
+     * @type {string}
+     */
+    this.reportDir = this.isolation?.patchDir ?? join(this.stateDir, rootDigest(this.root), 'reports')
     /**
      * Warnings established at start that every `flash_task` and `flash_batch` result
      * carries while they hold. The profile release stamps arrive from `createService`; the
@@ -434,7 +491,14 @@ export class FlashTaskService {
     const lengthWarning =
       this.isolation === undefined
         ? undefined
-        : slotPathWarning(slotRootPath(this.isolation.stateDir, 0), { platform })
+        : // A stable slot lives under the root's digest, not under the per-instance state
+          // directory, so the path to measure is the slot the pool actually holds.
+          slotPathWarning(
+            this.isolation.stableSlots === true && this.isolation.slots?.[0]?.dir !== undefined
+              ? `${this.isolation.slots[0].dir}${sep}`
+              : slotRootPath(this.isolation.stateDir, 0),
+            { platform },
+          )
     if (lengthWarning !== undefined) {
       this.startupWarnings.push(lengthWarning)
       this.log(lengthWarning)
@@ -616,16 +680,84 @@ export class FlashTaskService {
     return honoured
   }
 
-  /** Note that a call is reaching for one runtime key. */
+  /** Note that a call is reaching for one runtime key, and keep its idle timer from firing. */
   #holdRuntime(key) {
+    const run = this.runtimes.get(key)
+    if (run !== undefined) this.#clearRuntimeIdleShutdown(run)
     this.inFlight.set(key, (this.inFlight.get(key) ?? 0) + 1)
   }
 
   /** Release a hold; the runtime is free to be retired when the last one ends. */
   #releaseRuntime(key) {
     const held = (this.inFlight.get(key) ?? 0) - 1
-    if (held > 0) this.inFlight.set(key, held)
-    else this.inFlight.delete(key)
+    if (held > 0) {
+      this.inFlight.set(key, held)
+      return
+    }
+    this.inFlight.delete(key)
+    const run = this.runtimes.get(key)
+    if (run !== undefined) this.#scheduleRuntimeIdleShutdown(key, run)
+  }
+
+  /**
+   * Cancel the idle shutdown a runtime record may hold.
+   *
+   * @param {object} run - the runtime record.
+   * @returns {void}
+   */
+  #clearRuntimeIdleShutdown(run) {
+    if (run.idleTimer === undefined) return
+    clearTimeout(run.idleTimer)
+    run.idleTimer = undefined
+  }
+
+  /**
+   * Arm one runtime's idle shutdown, from the moment the last call using it ended.
+   *
+   * The timer is unref'd so it never keeps the server alive by itself, and it is keyed to the
+   * exact record: a runtime replaced under the same key must not be shut down by the old
+   * record's timer. A runtime still booting has no timer until its first call ends.
+   *
+   * @param {string} key - the runtime key.
+   * @param {object} run - the runtime record.
+   * @returns {void}
+   */
+  #scheduleRuntimeIdleShutdown(key, run) {
+    this.#clearRuntimeIdleShutdown(run)
+    if (!(this.runtimeIdleTimeoutMs > 0)) return
+    if (run.initialized !== true || (run.sessions ?? 0) > 0) return
+    const timer = setTimeout(() => {
+      void this.#shutDownIdleRuntime(key, run)
+    }, this.runtimeIdleTimeoutMs)
+    timer.unref?.()
+    run.idleTimer = timer
+  }
+
+  /**
+   * Shut down one runtime whose idle window has passed.
+   *
+   * The map is the authority: a runtime replaced under the key, or one a call reached for
+   * before this callback ran, is left alone. Deleting the record before awaiting the
+   * shutdown means a call arriving during it boots a fresh runtime instead of being handed
+   * a process that is closing.
+   *
+   * @param {string} key - the runtime key.
+   * @param {object} run - the runtime record the timer was armed for.
+   * @returns {Promise<void>}
+   */
+  async #shutDownIdleRuntime(key, run) {
+    if (this.runtimes.get(key) !== run) return
+    run.idleTimer = undefined
+    if ((run.sessions ?? 0) > 0 || (this.inFlight.get(key) ?? 0) > 0) return
+    this.runtimes.delete(key)
+    try {
+      await run.client?.shutdown()
+      this.log(
+        `shut down the idle ${run.profile}/${run.model} runtime on ${run.cwd} after ${formatElapsed(this.runtimeIdleTimeoutMs)} with no calls`,
+      )
+    } catch (error) {
+      this.log(`could not shut down the idle ${run.profile}/${run.model} runtime on ${run.cwd}: ${messageOf(error)}`)
+    }
   }
 
   /**
@@ -654,6 +786,7 @@ export class FlashTaskService {
       if (run.initialized !== true || (run.sessions ?? 0) > 0) continue
       if ((this.inFlight.get(key) ?? 0) > 0) continue
       this.runtimes.delete(key)
+      this.#clearRuntimeIdleShutdown(run)
       try {
         await run.client?.shutdown()
         this.log(`shut down the ${run.model} runtime on ${profileName} in ${cwd}: ${model} now serves that tree`)
@@ -699,7 +832,15 @@ export class FlashTaskService {
   async #lease(pool, label, budgetMs, signal, ticket, holder) {
     try {
       const slot = await pool.lease({ signal, deadline: Date.now() + budgetMs })
-      this.treeHolders.set(slot, { ...holder, since: Date.now() })
+      // Keep the ticket's activity record with the holder: it is the one clock that says
+      // when the holder last did anything, and the queue line reads it to tell an idle
+      // holder from a busy one. The ticket is already in hand here, so no call site
+      // changes for a fact only the queue reports.
+      this.treeHolders.set(slot, {
+        ...holder,
+        ...(ticket?.activity === undefined ? {} : { activity: ticket.activity }),
+        since: Date.now(),
+      })
       return slot
     } catch (error) {
       if (error instanceof IsolationError && error.code === 'CANCELLED') {
@@ -734,20 +875,31 @@ export class FlashTaskService {
    *
    * Only what the service itself knows is reported. A holder started as a background job is
    * named by its job id and label; a foreground call has no job, so its label is all there is.
+   * A holder's idle time is measured from its last real activity — the instant the progress
+   * heartbeat's line is built from — so a call that has emitted nothing for six minutes is
+   * named as idle, which is the fact a caller waiting behind it needs. A holder active within
+   * the last minute carries no `idleMs` at all.
    *
    * @param {{activity: object}} ticket - the queued call's ticket.
-   * @param {number} now - the clock the hold times are measured against.
-   * @returns {{position: number, of: number, holders: Array<{jobId?: string, label: string, runningMs: number}>}}
+   * @param {number} now - the clock the hold and idle times are measured against.
+   * @returns {{position: number, of: number, holders: Array<{jobId?: string, label: string, runningMs: number, idleMs?: number}>}}
    *   the call's place in the queue.
    */
   #queueView(ticket, now) {
     const holders = [...this.treeHolders.values()]
       .sort((a, b) => a.since - b.since)
-      .map((holder) => ({
-        ...(holder.jobId === undefined ? {} : { jobId: holder.jobId }),
-        label: holder.label,
-        runningMs: Math.max(0, now - holder.since),
-      }))
+      .map((holder) => {
+        // The activity record is written by every session event; `since` is the floor, so a
+        // holder that has not reported anything since taking the tree is idle from then on.
+        const lastActivityMs = Math.max(holder.since, holder.activity?.at ?? 0)
+        const idleMs = Math.max(0, now - lastActivityMs)
+        return {
+          ...(holder.jobId === undefined ? {} : { jobId: holder.jobId }),
+          label: holder.label,
+          runningMs: Math.max(0, now - holder.since),
+          ...(idleMs < HOLDER_IDLE_VISIBLE_MS ? {} : { idleMs }),
+        }
+      })
     return { position: this.leaseQueue.indexOf(ticket) + 1, of: this.leaseQueue.length, holders }
   }
 
@@ -913,6 +1065,7 @@ export class FlashTaskService {
       }
       this.runtimes.delete(key)
       this.runtimeEnvs.delete(key)
+      this.#clearRuntimeIdleShutdown(run)
       try {
         await run.client?.shutdown()
         this.log(`restarted the ${run.model} runtime on ${cwd}: slotEnv changed (${changed.join(', ')})`)
@@ -1065,6 +1218,9 @@ export class FlashTaskService {
    * @returns {Promise<object>} the compact structured result.
    */
   async flashTask(args, { signal, progress, progressToken, background = false, jobId, label } = {}) {
+    // One monotonic clock for every part of `timing`: the parts are measured around their own
+    // seams and must be comparable with the call's total.
+    const callStarted = performance.now()
     const task = this.#resolveTask(args)
     // The path the caller gave, not the resolved one: a stored patch names the brief the
     // call named, so it can be found again from the record alone.
@@ -1117,17 +1273,21 @@ export class FlashTaskService {
     let baseApplied
     let setup
     let queuedMs = 0
+    /** The call's own time breakdown; a part that did not happen is left out. */
+    const timing = { queuedMs: 0 }
     try {
       /** The wait for a tree, when there was one: its length, the pool's counts, nothing else. */
       let queued
       if (pool !== undefined) {
         const ticket = this.#joinLeaseQueue(activity)
         const queuedSince = this.#noteQueue(pool, activity, background !== true, ticket)
+        const queuedStarted = performance.now()
         slot = await this.#lease(pool, 'flash_task', this.taskTimeoutMs, signal, ticket, {
           ...(jobId === undefined ? {} : { jobId }),
           label: label ?? callLabel ?? taskLabel(task, HOLDER_LABEL_CHARS),
         })
         queuedMs = this.#noteLeased(activity, queuedSince)
+        timing.queuedMs = queuedSince === undefined ? 0 : Math.max(0, performance.now() - queuedStarted)
         if (queuedSince !== undefined) {
           // Snapshotted now: the counts a result reports are the ones the caller waited
           // behind, not whatever the pool looks like once the call is over.
@@ -1137,6 +1297,7 @@ export class FlashTaskService {
       const { promptCwd, runtimeCwd, extraEnv, slotPorts, slotValues } = this.#runLocation(slot, rootCwd, pool)
       if (slot !== undefined) await this.#restartForSlotEnv(slot, profileName, runtimeCwd, model, extraEnv)
       if (slot !== undefined) {
+        const prepareStarted = performance.now()
         try {
           pool.prepare(slot, {
             cwd: rootCwd,
@@ -1158,10 +1319,17 @@ export class FlashTaskService {
           if (error instanceof IsolationError) throw new FlashTaskError(error.message, error.code)
           throw error
         }
+        timing.prepareMs = Math.max(0, performance.now() - prepareStarted)
         // Setup runs on the fresh copy, before the base patch is planted and before the base
         // is re-recorded: what it writes belongs to the copy's starting state, not to the
         // worker's change nor to the patch this call continues from.
+        const setupStarted = performance.now()
         setup = await this.#runSlotSetup(pool, slot, activity, signal)
+        // A stamp that matched leaves one entry per step with `ran: false`: no step did any
+        // work, so there is no setup time to report.
+        if (Array.isArray(setup) && setup.some((step) => step?.ran === true)) {
+          timing.setupMs = Math.max(0, performance.now() - setupStarted)
+        }
         // After `prepare` and the setup, so the base this call's own patch is measured from is
         // the state the copy was made at, and before the worker, so it starts on top of the
         // patch. A base patch that cannot be planted is an early refusal: the slot is released
@@ -1211,9 +1379,21 @@ export class FlashTaskService {
           extraEnv,
           model,
         })
-      let attempt = await runAttempt(sessionId)
+      // The worker's run is measured in a `finally`, because a run the worker itself ends the
+      // call with — a timeout, an idle silence, a runtime that exited — throws out of
+      // `#runSession` instead of returning, and the error must still say how long it ran.
+      let workerStarted = performance.now()
+      const noteWorkerTime = () => {
+        timing.workerMs = (timing.workerMs ?? 0) + Math.max(0, performance.now() - workerStarted)
+      }
+      let attempt
       let attemptSessionId = sessionId
       let retried
+      try {
+        attempt = await runAttempt(sessionId)
+      } finally {
+        noteWorkerTime()
+      }
       const early = this.#earlyFailureReason({
         state: attempt.state,
         started: attempt.started,
@@ -1238,7 +1418,14 @@ export class FlashTaskService {
         await this.#waitBeforeRetry(signal, 'flash_task')
         attemptSessionId = `flash-task-${randomUUID()}`
         activity.sessionId = attemptSessionId
-        attempt = await runAttempt(attemptSessionId)
+        // The retry adds to the same part, and its own run is measured the same way: a retry
+        // that ends the call still has to carry what the caller paid for it.
+        workerStarted = performance.now()
+        try {
+          attempt = await runAttempt(attemptSessionId)
+        } finally {
+          noteWorkerTime()
+        }
         // There is never a third attempt, and `retried` stays whatever the second attempt
         // did: the caller paid for two, so the first attempt's session and usage belong in
         // the answer even when the same failure ended both. The failure itself is reported
@@ -1253,12 +1440,18 @@ export class FlashTaskService {
         )
       }
       this.#logToolTrace(state)
+      const collectStarted = performance.now()
       change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars, store: apply !== 'discard' })
-      const applied = change?.available === true && apply === 'auto' ? this.#applyChange(change) : undefined
+      if (slot !== undefined) timing.collectMs = Math.max(0, performance.now() - collectStarted)
+      const applied = change?.available === true && change.patchId !== undefined && apply === 'auto' ? this.#applyChange(change) : undefined
       const reportKey = jobId ?? attemptSessionId
+      // Validated here, not inside the store: a key outside the report alphabet could name a
+      // path, and refusing it must not lose a call whose worker has already run.
+      const reportTarget = this.#reportTargetFor(reportKey)
+      timing.totalMs = Math.max(0, performance.now() - callStarted)
       const result = this.#buildResult({
         state,
-        reportPath: this.#reportPathFor(reportKey),
+        reportPath: reportTarget.path,
         sessionId: attemptSessionId,
         started,
         profile: profileName,
@@ -1276,7 +1469,9 @@ export class FlashTaskService {
         background,
         retried,
         activity,
+        timing,
       })
+      if (reportTarget.warning !== undefined) result.warnings = [...(result.warnings ?? []), reportTarget.warning]
       // After the result is built, because the report it carries is the primary child's full
       // text (before the result's own clipping), and before the copy is emptied: the patch is
       // the record from here on.
@@ -1290,6 +1485,9 @@ export class FlashTaskService {
       if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'IDLE' || error?.code === 'CANCELLED')) {
         await this.#salvageOrphaned(pool, slot, error, profileName, jobId)
       }
+      // Closed after the salvage, so the failure's total is the time to the end of the call
+      // — collecting the salvaged change included — exactly as a success measures it.
+      this.#noteFailureTiming(error, timing, callStarted)
       throw error
     } finally {
       stopProgress()
@@ -1414,6 +1612,7 @@ export class FlashTaskService {
     for (const [key, run] of [...this.runtimes]) {
       if (run.profile !== profileName || run.cwd !== slot.dir) continue
       this.runtimes.delete(key)
+      this.#clearRuntimeIdleShutdown(run)
       if (run.client === undefined && run.starting !== undefined) sessionStopped = false
       try {
         await run.client?.shutdown()
@@ -1457,6 +1656,8 @@ export class FlashTaskService {
    * @returns {Promise<object>} the compact per-task fleet result.
    */
   async flashBatch(args, { signal, progress, progressToken, background = false, jobId, label } = {}) {
+    // One monotonic clock for every part of `timing`, as in flashTask.
+    const callStarted = performance.now()
     const tasks = normalizeTasks(args?.tasks, this.maxTasks, {
       readTaskFile: (value, field) => this.#readTaskFile(value, field),
     })
@@ -1498,18 +1699,22 @@ export class FlashTaskService {
     let baseApplied
     let setup
     let queuedMs = 0
+    /** The call's own time breakdown; a part that did not happen is left out. */
+    const timing = { queuedMs: 0 }
     try {
       /** The wait for a tree, when there was one; see flashTask. */
       let queued
       if (pool !== undefined) {
         const ticket = this.#joinLeaseQueue(activity)
         const queuedSince = this.#noteQueue(pool, activity, background !== true, ticket)
+        const queuedStarted = performance.now()
         slot = await this.#lease(pool, 'flash_batch', this.batchTimeoutMs, signal, ticket, {
           ...(jobId === undefined ? {} : { jobId }),
           // The same words a fleet's job label uses, so the two never name one call differently.
           label: label ?? callLabel ?? `${String(tasks.length)} tasks`,
         })
         queuedMs = this.#noteLeased(activity, queuedSince)
+        timing.queuedMs = queuedSince === undefined ? 0 : Math.max(0, performance.now() - queuedStarted)
         if (queuedSince !== undefined) {
           queued = { ms: queuedMs, inUse: activity.queuedInUse, size: activity.queuedSize }
         }
@@ -1517,6 +1722,7 @@ export class FlashTaskService {
       const { promptCwd, runtimeCwd, extraEnv, slotPorts, slotValues } = this.#runLocation(slot, rootCwd, pool)
       if (slot !== undefined) await this.#restartForSlotEnv(slot, profileName, runtimeCwd, model, extraEnv)
       if (slot !== undefined) {
+        const prepareStarted = performance.now()
         try {
           pool.prepare(slot, {
             cwd: rootCwd,
@@ -1534,8 +1740,15 @@ export class FlashTaskService {
           if (error instanceof IsolationError) throw new FlashTaskError(error.message, error.code)
           throw error
         }
+        timing.prepareMs = Math.max(0, performance.now() - prepareStarted)
         // The fleet's one copy gets the same setup as a single task's; see flashTask.
+        const setupStarted = performance.now()
         setup = await this.#runSlotSetup(pool, slot, activity, signal)
+        // A stamp that matched leaves one entry per step with `ran: false`: no step did any
+        // work, so there is no setup time to report.
+        if (Array.isArray(setup) && setup.some((step) => step?.ran === true)) {
+          timing.setupMs = Math.max(0, performance.now() - setupStarted)
+        }
         // The fleet's one copy starts on top of the base patch, exactly as a single task's does.
         if (basePatchId !== undefined) {
           try {
@@ -1594,9 +1807,20 @@ export class FlashTaskService {
           extraEnv,
           model,
         })
-      let attempt = await runAttempt(sessionId)
+      // As in flashTask: measured in a `finally`, so a fleet the worker itself ends the call
+      // with still carries the run's time on its error.
+      let workerStarted = performance.now()
+      const noteWorkerTime = () => {
+        timing.workerMs = (timing.workerMs ?? 0) + Math.max(0, performance.now() - workerStarted)
+      }
+      let attempt
       let attemptSessionId = sessionId
       let retried
+      try {
+        attempt = await runAttempt(sessionId)
+      } finally {
+        noteWorkerTime()
+      }
       const early = this.#earlyFailureReason({
         state: attempt.state,
         started: attempt.started,
@@ -1621,7 +1845,13 @@ export class FlashTaskService {
         await this.#waitBeforeRetry(signal, 'flash_batch')
         attemptSessionId = `flash-batch-${randomUUID()}`
         activity.sessionId = attemptSessionId
-        attempt = await runAttempt(attemptSessionId)
+        // The retry adds to the same part, exactly as in flashTask.
+        workerStarted = performance.now()
+        try {
+          attempt = await runAttempt(attemptSessionId)
+        } finally {
+          noteWorkerTime()
+        }
         // As in flashTask: never a third attempt, and the retry stays in the record even when
         // the second attempt failed the same way.
       }
@@ -1634,12 +1864,18 @@ export class FlashTaskService {
         )
       }
       this.#logToolTrace(state)
+      const collectStarted = performance.now()
       change = slot === undefined ? undefined : pool.collect(slot, { diffChars: this.diffChars, store: apply !== 'discard' })
-      const applied = change?.available === true && apply === 'auto' ? this.#applyChange(change) : undefined
+      if (slot !== undefined) timing.collectMs = Math.max(0, performance.now() - collectStarted)
+      const applied = change?.available === true && change.patchId !== undefined && apply === 'auto' ? this.#applyChange(change) : undefined
       const reportKey = jobId ?? attemptSessionId
+      // As in flashTask: a report key is validated before anything is stored, so an invalid
+      // one cannot fail a fleet whose workers have already run.
+      const reportTarget = this.#reportTargetFor(reportKey)
+      timing.totalMs = Math.max(0, performance.now() - callStarted)
       const result = this.#buildBatchResult({
         state,
-        reportPath: this.#reportPathFor(reportKey),
+        reportPath: reportTarget.path,
         tasks,
         sessionId: attemptSessionId,
         started,
@@ -1657,7 +1893,9 @@ export class FlashTaskService {
         background,
         retried,
         activity,
+        timing,
       })
+      if (reportTarget.warning !== undefined) result.warnings = [...(result.warnings ?? []), reportTarget.warning]
       // The fleet's record carries one paragraph per member: the patch outlives the call,
       // and the workers' own accounts are the only explanation of it.
       const report = result.fullReport ?? batchFinalMessage(result)
@@ -1670,6 +1908,9 @@ export class FlashTaskService {
       if (slot !== undefined && (error?.code === 'TIMEOUT' || error?.code === 'IDLE' || error?.code === 'CANCELLED')) {
         await this.#salvageOrphaned(pool, slot, error, profileName, jobId)
       }
+      // Closed after the salvage, so the failure's total is the time to the end of the call
+      // — collecting the salvaged change included — exactly as a success measures it.
+      this.#noteFailureTiming(error, timing, callStarted)
       throw error
     } finally {
       stopProgress()
@@ -1786,20 +2027,61 @@ export class FlashTaskService {
   }
 
   /**
-   * Where a call's whole report will be stored, or undefined when this service keeps no
-   * records (`--isolate none`). Read-only and discarding calls store one too: it is keyed by
-   * the job, not by a patch.
+   * Where a call's whole report will be stored. Read-only and discarding calls store one too:
+   * it is keyed by the job, not by a patch. With isolation off there is no patch store, so it
+   * goes in the server's own state directory (see `reportDir`), never the caller's repository.
    *
    * @param {string} key - the job id, or the session id of a call that had no job.
-   * @returns {string | undefined} the path.
+   * @returns {string} the path.
    */
   #reportPathFor(key) {
-    return this.isolation === undefined ? undefined : reportFilePath(this.isolation.patchDir, key)
+    return reportFilePath(this.reportDir, key)
+  }
+
+  /**
+   * The report target for one call, or the warning that says why there is none.
+   *
+   * A report key is a job id or a session id, never a path; `reportFilePath` refuses anything
+   * outside that alphabet. The refusal is read here, after the worker has run, because it
+   * must not turn a finished call into a failure: the result simply carries no `reportPath`
+   * and the warning names the reason.
+   *
+   * @param {string} key - the job id, or the session id of a call that had no job.
+   * @returns {{path: string} | {warning: string}} where the report goes, or why it cannot.
+   */
+  #reportTargetFor(key) {
+    try {
+      return { path: this.#reportPathFor(key) }
+    } catch (error) {
+      return { warning: `the worker's whole report was not stored: ${messageOf(error)}` }
+    }
+  }
+
+  /**
+   * Put the time breakdown measured so far on a call that ends in an error.
+   *
+   * A call that fails after its copy was prepared has still measured where its time went,
+   * and a timeout or a cancellation is exactly the case where that is worth knowing. The
+   * breakdown travels beside `error.salvage`, the other structured fact a failure carries;
+   * `totalMs` is closed here because no result will be built to close it, and it is called
+   * after the salvage so the total reaches the end of the call rather than stopping short
+   * of the work the failure itself did.
+   *
+   * @param {unknown} error - the failure about to be thrown.
+   * @param {object} timing - the parts measured so far, completed in place.
+   * @param {number} callStarted - the call's start on the monotonic clock.
+   * @returns {void}
+   */
+  #noteFailureTiming(error, timing, callStarted) {
+    if (error === null || typeof error !== 'object') return
+    timing.totalMs = Math.max(0, performance.now() - callStarted)
+    error.timing = { ...timing }
   }
 
   /**
    * Write a finished call's whole report beside the patch records, and say so on its result.
-   * A failed write is not a failed call: the result drops `reportPath` and carries a warning.
+   * With isolation off it is written in the server's state directory instead. A failed write
+   * is not a failed call: the result drops `reportPath` and carries a warning.
    *
    * @param {object} result - the call's result, completed in place.
    * @param {object} options - what to store.
@@ -1813,7 +2095,7 @@ export class FlashTaskService {
   #storeReport(result, { key, report, kind, jobId, label }) {
     if (result.reportPath === undefined) return
     try {
-      this.isolation.storeReport(key, {
+      const record = {
         kind,
         ...(jobId === undefined ? {} : { jobId }),
         sessionId: result.sessionId,
@@ -1822,13 +2104,44 @@ export class FlashTaskService {
         ...(result.stopReason === undefined ? {} : { stopReason: result.stopReason }),
         ...(result.finalMessageProblem === undefined ? {} : { finalMessageProblem: result.finalMessageProblem }),
         ...(result.change?.patchId === undefined ? {} : { patchId: result.change.patchId }),
+        ...(result.timing === undefined ? {} : { timing: result.timing }),
         createdAt: new Date().toISOString(),
         report,
-      })
+      }
+      if (this.isolation === undefined) this.#writeReportRecord(key, record)
+      else this.isolation.storeReport(key, record)
     } catch (error) {
       this.log(`could not store the whole report ${result.reportPath}: ${messageOf(error)}`)
       delete result.reportPath
       result.warnings = [...(result.warnings ?? []), `the worker's whole report could not be stored (${messageOf(error)})`]
+    }
+  }
+
+  /**
+   * Write one report record in the server's state directory, for a service without a copy
+   * pool. The shape is the pool's own (`{key, ...record}`), so a reader sees one format.
+   *
+   * The record is written to a temporary file in the same directory and renamed into place:
+   * a rename within one directory is atomic, so a reader opening the report path sees either
+   * the previous record or the whole new one, never half of it. The rename also replaces an
+   * existing record in one step instead of truncating it first.
+   *
+   * @param {string} key - the job id or the call's session id.
+   * @param {object} record - the report and its context.
+   * @returns {void}
+   */
+  #writeReportRecord(key, record) {
+    const path = this.#reportPathFor(key)
+    mkdirSync(this.reportDir, { recursive: true })
+    // A dot-prefixed name cannot collide with a report key (which never starts with a dot),
+    // and the nonce keeps two writers of the same key apart.
+    const temporary = join(this.reportDir, `.${key}.${randomUUID()}.tmp`)
+    try {
+      writeFileSync(temporary, `${JSON.stringify({ key, ...record }, null, 2)}\n`)
+      renameSync(temporary, path)
+    } finally {
+      // After a successful rename the temporary name is gone; `force` makes this a no-op.
+      rmSync(temporary, { force: true })
     }
   }
 
@@ -1839,8 +2152,31 @@ export class FlashTaskService {
    * @returns {object | undefined} the stored record, with its `reportPath`; undefined when none.
    */
   readReport(key) {
-    const record = this.isolation?.readReport(key)
-    return record === undefined ? undefined : { ...record, reportPath: reportFilePath(this.isolation.patchDir, key) }
+    let record
+    try {
+      record = this.isolation === undefined ? this.#readReportRecord(key) : this.isolation.readReport(key)
+    } catch (error) {
+      this.log(`could not read the stored report ${String(key)}: ${messageOf(error)}`)
+      return undefined
+    }
+    return record === undefined ? undefined : { ...record, reportPath: this.#reportPathFor(key) }
+  }
+
+  /**
+   * Read one report record from the server's state directory, or undefined when it is
+   * missing or not a report. Mirrors the pool's reader, including a bad key's answer.
+   *
+   * @param {string} key - the job id or session id.
+   * @returns {object | undefined} the record.
+   */
+  #readReportRecord(key) {
+    let parsed
+    try {
+      parsed = JSON.parse(readFileSync(this.#reportPathFor(key), 'utf8'))
+    } catch {
+      return undefined
+    }
+    return parsed !== null && typeof parsed === 'object' && typeof parsed.report === 'string' ? parsed : undefined
   }
 
   /**
@@ -1925,6 +2261,7 @@ export class FlashTaskService {
         dryRun: args?.dryRun === true,
         force: args?.force === true,
         threeWay: args?.threeWay === true,
+        excludeBase: args?.excludeBase === true,
       })
     } catch (error) {
       throw new FlashTaskError(messageOf(error), 'APPLY_FAILED')
@@ -1963,7 +2300,7 @@ export class FlashTaskService {
     }
     const pageChars = Math.min(maxChars ?? this.diffChars, MAX_PATCH_PAGE_CHARS)
     try {
-      return this.isolation.readPatch({ patchId, files, offset: offset ?? 0, maxChars: pageChars })
+      return this.isolation.readPatch({ patchId, files, offset: offset ?? 0, maxChars: pageChars, excludeBase: args?.excludeBase === true })
     } catch (error) {
       throw new FlashTaskError(messageOf(error), 'PATCH_UNAVAILABLE')
     }
@@ -2068,7 +2405,10 @@ export class FlashTaskService {
   async close() {
     const runs = [...this.runtimes.values()]
     this.runtimes.clear()
-    for (const run of runs) await run.client?.shutdown().catch(() => {})
+    for (const run of runs) {
+      this.#clearRuntimeIdleShutdown(run)
+      await run.client?.shutdown().catch(() => {})
+    }
     this.isolation?.close()
   }
 
@@ -2094,6 +2434,7 @@ export class FlashTaskService {
       // arriving meanwhile then waits for the fresh runtime instead of booting a second one.
       outdated = existing
       existing = undefined
+      this.#clearRuntimeIdleShutdown(outdated)
       this.runtimes.delete(key)
     }
     if (existing?.starting !== undefined) return await existing.starting
@@ -2106,6 +2447,7 @@ export class FlashTaskService {
       cwd,
       model,
       sessions: 0,
+      idleTimer: undefined,
     }
     this.runtimes.set(key, run)
     run.starting = (async () => {
@@ -2157,6 +2499,7 @@ export class FlashTaskService {
             continue
           }
           this.runtimes.delete(key)
+          this.#clearRuntimeIdleShutdown(run)
           const hint = stderrHint(diagnostics)
           const alreadyHinted = hint.length > 0 && messageOf(error).endsWith(hint)
           const attempts = attempt === 1 ? '' : 'tried twice, the first attempt timed out: '
@@ -2293,6 +2636,7 @@ export class FlashTaskService {
     }
     if (change === undefined) return fields
     const omitted = change.diffOmitted ?? []
+    const filesChanged = recordPaths(change.filesChanged)
     return {
       ...fields,
       change: {
@@ -2300,7 +2644,12 @@ export class FlashTaskService {
         ...(change.available ? {} : { reason: change.reason }),
         // Decoded by the record's own reader, so a name holding a tab, a newline or a
         // leading quote keeps the spelling `flash_apply`'s `files` takes.
-        filesChanged: recordPaths(change.filesChanged),
+        filesChanged,
+        // Nothing in the tree and nothing stored: `applied: false` is then the answer, not
+        // silence, so the change says why there is no patch to apply.
+        ...(change.available === true && filesChanged.length === 0
+          ? { note: 'the worker changed nothing, so no patch was stored' }
+          : {}),
         // Files the worker created that git ignores, so the patch cannot carry them.
         // Named so that "no change" is never the whole answer when there was work.
         ...((change.ignored ?? []).length === 0 ? {} : { ignored: change.ignored }),
@@ -2360,6 +2709,7 @@ export class FlashTaskService {
     background = false,
     retried,
     activity,
+    timing,
     reportPath,
   }) {
     const envelope = extractWorkflowValue(state.workflowText)
@@ -2531,8 +2881,9 @@ export class FlashTaskService {
     const setupWarning = slot === undefined ? undefined : (slot.settings ?? this.isolation)?.slotSetupWarning
     if (setupWarning !== undefined) warnings.push(setupWarning)
     // The fleet's shared activity record: one warning per command that keeps failing,
-    // whichever member of the fleet was running it.
-    warnings.push(...activityWarnings(activity))
+    // whichever member of the fleet was running it, plus any command that sat with no CPU
+    // and any background command the sandbox stopped with its worker.
+    warnings.push(...finalActivityWarnings(activity))
     if (queued !== undefined && background !== true) warnings.push(foregroundQueueWarning(queued))
     if (retried !== undefined) warnings.push(earlyRetryWarning(retried.reason))
     // Installation drift: a profile from another release, a Settings edit after start, or a
@@ -2570,6 +2921,7 @@ export class FlashTaskService {
       // The session's own run time: a wait for a free tree is reported separately, as queuedMs.
       durationMs: Date.now() - started,
       queuedMs,
+      ...(timing === undefined ? {} : { timing }),
       ...(usage === undefined ? {} : { usage }),
       instructions,
       ...(setup === undefined || setup.length === 0 ? {} : { setup }),
@@ -2645,6 +2997,7 @@ export class FlashTaskService {
     background = false,
     retried,
     activity,
+    timing,
     reportPath,
   }) {
     const children = state.children.map((child) => {
@@ -2713,8 +3066,9 @@ export class FlashTaskService {
     }
     // A worker that keeps repeating a step its sandbox cannot finish holds its tree for
     // hours while its progress keeps changing; the result says so even to a caller that
-    // never watched a heartbeat.
-    warnings.push(...activityWarnings(activity))
+    // never watched a heartbeat. A quiet command that was warned about while it ran, and a
+    // background command still running as its worker ended, are part of the call's history.
+    warnings.push(...finalActivityWarnings(activity))
     if (queued !== undefined && background !== true) warnings.push(foregroundQueueWarning(queued))
     if (retried !== undefined) warnings.push(earlyRetryWarning(retried.reason))
     // Same installation drift the fleet's members were started under.
@@ -2736,6 +3090,7 @@ export class FlashTaskService {
       // The session's own run time: a wait for a free tree is reported separately, as queuedMs.
       durationMs: Date.now() - started,
       queuedMs,
+      ...(timing === undefined ? {} : { timing }),
       ...(usage === undefined ? {} : { usage }),
       instructions,
       ...(setup === undefined || setup.length === 0 ? {} : { setup }),
@@ -2993,7 +3348,7 @@ export function createActivity(now = Date.now()) {
      * `openCallKey`). A value keeps the session too, so a result without an id can still
      * be matched to the oldest call of its own worker.
      *
-     * @type {Map<string, {session: string, id?: string, tool: string, command: string, jobId?: string, background?: boolean, since: number}>}
+     * @type {Map<string, {session: string, id?: string, tool: string, command: string, matchCommand?: string, jobId?: string, background?: boolean, since: number}>}
      */
     openCalls: new Map(),
     /**
@@ -3002,9 +3357,26 @@ export function createActivity(now = Date.now()) {
      * started it, so it cannot live in `openCalls`; this is what lets a later `job_output`
      * wait name the command instead of the wait itself.
      *
-     * @type {Map<string, {session: string, jobId: string, tool: string, command: string, since: number}>}
+     * @type {Map<string, {session: string, jobId: string, tool: string, command: string, matchCommand?: string, since: number}>}
      */
     backgroundJobs: new Map(),
+    /**
+     * Quiet warnings raised while commands ran, keyed by call key. Kept after the process
+     * sample and the open call are gone, so the result can say a command sat with no CPU even
+     * though it ended (see `finalActivityWarnings`).
+     *
+     * @type {Array<{callKey: string, command: string, jobId?: string, minutes: number, count: number, longest: string}>}
+     */
+    quietWarnings: [],
+    /**
+     * Background jobs that were still running when their worker session ended. A terminal
+     * `job_output` read removes a job from `backgroundJobs`; anything left there at the end
+     * of the session is what the last heartbeat showed as running, and the result warns that
+     * the sandbox stopped it with an unknown outcome.
+     *
+     * @type {Map<string, {session: string, jobId: string, tool: string, command: string, since: number}>}
+     */
+    runningBackgroundJobs: new Map(),
     /** How many calls this record has seen, so an id-less call still gets a unique key. */
     callSeq: 0,
     /**
@@ -3177,7 +3549,9 @@ function toolCallIdInBlocks(blocks) {
  * Remember one open tool call of one worker, from its `tool/call` event.
  *
  * A shell call's command line is what a stalled worker is stuck in, so it is kept nearly
- * whole; any other tool is named with the head of its arguments. The call stays open until
+ * whole; any other tool is named with the head of its arguments. A shell command is also
+ * kept at matching width (`matchCommand`) because the process watcher looks for the whole
+ * line in the process table, not the 300-character display head. The call stays open until
  * the result that answers *that call id* arrives, which is what makes "since when"
  * answerable even while the same worker runs a second call beside it.
  *
@@ -3203,11 +3577,13 @@ function noteToolCall(activity, session, tool, args, id) {
   // A file tool's failures are counted per file rather than by the head of its JSON, which
   // carried the edit's own text and so split one stuck edit into many keys.
   const file = tool === 'bash' || tool === 'pwsh' ? undefined : fileArgumentOf(args)
+  const matchCommand = matchCommandOf(tool, args)
   activity.openCalls.set(openCallKey(session, callId), {
     session,
     ...(id === undefined ? {} : { id }),
     tool,
     command: describeToolCall(tool, args),
+    ...(matchCommand === undefined ? {} : { matchCommand }),
     ...(file === undefined ? {} : { file }),
     ...(jobId === undefined ? {} : { jobId }),
     ...(background ? { background: true } : {}),
@@ -3221,8 +3597,8 @@ function noteToolCall(activity, session, tool, args, id) {
  * A worker cut off mid-call (cancelled, out of budget, its runtime gone) never sends the
  * result that would close its call, and the entry would otherwise stay in `current` for the
  * rest of the job as a command that is still running. Its background jobs are dropped for
- * the same reason: nobody will read their `job_output` status, so a later call must not
- * inherit them as waits in progress.
+ * the same reason, but a job still running at that moment is kept in
+ * `runningBackgroundJobs` so the result can say the sandbox stopped it.
  *
  * @param {object} activity - the call's activity record.
  * @param {unknown} session - the worker session that ended.
@@ -3234,7 +3610,12 @@ function closeSessionCalls(activity, session) {
     if (call.session === session) activity.openCalls.delete(key)
   }
   for (const [key, job] of activity.backgroundJobs ?? []) {
-    if (job.session === session) activity.backgroundJobs.delete(key)
+    if (job.session !== session) continue
+    activity.backgroundJobs.delete(key)
+    // A job still here was never read to a terminal status, so the last heartbeat showed it
+    // running. Keep it for the result: the sandbox stopped it with its worker, and the caller
+    // must not read the job's `ok` as that command's outcome.
+    activity.runningBackgroundJobs?.set(key, job)
   }
 }
 
@@ -3358,6 +3739,7 @@ function noteBackgroundStart(activity, call, text) {
     jobId,
     tool: call.tool,
     command: call.command,
+    ...(call.matchCommand === undefined ? {} : { matchCommand: call.matchCommand }),
     since: call.since,
   })
 }
@@ -3474,6 +3856,7 @@ function countFailure(activity, call, { exitCode, name, output, log }) {
   record.lastExitCode = exitCode
   record.lastName = name
   record.lastLine = output
+  record.tool = call.tool
   if (call.file !== undefined) {
     record.file = call.file
   } else {
@@ -3523,6 +3906,9 @@ function countSuccess(activity, call) {
 
 /** The file tools whose success means the file now holds the worker's change. */
 const FILE_CHANGING_TOOLS = new Set(['edit', 'write'])
+
+/** The tools that run a shell command: the only calls a fail-before check can be. */
+const SHELL_TOOLS = new Set(['bash', 'pwsh', 'sh'])
 
 /** Programs whose exit status 1 means "no match" or "the inputs differ". */
 const EXIT_ONE_ANSWERS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'diff', 'cmp'])
@@ -3683,6 +4069,131 @@ function describeToolCall(tool, args) {
 }
 
 /**
+ * The whole shell command a tool call runs, for matching against process command lines.
+ *
+ * The displayed `command` is cut to `ACTIVITY_COMMAND_CHARS`, and the cut is not a token
+ * boundary: a process does not hold the cut text, so matching on it finds nothing and the
+ * call is watched nowhere (the process watcher then falls back to an unrelated process). This
+ * keeps the command up to `ACTIVITY_MATCH_COMMAND_CHARS`, so the watcher sees the same words
+ * the shell was given.
+ *
+ * @param {string} tool - the tool name.
+ * @param {unknown} args - the event's `arguments` field.
+ * @returns {string | undefined} the command, or undefined when the call is not a shell or has none.
+ */
+function matchCommandOf(tool, args) {
+  if (tool !== 'bash' && tool !== 'pwsh') return undefined
+  const raw = typeof args === 'string' ? args : args === undefined || args === null ? '' : JSON.stringify(args)
+  const command = shellCommandOf(raw)
+  if (command === undefined || command.length === 0) return undefined
+  return clipText(command, ACTIVITY_MATCH_COMMAND_CHARS)
+}
+
+/** The shells whose command line runs a script argument: `-c`, `-Command` or `/c`. */
+const SCRIPT_SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'fish', 'ksh', 'pwsh', 'powershell', 'cmd'])
+
+/** The program name of a command line: its first word (quoted or not) without directory or `.exe`. */
+function programNameOf(text) {
+  const line = squashLine(text)
+  const quote = /^(["'])/.exec(line)
+  let first = line
+  if (quote !== null) {
+    const close = line.indexOf(quote[1], 1)
+    if (close !== -1) first = line.slice(1, close)
+  }
+  return first.split(/[\\/]/).at(-1).replace(/\.exe$/i, '').toLowerCase()
+}
+
+/** Collapse whitespace in a command line. */
+function squashLine(text) {
+  return String(text ?? '').replace(/\s+/g, ' ').trim()
+}
+
+/** Whether a shell option token is the one that introduces the script. */
+function isScriptFlag(shell, token) {
+  if (shell === 'pwsh' || shell === 'powershell') return /^-command$/i.test(token) || token === '-c'
+  if (shell === 'cmd') return /^\/c$/i.test(token)
+  return /^-[A-Za-z]*c[A-Za-z]*$/.test(token)
+}
+
+/** The canonical spelling of the script flag, so `-lc` and `-c` group together. */
+function scriptFlagName(shell) {
+  if (shell === 'pwsh' || shell === 'powershell') return '-Command'
+  if (shell === 'cmd') return '/c'
+  return '-c'
+}
+
+/** Remove one pair of matching outer quotes from a script argument. */
+function stripOuterQuotes(text) {
+  const quote = text[0]
+  if ((quote === "'" || quote === '"') && text.at(-1) === quote) return text.slice(1, -1)
+  return text
+}
+
+/**
+ * The script a shell invocation runs, when the command line is one: `bash -c '<script>'`,
+ * `sh -c`, `pwsh -Command` (and PowerShell's `-c`, cmd's `/c`). The script is what a
+ * repeated-failure warning must name; the shell and flag alone made every script one step.
+ *
+ * The script's own output plumbing is removed before it is named (see `COMMAND_PLUMBING`), so
+ * `bash -c 'cargo test 2>&1 | tail -50'` and `bash -c 'cargo test'` are one step, and a later
+ * plain success is that step going through rather than an unrelated run.
+ *
+ * @param {string} command - the command line.
+ * @returns {{shell: string, flag: string, script: string} | undefined} the invocation, when
+ *   the command is a shell running a script argument.
+ */
+function shellScriptOf(command) {
+  const line = withoutPrefixes(command).trim()
+  const match = /^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+)\s+([\s\S]*)$/.exec(line)
+  if (match === null) return undefined
+  const shell = programNameOf(match[1])
+  if (!SCRIPT_SHELLS.has(shell)) return undefined
+  const rest = match[2]
+  let index = 0
+  while (index < rest.length) {
+    while (index < rest.length && /\s/.test(rest[index])) index += 1
+    if (index >= rest.length) break
+    const start = index
+    let quote
+    while (index < rest.length) {
+      const char = rest[index]
+      if (quote === "'") {
+        if (char === "'") quote = undefined
+        index += 1
+        continue
+      }
+      if (quote === '"') {
+        if (char === '\\') {
+          index += 2
+          continue
+        }
+        if (char === '"') quote = undefined
+        index += 1
+        continue
+      }
+      if (char === '\\') {
+        index += 2
+        continue
+      }
+      if (char === "'" || char === '"') {
+        quote = char
+        index += 1
+        continue
+      }
+      if (/\s/.test(char)) break
+      index += 1
+    }
+    const token = rest.slice(start, index)
+    if (isScriptFlag(shell, token)) {
+      const script = withoutPlumbing(stripOuterQuotes(rest.slice(index).trim())).trim()
+      return script.length === 0 ? undefined : { shell, flag: scriptFlagName(shell), script }
+    }
+  }
+  return undefined
+}
+
+/**
  * The command key failures are counted under.
  *
  * `cd repo && cargo build --release` and `CARGO_X=1 cargo build -p app` are the same step
@@ -3690,10 +4201,18 @@ function describeToolCall(tool, args) {
  * an environment variable, so both are removed, whitespace is collapsed, and the first two
  * words are what is left (`cargo build`, `npm run`).
  *
+ * A shell running a script is named by the script's own start (see `SCRIPT_CHARS`) instead:
+ * `bash -c 'npm run build'` and `bash -c 'npm run lint'` are two different steps, and three
+ * failures of each are two warnings rather than one `"bash -c"` warning.
+ *
  * @param {string} command - the command line.
  * @returns {string} the key, or `''` when nothing but setup segments was there.
  */
 function failureKey(command) {
+  const script = shellScriptOf(command)
+  if (script !== undefined) {
+    return `${script.shell} ${script.flag} '${clipText(squashLine(script.script), SCRIPT_CHARS)}'`
+  }
   return normalizedCommand(command)
     .replace(/\s+/g, ' ')
     .trim()
@@ -3707,12 +4226,15 @@ function failureKey(command) {
  * The exact command a failure or success is matched by: the command line without its
  * leading setup segments (see `withoutSetup`) and with its whitespace collapsed, so
  * `cd app && cargo build` and `cargo build` are one command while `npm run lint` and
- * `npm run build` stay two.
+ * `npm run build` stay two. A shell script is matched by the whole script, so the same
+ * script quoted another way is the same run.
  *
  * @param {string} command - the command line.
  * @returns {string} the normalized command.
  */
 function exactCommandOf(command) {
+  const script = shellScriptOf(command)
+  if (script !== undefined) return `${script.shell} ${script.flag} ${squashLine(script.script)}`
   return normalizedCommand(command).replace(/\s+/g, ' ').trim()
 }
 
@@ -3744,6 +4266,28 @@ const COMMAND_PLUMBING = [
 ]
 
 /**
+ * A command line without the output plumbing of `COMMAND_PLUMBING` at its end. Applied to a
+ * whole command line and to the script inside `bash -c`, so both spellings of one step agree.
+ *
+ * @param {string} text - a command line or a shell script.
+ * @returns {string} what is left.
+ */
+function withoutPlumbing(text) {
+  let value = text
+  for (let again = true; again; ) {
+    again = false
+    for (const pattern of COMMAND_PLUMBING) {
+      const next = value.replace(pattern, '')
+      if (next !== value) {
+        value = next
+        again = true
+      }
+    }
+  }
+  return value
+}
+
+/**
  * A command line without what does not say which command it is: leading setup (`cd`,
  * assignments), the wrappers of `COMMAND_PREFIXES`, and the plumbing of `COMMAND_PLUMBING`
  * at its end. Whitespace is not collapsed here.
@@ -3752,18 +4296,7 @@ const COMMAND_PLUMBING = [
  * @returns {string} what is left.
  */
 function normalizedCommand(command) {
-  let text = withoutPrefixes(command)
-  for (let again = true; again; ) {
-    again = false
-    for (const pattern of COMMAND_PLUMBING) {
-      const next = text.replace(pattern, '')
-      if (next !== text) {
-        text = next
-        again = true
-      }
-    }
-  }
-  return text.trim()
+  return withoutPlumbing(withoutPrefixes(command)).trim()
 }
 
 /**
@@ -3946,7 +4479,8 @@ function laterSuccess(record, activity) {
 }
 
 /**
- * Every repeated-failure warning of a call, current as of `now`.
+ * Every warning of a call that is live as of `now`: repeated failures, and quiet commands
+ * whose call or background job is still running.
  *
  * @param {object} [activity] - the call's activity record.
  * @param {number} [now] - the clock to measure against.
@@ -3959,12 +4493,74 @@ export function activityWarnings(activity, now = Date.now()) {
     if (isExpectedFailure(record, activity)) continue
     warnings.push(repeatedFailureWarning(key, record, now, activity))
   }
-  // The process findings hold only while the call they were made about is still open.
-  const quiet = activity?.proc?.quiet
-  if (quiet !== undefined && activity.openCalls?.has(quiet.callKey)) warnings.push(quietWarning(quiet))
-  const held = activity?.proc?.held
-  if (held !== undefined && activity.openCalls?.has(held.callKey)) warnings.push(heldOpenWarning(held))
+  warnings.push(...liveQuietWarnings(activity))
   return warnings
+}
+
+/** Whether a process-watched call key still belongs to a running shell call or job. */
+function callIsWatched(activity, key) {
+  return activity?.openCalls?.has(key) === true || activity?.backgroundJobs?.has(key) === true
+}
+
+/** The quiet warnings of commands that are quiet right now. */
+function liveQuietWarnings(activity) {
+  const warnings = []
+  for (const record of activity?.proc?.calls?.values() ?? []) {
+    if (record.quiet === undefined || !callIsWatched(activity, record.key)) continue
+    warnings.push(quietWarning(record.quiet))
+  }
+  return warnings
+}
+
+/**
+ * Every warning a finished call's result must carry.
+ *
+ * Unlike `activityWarnings`, this keeps a quiet warning that was raised while a command ran
+ * even after the command ended: "it sat there for five minutes" is a fact about the call,
+ * and a result that drops it hides the stall from a caller that never watched a heartbeat.
+ * It also says when a background command was still running as its worker ended.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @param {number} [now] - the clock to measure against.
+ * @returns {string[]} the warnings.
+ */
+export function finalActivityWarnings(activity, now = Date.now()) {
+  const warnings = activityWarnings(activity, now)
+  const live = new Set()
+  for (const record of activity?.proc?.calls?.values() ?? []) {
+    if (record.quiet !== undefined && callIsWatched(activity, record.key)) live.add(record.key)
+  }
+  for (const quiet of activity?.quietWarnings ?? []) {
+    if (live.has(quiet.callKey)) continue
+    const warning = quietWarning(quiet)
+    if (!warnings.includes(warning)) warnings.push(warning)
+  }
+  warnings.push(...backgroundEndWarnings(activity))
+  return warnings
+}
+
+/**
+ * The warning for each background command that was still running when its worker ended.
+ *
+ * A terminal `job_output` read removes a job from `backgroundJobs`, so anything left there —
+ * or moved to `runningBackgroundJobs` as the worker session closed — was still running at
+ * the last heartbeat. The sandbox ends a script's background children with the call, so the
+ * job's own eventual status says nothing about the command.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @returns {string[]} the warnings, oldest job first.
+ */
+function backgroundEndWarnings(activity) {
+  const jobs = new Map()
+  for (const [key, job] of activity?.backgroundJobs ?? []) jobs.set(key, job)
+  for (const [key, job] of activity?.runningBackgroundJobs ?? []) jobs.set(key, job)
+  return [...jobs.values()]
+    .sort((a, b) => a.since - b.since)
+    .map(
+      (job) =>
+        `the worker ended while its background command ${job.jobId} (${job.command}) was still running; ` +
+        'the sandbox stopped it, so its outcome is unknown',
+    )
 }
 
 /**
@@ -3974,10 +4570,18 @@ export function activityWarnings(activity, now = Date.now()) {
  *
  * @param {object} record - the failure record.
  * @param {object} [activity] - the call's activity record.
- * @returns {boolean} true when the brief asked for it and a later run of the command passed.
+ * @returns {boolean} true when the brief asked for it, the failure was a shell command, and a
+ *   later run of that command passed.
  */
 function isExpectedFailure(record, activity) {
-  return activity?.expectsFailBefore === true && laterSuccess(record, activity)?.kind === 'run'
+  // A check is a shell command. An `edit` that failed with an `FsError` and then passed is
+  // the worker getting past a step, but it is not evidence of anything the brief asked to
+  // see fail first, so it keeps the ordinary repeated-failure warning.
+  return (
+    activity?.expectsFailBefore === true &&
+    SHELL_TOOLS.has(record.tool) &&
+    laterSuccess(record, activity)?.kind === 'run'
+  )
 }
 
 /**
@@ -4011,18 +4615,18 @@ export function activityNotes(activity, now = Date.now()) {
 }
 
 /**
- * The longest-running process under the runtime that is not the open command itself, as the
- * last process sample saw it: `cargo check` open, `cmake --build … ninja` the child.
+ * The child a status reader sees for one watched call, from the last process sample: the
+ * deepest idle process of its own subtree while it is quiet, else its longest-running
+ * process that is not the command's own shell or a sandbox wrapper.
  *
  * @param {object} [activity] - the call's activity record.
- * @param {string} command - the open call's command.
+ * @param {string} key - the open call's key, or the background job's key.
  * @param {number} now - the clock.
  * @returns {{command: string, runningMs: number, cpuSeconds: number} | undefined} the child.
  */
-function childOf(activity, command, now) {
-  const tree = activity?.proc?.tree
-  if (!Array.isArray(tree) || tree.length === 0) return undefined
-  return longestChild(tree, command, now)
+function childOf(activity, key, now) {
+  const record = activity?.proc?.calls?.get(key)
+  return record === undefined ? undefined : childOfCall(record, now)
 }
 
 /**
@@ -4036,16 +4640,25 @@ function childOf(activity, command, now) {
  * status would say `job_output {…}` for the whole wait and restart its clock at every poll.
  * An unknown job id has no command to show and keeps the ordinary rendering.
  *
+ * A running background job is listed whether or not a wait is open on it: a job a worker
+ * started and never polls is still running, and `current` that hid it would say the worker
+ * has nothing in flight. The entry comes from the heartbeat's `backgroundJobs` state (the
+ * same state `backgroundEndWarnings` reads), and its child is the one measured under the
+ * job's own key.
+ *
  * @param {object} [activity] - the call's activity record.
  * @param {number} [now] - the clock to measure against.
  * @returns {{tool: string, command: string, since: string, runningMs: number, background?: string, child?: {command: string, runningMs: number, cpuSeconds: number}}[]} the calls.
  */
 export function openCommands(activity, now = Date.now()) {
   const current = []
-  for (const call of activity?.openCalls?.values() ?? []) {
-    const child = childOf(activity, call.command, now)
+  const shown = new Set()
+  for (const [key, call] of activity?.openCalls?.entries() ?? []) {
     const job =
       call.jobId === undefined ? undefined : activity?.backgroundJobs?.get(backgroundJobKey(call.session, call.jobId))
+    const watchedKey = job === undefined ? key : backgroundJobKey(call.session, job.jobId)
+    shown.add(watchedKey)
+    const child = childOf(activity, watchedKey, now)
     if (job !== undefined) {
       current.push({
         tool: job.tool,
@@ -4062,6 +4675,18 @@ export function openCommands(activity, now = Date.now()) {
       command: call.command,
       since: new Date(call.since).toISOString(),
       runningMs: Math.max(0, now - call.since),
+      ...(child === undefined ? {} : { child }),
+    })
+  }
+  for (const [key, job] of activity?.backgroundJobs?.entries() ?? []) {
+    if (shown.has(key)) continue
+    const child = childOf(activity, key, now)
+    current.push({
+      tool: job.tool,
+      command: job.command,
+      since: new Date(job.since).toISOString(),
+      runningMs: Math.max(0, now - job.since),
+      background: job.jobId,
       ...(child === undefined ? {} : { child }),
     })
   }
@@ -4114,17 +4739,18 @@ export function describeActivity(activity, now = Date.now()) {
  * waiter, so the line is first come, first served. A holder that is a background job is named
  * by its id, so the caller can look it up or cancel it; a foreground call has no id.
  *
- * @param {{position: number, of: number, holders: Array<{jobId?: string, label: string, runningMs: number}>}} queue
+ * @param {{position: number, of: number, holders: Array<{jobId?: string, label: string, runningMs: number, idleMs?: number}>}} queue
  *   the call's place in the queue (see `FlashTaskService#queueView`).
  * @param {{inUse: number, size: number}} counts - the pool's counts, for a line with no holders.
  * @returns {string} e.g. `2nd in line for a free tree (first come, first served); trees held
- *   by job-ab12cd34 (fix the parser, 31m0s) and a foreground call (review it, 2m0s)`.
+ *   by job-ab12cd34 (fix the parser, 31m0s, idle 6m0s) and a foreground call (review it, 2m0s)`.
  */
 function describeQueue(queue, { inUse, size }) {
   const place = queue.position > 0 ? `${ordinal(queue.position)} in line` : 'in line'
   const names = queue.holders.map(
     (holder) =>
-      `${holder.jobId ?? 'a foreground call'} (${holder.label}, ${formatElapsed(holder.runningMs)})`,
+      `${holder.jobId ?? 'a foreground call'} (${holder.label}, ${formatElapsed(holder.runningMs)}` +
+      `${holder.idleMs === undefined ? '' : `, idle ${formatElapsed(holder.idleMs)}`})`,
   )
   const held =
     names.length === 0
@@ -4574,14 +5200,19 @@ function truncateText(text, maxChars) {
 }
 
 /**
- * Report a running call to the MCP client until the returned stop function is called.
+ * Report a running call to the MCP client, and keep its process tree sampled, until the
+ * returned stop function is called.
  *
  * MCP makes a progress notification valid only when the request carried a
- * `_meta.progressToken`, so a call without one gets no timer and sends nothing;
- * a notification without the token would be a protocol error, not a heartbeat.
- * The token belongs to the client and is carried back by the MCP layer's sender
- * (`sendProgress`); this helper only supplies the elapsed seconds, the budget in
- * seconds when one is known, and a short human message.
+ * `_meta.progressToken`, so a call without one sends nothing; a notification without the
+ * token would be a protocol error, not a heartbeat. The token belongs to the client and is
+ * carried back by the MCP layer's sender (`sendProgress`); this helper only supplies the
+ * elapsed seconds, the budget in seconds when one is known, and a short human message.
+ *
+ * The process sample is not a notification and needs no token: a quiet command is a fact
+ * about the call's result, so one timer per call samples the runtime's tree on this
+ * interval whether or not a token was sent. The timer is unref'd and cleared when the call
+ * ends, so it never keeps the process alive.
  *
  * @param {object} options - progress wiring.
  * @param {(report: object) => void} [options.progress] - MCP notification sender.
@@ -4589,26 +5220,27 @@ function truncateText(text, maxChars) {
  * @param {string} options.label - the tool name, for the message.
  * @param {string} options.sessionId - the worker session the call is waiting on.
  * @param {number} [options.budgetMs] - the call's wall-clock budget, when known.
- * @param {number} options.intervalMs - how often to report.
+ * @param {number} options.intervalMs - how often to report and to sample.
  * @param {object} [options.activity] - the call's activity record; it gets `heartbeat`, which
- *   sends one report at once, until the reporting stops.
+ *   takes one reading at once, until the reporting stops.
  * @param {(message: string) => void} [options.log] - diagnostic sink.
  * @returns {() => void} stops the reporting.
  */
 function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs, activity, log = () => {} }) {
-  if (token === undefined || token === null || typeof progress !== 'function') return () => {}
+  const sendsReports = token !== undefined && token !== null && typeof progress === 'function'
   const startedAt = Date.now()
-  /** One heartbeat: what the call is doing as of now. */
+  /** One heartbeat: a fresh process sample, and a report when the client asked for one. */
   const beat = () => {
+    // Ask for a fresh look at the runtime's processes; the answer lands in a later reading,
+    // so nothing here waits for the machine. This runs without a progress token too.
+    activity?.procWatch?.refresh(activity).catch((error) => log(`could not watch the process tree: ${messageOf(error)}`))
+    if (!sendsReports) return
     try {
       const now = Date.now()
       const elapsedMs = now - startedAt
       // The session id comes from the activity record, not this closure: a retried first
       // attempt runs under a new session, and the heartbeat must name the live one.
       const current = activity?.sessionId ?? sessionId
-      // Ask for a fresh look at the runtime's processes; the answer lands in a later beat, so
-      // nothing here waits for the machine.
-      activity?.procWatch?.refresh(activity).catch((error) => log(`could not watch the process tree: ${messageOf(error)}`))
       progress({
         progress: Math.round(elapsedMs) / 1000,
         ...(budgetMs === undefined || budgetMs === null ? {} : { total: Math.round(budgetMs / 1000) }),
@@ -4635,7 +5267,7 @@ function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs
   // The heartbeat must never be the only thing keeping the process alive.
   timer.unref?.()
   // Reachable from the activity record, so a moment that makes the last heartbeat wrong —
-  // a queued call getting its tree — can send a fresh one instead of waiting an interval.
+  // a queued call getting its tree — can take a fresh reading instead of waiting an interval.
   if (activity !== undefined) activity.heartbeat = beat
   return () => {
     clearInterval(timer)
@@ -4908,12 +5540,14 @@ function warnAboutIgnoredArguments(args, toolName, log) {
  * it survives. Three more exist because the caller reads the report, not the transcript: a
  * deviation from the named interface is invisible unless it is said first, a contract that
  * looks wrong is the caller's decision rather than something to route around, and a task
- * abandoned halfway must say so before its partial result is mistaken for a whole one. The
- * last three cover what a diff cannot show either: a command whose exit code was hidden, a
- * feature removed without a word, and a file changed outside the task's list. The last line
- * asks for a heading of its own: a change beside a rule the brief states ("only here", "never
- * that") is the one a reviewer most needs to find, and a sentence in the middle of a report
- * is where it gets lost.
+ * abandoned halfway must say so before its partial result is mistaken for a whole one. Three
+ * more cover what a diff cannot show either: a command whose exit code was hidden, a feature
+ * removed without a word, and a file changed outside the task's list. Two more cover the edges
+ * of a brief: a linter that must run on every package the change touched, and a missing piece
+ * that belongs in another layer and is said rather than built around. The last line asks for a
+ * heading of its own: a change beside a rule the brief states ("only here", "never that") is
+ * the one a reviewer most needs to find, and a sentence in the middle of a report is where it
+ * gets lost.
  */
 export const WORKER_INSTRUCTIONS = [
   'Do not commit unless the task explicitly asks: the service reads the change from the working tree, and a commit only confuses the report.',
@@ -4932,6 +5566,8 @@ export const WORKER_INSTRUCTIONS = [
   'A check named in the report is one you ran after your last edit; give the time beside it. A comment that states a measured fact must agree with the measurement. Do not call a failure "pre-existing" or "the sandbox\'s" without checking.',
   "When the brief spans a protocol another job writes, take the shape from the other side's code and say where it came from. A workaround that hides a fault from the tests needs the caller's word, not only a line in the report.",
   'Do not rewrite lines you do not mean to change; keep a file\'s encoding and characters (a worker turned "…" into `â€¦` on Windows).',
+  'When you change a package, run the project\'s linter on every package you changed, not only the one the brief names.',
+  'When the brief needs a piece outside its scope that is missing, say that it belongs in another layer and stop that part, instead of building around it.',
   'If a change touches code beside a stated rule (an "only", a "never", a "one place", a design note the task quotes), list it in the report under its own heading "Rules crossed", with the reason.',
 ]
 

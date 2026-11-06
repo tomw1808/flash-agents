@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url'
 import {
   canonicalTmpdir,
   defaultStateDir,
+  stableSlotDirectory,
   formatBytes,
   LOW_DISK_FREE_BYTES,
   LOW_DISK_FREE_FRACTION,
@@ -840,8 +841,16 @@ function checkStateBasePermissions({ base, env, fs, run }) {
  *        default slot layout in the Windows path-length row.
  * @param {string} [options.stateBase] - the base of the default slot layout
  *        (default `$TMPDIR/flash-mcp`), so the row measures the base a server would use.
+ * @param {string} [options.stateBaseSource] - the layer that named that base (`--state-base`,
+ *        `FLASH_STATE_BASE`, or `.flash-agents.local.json`); the `state-base` row says it.
+ * @param {string} [options.stateBaseLocalFile] - the absolute path of the local settings file
+ *        that decided the base; the `state-base` row names it, as `clean` does.
+ * @param {{path: string, message: string}} [options.localSettingsProblem] - a local settings
+ *        file that could not be read or parsed and was ignored; the report warns about it.
  * @param {string} [options.stateBaseProblem] - why the configured state base is unusable, when
  *        the options could not be parsed with it; the report then fails a `state-base` row.
+ * @param {boolean} [options.stateBaseProblemFromLocal] - whether that unusable value came from
+ *        `.flash-agents.local.json`, so the row's fix names that file and its key.
  * @param {boolean} [options.disk] - add the `state-disk` row: what each slot copy and cache and
  *        the cache store take, and the free space of the state volume. Off by default because it
  *        walks the trees; the command line turns it on.
@@ -980,12 +989,33 @@ export async function runChecks(options = {}) {
 
   // A state base the server would refuse at start-up: the same value, the same sentence.
   if (config.stateBaseProblem !== undefined) {
+    // A value from the local settings file is fixed in that file, not in the plugin option:
+    // the plugin option is synced from another machine, which is why the local file exists.
+    const fix =
+      config.stateBaseProblemFromLocal === true
+        ? 'clear "stateBase" in .flash-agents.local.json, or set it to an absolute path on this platform'
+        : 'clear the plugin option "state_base" (or FLASH_STATE_BASE), or set it to an absolute path on this platform'
+    record('state-base', 'state base', 'fail', `the server would not start: ${config.stateBaseProblem}`, fix)
+  } else if (config.stateBase !== undefined) {
+    // Which layer decided the base matters: a plugin setting is synced between machines,
+    // while the local settings file belongs to this one, and a user debugging a wrong base
+    // needs to know which file to edit. The row exists only when a base is configured, so
+    // the default layout keeps its existing report.
+    const source = config.stateBaseSource ?? 'the configured state base'
+    const at =
+      config.stateBaseLocalFile === undefined ? '' : ` at ${config.stateBaseLocalFile}`
+    record('state-base', 'state base', 'ok', `using ${config.stateBase} (from ${source}${at})`, '')
+  }
+  // A local settings file the server ignores is not a failed prerequisite; it is worth a
+  // warning, because the synced plugin setting then decides the base without a word.
+  if (config.localSettingsProblem !== undefined) {
+    const { path, message } = config.localSettingsProblem
     record(
-      'state-base',
-      'state base',
-      'fail',
-      `the server would not start: ${config.stateBaseProblem}`,
-      'clear the plugin option "state_base" (or FLASH_STATE_BASE), or set it to an absolute path on this platform',
+      'local-settings',
+      'local settings',
+      'warn',
+      `ignored ${path}: ${message}; its "stateBase" setting does not apply`,
+      `fix or remove ${path}`,
     )
   }
 
@@ -1067,7 +1097,12 @@ export async function runChecks(options = {}) {
     // The same expansion the server's option parsing applies, so a `~` base is measured
     // where the copies would really land instead of as a literal `~` directory.
     const defaultBase = resolveStateBase(config.stateBase, config.home ?? homedir()) ?? join(canonicalTmpdir(), 'flash-mcp')
-    const slotRoot = join(config.stateDir ?? defaultStateDir(serviceRoot, { baseDir: defaultBase }), 'slots', 'slot-0')
+    // A configured state directory keeps the per-instance layout; the default one puts slot
+    // copies at the stable `<base>/<digest>/slots/<n>`, which is what a server would use.
+    const slotRoot =
+      config.stateDir === undefined
+        ? stableSlotDirectory(serviceRoot, { baseDir: defaultBase, id: 0 })
+        : join(config.stateDir, 'slots', 'slot-0')
     const lengthWarning = slotPathWarning(slotRoot, { platform })
     if (lengthWarning === undefined) {
       const trailing = /[\\/]$/.test(slotRoot) ? slotRoot : `${slotRoot}\\`

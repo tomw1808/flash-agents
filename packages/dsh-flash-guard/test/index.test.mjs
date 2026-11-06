@@ -1025,13 +1025,541 @@ describe('guard fix round 3', () => {
     // `canonicalPath` used `tail.unshift` and one `existsSync` per missing ancestor, so
     // this path was quadratic: 30,000 segments took over 200 ms and a megabyte never
     // finished. The walk now pushes and reverses once, and stops after 256 levels.
+    //
+    // The measurement is this process's CPU time, not wall-clock: `npm test` runs the
+    // much larger flash-mcp suites beside this one, and wall-clock included the time
+    // the scheduler gave them. The regression this pins is the guard's own work, and a
+    // quadratic walk spends the same CPU either way.
     const segments = 60_000
     const deep = `mkdir -p ${'a/'.repeat(segments)}build`
-    const started = process.hrtime.bigint()
+    const started = process.cpuUsage()
     const verdict = ask(deep)
-    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6
+    const used = process.cpuUsage(started)
+    const elapsedMs = (used.user + used.system) / 1000
     assert.equal(verdict, undefined, 'a path below the fence is an ordinary mkdir')
-    assert.ok(elapsedMs < 100, `expected under 100 ms, took ${elapsedMs.toFixed(1)} ms`)
+    assert.ok(elapsedMs < 100, `expected under 100 ms of CPU, took ${elapsedMs.toFixed(1)} ms`)
+  })
+})
+
+// ── the fourth review: PowerShell writes and shells run as programs ──────────
+
+/**
+ * A live run on Windows 11 (0.1.11, the worker's shell tool is `pwsh`) found two
+ * writes the guard never saw. A PowerShell `Set-Content` to the user profile left
+ * the workspace with no `OUTSIDE_WORKSPACE`, and a Git Bash started as a program
+ * from PowerShell — `& "…\bash.exe" -c "…"` — carried a redirect into `.git` with no
+ * denial at all. The sandbox stopped both; the fence never fired.
+ *
+ * The paths are Windows spellings even though this suite runs on every host: the
+ * guard has to read a PowerShell command line wherever it is asked to, so the
+ * resolution and the comparison are pinned here rather than left to `node:path`.
+ * The home folder is a fake one under `C:\Users`, so no case can reach the real home.
+ */
+describe('guard fix round 4: PowerShell writes and nested shells', () => {
+  const root = 'C:\\work\\repo'
+  const home = 'C:\\Users\\someone'
+  const settings = resolveSettings({ root })
+  // `rootExplicit` is what `apply` writes back into the settings, so the fence is the
+  // configured root and not the directory a `cd` reached.
+  settings.rootExplicit = true
+
+  /** Ask the guard about one command run by the PowerShell tool. */
+  const ask = (command, name = 'pwsh') => decideToolCall({ name, args: { command }, cwd: root, home, settings })
+
+  test('the reported Set-Content escape outside the workspace is refused', () => {
+    const escape = `${home}\\flash-mcp-escape-123.txt`
+    for (const command of [
+      `Set-Content -Path ${escape} -Value x`,
+      `Set-Content ${escape} x`,
+      `echo x > ${escape}`,
+      `echo x >> ${escape}`,
+    ]) {
+      const verdict = ask(command)
+      assert.equal(verdict?.reason, REASON.OUTSIDE_WORKSPACE, command)
+      assert.match(verdict.detail, /outside C:\\work\\repo/, command)
+    }
+  })
+
+  test('the reported Git Bash behind Powershell’s & is parsed, and names the nesting', () => {
+    const command = '& "C:\\Program Files\\Git\\bin\\bash.exe" -c "echo x > .git/probe"'
+    const verdict = ask(command)
+    assert.equal(verdict?.reason, REASON.STATE, command)
+    assert.match(verdict.detail, /inside bash\.exe -c$/, command)
+  })
+
+  test('1. every PowerShell cmdlet and alias writes where it says it does', () => {
+    const outside = `${home}\\target.txt`
+    for (const command of [
+      `Set-Content -Path ${outside} -Value x`,
+      `Add-Content -Path ${outside} -Value x`,
+      `Out-File -FilePath ${outside}`,
+      `'x' | Out-File ${outside}`,
+      `New-Item -ItemType Directory ${home}\\build`,
+      `Copy-Item a.txt ${outside}`,
+      `Move-Item a.txt ${outside}`,
+      `Rename-Item -Path ${outside} -NewName b.txt`,
+      // The command's own aliases, which PowerShell resolves case-insensitively.
+      `sc ${outside} x`,
+      `ac ${outside} x`,
+      `ni ${home}\\build -ItemType Directory`,
+      `cp a.txt ${outside}`,
+      `copy a.txt ${outside}`,
+      `mv a.txt ${outside}`,
+      `move a.txt ${outside}`,
+      `ren ${outside} b.txt`,
+      `SC ${outside} x`,
+    ]) {
+      assert.equal(ask(command)?.reason, REASON.OUTSIDE_WORKSPACE, command)
+    }
+    // A PowerShell deletion runs through the *same* deletion rule as `rm`, so a target
+    // under the home folder is critical for both rather than fenced for one. `rd`,
+    // `rmdir` and `erase` are the cmd/PowerShell spellings of the same alias.
+    for (const command of [
+      `Remove-Item -Recurse -Force ${home}\\build`,
+      `del ${outside}`,
+      `ri ${outside}`,
+      `rd ${outside}`,
+      `rmdir ${outside}`,
+      `erase ${outside}`,
+      `rm ${outside}`,
+    ]) {
+      assert.equal(ask(command)?.reason, REASON.CRITICAL_RM, command)
+    }
+    // `-LiteralPath` and `-Destination` name the same target as `-Path` and the last
+    // positional argument.
+    assert.equal(ask(`Set-Content -LiteralPath ${outside} -Value x`)?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask(`Copy-Item -Destination ${outside} a.txt`)?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask(`Move-Item -Destination ${outside} a.txt`)?.reason, REASON.OUTSIDE_WORKSPACE)
+  })
+
+  test('2. every PowerShell redirect and .NET file write is a write', () => {
+    const outside = `${home}\\target.txt`
+    for (const command of [
+      `echo x > ${outside}`,
+      `echo x >> ${outside}`,
+      `echo x 2> ${home}\\err.txt`,
+      `echo x *> ${home}\\all.txt`,
+      `[System.IO.File]::WriteAllText("${outside}", "x")`,
+      `[System.IO.File]::AppendAllText("${outside}", "x")`,
+    ]) {
+      assert.equal(ask(command)?.reason, REASON.OUTSIDE_WORKSPACE, command)
+    }
+    // `.git` stays state whatever the cmdlet, the redirect, or the .NET call.
+    for (const command of [
+      'Set-Content .git\\probe x',
+      'echo x > .git/probe',
+      'Add-Content -Path .git\\config -Value x',
+      'Out-File -FilePath .git\\out',
+      'New-Item -ItemType File .git\\hooks\\pre-commit',
+      'Copy-Item a.txt .git\\config',
+      'Move-Item a.txt .git\\config',
+      'Rename-Item -Path .git\\config -NewName config2',
+      'Remove-Item -Recurse .git',
+      'del .git\\config',
+      '[System.IO.File]::WriteAllText(".git\\config", "x")',
+      `Remove-Item -Path ${root}\\.git\\config`,
+    ]) {
+      assert.equal(ask(command)?.reason, REASON.STATE, command)
+    }
+  })
+
+  test('3. paths are resolved the way PowerShell resolves them', () => {
+    // Both separators, and any case for a path inside the workspace.
+    assert.equal(ask('Set-Content C:/Users/someone/target.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('Set-Content C:/Users/someone\\target.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('Set-Content c:\\WORK\\Repo\\src\\a.txt x'), undefined)
+    assert.equal(ask('Set-Content C:/Work/Repo/src/a.txt x'), undefined)
+    // `..` is collapsed, and cannot climb above the drive root.
+    assert.equal(ask('Set-Content ..\\..\\escape.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('Set-Content src\\..\\ok.txt x'), undefined)
+    // The home spellings PowerShell adds, and the one bash shares.
+    assert.equal(ask('Set-Content $env:USERPROFILE\\flash.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('Set-Content $Env:UserProfile\\flash.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('Set-Content ${env:USERPROFILE}\\flash.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('Set-Content $HOME\\flash.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('Set-Content ~\\flash.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+    // A variable the guard does not know is placed by its literal spelling, exactly as
+    // an unresolvable bash write target is (see "an unfollowable cd places a relative
+    // write"): the file sandbox still confines the write, and refusing every `$out`
+    // would refuse ordinary work.
+    assert.equal(ask('Set-Content $UNKNOWN\\out.txt x'), undefined)
+    assert.equal(ask('Set-Content $env:TEMP\\out.txt x'), undefined)
+  })
+
+  test('4. a shell run as a program is parsed, whatever its path or spelling', () => {
+    const outside = `${home}\\target.txt`
+    const git = 'C:\\Program Files\\Git\\bin\\bash.exe'
+    for (const [command, reason] of [
+      [`pwsh -Command "Set-Content ${outside} x"`, REASON.OUTSIDE_WORKSPACE],
+      [`powershell -c "Set-Content ${outside} x"`, REASON.OUTSIDE_WORKSPACE],
+      [`sh -c "echo x > ${outside}"`, REASON.OUTSIDE_WORKSPACE],
+      [`powershell -Command "echo x > .git/probe"`, REASON.STATE],
+      [`cmd /c "echo x > .git\\probe"`, REASON.STATE],
+      [`cmd.exe /C "echo x > ${outside}"`, REASON.OUTSIDE_WORKSPACE],
+      [`cmd /c "Set-Content ${outside} x"`, REASON.OUTSIDE_WORKSPACE],
+      [`cmd /c "Remove-Item -Recurse -Force ${home}\\build"`, REASON.CRITICAL_RM],
+      [`& "${git}" -c "echo x > .git/probe"`, REASON.STATE],
+      [`& "${git.replace('bash.exe', 'BASH.EXE')}" -c "echo x > .git/probe"`, REASON.STATE],
+      [`"${git}" -c "echo x > ${outside}"`, REASON.OUTSIDE_WORKSPACE],
+      [`& "${git}" -c "rm -rf /"`, REASON.CRITICAL_RM],
+      [`C:\\Windows\\System32\\cmd.exe /c "echo x > .git\\probe"`, REASON.STATE],
+    ]) {
+      assert.equal(ask(command)?.reason, reason, command)
+    }
+    // The refusal names the nesting, so a caller can see where the line was found.
+    assert.match(ask(`pwsh -Command "Set-Content ${outside} x"`).detail, /inside pwsh -Command$/)
+    assert.match(ask(`cmd /c "echo x > .git\\probe"`).detail, /inside cmd \/c$/)
+    assert.match(ask(`& "${git}" -c "rm -rf /"`).detail, /inside bash\.exe -c$/)
+    // A payload that stays inside the fence stays ordinary.
+    assert.equal(ask('pwsh -Command "Set-Content src\\a.txt x"'), undefined)
+    assert.equal(ask('cmd /c "echo ok > build\\out.txt"'), undefined)
+    assert.equal(ask(`& "${git}" -c "npm test"`), undefined)
+  })
+
+  test('5. ordinary in-workspace PowerShell is still allowed', () => {
+    for (const command of [
+      'Set-Content src\\a.txt -Value x',
+      'New-Item -ItemType Directory build',
+      'Remove-Item -Recurse -Force .\\tmp',
+      'Add-Content -Path src\\a.txt -Value y',
+      'Copy-Item src\\a.txt src\\b.txt',
+      'Move-Item src\\a.txt src\\b.txt',
+      'Out-File build\\log.txt',
+      'sc src\\a.txt x',
+      'ni build -ItemType Directory',
+      'echo x > build\\out.txt',
+      'echo x 2> build\\err.txt',
+    ]) {
+      assert.equal(ask(command), undefined, command)
+    }
+  })
+})
+
+// ── the fifth review: an unknown PowerShell parameter ───────────────────────
+
+/**
+ * A parameter the guard does not know was read as a switch that consumes nothing, so its
+ * value became a positional argument. For the write cmdlets only the *first* positional
+ * was the target, so `Set-Content -ProgressAction SilentlyContinue C:\Users\x\f.txt v`
+ * named `SilentlyContinue` and never looked at the real path. Every positional is now a
+ * candidate destination: content words resolve inside the workspace and stay allowed.
+ */
+describe('guard fix round 5: an unknown PowerShell parameter cannot hide a write', () => {
+  const root = 'C:\\work\\repo'
+  const home = 'C:\\Users\\someone'
+  const settings = resolveSettings({ root })
+  settings.rootExplicit = true
+
+  /** Ask the guard about one command run by the PowerShell tool. */
+  const ask = (command) => decideToolCall({ name: 'pwsh', args: { command }, cwd: root, home, settings })
+
+  test('a value of an unknown or new common parameter is still a destination', () => {
+    for (const command of [
+      // The reported shape: the unknown parameter's value was the first positional.
+      `Set-Content -ProgressAction SilentlyContinue ${home}\\f.txt v`,
+      // The other two common parameters that take a value.
+      `Set-Content -InformationAction SilentlyContinue ${home}\\f.txt v`,
+      `Set-Content -InformationVariable info ${home}\\f.txt v`,
+      // A parameter this guard has never heard of is a switch, so its value is positional
+      // too; the real path after it must still be fenced.
+      `Set-Content -FutureAction SilentlyContinue ${home}\\f.txt v`,
+      `Add-Content -ProgressAction SilentlyContinue ${home}\\f.txt v`,
+      `Out-File -ProgressAction SilentlyContinue ${home}\\f.txt`,
+      `New-Item -ProgressAction SilentlyContinue ${home}\\f.txt`,
+      `Rename-Item -ProgressAction SilentlyContinue ${home}\\f.txt b.txt`,
+    ]) {
+      assert.equal(ask(command)?.reason, REASON.OUTSIDE_WORKSPACE, command)
+    }
+    // The real path is named even when another positional comes first.
+    assert.equal(ask(`Set-Content -ProgressAction SilentlyContinue src\\a.txt ${home}\\f.txt v`)?.reason, REASON.OUTSIDE_WORKSPACE)
+  })
+
+  test('content words stay allowed because they resolve inside the workspace', () => {
+    assert.equal(ask('Set-Content src\\a.txt "hello world"'), undefined)
+    assert.equal(ask('Add-Content src\\a.txt "hello world"'), undefined)
+    assert.equal(ask('Out-File build\\log.txt'), undefined)
+    assert.equal(ask('New-Item -ItemType Directory build'), undefined)
+  })
+})
+
+// ── the sixth review: eight gaps in the PowerShell and nested-shell reading ──
+
+/**
+ * A review ran `decideToolCall` with cwd `C:\work\repo` and home `C:\Users\someone`
+ * and confirmed eight gaps: a case variant of a protected segment, a root-relative
+ * path, an unquoted `-Command` payload, a comma list, a `.NET` write below a block, a
+ * Windows home taken from `USERPROFILE`, a PowerShell deletion fenced where bash is
+ * critical, and a PowerShell home spelling expanded for a POSIX bash line. Every case
+ * below failed before its fix.
+ */
+describe('guard fix round 6: the eight review findings', () => {
+  const root = 'C:\\work\\repo'
+  const home = 'C:\\Users\\someone'
+  const settings = resolveSettings({ root })
+  settings.rootExplicit = true
+  /** Ask the guard about one command run by the PowerShell tool. */
+  const ask = (command, name = 'pwsh') => decideToolCall({ name, args: { command }, cwd: root, home, settings })
+
+  // The POSIX side, for the cases whose point is that a bash line is not read the way
+  // PowerShell spells one.
+  const posixRoot = '/Users/tester/code/project'
+  const posixHome = '/Users/tester'
+  const posixSettings = resolveSettings({ root: posixRoot })
+  posixSettings.rootExplicit = true
+  /** Ask the guard about one command run by the bash tool on POSIX. */
+  const bash = (command) => decideToolCall({ name: 'bash', args: { command }, cwd: posixRoot, home: posixHome, settings: posixSettings })
+
+  test('1. protected segments fold case for Windows paths and PowerShell tools only', () => {
+    for (const command of [
+      'Set-Content .GIT\\config x',
+      'echo x > .Git/probe',
+      'Remove-Item -Recurse -Force .GIT',
+      'Add-Content -Path .GIT\\config -Value x',
+    ]) {
+      assert.equal(ask(command)?.reason, REASON.STATE, command)
+    }
+    // A Windows-spelled target is case-insensitive even when the tool is not a shell.
+    assert.equal(
+      decideToolCall({ name: 'write', args: { file_path: `${root}\\.GIT\\config` }, cwd: root, home, settings })?.reason,
+      REASON.STATE,
+    )
+    // POSIX bash keeps exact matching: `.GIT` there is an ordinary directory.
+    assert.equal(bash('echo x > .GIT/probe'), undefined)
+  })
+
+  test('2. one leading separator means the root of the cwd drive in PowerShell', () => {
+    assert.equal(ask('Set-Content \\Users\\someone\\f.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+    // The same spelling inside the workspace stays inside...
+    assert.equal(ask('Set-Content /work/repo/src/a.txt x'), undefined)
+    // ...and a drive-relative `C:foo` keeps the old placement.
+    assert.equal(ask('Set-Content C:foo.txt x'), undefined)
+    assert.equal(resolveTarget('\\Users\\someone\\f.txt', root, home, true), 'C:\\Users\\someone\\f.txt')
+  })
+
+  test('3. PowerShell and cmd take every remaining argument as the command line', () => {
+    for (const command of [
+      `pwsh -Command Set-Content ${home}\\f.txt x`,
+      `powershell -c Set-Content ${home}\\f.txt x`,
+      `powershell -Command Set-Content ${home}\\f.txt x`,
+    ]) {
+      assert.equal(ask(command)?.reason, REASON.OUTSIDE_WORKSPACE, command)
+    }
+    // cmd reads every remaining argument as its command line too. The case is a
+    // deletion on purpose: `cmd /c echo x > …` is refused by the outer redirect rule
+    // even when the payload is never read, so it proves nothing about this rule.
+    assert.equal(ask(`cmd /c del ${home}\\f.txt`)?.reason, REASON.CRITICAL_RM)
+    // The in-workspace forms stay ordinary.
+    assert.equal(ask('pwsh -Command Set-Content src\\a.txt x'), undefined)
+    // bash/sh still take one argument for `-c`.
+    assert.equal(bash('bash -c "npm test"'), undefined)
+    assert.equal(bash('bash -c "rm -rf /"')?.reason, REASON.CRITICAL_RM)
+  })
+
+  test('4. comma lists, joined parameter values and -Name below -Path are all read', () => {
+    for (const command of [
+      `Set-Content -Path a.txt, ${home}\\f.txt`,
+      `Set-Content -Path:a.txt,${home}\\f.txt`,
+      `Set-Content -LiteralPath:'${home}\\f.txt' x`,
+      `Copy-Item -Destination:${home}\\f.txt a.txt`,
+      'New-Item -Path build -Name ..\\..\\escape.txt',
+    ]) {
+      assert.equal(ask(command)?.reason, REASON.OUTSIDE_WORKSPACE, command)
+    }
+    // An in-workspace list and an in-workspace name stay ordinary.
+    assert.equal(ask('Set-Content -Path a.txt, b.txt'), undefined)
+    assert.equal(ask('New-Item -Path build -Name sub\\out.txt'), undefined)
+  })
+
+  test('5. a .NET write anywhere in a PowerShell line is a write', () => {
+    const outside = `${home}\\f.txt`
+    assert.equal(ask(`if (Test-Path x) { [System.IO.File]::WriteAllText("${outside}","x") }`)?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask(`Try { [System.IO.File]::AppendAllText("${outside}", "x") } Catch {}`)?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('if (Test-Path x) { [System.IO.File]::WriteAllText(".git\\config","x") }')?.reason, REASON.STATE)
+    // The same call inside the workspace stays ordinary.
+    assert.equal(ask('if (Test-Path x) { [System.IO.File]::WriteAllText("src\\a.txt","x") }'), undefined)
+  })
+
+  test('6. a native Windows process takes its home from USERPROFILE when HOME is unset', async () => {
+    const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
+    const handlers = new Map()
+    try {
+      delete process.env.HOME
+      process.env.USERPROFILE = posixHome
+      apply(
+        { logger: { info: () => {} }, on: (eventName, handler) => { handlers.set(eventName, handler) } },
+        { root: posixRoot },
+      )
+      const denied = await handlers.get('tools/execute')(
+        { name: 'write', arguments: { file_path: '~/.ssh/id_rsa', content: 'x' }, agent: { meta: { cwd: posixRoot } } },
+        async () => ({ content: [{ type: 'text', text: 'ran' }] }),
+      )
+      assert.equal(denied.error?.info.reason, REASON.SECRET)
+    } finally {
+      if (saved.HOME === undefined) delete process.env.HOME
+      else process.env.HOME = saved.HOME
+      if (saved.USERPROFILE === undefined) delete process.env.USERPROFILE
+      else process.env.USERPROFILE = saved.USERPROFILE
+    }
+  })
+
+  test('7. PowerShell deletions report what rm reports for the same path', () => {
+    const bashVerdict = ask(`rm -rf ${home}`, 'bash')
+    assert.equal(bashVerdict?.reason, REASON.CRITICAL_RM)
+    for (const command of [
+      `Remove-Item -Recurse -Force ${home}`,
+      `Remove-Item -Path ${home}`,
+      `del ${home}`,
+      `ri ${home}`,
+      `rd ${home}`,
+      `rmdir ${home}`,
+      `erase ${home}`,
+      `rm -rf ${home}`,
+    ]) {
+      assert.equal(ask(command)?.reason, bashVerdict.reason, command)
+    }
+    // A deletion inside the workspace is still ordinary work.
+    assert.equal(ask('Remove-Item -Recurse -Force .\\tmp'), undefined)
+    // cmd's switches are not paths: `del /f /q build\tmp.txt` deletes one file inside
+    // the workspace, and `rd /s /q <home>` deletes the home folder critically.
+    assert.equal(ask('cmd /c del /f /q build\\tmp.txt'), undefined)
+    assert.equal(ask(`cmd /c rd /s /q ${home}`)?.reason, REASON.CRITICAL_RM)
+  })
+
+  test('8. PowerShell home spellings are not expanded on a POSIX bash line', () => {
+    assert.equal(bash('echo x > $env:USERPROFILE\\notes.txt'), undefined)
+    assert.equal(bash('echo x > ~\\notes.txt'), undefined)
+    // The spellings bash really expands keep their fence.
+    assert.equal(bash('echo x > $HOME/notes.txt')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(bash('echo x > ~/notes.txt')?.reason, REASON.OUTSIDE_WORKSPACE)
+    // A PowerShell command line still expands them.
+    assert.equal(ask('Set-Content $env:USERPROFILE\\notes.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(ask('Set-Content ~\\notes.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+  })
+})
+
+// ── the seventh review: seven more gaps in the PowerShell reading ────────────
+
+/**
+ * A second review ran `decideToolCall` with cwd `C:\work\repo`, home
+ * `C:\Users\someone` and the `pwsh` tool, and traced seven defects: deleting the
+ * workspace itself was allowed because a Windows path is not "absolute" to
+ * `node:path` on a POSIX host; a `-Value`/`-InputObject` list swallowed the path after
+ * it; only protected *segments* folded case, not file names; a `.NET` write glued to
+ * an assignment was invisible; drive-root resolution fired for a `bash.exe` payload
+ * and rooted at `\\` below a UNC cwd; a backslash home prefix was read into a POSIX
+ * deletion; and one round-2 test only passed because of an unrelated rule.
+ *
+ * Every case below failed before its fix. The Windows spellings are pinned here even
+ * though the suite runs on every host: the guard has to reach the same verdict
+ * wherever it is asked, and `node:path` decides "absolute" differently per host.
+ */
+describe('guard fix round 7: the second review findings', () => {
+  const root = 'C:\\work\\repo'
+  const home = 'C:\\Users\\someone'
+  const settings = resolveSettings({ root })
+  settings.rootExplicit = true
+  /** Ask the guard about one command run by the PowerShell tool. */
+  const ask = (command) => decideToolCall({ name: 'pwsh', args: { command }, cwd: root, home, settings })
+
+  // The POSIX side, for the cases whose point is that a bash line keeps POSIX rules.
+  const posixRoot = '/Users/tester/code/project'
+  const posixHome = '/Users/tester'
+  const posixSettings = resolveSettings({ root: posixRoot })
+  posixSettings.rootExplicit = true
+  /** Ask the guard about one command run by the bash tool on POSIX. */
+  const bash = (command) => decideToolCall({ name: 'bash', args: { command }, cwd: posixRoot, home: posixHome, settings: posixSettings })
+
+  test('1. a PowerShell deletion of the workspace is a critical path, whatever the spelling', () => {
+    for (const command of [
+      'Remove-Item -Recurse -Force .',
+      'Remove-Item -Recurse -Force C:\\work\\repo',
+      'Remove-Item -Recurse ..',
+      'cmd /c rd /s /q .',
+    ]) {
+      assert.equal(ask(command)?.reason, REASON.CRITICAL_RM, command)
+    }
+    // bash reports the same for the same directory, so the two spellings cannot drift.
+    assert.equal(bash('rm -rf .')?.reason, REASON.CRITICAL_RM)
+    assert.equal(bash('rm -rf ..')?.reason, REASON.CRITICAL_RM)
+    // A subdirectory of the workspace is still ordinary work.
+    assert.equal(ask('Remove-Item -Recurse -Force .\\tmp'), undefined)
+  })
+
+  test('2. a trailing comma continues a path list, never another parameter', () => {
+    for (const command of [
+      `Set-Content -Value "x," ${home}\\f.txt`,
+      `Out-File -InputObject "x," ${home}\\f.txt`,
+    ]) {
+      assert.equal(ask(command)?.reason, REASON.OUTSIDE_WORKSPACE, command)
+    }
+    // The path list this rule exists for still works.
+    assert.equal(ask(`Set-Content -Path a.txt, ${home}\\f.txt`)?.reason, REASON.OUTSIDE_WORKSPACE)
+    // A trailing comma in ordinary content stays inside the workspace.
+    assert.equal(ask('Set-Content -Value "hello, world" src\\a.txt'), undefined)
+    assert.equal(ask('Out-File -InputObject "x," build\\log.txt'), undefined)
+  })
+
+  test('3. the .env, secret and protected file names fold case for Windows spellings', () => {
+    for (const [upper, lower, reason] of [
+      ['Set-Content .ENV x', 'Set-Content .env x', REASON.SECRET],
+      ['Set-Content .NPMRC x', 'Set-Content .npmrc x', REASON.SECRET],
+      ['Remove-Item .GITCONFIG', 'Remove-Item .gitconfig', REASON.STATE],
+    ]) {
+      assert.equal(ask(upper)?.reason, reason, upper)
+      assert.equal(ask(lower)?.reason, reason, lower)
+    }
+    // Templates stay readable and writable, case folded with the rest.
+    assert.equal(ask('Set-Content .ENV.EXAMPLE x'), undefined)
+    // POSIX bash keeps exact matching: these names are ordinary files there.
+    assert.equal(bash('echo x > .ENV'), undefined)
+    assert.equal(bash('echo x > .NPMRC'), undefined)
+    assert.equal(bash('rm -f .GITCONFIG'), undefined)
+  })
+
+  test('4. a .NET write glued to an assignment is found inside the token', () => {
+    for (const command of [
+      `$null=[System.IO.File]::WriteAllText("${home}\\f.txt","x")`,
+      `$x = [IO.File]::AppendAllText("${home}\\f.txt","x")`,
+    ]) {
+      assert.equal(ask(command)?.reason, REASON.OUTSIDE_WORKSPACE, command)
+    }
+    assert.equal(ask('$null=[System.IO.File]::WriteAllText(".git\\config","x")')?.reason, REASON.STATE)
+    // The same call inside the workspace stays ordinary.
+    assert.equal(ask('$null=[System.IO.File]::WriteAllText("src\\a.txt","x")'), undefined)
+  })
+
+  test('5. a drive-rooted path is a PowerShell spelling, and a UNC cwd roots at its share', () => {
+    const git = 'C:\\Program Files\\Git\\bin\\bash.exe'
+    // A bash payload keeps its POSIX root, so `/dev/null` is still the device.
+    assert.equal(ask(`& "${git}" -c "echo x > /dev/null"`), undefined)
+    // A PowerShell line still reads one leading separator against the drive root.
+    assert.equal(ask('Set-Content \\Users\\someone\\f.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+    assert.equal(resolveTarget('\\Users\\someone\\f.txt', root, home, true), 'C:\\Users\\someone\\f.txt')
+
+    // Below a UNC cwd a leading `\` is the share, not `\\` on its own.
+    const uncRoot = '\\\\server\\share\\repo'
+    const uncHome = '\\\\server\\share\\Users\\someone'
+    const uncSettings = resolveSettings({ root: uncRoot })
+    uncSettings.rootExplicit = true
+    const askUnc = (command) => decideToolCall({ name: 'pwsh', args: { command }, cwd: uncRoot, home: uncHome, settings: uncSettings })
+    assert.equal(resolveTarget('\\Users\\someone\\f.txt', uncRoot, uncHome, true), '\\\\server\\share\\Users\\someone\\f.txt')
+    // `\repo\src\a.txt` is below the share's `repo`, so it is inside the workspace.
+    assert.equal(askUnc('Set-Content \\repo\\src\\a.txt x'), undefined)
+    assert.equal(askUnc('Set-Content \\Users\\someone\\f.txt x')?.reason, REASON.OUTSIDE_WORKSPACE)
+  })
+
+  test('6. a backslash home prefix does not make a POSIX deletion critical', () => {
+    // `~\tester` is a literal file name in a POSIX shell, not the home folder.
+    assert.equal(bash('rm -rf ~\\tester'), undefined)
+    // The POSIX spelling of home is still protected.
+    assert.equal(bash('rm -rf ~/tester')?.reason, REASON.CRITICAL_RM)
+    assert.equal(bash('rm -rf $HOME')?.reason, REASON.CRITICAL_RM)
+  })
+
+  test('ordinary in-workspace PowerShell stays allowed', () => {
+    assert.equal(ask('Set-Content src\\a.txt "hello, world"'), undefined)
+    assert.equal(ask('Remove-Item -Recurse -Force .\\tmp'), undefined)
+    assert.equal(ask('New-Item -ItemType Directory build'), undefined)
   })
 })
 
@@ -1042,6 +1570,12 @@ test('path helpers resolve only what they can', () => {
   assert.equal(expandHome('$HOME/x', HOME), `${HOME}/x`)
   assert.equal(expandHome('/abs/x', HOME), '/abs/x')
   assert.equal(expandHome('~/x', ''), '~/x')
+  // The PowerShell spellings are expanded only when the path is read as PowerShell
+  // reads one; a POSIX bash line leaves them as literal file names.
+  assert.equal(expandHome('$env:USERPROFILE\\x', HOME, true), `${HOME}\\x`)
+  assert.equal(expandHome('$env:USERPROFILE\\x', HOME), '$env:USERPROFILE\\x')
+  assert.equal(expandHome('~\\x', HOME, true), `${HOME}\\x`)
+  assert.equal(expandHome('~\\x', HOME), '~\\x')
   assert.equal(resolveTarget('src/a.js', ROOT, HOME), `${ROOT}/src/a.js`)
   assert.equal(resolveTarget('../outside.js', ROOT, HOME), '/Users/tester/code/outside.js')
   assert.equal(resolveTarget('/etc/passwd', ROOT, HOME), '/etc/passwd')
@@ -1321,4 +1855,15 @@ test('the bypass corpus still allows the work these shapes also spell', () => {
   assert.equal(decide('bash', { command: 'rm -rf build', workdir: ROOT }), undefined)
   assert.equal(decide('bash', { command: 'npm test', workdir: '/Users/tester/code/project/packages' }), undefined)
   assert.equal(decide('apply_patch', { patch: '*** Update File: src/index.js\n' }), undefined)
+})
+
+test('a single-letter /x is a switch only for cmd\'s own deletion commands', () => {
+  const root = 'C:\\work\\repo'
+  const settings = resolveSettings({ root })
+  settings.rootExplicit = true
+  const ask = (command) => decideToolCall({ name: 'pwsh', args: { command }, cwd: root, home: 'C:\\Users\\someone', settings })
+  // cmd's `del /f file` deletes `file`; `/f` is a switch, not the drive-root `C:\f`.
+  assert.equal(ask('cmd /c del /f build\\out.txt'), undefined)
+  // PowerShell's Remove-Item has no `/f` switch: `/f` names `C:\f`, outside the workspace.
+  assert.notEqual(ask('Remove-Item /f'), undefined)
 })

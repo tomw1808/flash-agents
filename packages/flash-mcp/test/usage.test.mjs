@@ -84,8 +84,10 @@ function makeService(replay, { log = () => {} } = {}) {
     root,
     clientFactory: () => client,
     log,
-    // Accounting is independent of the tree, so these tests run in place.
-    isolate: { mode: 'none' },
+    // Accounting is independent of the tree, so these tests run in place. The state
+    // directory is nonetheless explicit and temporary: a stored report must never land in
+    // the real temp state base either.
+    isolate: { mode: 'none', stateDir: mkdtempSync(join(tmpdir(), 'flash-usage-state-')) },
   })
   return { root, client, service }
 }

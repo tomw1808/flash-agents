@@ -2012,9 +2012,13 @@ test('a failing setup step fails the call with SETUP_FAILED and releases the slo
 
 test('--copy-exclude and FLASH_COPY_EXCLUDE parse into copyExclude', () => {
   const config = mergeConfig({})
-  assert.deepEqual(parseOptions(['--copy-exclude', 'target, node_modules'], {}, config).copyExclude, ['target', 'node_modules'])
-  assert.deepEqual(parseOptions([], { FLASH_COPY_EXCLUDE: 'target,a/b' }, config).copyExclude, ['target', 'a/b'])
-  assert.equal(parseOptions([], {}, config).copyExclude, undefined)
-  assert.equal(parseOptions([], { FLASH_COPY_EXCLUDE: '' }, config).copyExclude, undefined)
-  assert.throws(() => parseOptions(['--copy-exclude'], {}, config), /needs a value/)
+  // The local settings file is read from this root, never from the repository the test runs in.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-options-')))
+  const options = ['--root', root]
+  assert.deepEqual(parseOptions([...options, '--copy-exclude', 'target, node_modules'], {}, config).copyExclude, ['target', 'node_modules'])
+  assert.deepEqual(parseOptions(options, { FLASH_COPY_EXCLUDE: 'target,a/b' }, config).copyExclude, ['target', 'a/b'])
+  assert.equal(parseOptions(options, {}, config).copyExclude, undefined)
+  assert.equal(parseOptions(options, { FLASH_COPY_EXCLUDE: '' }, config).copyExclude, undefined)
+  assert.throws(() => parseOptions([...options, '--copy-exclude'], {}, config), /needs a value/)
+  rmSync(root, { recursive: true, force: true })
 })

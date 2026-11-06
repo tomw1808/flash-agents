@@ -532,7 +532,7 @@ test('doctor: an installed profile that does not compose shows the error message
 test('doctor: a state_base the server would refuse is a failed row, and the other checks still run', async () => {
   const dshHome = realpathSync(mkdtempSync(join(SCRATCH, 'dsh-')))
   const lines = []
-  const code = await runDoctor([], {
+  const code = await runDoctor(['--root', dshHome], {
     env: { DSH_HOME: dshHome, FLASH_STATE_BASE: BAD_STATE_BASE, FLASH_SERVICE_ROOT: dshHome },
     write: (text) => lines.push(text),
     ...doctorFakes({ dump: { status: 0, stdout: '', stderr: '' } }),

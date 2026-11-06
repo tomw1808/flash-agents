@@ -12,13 +12,23 @@
 
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
 import { runClean } from '../lib/index.js'
-import { rootDigest } from '../lib/isolation.js'
+import { cleanLayout, rootDigest } from '../lib/isolation.js'
 
 /**
  * `clean` reads the durable patch store from `FLASH_DATA_DIR`, so every test here points
@@ -34,6 +44,21 @@ function makeBase() {
 /** A throwaway service root. */
 function makeRoot() {
   return realpathSync(mkdtempSync(join(tmpdir(), 'flash-clean-root-')))
+}
+
+/**
+ * A service root reached through a symlink, as macOS's `/tmp` is: the real directory, and a
+ * second spelling of it that `--root` can name.
+ *
+ * @returns {{real: string, link: string, holder: string}} the directory, a symlink to it, and
+ *   the throwaway directory holding that symlink.
+ */
+function makeSymlinkedRoot() {
+  const real = makeRoot()
+  const holder = mkdtempSync(join(tmpdir(), 'flash-clean-link-'))
+  const link = join(holder, 'root-link')
+  symlinkSync(real, link, 'dir')
+  return { real, link, holder }
 }
 
 /** A patch record and its file, as `collect` writes one. */
@@ -108,7 +133,7 @@ test('clean reports each root digest and reclaims this root’s dead trees and e
   assert.match(text, /patches: 2 \(0\.0 MB\)/)
   assert.match(
     text,
-    /removed: 1 dead owner\(s\), 1 expired patch\(es\), 1 empty digest\(s\), 0 trash director/,
+    /removed: 1 dead owner\(s\), 1 expired patch\(es\), 0 expired report\(s\), 1 empty digest\(s\), 0 trash director/,
     'the summary names the trash count even when there was none',
   )
 
@@ -142,11 +167,115 @@ test('clean removes and reports the trash an interrupted removal left behind', a
   assert.match(text, /trash-4242-1700000000000/, 'the removed trash is named')
   assert.match(
     text,
-    /removed: 0 dead owner\(s\), 0 expired patch\(es\), 0 empty digest\(s\), 1 trash directory/,
+    /removed: 0 dead owner\(s\), 0 expired patch\(es\), 0 expired report\(s\), 0 empty digest\(s\), 1 trash directory/,
     'the summary counts the trash it removed',
   )
   assert.equal(existsSync(trash), false, 'the trash of an interrupted removal is removed')
   assert.deepEqual(trashDirsIn(join(base, own)), [], 'and nothing is left to a background removal')
+})
+
+test('clean reclaims a report write a crash left behind, and leaves a fresh one alone', async () => {
+  // A report goes to `.<key>.<uuid>.tmp` in the same directory and is renamed into place. A
+  // crash between the two leaves that file, and no reader ever opens it: without this prune it
+  // sat in the report directory forever.
+  const base = makeBase()
+  const root = makeRoot()
+  const own = rootDigest(root)
+  const reports = join(base, own, 'reports')
+  mkdirSync(reports, { recursive: true })
+  const stale = join(reports, `.job-a70m1c000.${randomUUID()}.tmp`)
+  const fresh = join(reports, `.job-a70m1c001.${randomUUID()}.tmp`)
+  writeFileSync(stale, '{"key": "job-a70m1c000", "report": "half a rep')
+  writeFileSync(fresh, '{"key": "job-a70m1c001", "report": "half a rep')
+  const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+  utimesSync(stale, twoHoursAgo, twoHoursAgo)
+  // A file that is neither a report nor a report write is not this prune's business.
+  const other = join(reports, 'notes.txt')
+  writeFileSync(other, 'kept\n')
+  utimesSync(other, twoHoursAgo, twoHoursAgo)
+
+  const lines = []
+  const code = await runClean([], { env: { FLASH_SERVICE_ROOT: root }, write: (text) => lines.push(text), baseDir: base })
+  assert.equal(code, 0)
+  assert.equal(existsSync(stale), false, 'the half-written report of a crashed write is reclaimed')
+  assert.equal(existsSync(fresh), true, 'a temporary file a live write may still rename is left alone')
+  assert.equal(existsSync(other), true, 'a file that is not a report write is not removed')
+  assert.match(lines.join(''), /1 expired report\(s\)/, 'the summary counts the temp file it reclaimed')
+})
+
+test('clean prints each root’s reports and counts the reports it pruned', async () => {
+  // `cleanLayout` measured the reports all along, but the report line and the summary said
+  // nothing about them, so an operator reading `clean` saw a directory it could not account for.
+  const base = makeBase()
+  const { real, link, holder } = makeSymlinkedRoot()
+  try {
+    const own = rootDigest(real)
+    const dataDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-clean-data-reports-')))
+    const patchDir = join(dataDir, own, 'patches')
+    mkdirSync(patchDir, { recursive: true })
+    const expiredPatch = writePatch(patchDir, real, { createdAt: Date.now() - 30 * DAY_MS })
+    const reports = join(base, own, 'reports')
+    mkdirSync(reports, { recursive: true })
+    const kept = join(reports, 'job-keep00001.report.json')
+    writeFileSync(kept, `{"key": "job-keep00001", "report": "${'x'.repeat(512 * 1024)}"}\n`)
+    const expiredReport = join(reports, 'job-old000001.report.json')
+    writeFileSync(expiredReport, '{"key": "job-old000001", "report": "gone"}\n')
+    const monthAgo = new Date(Date.now() - 30 * DAY_MS)
+    utimesSync(expiredReport, monthAgo, monthAgo)
+
+    const lines = []
+    // The root is named through a symlink, as `/tmp/x` is on macOS: the line must be this
+    // root's, and the patches it prunes must be the ones the server stored.
+    const code = await runClean(['--root', link], { env: { FLASH_DATA_DIR: dataDir }, write: (text) => lines.push(text), baseDir: base })
+    assert.equal(code, 0)
+    const text = lines.join('')
+    const line = text.split('\n').find((entry) => entry.includes(`${own} (this root)`))
+    assert.ok(line, `expected this root’s report line in ${JSON.stringify(lines)}`)
+    // Counted before the prune, as the patch count is: the line describes what was found.
+    assert.match(line, /reports: 2 \(0\.5 MB\)/, 'the line names the reports and their size, as it does patches')
+    assert.match(
+      text,
+      /removed: 0 dead owner\(s\), 1 expired patch\(es\), 1 expired report\(s\)/,
+      'the summary counts the reports it pruned',
+    )
+    assert.equal(existsSync(expiredReport), false, 'an expired report is pruned')
+    assert.equal(existsSync(kept), true, 'a fresh report is a record of a call, not disk to reclaim')
+    assert.equal(existsSync(join(patchDir, `${expiredPatch}.patch`)), false, 'a symlinked --root still prunes its patches')
+  } finally {
+    rmSync(holder, { recursive: true, force: true })
+  }
+})
+
+test('cleanLayout keys the state by the real root, not by a symlinked spelling of it', async () => {
+  // The service digests the realpath'd root; `cleanLayout` digested the string it was given, so
+  // a symlinked root reported an empty digest and pruned none of that root's patches or reports.
+  const base = makeBase()
+  const { real, link, holder } = makeSymlinkedRoot()
+  try {
+    const digest = rootDigest(real)
+    assert.notEqual(rootDigest(link), digest, 'the two spellings of one root digest differently')
+    const dataDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-clean-data-link-')))
+    const patchDir = join(dataDir, digest, 'patches')
+    mkdirSync(patchDir, { recursive: true })
+    const expired = writePatch(patchDir, real, { createdAt: Date.now() - 30 * DAY_MS })
+    const reports = join(base, digest, 'reports')
+    mkdirSync(reports, { recursive: true })
+    const expiredReport = join(reports, 'job-0123456789.report.json')
+    writeFileSync(expiredReport, '{"key": "job-0123456789", "report": "gone"}\n')
+    const monthAgo = new Date(Date.now() - 30 * DAY_MS)
+    utimesSync(expiredReport, monthAgo, monthAgo)
+
+    const report = cleanLayout({ baseDir: base, dataDir, root: link })
+    assert.equal(report.own, digest, 'the digest is taken from the real root')
+    assert.equal(report.stats.find((entry) => entry.digest === digest)?.own, true, 'the real digest is this root’s line')
+    assert.equal(report.stats.find((entry) => entry.digest === rootDigest(link)), undefined, 'no digest of the link spelling')
+    assert.equal(existsSync(join(patchDir, `${expired}.patch`)), false, 'this root’s expired patch is pruned')
+    assert.equal(report.actions.patchesPruned, 1, 'and counted')
+    assert.equal(existsSync(expiredReport), false, 'this root’s expired report is pruned too')
+    assert.equal(report.actions.reportsPruned, 1, 'and counted')
+  } finally {
+    rmSync(holder, { recursive: true, force: true })
+  }
 })
 
 test('clean prunes the durable store and a legacy temp store, and reports both locations', async () => {
@@ -175,7 +304,7 @@ test('clean prunes the durable store and a legacy temp store, and reports both l
   assert.match(text, new RegExp(`flash-mcp patches: ${patchDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
   assert.match(text, new RegExp(`flash-mcp legacy patches: ${legacyPatchDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
   assert.match(text, /patches: 4 \(0\.0 MB\)/, 'this root’s line counts the durable store and the legacy one')
-  assert.match(text, /removed: 0 dead owner\(s\), 2 expired patch\(es\), 0 empty digest\(s\)/)
+  assert.match(text, /removed: 0 dead owner\(s\), 2 expired patch\(es\), 0 expired report\(s\), 0 empty digest\(s\)/)
 
   assert.equal(existsSync(join(patchDir, `${expiredNew}.patch`)), false, 'an expired durable patch is pruned')
   assert.equal(existsSync(join(patchDir, `${freshNew}.patch`)), true, 'a fresh durable patch is kept')
@@ -238,7 +367,7 @@ test('clean --all removes the trees of roots with no live server, never their pa
   writeFileSync(join(liveSlot, 'live.txt'), 'live')
 
   const lines = []
-  const code = await runClean(['--all'], { env: {}, write: (text) => lines.push(text), baseDir: base })
+  const code = await runClean(['--all', '--root', root], { env: {}, write: (text) => lines.push(text), baseDir: base })
   assert.equal(code, 0)
   assert.match(lines.join(''), /foreign tree\(s\)/)
 
@@ -261,12 +390,15 @@ test('clean refuses an unknown argument and answers --help', async () => {
 
 test('clean refuses a relative state base and expands a leading ~', async () => {
   const refusal = '--state-base must be an absolute path (got "rel")'
+  // A throwaway root: `clean` reads that root's local settings, and this test must not
+  // depend on whether this repository's own root has one.
+  const root = makeRoot()
   await assert.rejects(
-    () => runClean(['--state-base', 'rel'], { env: {}, write: () => {} }),
+    () => runClean(['--root', root, '--state-base', 'rel'], { env: {}, write: () => {} }),
     (error) => error.message === refusal,
   )
   await assert.rejects(
-    () => runClean([], { env: { FLASH_STATE_BASE: 'rel' }, write: () => {} }),
+    () => runClean(['--root', root], { env: { FLASH_STATE_BASE: 'rel' }, write: () => {} }),
     (error) => error.message === refusal,
   )
 

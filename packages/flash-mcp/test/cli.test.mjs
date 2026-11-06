@@ -29,7 +29,7 @@ import {
 } from '../lib/index.js'
 import { JobRegistry } from '../lib/jobs.js'
 import { DEFAULT_CONFIG, mergeConfig } from '../lib/config.js'
-import { rootDigest } from '../lib/isolation.js'
+import { rootDigest, stableSlotDirectory } from '../lib/isolation.js'
 import { resolveDshCommand } from '../lib/sdk.js'
 
 /**
@@ -48,6 +48,18 @@ const config = mergeConfig({
   limits: { slots: 7, maxTasks: 3, taskTimeoutMs: 1_234, diffChars: 99 },
 })
 
+/**
+ * A throwaway server root for every option parse. The local settings file is read from
+ * the server's root, so a `.flash-agents.local.json` in this repository must never decide
+ * what these tests see.
+ */
+const OPTIONS_ROOT = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-options-root-')))
+
+/** Parse options for the throwaway root, wherever the test process happens to run. */
+function parseCli(argv = [], env = {}, injectedConfig = config, inject = {}) {
+  return parseOptions(['--root', OPTIONS_ROOT, ...argv], env, injectedConfig, inject)
+}
+
 /** A harness home that does not exist: these tests never read or write the real ~/.dsh. */
 const ABSENT_DSH_HOME = join(tmpdir(), 'flash-cli-absent-dsh-home')
 
@@ -57,7 +69,7 @@ function doctorEnv(extra = {}) {
 }
 
 test('defaults are taken from the configuration, not from literals', () => {
-  const options = parseOptions([], {}, config)
+  const options = parseCli([], {}, config)
   assert.equal(options.provider, 'ollama')
   assert.equal(options.model, 'test-model:cloud')
   assert.equal(options.slots, 7)
@@ -82,7 +94,7 @@ test('an empty environment value counts as unset', () => {
     FLASH_DIFF_CHARS: '',
     FLASH_INIT_TIMEOUT_MS: '',
   }
-  const options = parseOptions([], env, config)
+  const options = parseCli([], env, config)
   assert.equal(options.isolate, 'copy')
   assert.equal(options.stateDir, undefined)
   assert.equal(options.logFile, undefined)
@@ -93,7 +105,7 @@ test('an empty environment value counts as unset', () => {
 })
 
 test('a set environment value and a flag both override the configuration', () => {
-  const fromEnv = parseOptions(
+  const fromEnv = parseCli(
     [],
     { FLASH_SLOTS: '4', FLASH_LOG_FILE: '/tmp/flash.log', FLASH_INIT_TIMEOUT_MS: '45000' },
     config,
@@ -102,7 +114,7 @@ test('a set environment value and a flag both override the configuration', () =>
   assert.equal(fromEnv.logFile, '/tmp/flash.log')
   assert.equal(fromEnv.initTimeoutMs, 45_000)
 
-  const fromFlags = parseOptions(
+  const fromFlags = parseCli(
     ['--slots', '5', '--isolate', 'none', '--model', 'other:latest', '--init-timeout-ms', '90000'],
     {},
     config,
@@ -112,34 +124,34 @@ test('a set environment value and a flag both override the configuration', () =>
   assert.equal(fromFlags.model, 'other:latest')
   assert.equal(fromFlags.initTimeoutMs, 90_000)
 
-  const retention = parseOptions(['--patch-retention-days', '3'], {}, config)
+  const retention = parseCli(['--patch-retention-days', '3'], {}, config)
   assert.equal(retention.patchRetentionDays, 3)
 })
 
 test('--allow-slot-setup and FLASH_ALLOW_SLOT_SETUP=1 are the opt-in for setup steps', () => {
-  assert.equal(parseOptions([], {}, config).allowSlotSetup, false)
-  assert.equal(parseOptions(['--allow-slot-setup'], {}, config).allowSlotSetup, true)
-  assert.equal(parseOptions([], { FLASH_ALLOW_SLOT_SETUP: '1' }, config).allowSlotSetup, true)
-  assert.equal(parseOptions([], { FLASH_ALLOW_SLOT_SETUP: '0' }, config).allowSlotSetup, false)
+  assert.equal(parseCli([], {}, config).allowSlotSetup, false)
+  assert.equal(parseCli(['--allow-slot-setup'], {}, config).allowSlotSetup, true)
+  assert.equal(parseCli([], { FLASH_ALLOW_SLOT_SETUP: '1' }, config).allowSlotSetup, true)
+  assert.equal(parseCli([], { FLASH_ALLOW_SLOT_SETUP: '0' }, config).allowSlotSetup, false)
   // The plugin setting's two values.
-  assert.equal(parseOptions([], { FLASH_ALLOW_SLOT_SETUP: 'on' }, config).allowSlotSetup, true)
-  assert.equal(parseOptions([], { FLASH_ALLOW_SLOT_SETUP: 'off' }, config).allowSlotSetup, false)
-  assert.equal(parseOptions([], { FLASH_ALLOW_SLOT_SETUP: '' }, config).allowSlotSetup, false)
+  assert.equal(parseCli([], { FLASH_ALLOW_SLOT_SETUP: 'on' }, config).allowSlotSetup, true)
+  assert.equal(parseCli([], { FLASH_ALLOW_SLOT_SETUP: 'off' }, config).allowSlotSetup, false)
+  assert.equal(parseCli([], { FLASH_ALLOW_SLOT_SETUP: '' }, config).allowSlotSetup, false)
 })
 
 test('an unusable option is refused', () => {
-  assert.throws(() => parseOptions(['--isolate', 'yolo'], {}, config), /is not available/)
-  assert.throws(() => parseOptions(['--nope'], {}, config), /unknown argument/)
-  assert.throws(() => parseOptions(['--slots'], {}, config), /needs a value/)
+  assert.throws(() => parseCli(['--isolate', 'yolo'], {}, config), /is not available/)
+  assert.throws(() => parseCli(['--nope'], {}, config), /unknown argument/)
+  assert.throws(() => parseCli(['--slots'], {}, config), /needs a value/)
   // The handshake timeout is a positive integer, from either door.
-  assert.throws(() => parseOptions(['--init-timeout-ms'], {}, config), /needs a value/)
-  assert.throws(() => parseOptions(['--init-timeout-ms', 'soon'], {}, config), /must be a positive integer/)
-  assert.throws(() => parseOptions(['--init-timeout-ms', '0'], {}, config), /must be a positive integer/)
-  assert.throws(() => parseOptions([], { FLASH_INIT_TIMEOUT_MS: '-1' }, config), /must be a positive integer/)
+  assert.throws(() => parseCli(['--init-timeout-ms'], {}, config), /needs a value/)
+  assert.throws(() => parseCli(['--init-timeout-ms', 'soon'], {}, config), /must be a positive integer/)
+  assert.throws(() => parseCli(['--init-timeout-ms', '0'], {}, config), /must be a positive integer/)
+  assert.throws(() => parseCli([], { FLASH_INIT_TIMEOUT_MS: '-1' }, config), /must be a positive integer/)
 })
 
 test('the parsed handshake timeout reaches the service', async () => {
-  const options = parseOptions(['--init-timeout-ms', '4321'], {}, config)
+  const options = parseCli(['--init-timeout-ms', '4321'], {}, config)
   options.root = mkdtempSync(join(tmpdir(), 'flash-mcp-cli-'))
   options.isolate = 'none'
   const service = createService(options)
@@ -213,7 +225,7 @@ test('a taskFile job is labelled with the brief it names, and names the path whe
 })
 
 test('the service allowlist holds its default first, whichever door named it', async () => {
-  const options = parseOptions(['--model', 'other:latest'], {}, config)
+  const options = parseCli(['--model', 'other:latest'], {}, config)
   options.root = mkdtempSync(join(tmpdir(), 'flash-mcp-cli-model-'))
   options.isolate = 'none'
   const service = createService(options)
@@ -244,7 +256,7 @@ function fakes({ dsh = { status: 0, stdout: `${config.dsh.version}\n`, stderr: '
 
 test('doctor exits zero when the prerequisites are met', async () => {
   const lines = []
-  const code = await runDoctor([], { env: doctorEnv(), write: (text) => lines.push(text), ...fakes() })
+  const code = await runDoctor(['--root', OPTIONS_ROOT], { env: doctorEnv(), write: (text) => lines.push(text), ...fakes() })
   assert.equal(code, 0)
   const text = lines.join('')
   assert.match(text, /all required checks passed/)
@@ -253,7 +265,7 @@ test('doctor exits zero when the prerequisites are met', async () => {
 
 test('doctor exits non-zero and prints a fix for each broken prerequisite', async () => {
   const lines = []
-  const code = await runDoctor([], {
+  const code = await runDoctor(['--root', OPTIONS_ROOT], {
     env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes({ dsh: { status: 1, stdout: '', stderr: 'not found' }, daemon: false }),
@@ -267,7 +279,7 @@ test('doctor exits non-zero and prints a fix for each broken prerequisite', asyn
 
 test('doctor asks about the model the service would actually run', async () => {
   const lines = []
-  await runDoctor([], {
+  await runDoctor(['--root', OPTIONS_ROOT], {
     env: doctorEnv({ FLASH_SERVICE_MODEL: 'someone-elses-model:latest' }),
     write: (text) => lines.push(text),
     ...fakes({ show: { status: 1, stdout: '', stderr: 'not found' } }),
@@ -277,7 +289,7 @@ test('doctor asks about the model the service would actually run', async () => {
 
 test('doctor checks the model named by --model, not the configured default', async () => {
   const lines = []
-  const code = await runDoctor(['--model', 'minimax-m3.1-flash:cloud'], {
+  const code = await runDoctor(['--root', OPTIONS_ROOT, '--model', 'minimax-m3.1-flash:cloud'], {
     env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes({ show: { status: 1, stdout: '', stderr: 'not found' } }),
@@ -355,7 +367,7 @@ test('doctor refuses a relative state base instead of measuring the repository',
 test('doctor --e2e skips the run when a check failed', async () => {
   const lines = []
   let built = false
-  const code = await runDoctor(['--e2e'], {
+  const code = await runDoctor(['--root', OPTIONS_ROOT, '--e2e'], {
     env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes({ dsh: { status: 1, stdout: '', stderr: 'not found' }, daemon: false }),
@@ -417,7 +429,7 @@ function e2eResult() {
 test('doctor --e2e exits non-zero when the service will not close, even after a passing run', async () => {
   const lines = []
   const fake = fakeE2eService({ result: e2eResult(), closeError: new Error('the pool would not close') })
-  const code = await runDoctor(['--e2e'], { env: doctorEnv(), write: (text) => lines.push(text), ...fakes(), createService: fake.createService })
+  const code = await runDoctor(['--root', OPTIONS_ROOT, '--e2e'], { env: doctorEnv(), write: (text) => lines.push(text), ...fakes(), createService: fake.createService })
   const text = lines.join('')
   assert.match(text, /fail\s+e2e\s+could not close the service: the pool would not close/)
   // A runtime or a tree may have been left behind; the exit code must say so too.
@@ -427,7 +439,7 @@ test('doctor --e2e exits non-zero when the service will not close, even after a 
 test('doctor --e2e proves a writing call in a throwaway repository', async () => {
   const lines = []
   const fake = fakeE2eService({ result: e2eResult() })
-  const code = await runDoctor(['--e2e'], {
+  const code = await runDoctor(['--root', OPTIONS_ROOT, '--e2e'], {
     env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes(),
@@ -478,7 +490,7 @@ test('doctor --e2e runs on the model it was asked for', async () => {
   const fake = fakeE2eService({
     result: { ...e2eResult(), route: { provider: 'ollama', model: 'minimax-m3.1-flash:cloud' } },
   })
-  const code = await runDoctor(['--e2e', '--model', 'minimax-m3.1-flash:cloud'], {
+  const code = await runDoctor(['--root', OPTIONS_ROOT, '--e2e', '--model', 'minimax-m3.1-flash:cloud'], {
     env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes(),
@@ -496,7 +508,7 @@ test('doctor --e2e fails when the observed model differs from the one asked for'
   const fake = fakeE2eService({
     result: { ...e2eResult(), route: { provider: 'ollama', model: 'deepseek-v4.1-flash:1017-cloud' } },
   })
-  const code = await runDoctor(['--e2e', '--model', 'minimax-m3.1-flash:cloud'], {
+  const code = await runDoctor(['--root', OPTIONS_ROOT, '--e2e', '--model', 'minimax-m3.1-flash:cloud'], {
     env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes(),
@@ -517,7 +529,7 @@ test('doctor --e2e fails when the worker leaves the temp repository touched', as
     result: e2eResult(),
     onCall: async (options) => writeFileSync(join(options.root, 'flash-hello.txt'), 'it works\n'),
   })
-  const code = await runDoctor(['--e2e'], {
+  const code = await runDoctor(['--root', OPTIONS_ROOT, '--e2e'], {
     env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes(),
@@ -533,7 +545,7 @@ test('doctor --e2e reports the exact error, with the note a NOT_DELEGATED run ne
   const lines = []
   const failure = new Error('the orchestrator finished without delegating')
   failure.code = 'NOT_DELEGATED'
-  const code = await runDoctor(['--e2e'], {
+  const code = await runDoctor(['--root', OPTIONS_ROOT, '--e2e'], {
     env: doctorEnv(),
     write: (text) => lines.push(text),
     ...fakes(),
@@ -677,7 +689,7 @@ test('createService only defers the sweep when the serve wiring asks for it', as
   // immediately, so the deferral must be the server's wiring, not a factory-wide default.
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-create-root-')))
   const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-create-state-')))
-  const options = { ...parseOptions([], {}, config), root, isolate: 'copy', slots: 1, stateDir, env: doctorEnv() }
+  const options = { ...parseCli([], {}, config), root, isolate: 'copy', slots: 1, stateDir, env: doctorEnv() }
   const immediate = createService(options)
   try {
     assert.equal(immediate.isolation.deferStartupSweep, false)
@@ -820,35 +832,55 @@ test('review: background refusals name the same argument as foreground for two o
 // ── --state-base / FLASH_STATE_BASE and the start-up launcher probe ──
 
 test('FLASH_STATE_BASE and --state-base select the default layout’s base', () => {
-  assert.equal(parseOptions([], { FLASH_STATE_BASE: '/tmp/flash-base' }, config).stateBase, '/tmp/flash-base')
+  assert.equal(parseCli([], { FLASH_STATE_BASE: '/tmp/flash-base' }, config).stateBase, '/tmp/flash-base')
   assert.equal(
-    parseOptions(['--state-base', '/tmp/flag-base'], { FLASH_STATE_BASE: '/tmp/env-base' }, config).stateBase,
+    parseCli(['--state-base', '/tmp/flag-base'], { FLASH_STATE_BASE: '/tmp/env-base' }, config).stateBase,
     '/tmp/flag-base',
     'the flag wins over the environment',
   )
-  assert.equal(parseOptions([], { FLASH_STATE_BASE: '' }, config).stateBase, undefined, 'empty means unset')
+  assert.equal(parseCli([], { FLASH_STATE_BASE: '' }, config).stateBase, undefined, 'empty means unset')
   // `--state-dir` keeps its own meaning; the two are separate settings.
-  const both = parseOptions(['--state-base', '/tmp/base', '--state-dir', '/tmp/dir'], {}, config)
+  const both = parseCli(['--state-base', '/tmp/base', '--state-dir', '/tmp/dir'], {}, config)
   assert.equal(both.stateBase, '/tmp/base')
   assert.equal(both.stateDir, '/tmp/dir')
   // A leading ~ expands the way DSH_HOME does; the injected home keeps the test off the
   // real one.
   assert.equal(
-    parseOptions([], { FLASH_STATE_BASE: ' ~/flash-base ' }, config, { home: '/home/u' }).stateBase,
+    parseCli([], { FLASH_STATE_BASE: ' ~/flash-base ' }, config, { home: '/home/u' }).stateBase,
     join('/home/u', 'flash-base'),
   )
-  assert.equal(parseOptions(['--state-base', '~'], {}, config, { home: '/home/u' }).stateBase, '/home/u')
+  assert.equal(parseCli(['--state-base', '~'], {}, config, { home: '/home/u' }).stateBase, '/home/u')
 })
 
 test('a relative state base is refused rather than landing inside the repository', () => {
   const refusal = '--state-base must be an absolute path (got "rel")'
-  assert.throws(() => parseOptions(['--state-base', 'rel'], {}, config), (error) => error.message === refusal)
-  assert.throws(() => parseOptions([], { FLASH_STATE_BASE: 'rel' }, config), (error) => error.message === refusal)
+  assert.throws(() => parseCli(['--state-base', 'rel'], {}, config), (error) => error.message === refusal)
+  assert.throws(() => parseCli([], { FLASH_STATE_BASE: 'rel' }, config), (error) => error.message === refusal)
   // `~user` is not a home-relative path this expands, so it stays relative and is refused.
   assert.throws(
-    () => parseOptions(['--state-base', '~someone/x'], {}, config),
+    () => parseCli(['--state-base', '~someone/x'], {}, config),
     /--state-base must be an absolute path \(got "~someone\/x"\)/,
   )
+})
+
+test('the local settings file is read from the resolved root, never the working directory', () => {
+  // A command that already resolved its root passes it in; the cwd's file is not consulted.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-local-root-')))
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-local-cwd-')))
+  writeFileSync(join(root, '.flash-agents.local.json'), JSON.stringify({ stateBase: join(root, 'from-root') }))
+  writeFileSync(join(cwd, '.flash-agents.local.json'), JSON.stringify({ stateBase: join(cwd, 'from-cwd') }))
+  const previous = process.cwd()
+  process.chdir(cwd)
+  try {
+    const options = parseOptions([], {}, config, { root })
+    assert.equal(options.root, root)
+    assert.equal(options.stateBase, join(root, 'from-root'))
+    assert.equal(options.stateBaseSource, '.flash-agents.local.json')
+  } finally {
+    process.chdir(previous)
+    rmSync(root, { recursive: true, force: true })
+    rmSync(cwd, { recursive: true, force: true })
+  }
 })
 
 test('the plugin exposes a state_base option and passes it as FLASH_STATE_BASE', () => {
@@ -867,11 +899,11 @@ test('the plugin exposes a state_base option and passes it as FLASH_STATE_BASE',
   assert.match(config.description, /must be an absolute path/)
 })
 
-test('FLASH_STATE_BASE places the slots under <base>/<digest>/<pid>/<instance>', async () => {
+test('FLASH_STATE_BASE places the state under <base>/<digest>/<pid>/<instance> and the slot at <base>/<digest>/slots/0', async () => {
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-base-')))
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-base-root-')))
   const service = createService({
-    ...parseOptions([], { FLASH_STATE_BASE: base }, config),
+    ...parseCli([], { FLASH_STATE_BASE: base }, config),
     root,
     isolate: 'copy',
     slots: 1,
@@ -882,7 +914,9 @@ test('FLASH_STATE_BASE places the slots under <base>/<digest>/<pid>/<instance>',
       service.isolation.stateDir.startsWith(join(base, rootDigest(root), String(process.pid))),
       `the state directory ${service.isolation.stateDir} must sit under ${base}`,
     )
-    assert.equal(service.isolation.slots[0].dir, join(service.isolation.stateDir, 'slots', 'slot-0'))
+    // The slot itself no longer lives under the per-instance state directory: its path has to
+    // be the same across restarts, so it is the root's own `<base>/<digest>/slots/<n>`.
+    assert.equal(service.isolation.slots[0].dir, stableSlotDirectory(root, { baseDir: base, id: 0 }))
   } finally {
     await service.close()
     rmSync(base, { recursive: true, force: true })
@@ -895,7 +929,7 @@ test('--state-dir wins over FLASH_STATE_BASE', async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-dir-root-')))
   const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-dir-state-')))
   const service = createService({
-    ...parseOptions([], { FLASH_STATE_BASE: base }, config),
+    ...parseCli([], { FLASH_STATE_BASE: base }, config),
     root,
     isolate: 'copy',
     slots: 1,
@@ -959,7 +993,7 @@ test('a call without dsh carries the same sibling launcher sentence as the start
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-nvm-root-')))
   const service = createService(
     {
-      ...parseOptions([], {}, config),
+      ...parseCli([], {}, config),
       root,
       isolate: 'none',
       env: { PATH: '', DSH_HOME: ABSENT_DSH_HOME },

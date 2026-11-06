@@ -1,7 +1,8 @@
 /**
  * 0.1.11 watch tests: a stuck worker is visible from the process tree, and failure warnings
  * name the real command. The process table is always a fake one; one optional smoke test
- * spawns its own `sleep` child and finds it. Nothing here reads a real home, a real
+ * spawns its own `sleep` child and finds it, and skips with the probe's reason when the real
+ * `ps` cannot be run (a sandbox denies it). Nothing here reads a real home, a real
  * `DSH_HOME`, the real temp state base or the real data directory.
  */
 
@@ -148,7 +149,7 @@ test('a tree that uses no CPU for the window is reported as stuck, once the wind
   const [warning] = activityWarnings(world.activity, world.now)
   assert.equal(
     warning,
-    'cd app && cargo check has used no CPU for 5 min (process tree of 3 processes, longest-running: cmake --build build -- ninja); ' +
+    'cd app && cargo check sat with no CPU for 5 min (process tree of 3 processes, longest-running: cmake --build build -- ninja); ' +
       'it may be waiting forever — check it, or flash_cancel (the change so far is kept as a patch)',
   )
   assert.equal(world.reads, 6, 'one read a minute, no more')
@@ -209,68 +210,35 @@ test('an unreadable table yields no data and no warning', async () => {
   assert.match(logs[0], /boom/)
 })
 
-test('current entries carry the longest-running child that is not the open command', async () => {
+test('current entries carry the longest-running child of the command’s own subtree', async () => {
   const world = makeWorld()
   await world.step(0)
   const [call] = openCommands(world.activity, world.now)
-  // The shell wrapper and `cargo check` are the open command; the process under them is the child.
-  assert.deepEqual(call.child, { command: 'cmake --build build -- ninja', runningMs: 29_800, cpuSeconds: 0.5 })
-  assert.equal(call.child.command === call.command, false)
+  // The shell that holds `cd app && cargo check` is the command's own shell; `cargo check`
+  // is the longest-running process it owns.
+  assert.deepEqual(call.child, { command: 'cargo check', runningMs: 29_900, cpuSeconds: 0.2 })
+  assert.notEqual(call.child.command, call.command)
 
   // The same holds when the open command is `cargo check` alone.
   world.activity.openCalls.set('s:c1', { session: 's', tool: 'bash', command: 'cargo check', since: world.start })
   const [again] = openCommands(world.activity, world.now)
-  assert.equal(again.child.command, 'cmake --build build -- ninja')
-  assert.equal(again.child.cpuSeconds, 0.5)
+  assert.equal(again.child.command, 'cargo check')
+  assert.equal(again.child.cpuSeconds, 0.2)
 
   const long = 'x'.repeat(2000)
-  const tall = observeTree(undefined, {
+  const record = observeTree(undefined, {
     pid: 100,
     at: world.now,
-    calls: [],
-    table: [{ pid: 100, ppid: 1, cpuSeconds: 0, startedMs: 0, command: 'rt' }, { pid: 101, ppid: 100, cpuSeconds: 0, startedMs: 5, command: long }],
+    calls: [{ key: 's:c1', tool: 'bash', command: 'run', since: world.start }],
+    table: [
+      { pid: 100, ppid: 1, cpuSeconds: 0, startedMs: world.start, command: 'rt' },
+      { pid: 101, ppid: 100, cpuSeconds: 0, startedMs: world.start, command: 'bash -c run' },
+      { pid: 102, ppid: 101, cpuSeconds: 0, startedMs: world.start + 5, command: long },
+    ],
   })
-  world.activity.proc = tall
+  world.activity.proc = record
   const [clipped] = openCommands(world.activity, world.now)
   assert.equal(clipped.child.command.length, COMMAND_CHARS)
-})
-
-test('a call whose shell is gone but whose children live is reported as held open', async () => {
-  // The call's command is in no live process; a static server and a headless Chrome that
-  // started after the call are.
-  const world = makeWorld({ cpu: () => 5 })
-  world.table = () => [
-    { pid: 100, ppid: 1, cpuSeconds: 9, startedMs: world.now - 3_600_000, command: 'dsh runtime' },
-    { pid: 300, ppid: 1, cpuSeconds: 1, startedMs: world.start + 5_000, command: 'python3 -m http.server 8000' },
-    { pid: 301, ppid: 100, cpuSeconds: 1, startedMs: world.start + 6_000, command: 'chrome --headless --remote-debugging-port=9222' },
-    { pid: 302, ppid: 301, cpuSeconds: 1, startedMs: world.start + 7_000, command: 'chrome --type=renderer' },
-    { pid: 303, ppid: 301, cpuSeconds: 1, startedMs: world.start + 8_000, command: 'chrome --type=gpu' },
-  ]
-  world.table = ((make) => () => make().filter((p) => p.pid !== 300))(world.table)
-  world.activity.openCalls.set('s:c1', { session: 's', tool: 'bash', command: 'node check.js && echo done', since: world.start })
-  // The command is seen first, as the shell that runs it; the warning needs it gone.
-  const gone = world.table
-  world.table = () => [...gone(), { pid: 299, ppid: 100, cpuSeconds: 1, startedMs: world.start + 1, command: 'bash -c node check.js && echo done' }]
-  await world.step(0)
-  world.table = gone
-  await world.step(MIN)
-  assert.deepEqual(activityWarnings(world.activity, world.now), [], 'one sighting is not enough')
-  await world.step(MIN)
-  const [warning] = activityWarnings(world.activity, world.now)
-  assert.equal(
-    warning,
-    'node check.js && echo done finished, but processes it started (chrome --headless --remote-debugging-port=9222, ' +
-      'chrome --type=renderer, chrome --type=gpu) are still running and may hold its output open; the call ends when they do',
-  )
-  world.activity.openCalls.clear()
-  assert.deepEqual(activityWarnings(world.activity, world.now), [])
-})
-
-test('a call whose command is still running is not reported as held open', async () => {
-  const world = makeWorld({ cpu: () => 5 })
-  await world.step(0)
-  await world.step(MIN)
-  assert.deepEqual(activityWarnings(world.activity, world.now), [])
 })
 
 /** Feed one failing or passing shell call through the observer the service really uses. */
@@ -369,7 +337,17 @@ test('grep exit 1 under a wrapper still does not count', () => {
   assert.deepEqual(activityWarnings(state.activity), [])
 })
 
-test('smoke: the real process table finds a child this test spawned', { skip: process.platform === 'win32' }, async () => {
+test('smoke: the real process table finds a child this test spawned', { skip: process.platform === 'win32' }, async (t) => {
+  // A sandbox can refuse the real `ps` (`Operation not permitted`), and `listProcesses`
+  // answers [] by design. Probe once, before spawning anything, and skip with the reason
+  // the probe logged. On a machine where `ps` works the probe is not empty, so the test
+  // below runs and may never skip silently.
+  const probeLogs = []
+  const probe = await listProcesses({ log: (line) => probeLogs.push(line) })
+  if (probe.length === 0) {
+    t.skip(`the real process table cannot be read here: ${probeLogs[0] ?? 'ps returned no processes'}`)
+    return
+  }
   const child = spawn('sleep', ['30'], { stdio: 'ignore' })
   try {
     const table = await listProcesses()

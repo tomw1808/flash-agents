@@ -26,6 +26,14 @@ export const MAX_ENDED_JOBS = 50
 export const ENDED_RETENTION_MS = 6 * 60 * 60 * 1000
 
 /**
+ * How much of an ended job's last progress line a status *listing* keeps. A listing shows
+ * many jobs, and each ended job's full heartbeat line (a sentence plus its open commands)
+ * made the page hard to scan; the first line and this many characters identify the job,
+ * and `flash_status` with its jobId still returns the line whole.
+ */
+export const LISTING_PROGRESS_CHARS = 160
+
+/**
  * The three tools that work on background jobs.
  *
  * Same shape as the service's other tool descriptors. None can start work, so none
@@ -46,16 +54,19 @@ export const JOB_TOOLS = [
       'most recently ended ones, up to `limit` of them (default 10), together with how many are',
       'running, how many have ended, and how many ended ones were left out. Pass `state: "running"`',
       'or `state: "ended"` to see only one group, and a larger `limit` (up to 50) to see more.',
+      'In a listing an ended job\'s `lastProgress` keeps only its first line, cut at 160 characters (with … when cut);',
+      'a running job keeps the line whole, and asking for one job by id always returns it whole.',
       '',
       'A running job also shows what its workers are doing as of the last heartbeat: `current` lists',
       'each open tool call (tool, command, since, runningMs), and `warnings` names a command that',
       'failed three or more times in the call — a worker repeating a step its sandbox cannot finish —',
       'or a tool call whose process tree has used no CPU for minutes. A `current` entry carries `child`',
-      '(command, runningMs, cpuSeconds) when a process under the runtime has run longer than the command.',
+      '(command, runningMs, cpuSeconds) when a process under the runtime has run longer than the command,',
+      'and `background` (the job id) when it is a background job.',
       '`info` lists failures the brief asked for (checks that fail before the change and pass after it).',
       'A job still waiting for a free tree shows `queue`: its place in line (`position` of `of`; trees go',
       'to the longest waiter first) and the calls holding the trees (`holders`: jobId when it is a job,',
-      'label, runningMs).',
+      'label, runningMs, and idleMs when the holder has shown no activity for a minute).',
       '',
       'This reports status only: it never returns a job\'s result — use flash_result for that. A job',
       'id is meaningful only to the server process that created it, and jobs do not survive a restart.',
@@ -95,6 +106,11 @@ export const JOB_TOOLS = [
       'the job to end — prefer waiting in chunks (e.g. waitSeconds: 300) between other work, so you',
       'stay responsive and can report progress instead of blocking on one long call.',
       '',
+      'Pass `jobIds` (2 to 16 ids) instead of `jobId` to wait on several jobs together; the two are',
+      'mutually exclusive. The answer is the first of them that ends, with `pending` naming the ids',
+      'still running; without `waitSeconds` it returns the first that has already ended, or lists them',
+      'all as `pending`.',
+      '',
       'If the request carrying this call is cancelled, the wait stops and the job keeps running; some',
       'clients cancel a long tool call on their own timeout, so a wait can end before `waitSeconds`.',
       'The answer\'s `wait.endedBy` says what ended it: "job-ended", "timeout", "request-cancelled", or',
@@ -106,23 +122,31 @@ export const JOB_TOOLS = [
       'you have not collected is never evicted by that count. The result does not survive a restart,',
       'but the worker\'s whole report does: for a job the server no longer holds, flash_result returns',
       'the stored report with its status (and `reportPath`), and the finished work is a patch as well.',
+      'That stored report carries the call\'s `timing` when it measured one.',
     ].join('\n'),
     inputSchema: {
       type: 'object',
       properties: {
         jobId: {
           type: 'string',
-          description: 'The job whose result to collect.',
+          description: 'The job whose result to collect. Pass either jobId or jobIds.',
+        },
+        jobIds: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 2,
+          maxItems: 16,
+          description:
+            'Two to sixteen jobs to collect from together. With waitSeconds, returns as soon as any one ends; without it, the first that has already ended. Mutually exclusive with jobId.',
         },
         waitSeconds: {
           type: 'integer',
           minimum: 0,
           maximum: 600,
           description:
-            'How long to wait for the job to end before answering with its current state. Defaults to 0, which answers at once.',
+            'How long to wait for the job (or any of jobIds) to end before answering with its current state. Defaults to 0, which answers at once.',
         },
       },
-      required: ['jobId'],
       additionalProperties: false,
     },
   },
@@ -293,7 +317,7 @@ export class JobRegistry {
       state === 'running'
         ? []
         : entries.filter(({ job }) => job.state !== 'running').sort(newestFirst).slice(0, Math.max(0, limit))
-    return [...running, ...ended].map(({ job }) => this.#project(job))
+    return [...running, ...ended].map(({ job }) => this.#project(job, { listing: true }))
   }
 
   /**
@@ -366,6 +390,56 @@ export class JobRegistry {
         () => finish('job-ended'),
         () => finish('job-ended'),
       )
+    })
+  }
+
+  /**
+   * Wait for the first of several jobs to end, up to `waitMs`, until `signal` aborts, or until
+   * the timer expires.
+   *
+   * This is `waitFor` for a group: a caller watching a fleet it split across jobs wants the
+   * first answer, not the first id in its list. A job that has already ended wins at once;
+   * otherwise the first to settle ends the wait, whichever position it holds in `jobIds`.
+   * `endedBy` has the same meaning as in `waitFor`; `job` is undefined when no job had ended
+   * when the wait stopped. `missing` names an id the registry no longer holds, which the
+   * caller reports as an unknown job rather than as a timeout.
+   *
+   * @param {string[]} jobIds - the jobs to wait on.
+   * @param {number} waitMs - the longest to wait.
+   * @param {AbortSignal} [signal] - the waiting request's cancellation.
+   * @returns {Promise<{job: object | undefined, endedBy: 'job-ended' | 'timeout' | 'request-cancelled' | 'not-waited', missing?: string}>}
+   *   the first job that ended (or undefined) and what ended the wait.
+   */
+  waitForAny(jobIds, waitMs, signal) {
+    const jobs = []
+    for (const jobId of jobIds) {
+      const job = this.get(jobId)
+      if (job === undefined) return Promise.resolve({ job: undefined, missing: jobId, endedBy: 'not-waited' })
+      jobs.push(job)
+    }
+    const alreadyEnded = jobs.find((job) => job.state !== 'running')
+    if (alreadyEnded !== undefined) return Promise.resolve({ job: alreadyEnded, endedBy: 'not-waited' })
+    if (waitMs <= 0) return Promise.resolve({ job: undefined, endedBy: 'not-waited' })
+    if (signal?.aborted === true) return Promise.resolve({ job: undefined, endedBy: 'request-cancelled' })
+    return new Promise((resolve) => {
+      let done = false
+      const finish = (job, endedBy) => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        resolve({ job: job === undefined ? undefined : (this.jobs.get(job.jobId) ?? job), endedBy })
+      }
+      const onAbort = () => finish(undefined, 'request-cancelled')
+      const timer = setTimeout(() => finish(undefined, 'timeout'), waitMs)
+      timer.unref?.()
+      signal?.addEventListener('abort', onAbort, { once: true })
+      for (const job of jobs) {
+        job.settled.then(
+          () => finish(job, 'job-ended'),
+          () => finish(job, 'job-ended'),
+        )
+      }
     })
   }
 
@@ -457,14 +531,28 @@ export class JobRegistry {
    * repeated-failure warnings the last heartbeat carried, and, while it waits for a tree, its
    * place in the queue and who holds the trees. All are dropped once the job has ended — an
    * ended job's answer is its result, and a stale snapshot of a command that was running an
-   * hour ago would read as if it were still running.
+   * hour ago would read as if it were still running. The one part of a finished call's result
+   * that belongs in its status by id is `timing`, the phase breakdown a caller uses to see
+   * where a slow call went; a listing still leaves it out, so a page stays scannable.
+   *
+   * A listing is a page, not one job's report: an ended job's progress line is cut to its
+   * first line and `LISTING_PROGRESS_CHARS`, so a page of history stays scannable. Asking
+   * for the job by id, or reading a running job, keeps the line whole.
+   *
+   * @param {object} job - the job to project.
+   * @param {object} [options] - how the projection is used.
+   * @param {boolean} [options.listing] - whether this is one entry of a status listing.
    */
-  #project(job) {
+  #project(job, { listing = false } = {}) {
     const detail = job.state === 'running' ? job.lastProgress?.detail : undefined
     const current = detail?.current
     const warnings = detail?.warnings
     const queue = detail?.queue
     const info = detail?.info
+    const message =
+      listing && job.state !== 'running' && job.lastProgress !== undefined
+        ? listingProgress(job.lastProgress.message)
+        : job.lastProgress?.message
     return {
       jobId: job.jobId,
       kind: job.kind,
@@ -475,11 +563,12 @@ export class JobRegistry {
       elapsedMs: Math.max(0, (job.endedMs ?? this.now()) - job.startedMs),
       ...(job.lastProgress === undefined
         ? {}
-        : { lastProgress: { message: job.lastProgress.message, at: job.lastProgress.at } }),
+        : { lastProgress: { message, at: job.lastProgress.at } }),
       ...(Array.isArray(current) && current.length > 0 ? { current } : {}),
       ...(Array.isArray(warnings) && warnings.length > 0 ? { warnings } : {}),
       ...(Array.isArray(info) && info.length > 0 ? { info } : {}),
       ...(queue !== null && typeof queue === 'object' && !Array.isArray(queue) ? { queue } : {}),
+      ...(listing || job.result?.timing === undefined ? {} : { timing: job.result.timing }),
       resultReady: job.state !== 'running' && job.error === undefined,
     }
   }
@@ -488,4 +577,22 @@ export class JobRegistry {
 /** Render an elapsed span in minutes with one decimal, the way the log reads it. */
 function formatMinutes(ms) {
   return (Math.max(0, ms) / 60_000).toFixed(1)
+}
+
+/**
+ * The start of a progress line, for a status listing: its first non-empty line, at most
+ * `LISTING_PROGRESS_CHARS` code points. Leading blank lines are skipped so a message that
+ * starts with a newline still shows its text; `\r`, `\n` and `\r\n` all end a line. The cut
+ * is by code point, so a surrogate pair (an emoji) is never split, and it is marked with an
+ * ellipsis because the line continues. A single-job status keeps the whole line.
+ *
+ * @param {string} message - the job's latest progress line.
+ * @returns {string} the shortened line.
+ */
+function listingProgress(message) {
+  const firstLine = message.split(/\r\n|\r|\n/).find((line) => line.length > 0) ?? ''
+  const codePoints = Array.from(firstLine)
+  return codePoints.length <= LISTING_PROGRESS_CHARS
+    ? firstLine
+    : `${codePoints.slice(0, LISTING_PROGRESS_CHARS).join('')}…`
 }

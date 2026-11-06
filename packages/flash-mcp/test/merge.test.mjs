@@ -11,11 +11,11 @@
 import assert from 'node:assert/strict'
 import test, { after } from 'node:test'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { WorkspaceIsolation, rootDigest } from '../lib/isolation.js'
+import { SLOT_LOCK_FORMAT, WorkspaceIsolation, slotLockPath } from '../lib/isolation.js'
 import { FlashTaskService } from '../lib/service.js'
 
 const GIT_ID = ['-c', 'user.email=t@t', '-c', 'user.name=t']
@@ -524,9 +524,14 @@ test('a crashed server’s edits inside a nested repository are salvaged with it
   anchor.prepare(slot)
   writeFileSync(join(slot.dir, 'lib', 'x.txt'), 'x1 FROM THE DEAD WORKER\n')
   anchor.release(slot)
-  // The live pid level moved under a dead pid is what a crashed server leaves behind.
-  renameSync(dirname(anchor.stateDir), join(base, rootDigest(repo), '4194303'))
-  anchor.close()
+  // A lock naming a pid no process has is what a crashed server leaves behind: the next
+  // server moves the dead tree aside under a name of its own and salvages the work from
+  // there. The anchor is not closed first: a close empties the stable slot's copy and takes
+  // the lock, and that copy is exactly the work this test is about.
+  writeFileSync(
+    slotLockPath(slot.dir),
+    `${JSON.stringify({ format: SLOT_LOCK_FORMAT, pid: 4194303, startedAt: Date.now(), instance: 'dead0001' })}\n`,
+  )
 
   const next = new WorkspaceIsolation({ root: repo, slots: 1, baseDir: base, sweepIntervalMs: 0 })
   try {
@@ -537,6 +542,7 @@ test('a crashed server’s edits inside a nested repository are salvaged with it
     assert.equal(readFileSync(join(listed, 'x.txt'), 'utf8'), 'x1 FROM THE DEAD WORKER\n')
   } finally {
     next.close()
+    anchor.close()
   }
 })
 

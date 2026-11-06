@@ -505,6 +505,22 @@ path was neither a secret, nor repository state, nor adjacent to the root, so no
 a mutation outside the workspace is refused however it is spelled, and reads stay open: a worker may
 still read `/etc/hosts`, `/usr/share/doc`, or a shared cache.
 
+**On Windows the wall reads PowerShell too.** The `pwsh` tool's writes are found through redirects
+(`>`, `>>`, `2>`, `*>`, `| Out-File`), through `Set-Content`, `Add-Content`, `Out-File`, `New-Item`,
+`Copy-Item`, `Move-Item`, `Rename-Item`, `Remove-Item` and their aliases (`sc`, `ac`, `ni`, `cp`,
+`copy`, `mv`, `move`, `ren`, `rm`, `del`, `ri`, `rd`, `rmdir`, `erase`), reading `-Path`,
+`-LiteralPath`, `-Destination`, comma lists, the `-Param:value` form and positional arguments, and
+through `[System.IO.File]::WriteAllText(…)`-style calls with a literal path. Paths resolve the way
+PowerShell resolves them: drive-absolute, one leading slash as the current drive's root,
+`$env:USERPROFILE`, `$HOME`, `~`, either slash, and case-insensitively. A shell started as a
+program is read with that shell's rules — `& "C:\Program Files\Git\bin\bash.exe" -c "…"`, `sh -c`,
+`pwsh -Command`, `powershell -c`, `cmd /c` — whatever its path or `.exe` spelling, and the refusal
+says where the nested line was found (`inside bash.exe -c`). `.git` and the other protected
+segments match case-insensitively for a Windows path or a PowerShell/cmd call, while a POSIX
+`bash` line keeps exact matching and does not expand `$env:` spellings. A PowerShell deletion
+(`Remove-Item` and its aliases) runs through the same classification as `rm`, so
+`Remove-Item -Recurse -Force C:\Users\someone` and `rm -rf C:\Users\someone` report the same code.
+
 **Every path belongs to the directory its own command runs in.** A leading `cd`, `pushd`, `popd` or
 `cd -` moves the classification for every rule below it — deletions, redirects, write destinations
 and secret reads — while the fence stays the root the caller named. A `cd` inside `( … )`
@@ -633,25 +649,69 @@ to apply.
 | `--max-state-bytes <n>` | 20 GiB | cap on this root's stored patches and retired trees (see below) |
 | `--log-file <path>` | unset | append every diagnostic line, timestamped, to a file as well as stderr |
 
-The state directory is keyed by root, by process, and by pool:
+The state base is keyed by root. The default layout keeps each slot at a fixed path and gives each
+running server a private directory beside it:
 
 ```
-<base>/<sha256(root)[0:12]>/<pid>/<instance>
+<base>/<sha256(root)[0:12]>/slots/<n>                        a stable slot tree, its <n>.lock beside it
+<base>/<sha256(root)[0:12]>/slots/<n>.retired-<instance>    a tree retired by a timeout or a cancel
+<base>/<sha256(root)[0:12]>/slots/<n>.dead-<pid>-<ms>       a dead server's leftover copy
+<base>/<sha256(root)[0:12]>/caches                           stored build caches (since 0.1.11)
+<base>/<sha256(root)[0:12]>/reports                          reports of a server with --isolate none
+<base>/<sha256(root)[0:12]>/<pid>/<instance>                 the server's private state directory
 ```
 
 `<base>` is `$TMPDIR/flash-mcp` unless `--state-base` (`FLASH_STATE_BASE`, or the plugin's
-`state_base`) moves it; `<instance>` is a per-pool nonce. A relative base is refused
-(`--state-base must be an absolute path (got "rel")`): resolved against the process cwd it would
+`state_base`) moves it. This machine's `.flash-agents.local.json` may also set it (`stateBase`, or
+under `platform.<os>`): that wins over the plugin setting and the environment, because the plugin
+setting is synced between machines, but not over an explicit `--state-base`. A relative base is
+refused (`--state-base must be an absolute path (got "rel")`): resolved against the process cwd it would
 put the copies inside the caller's own repository, where a later sweep could delete parts of it.
-`~` is expanded, so `~/flash-state` works. `clean` takes the same flag and variable, so it sweeps
-the base the server really uses. On Windows the first slot's root path, trailing separator
-included, is measured at start: over 64 characters it logs one warning and adds it to every
+`~` is expanded, so `~/flash-state` works. `clean` takes the same flag and variable, and reads the
+same local file under its `--root`, so it sweeps the base the server really uses. On Windows the
+first slot's root path, trailing separator included, is measured at start: over 64 characters it
+logs one warning and adds it to every
 call's `warnings`, because MSVC's `cl.exe` and other tools that ignore long-path support fail past
 260 characters, and a slot root is about 85 before a project's own build folders are added. The
 doctor has the same measurement as `slot-path-length`, with the fix `set the plugin option
 "state_base" (or FLASH_STATE_BASE) to a short absolute folder such as C:\fm`. The warning is
 advisory rather than a refusal, because the layout is shared by the sweep, `clean` and salvage,
 and changing it silently would strand existing trees.
+
+**A stable slot is claimed by a lock.** The lock file `<n>.lock` holds one JSON line,
+`{ format, pid, command, instance }`. It is written complete to a temp file and linked into place
+(`link` fails with `EEXIST` and never replaces); on a filesystem without hard links (exFAT, some SMB
+shares) it is created with an exclusive `open` and `fsync` instead. Numbers are claimed from 0 up, so
+two servers on one root get disjoint ones and the second starts at the first number no live server
+holds. A lock is live while its pid exists and that pid still runs the recorded command line — read
+from `/proc/<pid>/cmdline`, `ps -ww -o args=`, or `Win32_Process.CommandLine`, compared without the
+program token and without quotes, and recorded through the same reader by the owner itself. No
+clock is involved: a start time printed in local time made a live lock look dead after a
+daylight-saving change. An answer is reused for 60 s per pid and command. A lock that cannot be read
+counts as held for 60 s after its mtime, then as dead.
+
+**Only the lock holder touches a slot.** Claim, takeover, sweep and `clean` all acquire the lock
+first: a dead lock is renamed to `<n>.lock.stale-<pid>-<ms>`, this server's lock is created, and only
+then is the tree touched; if another server's lock appeared in between, nothing is touched. Whoever
+holds a number moves a leftover copy aside to `slots/<n>.dead-<pid>-<ms>` — never erased — and keeps
+the `.flash-cache` in the slot; when that move fails (EPERM or EBUSY on Windows from an open handle)
+it restores the dead lock, leaves the tree as it is and skips the number. `close` checks that it
+still holds its lock before it empties a slot or removes a lock. On normal shutdown the lock is
+removed and the directory, with its `.flash-cache`, stays for the next server.
+
+**The sweep never deletes a stable `slots/<n>`.** It salvages and removes only the trees no stable
+number names — `slots/<n>.dead-*` and `slots/<n>.retired-*` — after acquiring their locks, and
+re-checks the lock right before removing. It also removes leftover lock temp and stale files.
+`clean` takes dead stable slots too, under the same lock rule. A root counts as live while it has a
+live process directory or a live slot lock, and another root's state folder is never removed while
+its `slots/` holds a lock file. A tree retired by a timeout or a cancel is renamed aside to
+`slots/<n>.retired-<instance>` and the live slot continues at the stable path; only when that rename
+fails (Windows, an open handle) does the slot continue under the retired name instead. A pool that
+cannot claim a single number falls back to its private `<pid>/<instance>/slots/slot-<n>` layout and
+logs it.
+
+A configured `--state-dir` keeps the older `<stateDir>/slots/slot-<n>` layout, where every
+generation is the pool's own and no lock is needed.
 
 A short base directly under `C:\` needs one more step. Windows gives the maker of a folder there
 modify rights but not the right to change its permissions, and the sandbox's first step for every
@@ -695,8 +755,8 @@ the owner's directory (`salvage-attempts`, including which slots already produce
 retry cannot store the same change twice), and `prepare` sweeps before every call, so three calls
 in a row cannot burn all three attempts within seconds.
 
-**Before 0.1.7 the sweep looked for a dead server's trees one directory too high.** A current
-server keeps a slot at `<pid>/<instance>/slots/<name>`; the sweep looked at `<pid>/slots/<name>`,
+**Before 0.1.7 the sweep looked for a dead server's trees one directory too high.** A server on the
+older per-process layout keeps a slot at `<pid>/<instance>/slots/<name>`; the sweep looked at `<pid>/slots/<name>`,
 found nothing, judged the dead owner clean, and removed the whole directory with the uncommitted
 work still inside it. A crash after a worker had written files therefore lost that work, and the
 salvage `flash_apply` advertises could only find trees left by an older layout. 0.1.7 enumerates
@@ -813,9 +873,11 @@ Honest limits of this design:
 - A **non-git root** is still isolated, but there is no diff to compute, so there is no verdict — only
   the worker's report.
 - Without copy-on-write the copy is a real copy and costs real time and space per call, and
-  `--slots 1` bounds it. The copy is Node's own, so it needs no `cp`; each file is cloned with
-  `COPYFILE_FICLONE_FORCE` — `clonefile` on APFS, a reflink on Linux — and the fallback is reported
-  as `copy`, not silently as a clone.
+  `--slots 1` bounds it. The copy is Node's own, so it needs no `cp`. On Linux each file is tried
+  as a reflink with `COPYFILE_FICLONE_FORCE` first, and the first failure switches the rest of the
+  tree to a byte copy with one log line naming the flag and the error. macOS and Windows copy
+  plainly from the first file, because Node answers the forced clone with `ENOSYS` on APFS and does
+  not clone on NTFS.
 - `apply` writes the patch with `git apply` into the working tree, leaving your index alone; when
   the root is no longer a repository, git is kept from finding one above it. A patch that no longer applies is reported as an error
   naming the kept patch file, so a conflict is never lost work.
@@ -1335,11 +1397,16 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
 ## Known limits
 
 - **The process watcher sees only the runtime's own process tree.** It samples `ps` (PowerShell's
-  `Win32_Process` on Windows) from outside the sandbox, once a minute while a tool call is open, and
-  follows parent ids from the runtime's pid. A process that daemonises and is re-parented to init
-  leaves the tree and is not counted. The held-open-shell warning assumes the harness runs a shell
-  call as `bash -c "<cmd>"`, so the command text is visible; it is new in 0.1.11 and not yet checked
-  against a live worker.
+  `Win32_Process` on Windows) from outside the sandbox, once a minute for every running call, with
+  or without a progress token, and follows parent ids from the runtime's pid. It measures the
+  subtree of the process that runs the command — the deepest shell or program whose arguments hold
+  the command text, below the sandbox's own `bwrap`, `dsh` and `runner.js` — so a wrapper's CPU never
+  counts against a waiting command. A process that daemonises and is re-parented to init leaves the
+  tree and is not counted, and a child that starts and exits between two samples is never in a
+  table. Inside a sandbox `ps` may be unavailable (`ps: Operation not permitted`), and the watcher
+  then has nothing to read. The held-open-shell warning of 0.1.11 is gone: on Linux each shell call
+  runs under its own `bwrap --unshare-pid --die-with-parent`, and the Windows shell tool does not
+  wait for inherited handles, so the sandbox ends a script's background children with the call.
 
 - **`flash_gauntlet` is not implemented over MCP.** The Ralph row stays disabled in the service
   profile: `flash_task` covers one task and `flash_batch` covers a pre-split fleet, and an iterative
@@ -1363,9 +1430,10 @@ The engine caps are **per run**; two concurrent workflows each get their own bud
   `FIND_NARROWING` in the row's source — but expect more denials, not fewer.
 - **Copies are not machines.** Parallel slots share ports, the keyring and every per-user service;
   a test server on a fixed port can answer another slot's tests.
-- **macOS copies are byte copies.** `COPYFILE_FICLONE_FORCE` returns `ENOSYS` on macOS in Node, so the
-  clone path never runs there and the walk falls back to a plain copy on the first file; size the
-  copy with `copyExclude`, not with APFS clones in mind.
+- **macOS and Windows copies are byte copies.** `COPYFILE_FICLONE_FORCE` returns `ENOSYS` on macOS
+  in Node, and NTFS has no reflink, so the clone path never runs there and the walk copies plainly
+  from the first file. Only Linux tries the clone. Size the copy with `copyExclude`, not with
+  clone-on-write in mind.
 - **A running task cannot be interrupted.** The SDK protocol has no cancel method, so a cancelled
   MCP request or a timed-out task stops being *waited on* while the session keeps running inside
   Harness, and its later notifications are ignored.

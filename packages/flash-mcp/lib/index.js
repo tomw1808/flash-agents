@@ -24,6 +24,7 @@ import {
   mkdtempSync,
   openSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
   statSync,
@@ -115,7 +116,7 @@ export function instructionsFor(models = [DEFAULT_MODEL]) {
     'tool call (`tool`, `command`, `since`, `runningMs`) as of the last heartbeat, and `warnings`',
     'names a command that failed three or more times in the call, or one whose process tree has',
     'used no CPU for minutes; a `current` entry carries `child` when a process under the runtime',
-    'has run longer than the command.',
+    'has run longer than the command, and `background` (the job id) when it is a background job.',
     '',
     'Project facts every worker needs (layout, check commands, style rules) belong in an',
     '`AGENTS.md` or `CLAUDE.md` in the repository: the Harness loads those into every worker',
@@ -168,7 +169,7 @@ export function listTools(models = [DEFAULT_MODEL]) {
           taskFile: {
             type: 'string',
             description:
-              'Path to a UTF-8 file holding the task text, sent exactly as written — for a long brief that would otherwise have to be pasted. A relative path resolves against the service root, and the file must resolve inside it; it must be a regular file of at most 256 KB. Pass exactly one of task and taskFile.',
+              'Path to a UTF-8 file holding the task text, sent exactly as written — for a long brief that would otherwise have to be pasted. A relative path resolves against the service root, and the file must resolve inside it; it must be a regular file of at most 256 KB. Pass exactly one of task and taskFile. `taskFile` is the whole task: do not pass `task` with it.',
           },
           cwd: {
             type: 'string',
@@ -258,7 +259,7 @@ export function listTools(models = [DEFAULT_MODEL]) {
                     taskFile: {
                       type: 'string',
                       description:
-                        "Path to a UTF-8 file holding this task's text, sent exactly as written. A relative path resolves against the service root and must stay inside it. Use either task or taskFile.",
+                        "Path to a UTF-8 file holding this task's text, sent exactly as written. A relative path resolves against the service root and must stay inside it. Use either task or taskFile. `taskFile` is the whole task: do not pass `task` with it.",
                     },
                     acceptance: { type: 'string', description: 'Optional acceptance criteria for this task.' },
                   },
@@ -344,6 +345,9 @@ export function listTools(models = [DEFAULT_MODEL]) {
         'conflict leaves conflict markers in the named files and is listed in `conflicts`.',
         '`dryRun` with `threeWay` predicts the conflicts without writing anything.',
         '',
+        'Pass `excludeBase: true` to apply only the work this patch added on top of the base patch',
+        'it continued from, not the base patch\'s change as well.',
+        '',
         'The result has a `status` ("success", "conflict" or "failed") and a `files` entry per file:',
         '`applied`, `merged` (your tree had moved and the change was merged in), `conflict` (markers',
         'left in the file) or `failed` (with a `reason`). If one file cannot be merged, nothing is written',
@@ -377,6 +381,10 @@ export function listTools(models = [DEFAULT_MODEL]) {
             type: 'boolean',
             description: 'When the plain apply fails, merge the patch three ways against the base it was made from.',
           },
+          excludeBase: {
+            type: 'boolean',
+            description: 'Apply only the change this patch made on top of the base patch it continued from: the job\'s own change, not the base patch\'s work it already contains. Refused when the patch recorded no base patch, or that base patch is no longer stored.',
+          },
         },
         required: ['patchId'],
         additionalProperties: false,
@@ -408,6 +416,9 @@ export function listTools(models = [DEFAULT_MODEL]) {
         'The first page also lists `overlaps`: other stored patches of this root that are not applied',
         'and change some of the same files (`patchId`, `files`, `label`, `createdAt`). A patch that',
         'continues from another (`basePatch`) is not an overlap. It is left out when there are none.',
+        '',
+        'Pass `excludeBase: true` to read only the work this patch added on top of the base patch',
+        'it continued from.',
       ].join('\n'),
       inputSchema: {
         type: 'object',
@@ -432,6 +443,10 @@ export function listTools(models = [DEFAULT_MODEL]) {
             maximum: 200000,
             description: 'Page size in characters. Defaults to the service diff limit, capped at 200000.',
           },
+          excludeBase: {
+            type: 'boolean',
+            description: 'Read only the change this patch made on top of the base patch it continued from: the job\'s own change, not the base patch\'s work it already contains. Refused when the patch recorded no base patch, or that base patch is no longer stored.',
+          },
         },
         required: ['patchId'],
         additionalProperties: false,
@@ -441,6 +456,9 @@ export function listTools(models = [DEFAULT_MODEL]) {
   ]
 }
 
+/** The repository's per-machine settings file, which may name this machine's state base. */
+const LOCAL_SETTINGS_FILE = '.flash-agents.local.json'
+
 /**
  * Parse CLI arguments and environment into service options.
  *
@@ -449,17 +467,39 @@ export function listTools(models = [DEFAULT_MODEL]) {
  * `textFrom`, which treats an empty string as unset: a plugin manifest expands an
  * unset setting to `""`, and `--isolate ""` would otherwise be a startup error.
  *
+ * The state base can also come from `.flash-agents.local.json` in the server's root.
+ * Claude Code syncs plugin settings between machines, so a `state_base` that is right on
+ * Windows (`C:\fm`) is wrong on Linux; the git-ignored local file belongs to one machine
+ * and therefore wins over the environment the plugin passes. An explicit `--state-base`
+ * still wins, as every command-line option does over the settings files. The local file's
+ * `platform.<process.platform>` section wins over its top level, exactly as the copy
+ * settings layer in the README's "Per-repository settings".
+ *
  * @param {string[]} [argv] - arguments after the command name.
  * @param {Record<string, string | undefined>} [env] - environment to read.
  * @param {object} [config] - resolved configuration; loaded from disk by default.
  * @param {object} [options] - effects a test can inject.
  * @param {string} [options.home] - the home directory a `~` in `--state-base` expands
  *   against (default the process's; injectable so a test needs no real home).
- * @returns {object} the service options.
+ * @param {string} [options.platform] - platform whose local settings section applies
+ *   (default `process.platform`; injectable so a test needs no real platform).
+ * @param {boolean} [options.ignoreLocalSettings] - skip `.flash-agents.local.json`; the
+ *   doctor uses this to check the rest of a machine whose local state base is unusable.
+ * @param {string} [options.root] - the server root a caller already resolved; the local
+ *   settings file is read from it. `--root` and `FLASH_SERVICE_ROOT` still decide the
+ *   root when it is not given, and the cwd is the last resort.
+ * @returns {object} the service options, plus `localSettingsProblem` (`{path, message}`)
+ *   when the local settings file could not be read or parsed and was therefore ignored.
  */
-export function parseOptions(argv = process.argv.slice(2), env = process.env, config = loadConfig({ env }), { home = homedir() } = {}) {
+export function parseOptions(
+  argv = process.argv.slice(2),
+  env = process.env,
+  config = loadConfig({ env }),
+  { home = homedir(), platform = process.platform, ignoreLocalSettings = false, root } = {},
+) {
+  const envStateBase = textFrom(env.FLASH_STATE_BASE)
   const options = {
-    root: textFrom(env.FLASH_SERVICE_ROOT) ?? process.cwd(),
+    root: root ?? textFrom(env.FLASH_SERVICE_ROOT) ?? process.cwd(),
     profile: textFrom(env.FLASH_SERVICE_PROFILE) ?? 'flash-service',
     provider: config.route.provider,
     model: config.route.model,
@@ -486,7 +526,10 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
     stateDir: textFrom(env.FLASH_STATE_DIR),
     // The base of the default per-root/per-process layout. `--state-dir` replaces that
     // layout entirely and wins over this; a base only moves where the default lives.
-    stateBase: textFrom(env.FLASH_STATE_BASE),
+    stateBase: envStateBase,
+    // Where that base came from, for the doctor's report: the plugin setting by default,
+    // and the local settings file or the flag when they decided it below.
+    ...(envStateBase === undefined ? {} : { stateBaseSource: 'FLASH_STATE_BASE' }),
     copyExclude: listFrom(env.FLASH_COPY_EXCLUDE),
     // Running a repository's `slotSetup` steps is host code outside the worker's sandbox,
     // so it is off unless the operator explicitly says yes.
@@ -498,6 +541,7 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
     logFile: textFrom(env.FLASH_LOG_FILE),
     help: false,
   }
+  let stateBaseFromFlag = false
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index]
     const next = () => {
@@ -538,6 +582,8 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
         break
       case '--state-base':
         options.stateBase = next()
+        options.stateBaseSource = '--state-base'
+        stateBaseFromFlag = true
         break
       case '--copy-exclude':
         options.copyExclude = listFrom(next())
@@ -574,14 +620,107 @@ export function parseOptions(argv = process.argv.slice(2), env = process.env, co
         throw new Error(`unknown argument "${flag}"`)
     }
   }
+  // Help is not a start: usage must print even when this machine's settings would keep a
+  // server from starting, so neither the local file nor the state base is read or validated.
+  if (options.help) return options
   if (options.isolate !== 'copy' && options.isolate !== 'none') {
     throw new Error(`--isolate ${JSON.stringify(options.isolate)} is not available; use "copy" (default) or "none"`)
+  }
+  // The local file wins over the plugin setting (the environment), but not over an
+  // explicit `--state-base`: a flag is this run's decision, and the settings files are
+  // the layers beneath it.
+  if (!stateBaseFromFlag && !ignoreLocalSettings) {
+    const local = localStateBase(options.root, platform)
+    // A file that cannot be read or parsed contributes nothing, but it is not silent: the
+    // caller reports it at start-up and the doctor shows it as a warning, so a synced plugin
+    // setting that wins unnoticed is visible.
+    if (local?.problem !== undefined) {
+      options.localSettingsProblem = { path: local.path, message: local.problem }
+    }
+    if (local?.value !== undefined) {
+      options.stateBase = local.value
+      options.stateBaseSource = local.source
+      options.stateBaseLocalFile = local.path
+    }
   }
   // A relative base is resolved against the service root, which puts the copies inside the
   // caller's repository; `~` is expanded first, exactly as `DSH_HOME` is. Refusing here
   // means `serve`, `clean` and `doctor` report the same sentence before anything exists.
-  options.stateBase = requireAbsoluteStateBase(options.stateBase, home)
+  try {
+    options.stateBase = requireAbsoluteStateBase(options.stateBase, home)
+  } catch (error) {
+    // Carry the origin so the startup report can say it was the local file, not the
+    // plugin setting, that named an unusable path. A value the local file itself put on
+    // the error is kept as it is — `null` included, which `??=` would replace.
+    if (error !== null && typeof error === 'object') {
+      if (!('stateBaseSource' in error)) error.stateBaseSource = options.stateBaseSource
+      if (!('stateBaseValue' in error)) error.stateBaseValue = options.stateBase
+    }
+    throw error
+  }
   return options
+}
+
+/**
+ * The `stateBase` `.flash-agents.local.json` sets for this machine, if any.
+ *
+ * The platform section is resolved before the top level, exactly as the other settings
+ * layer: when `platform.<current>` carries a `stateBase`, the top-level one is not read
+ * at all, so an unusable shared value does not shadow a good one for this machine. Only
+ * the value that wins is validated.
+ *
+ * The file is convenience configuration like the copy settings beside it: a missing file
+ * contributes nothing here. One that cannot be read, or is not JSON (a leading UTF-8 BOM,
+ * which Notepad writes, is stripped first), also contributes nothing, but its problem is
+ * returned so the server can say why the file was ignored and the doctor can warn about it.
+ * A `stateBase` that is present but not a string naming a path (a non-string, `""`, or only
+ * blanks) is different: it is a value the server would otherwise silently ignore, so it is
+ * refused with the same `STATE_BASE_INVALID` code as a relative path, and the startup report
+ * names the local file as its source.
+ *
+ * @param {string} root - the server's root.
+ * @param {string} platform - `process.platform`, whose section applies.
+ * @returns {{value: string, source: string, path: string} | {problem: string, path: string} | undefined}
+ *   the winning value and the layer it came from, why the file was ignored, or undefined
+ *   when there is no file or it names no stateBase.
+ * @throws {Error} when a present stateBase is not a non-empty string.
+ */
+function localStateBase(root, platform) {
+  const path = join(resolve(root), LOCAL_SETTINGS_FILE)
+  let text
+  try {
+    text = readFileSync(path, 'utf8')
+  } catch (error) {
+    // A missing file is the normal case: the local settings are optional.
+    if (error?.code === 'ENOENT') return undefined
+    return { path, problem: `it could not be read (${describeError(error)})` }
+  }
+  // Notepad writes a UTF-8 BOM; JSON.parse refuses it, so a valid file would read as broken.
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1)
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch (error) {
+    return { path, problem: `it is not valid JSON (${describeError(error)})` }
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+  const platformSection = parsed.platform?.[platform]
+  const platformNames =
+    platformSection !== null &&
+    typeof platformSection === 'object' &&
+    !Array.isArray(platformSection) &&
+    Object.hasOwn(platformSection, 'stateBase')
+  const section = platformNames ? platformSection : parsed
+  if (!Object.hasOwn(section, 'stateBase')) return undefined
+  const label = platformNames ? `${LOCAL_SETTINGS_FILE} platform.${platform}` : LOCAL_SETTINGS_FILE
+  const raw = section.stateBase
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    throw Object.assign(
+      new Error(`${label} sets "stateBase" to ${JSON.stringify(raw)}, which is not a path`),
+      { code: 'STATE_BASE_INVALID', stateBaseSource: label, stateBaseValue: raw },
+    )
+  }
+  return { value: raw, source: label, path }
 }
 
 /**
@@ -774,20 +913,31 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
     })
   }
 
+  /** The explanation every unknown-job refusal ends with. */
+  const UNKNOWN_JOB_HINT =
+    'Job ids look like job-xxxxxxxx (8 lowercase hex characters) and live only in the server ' +
+    'process that made them: jobs do not survive a restart. After a restart, the call\'s ' +
+    'finished work is still salvaged as a patch by the next server, and flash_apply can apply it by id.'
+
   const unknownJob = (tool, jobId) =>
+    errorResult(`${tool} failed: unknown job ${JSON.stringify(jobId)}. ${UNKNOWN_JOB_HINT}`)
+
+  /** Refuse a group of ids that the registry does not hold and no stored report answers. */
+  const unknownJobs = (tool, jobIds) =>
     errorResult(
-      `${tool} failed: unknown job ${JSON.stringify(jobId)}. Job ids look like job-xxxxxxxx ` +
-        '(8 lowercase hex characters) and live only in the server process that made them: jobs do ' +
-        "not survive a restart. After a restart, the call's finished work is still salvaged as a " +
-        'patch by the next server, and flash_apply can apply it by id.',
+      `${tool} failed: unknown jobs ${jobIds.map((id) => JSON.stringify(id)).join(', ')}. ${UNKNOWN_JOB_HINT}`,
     )
 
   /**
    * A job the server no longer holds: its stored report, when the call finished and stored one,
    * otherwise the unknown-job refusal. The report file outlives the process and the in-memory
    * registry, so a restart or a lost context does not lose the review.
+   *
+   * `extra` carries the fields a group call adds around the same report (`pending`,
+   * `unknown`). The single-id path passes none: its answer is the stored report itself, which
+   * also carries `timing` when the record measured one.
    */
-  const storedReport = (tool, jobId) => {
+  const storedReport = (tool, jobId, extra = {}) => {
     const stored = service?.readReport?.(jobId)
     if (stored === undefined) return unknownJob(tool, jobId)
     return okResult({
@@ -801,6 +951,8 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
       createdAt: stored.createdAt,
       reportPath: stored.reportPath,
       report: stored.report,
+      ...(stored.timing === undefined ? {} : { timing: stored.timing }),
+      ...extra,
       note: 'the job is no longer held in memory (the server restarted, or the job was evicted); this is the worker\'s whole report as stored on disk',
     })
   }
@@ -834,20 +986,24 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
 
   /**
    * The heartbeat a waiting `flash_result` sends: elapsed seconds, the wait the caller asked
-   * for, and the job's latest progress line. A client without a progress token gets nothing,
-   * because such a notification would be invalid; a sender that throws is ignored, because a
-   * client that has gone away must not turn a wait into a failure.
+   * for, and the latest progress line of the job (or jobs) waited on. A client without a
+   * progress token gets nothing, because such a notification would be invalid; a sender that
+   * throws is ignored, because a client that has gone away must not turn a wait into a failure.
    */
-  const startWaitProgress = ({ jobId, waitSeconds, progressToken, sendProgress }) => {
+  const startWaitProgress = ({ jobId, jobIds, waitSeconds, progressToken, sendProgress }) => {
     if (progressToken === undefined || progressToken === null || typeof sendProgress !== 'function') return () => {}
+    const ids = Array.isArray(jobIds) ? jobIds : [jobId]
+    const waitedOn = ids.length === 1 ? ids[0] : `${String(ids.length)} jobs`
     const startedAt = Date.now()
     const timer = setInterval(() => {
       try {
-        const latest = jobs.get(jobId)?.lastProgress?.message
+        const latest = ids
+          .map((id) => jobs.get(id)?.lastProgress?.message)
+          .find((message) => message !== undefined)
         sendProgress({
           progress: Math.round((Date.now() - startedAt) / 1000),
           total: waitSeconds,
-          message: `waiting for ${jobId}: ${latest ?? 'no progress yet'}`,
+          message: `waiting for ${waitedOn}: ${latest ?? 'no progress yet'}`,
         })
       } catch (error) {
         log(`could not send a progress notification: ${describeError(error)}`)
@@ -858,16 +1014,164 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
     return () => clearInterval(timer)
   }
 
+  /**
+   * The answer for one ended (or still running) job, in the shape `flash_result` has always
+   * used. `pending` is added when the call named several jobs: the ids still running, so a
+   * group wait says what is left. `unknown` names the group ids neither the registry nor a
+   * stored report answered.
+   */
+  const answerJob = (job, { wait, pending, unknown } = {}) => {
+    // Project the job already held rather than looking it up again by id: the sweep may have
+    // evicted it while this request waited, and a second lookup that comes back undefined
+    // used to throw a TypeError straight out of the dispatcher.
+    const status = jobs.statusOf(job)
+    if (job.state === 'running') {
+      return okResult({
+        jobId: job.jobId,
+        state: 'running',
+        elapsedMs: status.elapsedMs,
+        ...(status.lastProgress === undefined ? {} : { lastProgress: status.lastProgress }),
+        ...(wait === undefined ? {} : { wait }),
+        ...(pending === undefined ? {} : { pending }),
+        ...(unknown === undefined || unknown.length === 0 ? {} : { unknown }),
+      })
+    }
+    if (job.error === undefined) {
+      // The caller has the result now; the cap may reclaim the job under pressure, so the
+      // one result it is allowed to drop is the one already delivered.
+      job.collected = true
+      // The call's full result, exactly as the synchronous call would have returned it, plus
+      // the job's identity so the caller can tie it back to the id it holds.
+      return okResult({
+        ...job.result,
+        job: { jobId: job.jobId, state: job.state, elapsedMs: status.elapsedMs },
+        ...(wait === undefined ? {} : { wait }),
+        ...(pending === undefined ? {} : { pending }),
+        ...(unknown === undefined || unknown.length === 0 ? {} : { unknown }),
+      })
+    }
+    // Failed or cancelled: the same message the synchronous dispatch would have produced.
+    // A group wait still names what is pending and unknown, since an error envelope carries
+    // no fields; the failure's own timing and salvage ride in the structured part, exactly as
+    // they do for a foreground call.
+    const message = `${job.kind} failed: ${describeError(job.error)} (job ${job.jobId})`
+    const parts = []
+    if (pending !== undefined && pending.length > 0) parts.push(`still running: ${pending.join(', ')}`)
+    if (unknown !== undefined && unknown.length > 0) parts.push(`unknown: ${unknown.join(', ')}`)
+    return errorResult(
+      parts.length === 0 ? message : `${message}; ${parts.join('; ')}`,
+      failureFields(job.error),
+    )
+  }
+
+  /** The ids of `jobIds` that are still running and not already named as unknown, excluding the one whose answer is returned. */
+  const pendingJobs = (jobIds, answered, unknown = []) =>
+    jobIds.filter((id) => id !== answered && !unknown.includes(id) && jobs.get(id)?.state === 'running')
+
+  /**
+   * `flash_result` over several jobs: the first that ends answers, and `pending` names the
+   * rest. Without a wait, the first id in the caller's order that has already ended wins, so
+   * the answer is deterministic; with a wait, whichever job settles first wins.
+   *
+   * An id the registry no longer holds is not a refusal by itself: its stored report answers
+   * exactly as the single-id path does, because a report outlives the process and the job's
+   * eviction. Only an id with neither a held job nor a stored report is listed under
+   * `unknown`, and the rest of the group still answers; the call refuses only when every id
+   * is unknown.
+   */
+  const resultToolForJobs = async (jobIds, waitSeconds, signal, { progressToken, sendProgress } = {}) => {
+    if (!Array.isArray(jobIds) || jobIds.length < 2 || jobIds.length > 16) {
+      return errorResult(
+        `flash_result failed: jobIds must be an array of 2 to 16 job ids; got ${JSON.stringify(jobIds)}`,
+      )
+    }
+    const bad = jobIds.find((id) => typeof id !== 'string' || id.length === 0)
+    if (bad !== undefined) {
+      return errorResult(`flash_result failed: jobIds must contain only non-empty strings; got ${JSON.stringify(bad)}`)
+    }
+    const live = new Map()
+    const stored = new Set()
+    const unknown = []
+    for (const id of jobIds) {
+      const job = jobs.get(id)
+      if (job !== undefined) live.set(id, job)
+      else if (service?.readReport?.(id) !== undefined) stored.add(id)
+      else unknown.push(id)
+    }
+    if (live.size === 0 && stored.size === 0) return unknownJobs('flash_result', unknown)
+    // The unknown list is read at answer time: the wait may name one more id it no longer
+    // found in the registry (an eviction between collecting the group and waiting on it).
+    const unknownExtra = () => (unknown.length === 0 ? {} : { unknown: [...unknown] })
+    // A stored report is an ended job by definition, so the first id in the caller's order
+    // that is stored or held-and-ended is the deterministic answer with or without a wait.
+    const readyId = jobIds.find(
+      (id) => stored.has(id) || (live.get(id) !== undefined && live.get(id).state !== 'running'),
+    )
+    let job
+    let answeredStored
+    let wait
+    if (readyId !== undefined) {
+      if (stored.has(readyId)) answeredStored = readyId
+      else job = live.get(readyId)
+      if (waitSeconds > 0) {
+        wait = { requestedMs: waitSeconds * 1000, waitedMs: 0, endedBy: 'not-waited' }
+      }
+    } else if (waitSeconds > 0) {
+      const requestedMs = waitSeconds * 1000
+      const startedWaiting = Date.now()
+      const stopProgress = startWaitProgress({ jobIds, waitSeconds, progressToken, sendProgress })
+      try {
+        // Only held ids are waited on: a stored report is ready already, and an unknown id
+        // is named in the answer rather than ending the wait.
+        const outcome = await jobs.waitForAny([...live.keys()], requestedMs, signal)
+        job = outcome.job
+        // An id the registry dropped while the wait ran is named with the unknown ones, so
+        // the answer never leaves it out of both `pending` and `unknown`.
+        if (outcome.missing !== undefined && !unknown.includes(outcome.missing)) unknown.push(outcome.missing)
+        wait = { requestedMs, waitedMs: Date.now() - startedWaiting, endedBy: outcome.endedBy }
+      } finally {
+        stopProgress()
+      }
+    }
+    if (job === undefined && answeredStored === undefined) {
+      // Nothing was ready (or nothing ended within the wait): the list is the answer.
+      return okResult({
+        pending: jobIds.filter((id) => !unknown.includes(id) && jobs.get(id)?.state === 'running'),
+        ...(wait === undefined ? {} : { wait }),
+        ...unknownExtra(),
+      })
+    }
+    const answered = answeredStored ?? job.jobId
+    if (answeredStored !== undefined) {
+      return storedReport('flash_result', answeredStored, {
+        pending: pendingJobs(jobIds, answered, unknown),
+        ...unknownExtra(),
+      })
+    }
+    return answerJob(job, {
+      ...(wait === undefined ? {} : { wait }),
+      pending: pendingJobs(jobIds, answered, unknown),
+      ...unknownExtra(),
+    })
+  }
+
   const resultTool = async (args, signal, { progressToken, sendProgress } = {}) => {
     const jobId = args?.jobId
-    if (typeof jobId !== 'string' || jobId.length === 0) {
-      return errorResult(`flash_result failed: jobId must be a non-empty string; got ${JSON.stringify(jobId)}`)
+    const jobIds = args?.jobIds
+    if (jobId !== undefined && jobIds !== undefined) {
+      return errorResult('flash_result failed: pass either jobId or jobIds, not both')
     }
     const waitSeconds = args?.waitSeconds ?? 0
     if (!Number.isInteger(waitSeconds) || waitSeconds < 0 || waitSeconds > 600) {
       return errorResult(
         `flash_result failed: waitSeconds must be an integer between 0 and 600; got ${JSON.stringify(args?.waitSeconds)}`,
       )
+    }
+    if (jobIds !== undefined) {
+      return resultToolForJobs(jobIds, waitSeconds, signal, { progressToken, sendProgress })
+    }
+    if (typeof jobId !== 'string' || jobId.length === 0) {
+      return errorResult(`flash_result failed: jobId must be a non-empty string; got ${JSON.stringify(jobId)}`)
     }
     if (jobs.get(jobId) === undefined) return storedReport('flash_result', jobId)
     // Waiting is on the *request's* signal: cancelling this call stops the wait, and the job
@@ -890,33 +1194,7 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
       job = jobs.get(jobId)
     }
     if (job === undefined) return storedReport('flash_result', jobId)
-    // Project the job already held rather than looking it up again by id: the sweep may have
-    // evicted it while this request waited, and a second lookup that comes back undefined
-    // used to throw a TypeError straight out of the dispatcher.
-    const status = jobs.statusOf(job)
-    if (job.state === 'running') {
-      return okResult({
-        jobId: job.jobId,
-        state: 'running',
-        elapsedMs: status.elapsedMs,
-        ...(status.lastProgress === undefined ? {} : { lastProgress: status.lastProgress }),
-        ...(wait === undefined ? {} : { wait }),
-      })
-    }
-    if (job.error === undefined) {
-      // The caller has the result now; the cap may reclaim the job under pressure, so the
-      // one result it is allowed to drop is the one already delivered.
-      job.collected = true
-      // The call's full result, exactly as the synchronous call would have returned it, plus
-      // the job's identity so the caller can tie it back to the id it holds.
-      return okResult({
-        ...job.result,
-        job: { jobId: job.jobId, state: job.state, elapsedMs: status.elapsedMs },
-        ...(wait === undefined ? {} : { wait }),
-      })
-    }
-    // Failed or cancelled: the same message the synchronous dispatch would have produced.
-    return errorResult(`${job.kind} failed: ${describeError(job.error)} (job ${job.jobId})`)
+    return answerJob(job, wait === undefined ? {} : { wait })
   }
 
   const cancelTool = async (args) => {
@@ -990,7 +1268,9 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
       return okResult(await run())
     } catch (error) {
       log(`${name} failed: ${describeError(error)}`)
-      return errorResult(`${name} failed: ${describeError(error)}`)
+      // A failed call's timing and salvage are data, not prose: they ride in the structured
+      // part a finished call's result uses, so a client reads them without parsing the line.
+      return errorResult(`${name} failed: ${describeError(error)}`, failureFields(error))
     }
   }
 }
@@ -1004,8 +1284,38 @@ function okResult(result) {
 }
 
 /** One MCP tool error, formatted like the synchronous path's failures. */
-function errorResult(text) {
-  return { content: [{ type: 'text', text }], isError: true }
+function errorResult(text, structured) {
+  return {
+    content: [{ type: 'text', text }],
+    ...(structured === undefined ? {} : { structuredContent: structured }),
+    isError: true,
+  }
+}
+
+/**
+ * The structured facts a failed call carries, in the fields `flash_cancel` already reports.
+ *
+ * The text says what went wrong; the breakdown a timeout measured and the patch a
+ * cancellation salvaged are the data beside it, and a caller that wants them should not have
+ * to parse a sentence. Nothing is invented: a failure that carries neither adds no part.
+ *
+ * @param {unknown} error - the failure the dispatcher or a job holds.
+ * @returns {object | undefined} the structured part, or undefined when the failure has none.
+ */
+function failureFields(error) {
+  if (error === null || typeof error !== 'object') return undefined
+  const fields = {}
+  if (error.timing !== undefined) fields.timing = error.timing
+  const salvage = error.salvage
+  if (salvage?.patchId !== undefined) {
+    fields.patchId = salvage.patchId
+    fields.diffstat = salvage.diffstat
+    fields.filesChanged = salvage.filesChanged
+  } else if (salvage?.note !== undefined) {
+    fields.stored = false
+    fields.storedNote = salvage.note
+  }
+  return Object.keys(fields).length === 0 ? undefined : fields
 }
 
 /** A shallow copy of `args` without one property; never mutates the caller's object. */
@@ -1619,6 +1929,7 @@ export async function runDoctor(
   const flags = doctorFlags(argv)
   let options
   let stateBaseProblem
+  let stateBaseProblemFromLocal = false
   const parseEnv = flags.copy ? envWithProjectRoot(env) : env
   try {
     options = parseOptions(flags.optionsArgv, parseEnv, config)
@@ -1631,9 +1942,18 @@ export async function runDoctor(
     }
     // The server would exit on this value; the report should show that as a failed row, and
     // still check everything else, so it is parsed again without the unusable base.
-    stateBaseProblem = `the plugin setting "state_base" (FLASH_STATE_BASE) is ${JSON.stringify(configuredStateBase(flags.optionsArgv, parseEnv) ?? '')}, which cannot be used on ${process.platform} (${describeError(error)})`
+    const fromLocalFile =
+      typeof error?.stateBaseSource === 'string' && error.stateBaseSource.startsWith(LOCAL_SETTINGS_FILE)
+    stateBaseProblemFromLocal = fromLocalFile
+    stateBaseProblem = fromLocalFile
+      ? `${error.stateBaseSource} sets "stateBase" to ${JSON.stringify(error.stateBaseValue === undefined ? '' : error.stateBaseValue)}, which cannot be used on ${process.platform} (${describeError(error)})`
+      : `the plugin setting "state_base" (FLASH_STATE_BASE) is ${JSON.stringify(configuredStateBase(flags.optionsArgv, parseEnv) ?? '')}, which cannot be used on ${process.platform} (${describeError(error)})`
     try {
-      options = parseOptions(flags.optionsArgv, { ...parseEnv, FLASH_STATE_BASE: '' }, config)
+      // Drop both sources at once: an unusable base in either the environment or the local
+      // file must not keep the rest of the report from running.
+      options = parseOptions(flags.optionsArgv, { ...parseEnv, FLASH_STATE_BASE: '' }, config, {
+        ignoreLocalSettings: true,
+      })
     } catch (second) {
       emit(`flash-agents: ${describeError(second)}\n\n${usage()}`)
       return 2
@@ -1659,7 +1979,11 @@ export async function runDoctor(
       root: options.root,
       ...(options.stateDir === undefined ? {} : { stateDir: options.stateDir }),
       ...(options.stateBase === undefined ? {} : { stateBase: options.stateBase }),
+      ...(options.stateBaseSource === undefined ? {} : { stateBaseSource: options.stateBaseSource }),
+      ...(options.stateBaseLocalFile === undefined ? {} : { stateBaseLocalFile: options.stateBaseLocalFile }),
+      ...(options.localSettingsProblem === undefined ? {} : { localSettingsProblem: options.localSettingsProblem }),
       ...(stateBaseProblem === undefined ? {} : { stateBaseProblem }),
+      ...(stateBaseProblemFromLocal ? { stateBaseProblemFromLocal: true } : {}),
       disk: true,
       ...(run === undefined ? {} : { run }),
       ...(probe === undefined ? {} : { probe }),
@@ -2137,9 +2461,11 @@ Usage: flash-agents clean [--all] [--caches] [--root <path>] [--state-base <path
   --all                      also remove the slot trees of roots with no live server
   --caches                   remove only build caches: the stored ones, and the cache of every dead
                              server's slots; trees, patches and owners are left alone
-  --root <path>              service root whose digest is swept (default: cwd)
-  --state-base <path>        base directory of the default layout (default: $TMPDIR/flash-mcp,
-                             or FLASH_STATE_BASE); it must be absolute and a leading ~ is
+  --root <path>              service root whose digest is swept (default: cwd), and whose
+                             .flash-agents.local.json may name the state base
+  --state-base <path>        base directory of the default layout (default: the local
+                             settings file of --root, else $TMPDIR/flash-mcp or
+                             FLASH_STATE_BASE); it must be absolute and a leading ~ is
                              expanded; pass the same base the server runs with
   --patch-retention-days <n> days an unapplied patch is kept (default: flash.config.json)
 
@@ -2169,18 +2495,27 @@ nothing else.
  * @param {string} [options.baseDir] - the state base directory, for tests.
  * @param {string} [options.home] - the home directory a `~` base expands against (default
  *   the process's; injectable so a test needs no real home).
+ * @param {string} [options.platform] - platform whose local settings section applies
+ *   (default `process.platform`; injectable so a test needs no real platform).
  * @param {number} [options.now] - the current time, for tests.
  * @returns {Promise<number>} the exit code: 0 unless an argument is unknown.
  */
-export async function runClean(argv = [], { env = process.env, write, baseDir, home = homedir(), now } = {}) {
+export async function runClean(
+  argv = [],
+  { env = process.env, write, baseDir, home = homedir(), platform = process.platform, now } = {},
+) {
   const emit = write ?? ((text) => process.stdout.write(text))
   let all = false
   let cachesOnly = false
   let root = textFrom(env.FLASH_SERVICE_ROOT) ?? process.cwd()
-  // The base the server's default layout sits under: `--state-base` overrides the
-  // environment, and an injected base (tests) is the starting point so a flag can still
-  // move it. Without any, `cleanLayout` uses the platform temp base.
+  // The base the server's default layout sits under, in the server's own order: the flag
+  // wins, then this machine's local settings file (which the plugin setting cannot
+  // override), then the environment/plugin setting. An injected base (tests) stands in for
+  // the environment layer. Without any, `cleanLayout` uses the platform temp base.
   let base = baseDir ?? textFrom(env.FLASH_STATE_BASE)
+  let baseFromFlag = false
+  /** @type {{value: string, source: string, path: string} | {problem: string, path: string} | undefined} */
+  let localState
   /** @type {number | undefined} */
   let retentionDays
   for (let index = 0; index < argv.length; index += 1) {
@@ -2193,18 +2528,31 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, h
     if (flag === '--all') all = true
     else if (flag === '--caches') cachesOnly = true
     else if (flag === '--root') root = next()
-    else if (flag === '--state-base') base = next()
-    else if (flag === '--patch-retention-days') retentionDays = numberFrom(next(), undefined)
+    else if (flag === '--state-base') {
+      base = next()
+      baseFromFlag = true
+    } else if (flag === '--patch-retention-days') retentionDays = numberFrom(next(), undefined)
     else if (flag === '--help' || flag === '-h') {
       emit(CLEAN_USAGE)
       return 0
     } else throw new Error(`unknown argument "${flag}"`)
   }
+  if (!baseFromFlag) localState = localStateBase(root, platform)
+  if (localState?.value !== undefined) base = localState.value
   const config = loadConfig({ env })
   // The base `clean` sweeps is the base the server would create: `~` expanded, and a
   // relative path refused, because a relative base resolves against the service root and
   // would make `clean` work inside the caller's repository instead of under the state base.
-  base = requireAbsoluteStateBase(base, home)
+  try {
+    base = requireAbsoluteStateBase(base, home)
+  } catch (error) {
+    // Carry the origin, so a bad local value is reported as that file's, like the server.
+    if (localState?.value !== undefined && error !== null && typeof error === 'object') {
+      if (!('stateBaseSource' in error)) error.stateBaseSource = localState.source
+      if (!('stateBaseValue' in error)) error.stateBaseValue = localState.value
+    }
+    throw error
+  }
   const dataDir = textFrom(env.FLASH_DATA_DIR)
   const report = cleanLayout({
     ...(base === undefined ? {} : { baseDir: base }),
@@ -2220,7 +2568,15 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, h
     ...(now === undefined ? {} : { now }),
     log: (message) => emit(`[flash-mcp clean] ${message}\n`),
   })
-  emit(`flash-mcp state: ${report.baseDir}\n`)
+  // A base `clean` takes from the local settings file is named with its path, so a user
+  // editing FLASH_STATE_BASE knows which file to change instead.
+  const localBase = localState?.value === undefined ? undefined : localState
+  const localFile = localBase === undefined ? undefined : localBase.path
+  emit(
+    `flash-mcp state: ${report.baseDir}` +
+      (localBase === undefined ? '' : ` (from ${localBase.source} at ${localFile})`) +
+      '\n',
+  )
   emit(`flash-mcp patches: ${report.patchDir}\n`)
   if (report.legacyPatchDir !== undefined) emit(`flash-mcp legacy patches: ${report.legacyPatchDir}\n`)
   for (const entry of report.stats) {
@@ -2229,6 +2585,7 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, h
       `${entry.digest}${entry.own ? ' (this root)' : ''}  live pids: ${pids} | ` +
         `slot trees: ${String(entry.slotTrees)} (${formatMb(entry.slotBytes)}) | ` +
         `patches: ${String(entry.patches)} (${formatMb(entry.patchBytes)}) | ` +
+        `reports: ${String(entry.reports)} (${formatMb(entry.reportBytes)}) | ` +
         `stored caches: ${String(entry.caches)} (${formatMb(entry.cacheBytes)})\n`,
     )
   }
@@ -2239,6 +2596,9 @@ export async function runClean(argv = [], { env = process.env, write, baseDir, h
   }
   emit(
     `removed: ${String(actions.deadOwnersRemoved)} dead owner(s), ${String(actions.patchesPruned)} expired patch(es), ` +
+      // Reports age out on the same window and by the same command; a summary that left them
+      // out named a smaller removal than actually happened, as it once did for caches.
+      `${String(actions.reportsPruned)} expired report(s), ` +
       `${String(actions.emptyDigestsRemoved)} empty digest(s)` +
       (all ? `, ${String(actions.foreignTreesRemoved)} foreign tree(s)` : '') +
       // The trash a crash left between the rename and the delete is disk `clean` reclaimed
@@ -2278,6 +2638,32 @@ function startupLogPath(argv, env) {
 }
 
 /**
+ * Append one `[flash-mcp]` line to the configured log file, falling back to `flash.log` in the
+ * data directory when the configured one cannot be written.
+ *
+ * @param {string} message - the line, without the timestamp or prefix.
+ * @param {object} options - what the process was started with.
+ * @param {string[]} options.argv - arguments after the command name.
+ * @param {Record<string, string | undefined>} [options.env] - environment to read.
+ * @returns {string} the log file written, or '' when none could be.
+ */
+function writeStartupLog(message, { argv, env = process.env }) {
+  const configured = startupLogPath(argv, env)
+  const fallback = join(durableBaseDir(env), 'flash.log')
+  for (const path of configured === fallback ? [configured] : [configured, fallback]) {
+    try {
+      mkdirSync(dirname(path), { recursive: true })
+      const where = path === configured ? '' : ` (written to ${path} because the configured log file could not be written)`
+      appendFileSync(path, `${new Date().toISOString()} [flash-mcp] ${message}${where}\n`)
+      return path
+    } catch {
+      // The next candidate, then stderr alone.
+    }
+  }
+  return ''
+}
+
+/**
  * Say why the server is exiting because the configured state base is unusable: to stderr and to
  * flash.log, naming the setting, its value and the platform.
  *
@@ -2293,24 +2679,38 @@ function startupLogPath(argv, env) {
  * @returns {string} the log file the reason was written to, or '' when none could be written.
  */
 export function reportStateBaseRefusal(error, { argv, env = process.env, platform = process.platform }) {
-  const value = configuredStateBase(argv, env)
+  // A value from the local settings file names that file, because clearing the plugin
+  // setting would not fix it. Everything else keeps the wording the plugin setting had.
+  const fromLocalFile =
+    typeof error?.stateBaseSource === 'string' && error.stateBaseSource.startsWith(LOCAL_SETTINGS_FILE)
+  const value = fromLocalFile ? error.stateBaseValue : configuredStateBase(argv, env)
+  const shown = JSON.stringify(value === undefined ? '' : value)
+  const message = fromLocalFile
+    ? `cannot start: ${error.stateBaseSource} sets "stateBase" to ${shown}, which cannot be used on ${platform} ` +
+      `(${describeError(error)}); clear it or give an absolute path for this platform`
+    : `cannot start: the plugin setting "state_base" (FLASH_STATE_BASE) is ${shown}, which cannot be used on ${platform} ` +
+      `(${describeError(error)}); clear the setting or give an absolute path for this platform`
+  const written = writeStartupLog(message, { argv, env })
+  process.stderr.write(`[flash-mcp] ${message}${written === '' ? '' : `; logged to ${written}`}\n`)
+  return written
+}
+
+/**
+ * Say that `.flash-agents.local.json` was ignored, because a file the operator edited and a
+ * synced plugin setting otherwise decided the state base without a word: one line to stderr and
+ * to flash.log. The value is still ignored; this only makes the reason visible.
+ *
+ * @param {{path: string, message: string}} problem - the file and why it was not used.
+ * @param {object} options - what the process was started with.
+ * @param {string[]} options.argv - arguments after the command name.
+ * @param {Record<string, string | undefined>} [options.env] - environment to read.
+ * @returns {string} the log file the reason was written to, or '' when none could be written.
+ */
+function reportLocalSettingsProblem(problem, { argv, env = process.env }) {
   const message =
-    `cannot start: the plugin setting "state_base" (FLASH_STATE_BASE) is ${JSON.stringify(value ?? '')}, which cannot be used on ${platform} ` +
-    `(${describeError(error)}); clear the setting or give an absolute path for this platform`
-  const configured = startupLogPath(argv, env)
-  const fallback = join(durableBaseDir(env), 'flash.log')
-  let written = ''
-  for (const path of configured === fallback ? [configured] : [configured, fallback]) {
-    try {
-      mkdirSync(dirname(path), { recursive: true })
-      const where = path === configured ? '' : ` (written to ${path} because the configured log file could not be written)`
-      appendFileSync(path, `${new Date().toISOString()} [flash-mcp] ${message}${where}\n`)
-      written = path
-      break
-    } catch {
-      // The next candidate, then stderr alone.
-    }
-  }
+    `the local settings file ${problem.path} was ignored (${problem.message}); ` +
+    'its "stateBase" setting does not apply'
+  const written = writeStartupLog(message, { argv, env })
   process.stderr.write(`[flash-mcp] ${message}${written === '' ? '' : `; logged to ${written}`}\n`)
   return written
 }
@@ -2347,6 +2747,11 @@ async function main() {
   if (options.help) {
     process.stdout.write(usage())
     return
+  }
+  // A local settings file the operator edited but the server could not use is named once,
+  // before the service starts; the plugin setting it loses to is otherwise invisible.
+  if (options.localSettingsProblem !== undefined) {
+    reportLocalSettingsProblem(options.localSettingsProblem, { argv })
   }
   options.root = resolve(options.root)
   const { done } = startServer(options)

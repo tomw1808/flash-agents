@@ -176,28 +176,47 @@ it), `flash_cancel` stops it. `flash_status` lists running jobs first, then the 
 ended, and for a running one says what its workers are doing: `current` holds each open tool call
 (`tool`, `command`, `since`, `runningMs`, as of the last heartbeat) and `warnings` names a command
 that failed three or more times in the call. A worker waiting on a backgrounded command shows that
-command instead, with `background: <job id>` and the time since the shell call that started it; a
-background command that ends non-zero counts toward `warnings` like a foreground one. The warning
-names the real command after a prefix such as `nice -n 19` or `timeout 600`, groups spellings of one
-command (`cargo test 2>&1 | tail -50` and `cargo test`), quotes the last output line, says when a
-later run passed, and reads an exit code above 128 as a signal (`exit 137 = killed by signal 9`). When
-the brief asks for tests that fail before a fix, those failures are an `info` line, not a warning.
+command instead, with `background: <job id>` and the time since the shell call that started it;
+every other running background job is listed too, whether or not anyone waits on it. A background
+command that ends non-zero counts toward `warnings` like a foreground one. In the listing an ended
+job's `lastProgress` keeps only its first line, at most 160 characters; a running job, and a job
+asked for by id, keeps the line whole. The warning names the real command after a prefix such as
+`nice -n 19` or `timeout 600`, groups spellings of one command (`cargo test 2>&1 | tail -50` and
+`cargo test`), quotes the last output line, says when a later run passed, and reads an exit code
+above 128 as a signal (`exit 137 = killed by signal 9`). For `bash -c '<script>'`, `sh -c` and
+`pwsh -Command`, it names the script's first 60 characters, so two scripts are told apart. When the
+brief asks for tests that fail before a fix, those failures are an `info` line, not a warning; only
+a shell command can be such a check, so a failed `edit` or `write` keeps the ordinary warning.
+
+Since 0.1.12 `flash_result` also takes `jobIds` (2 to 16 ids, not with `jobId`): with `waitSeconds`
+it returns as soon as any one of them ends, with that job's result and `pending` naming the rest;
+without it, it returns the first in the list that has already ended, or lists them all as `pending`. An id whose
+job the server no longer holds is answered from its stored report; when at least one id is known,
+an id with neither a job nor a report is named under `unknown`.
 
 The service also watches each running worker's process tree from outside the sandbox (once a minute,
-only while a tool call is open). `current` names the longest-running child of an open command
-(`child: { command, runningMs, cpuSeconds }`, such as the `cmake` under a `cargo check`). A command
-whose whole tree used under a second of CPU for five minutes gets a warning that it may be waiting
-forever. A shell call whose script ended while processes it started (a test server, a browser) still
-hold it open gets one too. Nothing is stopped for you: `flash_cancel` keeps the change so far.
+for every running call, with or without a progress token). `current` names a `child` of an open
+command (`child: { command, runningMs, cpuSeconds }`, such as the `cmake` under a `cargo check`):
+the deepest idle process of the command's own tree, or its longest-running one while the command is
+busy. Sandbox processes such as `bwrap`, `dsh` and the harness runner are never the child, and their
+CPU never counts. A command whose own tree used under a second of CPU for five minutes gets a
+warning that it may be waiting forever — background commands included, as `<command> (background
+job <job id>) sat with no CPU for 5 min` — and a warning raised during the call stays in the result
+after the command ends. A call whose worker ends while one of its background commands is still
+running says so: `the worker ended while its background command <job id> (<command>) was still
+running; the sandbox stopped it, so its outcome is unknown`. The held-open-shell warning of 0.1.11
+is gone: the sandbox ends a call's children, so it could not arise. Nothing is stopped for you:
+`flash_cancel` keeps the change so far.
 
 A job is labelled with `label` when you pass one (up to 120 characters), else with the brief's first
 line, so jobs whose briefs start with the same shared rules still differ in the listing. A
 call still waiting for a free copy says where it stands and what it waits behind — `queued 1m10s: 2nd
 in line for a free tree (first come, first served); trees held by job-ab12cd34 (fix the parser,
-31m0s) and a foreground call (review it, 2m0s)` — and `flash_status` carries the same as
-`queue: { position, of, holders }`. A writing call sent without `background: true` reads
-`queued in the foreground …`: it holds your turn while it waits, and its result carries the same
-warning. A background call checks its
+31m0s, idle 6m0s) and a foreground call (review it, 2m0s)` — and `flash_status` carries the same as
+`queue: { position, of, holders }`. A holder's `idleMs` is its time since the last heartbeat, and
+a holder active within the last minute carries none. A writing call sent without
+`background: true` reads `queued in the foreground …`: it holds your turn while it waits, and its
+result carries the same warning. A background call checks its
 arguments before it answers, so a bad `task`/`taskFile` pair, an unreadable brief, an unknown `mode`
 or a `source` a read-only call cannot honour fails the call at once, as a foreground one does.
 
@@ -221,7 +240,8 @@ patch: verify it, and continue with `basePatch`. `flash_status` shows a job's st
 status (`ok`, `partial`, `error`), so the two never disagree.
 
 A long brief can be written to a file and sent with `taskFile` instead of `task` — exactly as
-written, once. When a worker stopped partway, `basePatch: <its patchId>` starts the next call
+written, once. `taskFile` is the whole task: passing `task` beside it is refused. When a worker
+stopped partway, `basePatch: <its patchId>` starts the next call
 from that work: the patch is applied to the new copy first (merged if your tree moved on), and
 the new call's patch holds both, so you apply only the last one. The exception is a base patch you
 already applied: the copy is taken from your tree, so it already holds that change. It is not
@@ -240,11 +260,21 @@ returns the task. A patch salvaged after a crash still names its task.
 Every finished job's whole report is also stored on disk by job id, read-only and `discard` jobs
 included, and the result names it as `reportPath`; a result cut at 24,000 characters points there.
 `flash_result` for a job the server no longer holds (after a restart) returns that stored report with
-its status, and `flash_patch` returns the whole report rather than the excerpt. `flash_cancel` on a
-writing job stores the copy's change as a patch before the copy goes and returns its `patchId`, or
-says `stored: false` when there was none. `flash_patch` and a writing result list `overlaps`: other
-unapplied patches of the same root that change any of the same files, such as two jobs that both took
-the next schema number.
+its status, and `flash_patch` returns the whole report rather than the excerpt. Since 0.1.12 a
+server without copies (`--isolate none`) stores its reports under the state base, in
+`<state base>/<root digest>/reports` (the digest is 12 hex characters of a hash of the root
+path), so `reportPath` and `flash_result` after a restart work there too. A report is written to a
+temporary file and renamed into place, so a reader never sees a half-written one. Reports use the
+patch window: a server with a copy pool prunes the expired ones at start-up, and `clean` removes
+them. `flash_cancel` on a writing job stores the copy's change as a patch before the copy goes and
+returns its `patchId`, or says `stored: false` when there was none. `flash_patch` and a writing
+result list `overlaps`: other unapplied patches of the same root that change any of the same
+files, such as two jobs that both took the next schema number.
+
+A writing call whose worker changed nothing stores no patch: `change.available` stays true,
+`filesChanged` is empty, there is no `patchId` or `patchPath`, and `change.note` says `the worker
+changed nothing, so no patch was stored`. `apply: "auto"` then applies nothing and adds no
+`applied` entry, which is not an error.
 
 A patch can also be applied a file at a time. `flash_apply` takes `files`, naming entries as
 `change.filesChanged` spells them (a rename by its old or by its new path), and records each applied
@@ -253,6 +283,13 @@ stored patch stays whole, and `flash_patch` reports `appliedFiles` on its first 
 whole patch after a partial one is refused with the count — `3 of 7 files were already applied …;
 pass files with the rest, or force: true to apply the whole patch again` — and `force: true` lifts
 it.
+
+Since 0.1.12 `flash_patch` and `flash_apply` take `excludeBase: true` for a patch that continued
+from another (`basePatch`): it reads, or lands, only the work this call added, not the base
+patch's change as well. A patch that added nothing of its own comes back empty with the note `this patch holds no
+work beyond its base patch <id>; nothing to apply`. A second `excludeBase` apply is refused like a
+second whole apply, and `force: true` lifts it. Both refuse when the patch recorded no base patch,
+or that base patch is no longer stored.
 
 `flash_apply` and `flash_patch` report `drift`: `commitsBehind` (how many commits your `HEAD` has
 since the patch's base; `null` when that cannot be answered) and `filesChangedSince` (the patch's
@@ -280,10 +317,15 @@ every file it already wrote or deleted. A merged file keeps the line endings it 
 0.1.10 they failed the apply with `git cat-file --filters … failed`.
 
 Every result reports the tokens the call used (`usage`), and lists any uncommitted files the copy
-started with (`isolation.uncommittedAtStart`). If another session has uncommitted work in the same
-tree, `source: "head"` starts the copy from the last commit instead; the result then warns how many
-uncommitted files of your tree it left out, since the patch may not apply on top of them. `head` is a writing call's
-choice only: a read-only call runs in your tree rather than in a copy, and refuses it.
+started with (`isolation.uncommittedAtStart`). Since 0.1.12 it also carries `timing`, the call's
+phases in milliseconds: `queuedMs` for a free tree, `prepareMs` for the copy, `setupMs` for the
+`slotSetup` steps (when any ran), `workerMs` for the worker's runs, `collectMs` for collecting the
+patch (when there was a copy) and `totalMs`. `queuedMs` is 0 when there was no wait, and a phase
+that did not run is absent. `flash_status` by id reports it for an ended job, and it survives a
+restart with the stored report. If another session has uncommitted work in the same tree, `source: "head"`
+starts the copy from the last commit instead; the result then warns how many uncommitted files
+of your tree it left out, since the patch may not apply on top of them. `head` is a writing
+call's choice only: a read-only call runs in your tree rather than in a copy, and refuses it.
 
 Project facts every worker needs — layout, check commands, style rules — go in an `AGENTS.md` (or
 `CLAUDE.md`) in your repository. The harness loads it into every worker, from the repository root
@@ -320,8 +362,8 @@ Both `flash_task` and `flash_batch` take a `model` from that list: one task, or 
 run on a different allowed model, and the result's `route` reports the model that actually ran.
 Omit `model` for the default.
 
-The settings also cover how many copies may be in flight (each is a process, so this is a memory
-decision; default 2), where copies and patches live, and **Base folder for worker copies**
+The settings also cover how many copies may be in flight (up to 16, each a process, so this is a
+memory decision; default 2), where copies and patches live, and **Base folder for worker copies**
 (`state_base`; `FLASH_STATE_BASE` or `--state-base` for a manual install). That base moves the
 default copy layout only — a configured state directory replaces it — and it must be an absolute
 path, with a leading `~` expanded. It works on every platform. On Linux and macOS a short one
@@ -355,7 +397,8 @@ older release refuses a per-call choice until it is regenerated.
 
 Limits live in [`flash.config.json`](flash.config.json). The defaults: a call is stopped after
 **10 minutes without any activity** (stuck), or 3 hours in total (a ceiling for honest work);
-either way, the change so far is salvaged as a patch.
+either way, the change so far is salvaged as a patch. A worker runtime that no call is using is
+shut down after the same 10 minutes, read-only runtimes included.
 
 ### Per-repository settings
 
@@ -376,6 +419,12 @@ section, the local file, its platform section, then the server's own options
 `slotEnv` merges by variable name, case-insensitively on Windows, and a `null` in a later layer
 removes an earlier entry; the last `copyExcludeDefaults` wins. A local `slotSetup` is host code like
 any other, behind the same `--allow-slot-setup` gate.
+
+The local file may also set this machine's state base: `{ "stateBase": "/data/fm" }`, or a
+`stateBase` in its `platform.<os>` section. It wins over the plugin setting and `FLASH_STATE_BASE`,
+because the plugin's setting is synced between machines, but not over an explicit `--state-base`.
+A value that is not a non-empty path is refused at start, naming the file. `doctor`'s `state-base`
+row says which layer the value came from, and `clean` reads the same local file under its `--root`.
 
 The server logs the layers it applied
 (`settings: .flash-agents.json, .flash-agents.json platform.win32, .flash-agents.local.json
@@ -425,12 +474,13 @@ checkout gets neither, because no `platform.linux` section names them.
   folders (and `slotSetup`'s `keep` paths) move to the replacement copy instead of being deleted, so
   the retry does not build from cold; each `slotSetup` step runs once more there. A result with
   `isolation.buildCacheEmpty: true` started with an empty cache, which explains a slow build.
-  Since 0.1.11 the `cache:` folders also outlive the server: when it shuts down, or when the next
-  one finds it dead, they go into a store for the repository (one per slot, kept 14 days), and a
-  new server's slots take them from there (`isolation.buildCacheFrom: "store"`). `flash-agents clean`
-  removes them with the rest, `clean --caches` removes only them, and `doctor` lists what each slot,
-  its cache and the store take on disk. A call warns when the volume holding the copies has under
-  10 % or under 5 GiB free.
+  Since 0.1.11 the `cache:` folders also outlive the server: they can go into a store for the
+  repository (one per slot, kept 14 days), and a slot with none takes one from there
+  (`isolation.buildCacheFrom: "store"`). Since 0.1.12 a slot's cache normally stays in its stable
+  directory instead (see below), so the store serves the retired trees and a slot that is new.
+  `flash-agents clean` removes the stored caches with the rest, `clean --caches` removes only them, and
+  `doctor` lists what each slot, its cache and the store take on disk. A call warns when the volume
+  holding the copies has under 10 % or under 5 GiB free.
   `port:<base>` gives each slot its own port base (`base + slot × 10`; `port:41000/100` for a
   stride of 100), for test servers that would otherwise share a fixed port. `value:<text>` sets a
   plain value in every slot, for a setting the whole project shares rather than one brief:
@@ -472,6 +522,26 @@ checkout gets neither, because no `platform.linux` section names them.
 | uv | `~/.cache/uv`, its tools and Pythons | `UV_CACHE_DIR: "cache:uv"`, `UV_TOOL_DIR: "cache:uv-tools"`, `UV_PYTHON_INSTALL_DIR: "cache:uv-python"` |
 
 `FLASH_COPY_EXCLUDE` (comma-separated) or `--copy-exclude` add to `copyExclude` for one server.
+
+Since 0.1.12 a writing call's copy lives at the same path across restarts:
+`<state base>/<root digest>/slots/<n>`, with its `.flash-cache` inside. Build tools write absolute
+paths into what they build (SwiftPM's `.build`, CMake's caches, cargo's fingerprints for path
+dependencies), so a slot that moved would rebuild from cold; now the next server on that root uses
+the same directory. A slot is claimed by a lock file, `<n>.lock`, written complete in one step, that
+names the server's pid and command line. A lock is taken over when its pid is gone, or when the pid
+now runs a different command (the system reused it); no clock is involved, so a time-zone or
+daylight-saving change cannot make a live lock look dead. Only the holder of a slot's lock moves,
+empties or deletes that slot, and a server's own sweep never deletes a stable `slots/<n>`. Two
+servers on one root get different numbers:
+the second starts at the first number no live server holds. A server that shuts down removes its
+lock, empties the copy and leaves the directory and its cache; a server that crashes leaves its
+copy behind, and the next server on that number moves the tree aside to
+`slots/<n>.dead-<pid>-<ms>`, keeps the cache in the slot, and a sweep stores the uncommitted work
+as a patch before removing it. A configured state directory (`--state-dir`) keeps the older
+per-process layout.
+
+On Linux a copy tries a reflink clone first and falls back to a byte copy, with one log line naming
+the flag the filesystem did not support; macOS and Windows copy plainly from the first file.
 
 To watch workers live, set a log file and `tail -f` it — see
 [Observing a run](docs/design.md#observing-a-run).
@@ -521,7 +591,15 @@ To watch workers live, set a log file and `tail -f` it — see
 - **The guard follows the shell, and an update no longer leaves it behind.** The wall now places
   every path in the directory its own command runs in, so `cd .. && echo x > ../elsewhere` is refused
   and `cd server && … > ../log` is allowed; a deletion after a `cd` it cannot follow is refused
-  rather than guessed at. And a plugin update no longer leaves the old guard and worker profile behind silently: the
+  rather than guessed at. Since 0.1.12 it reads PowerShell too: writes through `Set-Content`,
+  `Add-Content`, `Out-File`, `New-Item`, `Copy-Item`, `Move-Item`, `Rename-Item`, `Remove-Item` and
+  their aliases, through redirects, and through `[System.IO.File]::WriteAllText(…)` calls with a
+  literal path. A shell started as a program is read with that shell's rules — `& "C:\Program
+  Files\Git\bin\bash.exe" -c "…"`, `sh -c`, `pwsh -Command`, `powershell -c`, `cmd /c` — whatever
+  its path or `.exe` spelling, and the refusal says where the nested line was found
+  (`inside bash.exe -c`). `.git` matches in any case, a path with one leading slash is the root of
+  the current drive, and a PowerShell deletion reports the same code as `rm`. A plugin update no
+  longer leaves the old guard and worker profile behind silently: the
   server names the drift in its log and in every task result, and `node install.mjs` in the plugin folder
   is the fix. A runtime that boots after that install re-reads the profile's stamp and drops the
   warning by itself; an idle runtime booted before it is replaced at its next use, and a busy one
@@ -576,6 +654,12 @@ MCP over stdio, so any MCP client can use it, not only Claude Code.
 npm test          # 3 suites, no LLM, no network, about 10 seconds
 npm run verify    # live end-to-end through the official MCP client; needs Ollama
 ```
+
+`npm run verify` must run from a full git clone, not from the installed plugin folder and not from
+a git worktree (its copy would share the original's objects and refs), because its change
+checks read the snapshot's git state. It also needs the official MCP client SDK, which is
+not a dependency of this package: install it with `npm i @modelcontextprotocol/sdk@1` in a folder
+of its own and set `MCP_SDK_DIR` to that folder's `node_modules/@modelcontextprotocol/sdk`.
 
 No runtime dependencies. [docs/design.md](docs/design.md) has the full contract, the safety
 model, every option, what was verified live, and why things are the way they are.

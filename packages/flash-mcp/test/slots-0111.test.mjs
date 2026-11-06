@@ -29,7 +29,7 @@ import { test } from 'node:test'
 
 import { DISK_CHECK_ID, runChecks } from '../lib/doctor.js'
 import { runClean } from '../lib/index.js'
-import { defaultStateDir, measureDisk, rootDigest, WorkspaceIsolation } from '../lib/isolation.js'
+import { defaultStateDir, measureDisk, rootDigest, stableSlotDirectory, WorkspaceIsolation } from '../lib/isolation.js'
 import { FlashTaskService } from '../lib/service.js'
 
 /** Stored patches go to the durable data directory by default; keep them out of the real one. */
@@ -109,7 +109,7 @@ function plantDeadSlot(baseDir, repo, { pid = DEAD_PID, instance = 'dead0001', s
   return slotDir
 }
 
-test('a build cache survives the server and the next server on the root claims it', async () => {
+test('a build cache stays in its stable slot, so the next server on the root finds it there', async () => {
   const repo = makeRepo()
   const base = tempDir('flash-slots0111-base-')
   const first = makePool(repo, base)
@@ -119,21 +119,26 @@ test('a build cache survives the server and the next server on the root claims i
     assert.equal(slot.buildCacheEmpty, true, 'the first server on a fresh root starts cold')
     assert.equal(slot.buildCacheFrom, undefined)
     const target = writeBuild(first, slot, 'one')
+    const slotDir = slot.dir
     first.release(slot)
     first.close()
-    assert.deepEqual(storedNumbers(base, repo), ['0'], 'the cache went into the store at shutdown')
-    assert.equal(existsSync(target), false, 'and left the slot tree')
+    // The slot's directory is the path the next server of this root claims, so its cache is
+    // already where that server looks and is not moved out (see `stableSlotDirectory`).
+    assert.equal(slotDir, stableSlotDirectory(repo, { baseDir: base, id: 0 }))
+    assert.deepEqual(storedNumbers(base, repo), [], 'a cache in place in a stable slot is not moved into the store')
+    assert.equal(readFileSync(join(target, 'debug', 'deps', 'libapp.rlib'), 'utf8'), 'built one\n', 'the cache stayed in the slot')
 
     const second = makePool(repo, base, { log: (line) => logs.push(line) })
     try {
       const next = await startCall(second)
+      assert.equal(next.dir, slotDir, 'the next server claims the same slot path')
       assert.equal(next.buildCacheEmpty, false, 'the next server starts warm')
-      assert.equal(next.buildCacheFrom, 'store')
+      assert.equal(next.buildCacheFrom, undefined, 'its cache was in place, not taken from the store')
       const built = join(second.slotEnvFor(next).CARGO_TARGET_DIR, 'debug', 'deps', 'libapp.rlib')
       assert.equal(readFileSync(built, 'utf8'), 'built one\n')
       assert.equal(lstatSync(join(second.slotEnvFor(next).CARGO_TARGET_DIR, 'debug', 'latest')).isSymbolicLink(), true, 'a link inside the cache arrives as a link')
-      assert.deepEqual(storedNumbers(base, repo), [], 'the claimed cache left the store')
-      assert.equal(logs.some((line) => /claimed stored build cache/.test(line)), true)
+      assert.deepEqual(storedNumbers(base, repo), [], 'the store was not needed')
+      assert.equal(logs.some((line) => /claimed stored build cache/.test(line)), false)
     } finally {
       second.close()
     }

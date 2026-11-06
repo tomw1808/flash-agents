@@ -51,6 +51,7 @@
  */
 
 import { existsSync, realpathSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
 
 /** Cordis plugin name. */
@@ -92,8 +93,20 @@ const PATH_ARGUMENT = /^(file_?path|path|target|target_?path|paths|files?|filena
 
 /** `.env` and its variants, but not `.envrc` (a state file, not a secret). */
 const ENV_FILE = /^\.env(\..+)?$/
-/** A `~`, `$HOME`, or `${HOME}` prefix. */
-const HOME_PREFIX = /^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/
+/**
+ * A `~`, `$HOME`, or `${HOME}` prefix a POSIX shell expands. Only a slash (or the
+ * end of the word) may follow it: on a POSIX shell `~\f` is the literal name `~\f`
+ * in the workspace, not the home folder, because a backslash is not a separator.
+ */
+const POSIX_HOME_PREFIX = /^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/
+/** A `~`, `$HOME`, or `${HOME}` prefix. A backslash counts: PowerShell spells the rest of a home path that way. */
+const HOME_PREFIX = /^(?:~|\$HOME|\$\{HOME\})(?=[\\/]|$)/
+/** The home spellings PowerShell adds. Its variable names are case-insensitive, unlike bash's. */
+const POWERSHELL_HOME_PREFIX = /^(?:\$env:USERPROFILE|\$\{env:USERPROFILE\})(?=[\\/]|$)/i
+/** A drive-absolute Windows path: `C:\…` or `C:/…`. PowerShell reads both separators. */
+const WINDOWS_DRIVE_PATH = /^[A-Za-z]:[\\/]/
+/** A UNC path: `\\server\share`. */
+const WINDOWS_UNC_PATH = /^\\\\[^\\/]+[\\/][^\\/]+/
 /** Shell control operators that end one simple command. */
 
 const DEFAULT_SETTINGS = Object.freeze({
@@ -209,14 +222,97 @@ function basenameOf(value) {
 }
 
 /**
- * Expand a `~` / `$HOME` prefix using the process home directory.
+ * Expand a home prefix using the process home directory.
+ *
+ * The spellings a POSIX shell understands are expanded always. The PowerShell
+ * spellings — `$env:USERPROFILE`, and a `~\f` whose backslash really is a separator —
+ * are expanded only when the command line is a PowerShell (or `cmd`) one, or when the
+ * path itself is Windows-spelled. Expanding them for a POSIX `bash` line made
+ * `echo x > $env:USERPROFILE\notes.txt` (which bash writes as a file literally named
+ * that, inside the workspace) look like a write into the home folder.
+ *
  * @param {string} value - a path that may be home-relative.
  * @param {string} home - the home directory, or an empty string when unknown.
+ * @param {boolean} [powershell] - whether the caller reads the path the way PowerShell does.
  * @returns {string} the expanded path.
  */
-function expandHome(value, home) {
-  if (home.length === 0 || !HOME_PREFIX.test(value)) return value
-  return value.replace(HOME_PREFIX, home)
+function expandHome(value, home, powershell = false) {
+  if (home.length === 0) return value
+  if (powershell) {
+    if (HOME_PREFIX.test(value)) return value.replace(HOME_PREFIX, home)
+    if (POWERSHELL_HOME_PREFIX.test(value)) return value.replace(POWERSHELL_HOME_PREFIX, home)
+    return value
+  }
+  if (POSIX_HOME_PREFIX.test(value)) return value.replace(POSIX_HOME_PREFIX, home)
+  return value
+}
+
+/**
+ * Whether a path is spelled the way Windows spells one.
+ * @param {string} value - a path.
+ * @returns {boolean} true for a drive-absolute or UNC path.
+ */
+function isWindowsPath(value) {
+  return typeof value === 'string' && (WINDOWS_DRIVE_PATH.test(value) || WINDOWS_UNC_PATH.test(value))
+}
+
+/**
+ * Normalise a Windows path: both separators, `.`/`..`, and a root that `..` cannot pass.
+ *
+ * The guard has to read PowerShell command lines on every host, and `node:path` on a
+ * POSIX host neither treats `C:\…` as absolute nor collapses `..` in it. Resolving the
+ * path the way PowerShell would keeps a `C:\Users\…` write fenced even when the suite
+ * that exercises it runs on Linux, and keeps `src\a.txt` inside a Windows workspace
+ * instead of turning it into a path below the test process.
+ *
+ * Case is preserved here; the comparison folds it, because PowerShell's filesystem is
+ * case-insensitive.
+ *
+ * @param {string} value - a drive-absolute or UNC path, or a path joined with one.
+ * @returns {string} the normalised path, with no trailing separator unless it is a root.
+ */
+function normalizeWindowsPath(value) {
+  const unified = value.replace(/\//g, '\\')
+  const unc = unified.startsWith('\\\\')
+  const parts = []
+  // `C:\` and `\\server\share` are roots a `..` cannot climb above.
+  const rootDepth = unc ? 2 : 1
+  for (const segment of (unc ? unified.replace(/^\\+/, '') : unified).split('\\')) {
+    if (segment === '' || segment === '.') continue
+    if (segment === '..') {
+      if (parts.length > rootDepth) parts.pop()
+      continue
+    }
+    parts.push(segment)
+  }
+  if (parts.length === 0) return unc ? '\\\\' : unified.slice(0, 2) + '\\'
+  if (unc) return `\\\\${parts.join('\\')}`
+  const [drive, ...rest] = parts
+  return rest.length === 0 ? `${drive}\\` : `${drive}\\${rest.join('\\')}`
+}
+
+/**
+ * Normalise a POSIX-spelled absolute path without the host's `node:path` flavour.
+ *
+ * A `bash.exe -c` payload run from a Windows cwd names POSIX paths, and `path.normalize`
+ * on a Windows host would turn `/dev/null` into `\dev\null` — losing the device
+ * allowance on that host and keeping it on this one. The guard must give the same
+ * verdict wherever it runs, so the POSIX spelling is collapsed here.
+ *
+ * @param {string} value - a path that begins with `/`.
+ * @returns {string} the normalised path, with a root `/` when nothing is left.
+ */
+function normalizePosixPath(value) {
+  const parts = []
+  for (const segment of value.split('/')) {
+    if (segment === '' || segment === '.') continue
+    if (segment === '..') {
+      if (parts.length > 0) parts.pop()
+      continue
+    }
+    parts.push(segment)
+  }
+  return parts.length === 0 ? '/' : `/${parts.join('/')}`
 }
 
 /**
@@ -239,18 +335,67 @@ function stripTrailingSeparators(value) {
 }
 
 /**
- * Resolve a candidate path against a working directory when one is known.
+ * Resolve a PowerShell path that begins with one separator against the cwd's root.
+ *
+ * In PowerShell `\Users\someone\f.txt` (and `/Users/someone/f.txt`) is not relative to
+ * the working directory: it names the root of the drive the cwd is on, so from
+ * `C:\work\repo` it is `C:\Users\someone\f.txt`. A UNC path begins with two
+ * separators and a drive-relative `C:foo` names neither, so both are left to the
+ * existing rules.
+ *
+ * A cwd under a UNC share roots the path at the share, not at `\\`: from
+ * `\\server\share\repo`, `\Users\x` is `\\server\share\Users\x`, because `\\` alone
+ * names no server.
+ *
+ * Only a PowerShell (or `cmd`) line is read this way. A `bash.exe -c` payload on the
+ * same cwd names POSIX paths, where a leading `/` is the shell's own root and
+ * `/dev/null` is the device it says it is.
+ *
+ * @param {string} value - the expanded path token.
+ * @param {string} cwd - the directory the command runs in.
+ * @returns {string | undefined} the rooted path, or undefined when the spelling is not
+ *   a single leading separator below a Windows cwd.
+ */
+function driveRootedPath(value, cwd) {
+  if (!isWindowsPath(cwd) || value.length === 0) return undefined
+  if (value[0] !== '\\' && value[0] !== '/') return undefined
+  if (value.length > 1 && (value[1] === '\\' || value[1] === '/')) return undefined
+  const share = WINDOWS_UNC_PATH.exec(cwd)
+  const root = share === null ? cwd.slice(0, 2) : share[0]
+  return normalizeWindowsPath(`${root}${value.replace(/^\//, '\\')}`)
+}
+
+/**
+ * Resolve a candidate path against a working directory when one is known, reading
+ * Windows spellings the way PowerShell does.
  * A relative path with no known cwd stays relative; the segment and basename
  * rules below still apply to it, which is why the result is usable either way.
  * @param {string} value - candidate path.
  * @param {string} cwd - the caller's working directory, or an empty string.
  * @param {string} home - the home directory, or an empty string.
+ * @param {boolean} [powershell] - whether the path is read the way PowerShell does; a
+ *   Windows path, or a cwd on Windows, is enough to decide that on its own.
  * @returns {string} an absolute path when it could be resolved, else the expanded value.
  */
-function resolveTarget(value, cwd, home) {
-  const expanded = expandHome(value, home)
-  if (isAbsolute(expanded)) return stripTrailingSeparators(normalize(expanded))
+function resolveTarget(value, cwd, home, powershell = false) {
+  const windowsFlavour = powershell === true || isWindowsPath(value) || isWindowsPath(cwd)
+  const expanded = expandHome(value, home, windowsFlavour)
+  if (isWindowsPath(expanded)) return stripTrailingSeparators(normalizeWindowsPath(expanded))
+  // A single leading separator is a root spelling only in PowerShell and `cmd`.
+  if (powershell === true) {
+    const rooted = driveRootedPath(expanded, cwd)
+    if (rooted !== undefined) return stripTrailingSeparators(rooted)
+  }
+  if (isAbsolute(expanded)) {
+    // A POSIX-absolute path below a Windows cwd is a `bash.exe -c` payload: collapse it
+    // with POSIX rules so the same command is the same path on every host.
+    if (powershell !== true && isWindowsPath(cwd) && expanded.startsWith('/')) {
+      return stripTrailingSeparators(normalizePosixPath(expanded))
+    }
+    return stripTrailingSeparators(normalize(expanded))
+  }
   if (cwd.length === 0) return stripTrailingSeparators(expanded)
+  if (isWindowsPath(cwd)) return stripTrailingSeparators(normalizeWindowsPath(`${cwd}\\${expanded}`))
   return stripTrailingSeparators(normalize(resolve(cwd, expanded)))
 }
 
@@ -322,6 +467,46 @@ function isAtOrUnder(child, parent) {
 }
 
 /**
+ * Whether `child` is `parent` itself or below it, folding case for Windows paths.
+ *
+ * PowerShell's filesystem is case-insensitive and accepts both separators, so
+ * `C:\Work\Repo\src\a.txt` is inside `c:\work\repo` while a plain `startsWith` on a
+ * POSIX host calls it outside. The extra branch only applies when both sides are
+ * spelled as Windows paths; a POSIX comparison is left exactly as it was.
+ *
+ * @param {string} child - candidate descendant.
+ * @param {string} parent - candidate ancestor.
+ * @returns {boolean} true when child is at or under parent.
+ */
+function isAtOrUnderPath(child, parent) {
+  if (isAtOrUnder(child, parent)) return true
+  if (!isWindowsPath(child) || !isWindowsPath(parent)) return false
+  const fold = (value) => normalizeWindowsPath(value).replace(/\\+$/, '').toLowerCase()
+  const beneath = fold(child)
+  const above = fold(parent)
+  return beneath === above || beneath.startsWith(above.endsWith('\\') ? above : `${above}\\`)
+}
+
+/**
+ * Whether two resolved paths name the same location, folding case for Windows paths.
+ *
+ * The sibling rule in `isOutsideRootCritical` compared parent directories with `===`,
+ * so `C:\Work\repo-other` was not a sibling of `C:\work\repo` on a POSIX host while it
+ * was on Windows. The fold is only applied when both sides are Windows-spelled; a
+ * POSIX comparison stays exact.
+ *
+ * @param {string} left - one resolved path.
+ * @param {string} right - another resolved path.
+ * @returns {boolean} true when both name the same location.
+ */
+function samePath(left, right) {
+  if (left === right) return true
+  if (!isWindowsPath(left) || !isWindowsPath(right)) return false
+  const fold = (value) => normalizeWindowsPath(value).replace(/\\+$/, '').toLowerCase()
+  return fold(left) === fold(right)
+}
+
+/**
  * Whether a resolved path is one of the home-relative credential paths.
  * @param {string} resolved - the resolved path.
  * @param {string} home - the home directory, or an empty string.
@@ -330,29 +515,40 @@ function isAtOrUnder(child, parent) {
  */
 function isHomeProtected(resolved, home, settings) {
   if (home.length === 0) return false
-  return settings.homeProtectedPaths.some((relative) => isAtOrUnder(resolved, join(home, relative)))
+  return settings.homeProtectedPaths.some((relative) => isAtOrUnderPath(resolved, join(home, relative)))
 }
 
 /**
  * Classify one path access. Secrets are protected against reading and writing;
  * state files are protected against writing only.
- * @param {object} input - `{path, cwd, home, settings, mutate}`.
+ * @param {object} input - `{path, cwd, home, settings, mutate, fence, powershell}`.
  * @returns {{reason: string, detail: string} | undefined} the verdict, or undefined to allow.
  */
 function classifyPathAccess(input) {
-  const { path: candidate, cwd = '', home = '', settings, mutate, fence = '' } = input
+  const { path: candidate, cwd = '', home = '', settings, mutate, fence = '', powershell = false } = input
   if (typeof candidate !== 'string' || candidate.length === 0) return undefined
-  const resolved = resolveTarget(candidate, cwd, home)
+  const resolved = resolveTarget(candidate, cwd, home, powershell === true)
   const base = basenameOf(resolved)
   // The shell expands a glob before the program ever sees it, so `.env*` and `.en?`
   // reach the same file as `.env` while reading as an ordinary pattern to a name
   // check.
   const unglobbed = base.replace(/[*?[\]]/g, '')
+  // PowerShell's filesystem folds case for every name, not only for path segments, so
+  // `.ENV` is the `.env` file and `.NPMRC` the one that holds the registry token. A
+  // POSIX shell keeps exact matching: `.ENV` there is an ordinary file.
+  const foldNames = powershell === true || isWindowsPath(resolved)
+  /** Whether a configured name list contains this file name, folding case when told to. */
+  const namesInclude = (list, name) =>
+    foldNames ? list.some((entry) => entry.toLowerCase() === name.toLowerCase()) : list.includes(name)
+  /** Whether the `.env` name is one of the templates rather than a secret. */
+  const envException = foldNames
+    ? settings.envFileExceptions.some((entry) => entry.toLowerCase() === unglobbed.toLowerCase())
+    : settings.envFileExceptions.includes(unglobbed)
 
-  if (settings.protectEnvFiles && ENV_FILE.test(unglobbed) && !settings.envFileExceptions.includes(unglobbed)) {
+  if (settings.protectEnvFiles && ENV_FILE.test(foldNames ? unglobbed.toLowerCase() : unglobbed) && !envException) {
     return { reason: REASON.SECRET, detail: `the .env family is secret (${base})` }
   }
-  if (settings.secretFileNames.includes(base) || settings.secretFileNames.includes(unglobbed)) {
+  if (namesInclude(settings.secretFileNames, base) || namesInclude(settings.secretFileNames, unglobbed)) {
     return { reason: REASON.SECRET, detail: `credential file (${base})` }
   }
   if (isHomeProtected(resolved, home, settings)) {
@@ -360,12 +556,18 @@ function classifyPathAccess(input) {
   }
   if (!mutate) return undefined
   const segments = segmentsOf(resolved)
+  // PowerShell's filesystem is case-insensitive, so `.GIT` is the same directory as
+  // `.git` and `Remove-Item -Force .GIT` removes the repository state. A POSIX shell
+  // keeps exact matching: `.GIT` there is an ordinary directory.
   for (const protectedSegment of settings.protectedSegments) {
-    if (segments.includes(protectedSegment)) {
+    const matched = foldNames
+      ? segments.some((segment) => segment.toLowerCase() === protectedSegment.toLowerCase())
+      : segments.includes(protectedSegment)
+    if (matched) {
       return { reason: REASON.STATE, detail: `${protectedSegment} holds repository state` }
     }
   }
-  if (settings.protectedFileNames.includes(base)) {
+  if (namesInclude(settings.protectedFileNames, base)) {
     return { reason: REASON.STATE, detail: `${base} configures the tooling` }
   }
   // The fence, kept last so the more specific diagnosis wins: a secret, a state file,
@@ -384,7 +586,7 @@ function classifyPathAccess(input) {
   if (settings.fenceMutations !== false && fence !== '' && !DEVICE_PATH.test(resolved)) {
     const fenceCanonical = canonicalPath(fence)
     const resolvedCanonical = canonicalPath(resolved)
-    if (!isAtOrUnder(resolvedCanonical, fenceCanonical)) {
+    if (!isAtOrUnderPath(resolvedCanonical, fenceCanonical)) {
       return { reason: REASON.OUTSIDE_WORKSPACE, detail: `mutates ${resolved}, which is outside ${fence}` }
     }
   }
@@ -845,7 +1047,32 @@ function shellArguments(argv) {
 const SHELL_SUBSTITUTION = /\$\(|`|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/
 
 /** Shells whose `-c` payload is another command line, so it is parsed as one. */
-const SHELL_PROGRAMS = new Set(['sh', 'bash', 'zsh', 'ksh', 'dash', 'ash', 'pwsh', 'powershell'])
+const SHELL_PROGRAMS = new Set(['sh', 'bash', 'zsh', 'ksh', 'dash', 'ash', 'pwsh', 'powershell', 'cmd'])
+
+/**
+ * Shells whose command line and paths follow PowerShell's rules: Windows separators,
+ * a case-insensitive filesystem, a `-Command`/`/c` payload that runs to the end of
+ * the line, and the `$env:USERPROFILE` spelling of home. `cmd` shares the Windows
+ * path rules and its `/c` payload rule.
+ */
+const POWERSHELL_SHELLS = new Set(['pwsh', 'powershell', 'cmd'])
+
+/**
+ * The shell a program token names, or an empty string when it names none.
+ *
+ * A worker on Windows starts Git Bash as a program — `& "C:\Program Files\Git\bin\bash.exe"
+ * -c "…"` — so the token is a path, may be quoted, may carry `.exe`, and may be spelled
+ * in any case. Reading only the bare lower-case name let every one of those spellings
+ * hide a whole command line from the rules.
+ *
+ * @param {string} program - the program token, as the lexer read it.
+ * @returns {string} the bare lower-case shell name, or '' when it is not a shell.
+ */
+function shellProgramName(program) {
+  const base = basenameOf(program).toLowerCase()
+  const bare = base.endsWith('.exe') ? base.slice(0, -'.exe'.length) : base
+  return SHELL_PROGRAMS.has(bare) ? bare : ''
+}
 
 /** Inline-code flags per interpreter, whose payload is scanned for deletion calls. */
 const INLINE_CODE_FLAGS = {
@@ -882,6 +1109,96 @@ const WRITE_DESTINATION_PROGRAMS = new Set([
 
 /** Programs that read a file named as an argument. */
 const FIND_NARROWING = ['-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex']
+
+/**
+ * PowerShell cmdlets and aliases that write a path named in their arguments,
+ * mapped to the cmdlet whose argument rule they share.
+ *
+ * The `pwsh`/`powershell` tool hands the guard PowerShell, and a write there is not a
+ * redirect with a program in front of it: `Set-Content`, `Out-File`, `New-Item`,
+ * `Copy-Item`, `Move-Item`, `Rename-Item` and `Remove-Item` name their target as a
+ * parameter value or a positional argument. The map is keyed by lower-case name because
+ * PowerShell resolves command names case-insensitively.
+ */
+const POWERSHELL_WRITE_CMDLET = new Map([
+  ['set-content', 'set-content'],
+  ['sc', 'set-content'],
+  ['add-content', 'add-content'],
+  ['ac', 'add-content'],
+  ['out-file', 'out-file'],
+  ['new-item', 'new-item'],
+  ['ni', 'new-item'],
+  ['copy-item', 'copy-item'],
+  ['cp', 'copy-item'],
+  ['copy', 'copy-item'],
+  ['move-item', 'move-item'],
+  ['mv', 'move-item'],
+  ['move', 'move-item'],
+  ['rename-item', 'rename-item'],
+  ['ren', 'rename-item'],
+  ['remove-item', 'remove-item'],
+  ['rm', 'remove-item'],
+  ['del', 'remove-item'],
+  ['ri', 'remove-item'],
+  // cmd's and PowerShell's own spellings of the same deletion. Missed here, they fell
+  // through to the fence and reported `OUTSIDE_WORKSPACE` where bash's `rm` reports
+  // `CRITICAL_PATH` for the very same path.
+  ['rd', 'remove-item'],
+  ['rmdir', 'remove-item'],
+  ['erase', 'remove-item'],
+])
+
+/**
+ * PowerShell cmdlets and aliases that delete, not merely write. They run through the
+ * same classification as `rm`, so `Remove-Item -Recurse -Force C:\Users\someone` and
+ * `rm -rf C:\Users\someone` report the same reason.
+ */
+/** cmd's own deletion commands, whose `/f`, `/q`, `/s` are switches rather than paths. */
+const CMD_DELETE_BUILTINS = new Set(['del', 'erase', 'rd', 'rmdir'])
+
+const POWERSHELL_DELETE_CMDLET = new Set(['remove-item', 'rm', 'del', 'ri', 'rd', 'rmdir', 'erase'])
+
+/**
+ * PowerShell parameters that take a value.
+ *
+ * A destination rule reads positional arguments, so a value belonging to another
+ * parameter has to be skipped first: `New-Item -ItemType Directory build` writes
+ * `build`, not a directory named `Directory`. A parameter not in this set is a switch
+ * and consumes nothing, which is the fail-closed side for an unknown spelling.
+ */
+const POWERSHELL_VALUED_PARAMETER = new Set([
+  'path', 'literalpath', 'filepath', 'destination', 'value', 'content', 'itemtype', 'name',
+  'newname', 'encoding', 'filter', 'include', 'exclude', 'depth', 'width', 'inputobject',
+  'credential', 'stream', 'erroraction', 'errorvariable', 'warningaction', 'warningvariable',
+  'outvariable', 'outbuffer', 'pipelinevariable', 'totalcount', 'delimiter',
+  // Common parameters whose value is not a path but which still swallow the next token.
+  // Unknown, they were read as switches, and their value became a positional argument.
+  'progressaction', 'informationaction', 'informationvariable',
+])
+
+/** Parameters whose value is a path this cmdlet writes. */
+const POWERSHELL_PATH_PARAMETER = new Set(['path', 'literalpath', 'filepath', 'destination'])
+
+/**
+ * The `.NET` file-writing calls PowerShell can reach without a cmdlet.
+ *
+ * `[System.IO.File]::WriteAllText("C:\…\f", "x")` writes a literal path with no
+ * redirect and no cmdlet, so neither rule above can see it. Only the path argument is
+ * read, and only when it is written as a literal: a variable is placed the way an
+ * unresolvable bash path is.
+ */
+const DOTNET_FILE_WRITE = /^\[(?:System\.)?IO\.File\]::(?:WriteAllText|WriteAllLines|WriteAllBytes|AppendAllText|AppendAllLines|AppendAllBytes)$/i
+
+/**
+ * The same `.NET` call found anywhere inside a token.
+ *
+ * `$null=[System.IO.File]::WriteAllText("…", "x")` glues the call to the assignment, and
+ * the lexer keeps `$null=[System.IO.File]::WriteAllText` as one token because `=` is
+ * not a separator. A scan that only matched a whole token therefore never saw the
+ * write. The call is the part after `=`, `(`, `;` or `{`; the path is still the token
+ * the call's parenthesis is followed by, so only the recognition changes.
+ */
+const DOTNET_FILE_WRITE_CALL = /\[(?:System\.)?IO\.File\]::(?:WriteAllText|WriteAllLines|WriteAllBytes|AppendAllText|AppendAllLines|AppendAllBytes)/i
 
 /**
  * Program prefixes that merely wrap the real program. `exec` belongs here because
@@ -974,6 +1291,21 @@ const SECRET_HUNT = /(?:secret|token|password|passwd|api[_-]?key|private[_-]?key
 const PATCH_BODY_ARGUMENT = /^(?:patch|input|diff|body)$/i
 
 /**
+ * The directory that contains a path, for either path flavour.
+ * `path.dirname` reads a backslash as an ordinary character on a POSIX host, so a
+ * Windows target's parent came out as `.` and every such target looked like a sibling
+ * of the workspace.
+ * @param {string} value - a resolved path.
+ * @returns {string} its parent directory.
+ */
+function parentDirectory(value) {
+  if (!isWindowsPath(value)) return dirname(value)
+  const normalised = normalizeWindowsPath(value)
+  const cut = normalised.lastIndexOf('\\')
+  return cut <= 2 ? normalised.slice(0, 3) : normalised.slice(0, cut)
+}
+
+/**
  * Whether a target is dangerous precisely because it is adjacent to the workspace:
  * inside the home directory, an ancestor of the root, or a sibling of it. This is
  * the rule that stops `rm -rf ~/Projects/thing` and `rm -rf <root>/..` without
@@ -985,10 +1317,10 @@ const PATCH_BODY_ARGUMENT = /^(?:patch|input|diff|body)$/i
 function isOutsideRootCritical(resolved, context) {
   const { root, home } = context
   if (resolved === '' || root === undefined || root === '') return false
-  if (resolved === root || isAtOrUnder(resolved, root)) return false
-  if (home !== '' && isAtOrUnder(resolved, home)) return true
-  if (isAtOrUnder(root, resolved)) return true
-  return dirname(resolved) === dirname(root)
+  if (resolved === root || isAtOrUnderPath(resolved, root)) return false
+  if (home !== '' && isAtOrUnderPath(resolved, home)) return true
+  if (isAtOrUnderPath(root, resolved)) return true
+  return samePath(parentDirectory(resolved), parentDirectory(root))
 }
 
 /**
@@ -1331,6 +1663,143 @@ function programPathEffects(program, argv) {
 }
 
 /**
+ * Split one PowerShell token into the elements of a comma list.
+ *
+ * PowerShell accepts `-Path a.txt, C:\Users\someone\f.txt` and the joined
+ * `-Path:a.txt,C:\Users\someone\f.txt` spelling. The shared lexer has already
+ * removed the quotes around a value, so the split is on the token's commas: reading a
+ * quoted comma as two candidates can only add a path the fence then checks, never
+ * hide one.
+ *
+ * @param {string} value - one parameter value or positional token.
+ * @returns {string[]} its non-empty elements.
+ */
+function commaListElements(value) {
+  return value
+    .split(',')
+    .map((element) => element.trim())
+    .filter((element) => element.length > 0)
+}
+
+/**
+ * The paths a PowerShell cmdlet writes and reads.
+ *
+ * Each cmdlet is read by its own parameter rule rather than by "the last argument":
+ * `Set-Content`/`Add-Content`/`Out-File` name the file as `-Path`/`-LiteralPath`/
+ * `-FilePath` or as their first positional parameter, `New-Item` writes the path it is
+ * given (or the `-Name` below it), `Copy-Item`/`Move-Item` write `-Destination` or the
+ * last positional and read the rest, and `Remove-Item` deletes every path it names.
+ *
+ * @param {string} program - the invoked program.
+ * @param {string[]} argv - its tokens, program first.
+ * @returns {{destinations: string[], reads: string[]}} the paths it writes and reads.
+ */
+function powershellPathEffects(program, argv) {
+  const destinations = []
+  const reads = []
+  const keep = (list, value) => {
+    if (typeof value === 'string' && value.length > 0) list.push(value)
+  }
+  const cmdlet = POWERSHELL_WRITE_CMDLET.get(program.toLowerCase())
+  if (cmdlet === undefined) return { destinations, reads }
+  const args = shellArguments(argv).slice(1)
+  const values = new Map()
+  const positional = []
+  /** Record a parameter value, one element per comma-separated path. */
+  const remember = (parameter, value) => {
+    const elements = commaListElements(value)
+    const known = values.get(parameter)
+    if (known === undefined) values.set(parameter, elements)
+    else known.push(...elements)
+  }
+  for (let at = 0; at < args.length; at += 1) {
+    const token = args[at]
+    const match = /^-{1,2}([A-Za-z][A-Za-z0-9]*)(?:[:=](.*))?$/.exec(token)
+    if (match === null) {
+      // `cmd` spells a deletion's switches `/f`, `/q`, `/s`; they are not paths. Only a
+      // deletion is read this way, and only a single-letter spelling is dropped, so a
+      // root-relative path like `/Users/...` is still classified.
+      // `Remove-Item`, `rm` and `ri` take no such switches, so there `/x` is a path at the
+      // drive root and stays a target.
+      if (CMD_DELETE_BUILTINS.has(program.toLowerCase()) && /^\/[A-Za-z]$/.test(token)) continue
+      // A positional path is a list element too: `Set-Content a.txt, C:\…\f.txt`.
+      for (const element of commaListElements(token)) positional.push(element)
+      continue
+    }
+    const parameter = match[1].toLowerCase()
+    let value = match[2]
+    if (value === undefined && POWERSHELL_VALUED_PARAMETER.has(parameter)) {
+      value = args[at + 1]
+      at += 1
+    }
+    if (typeof value !== 'string') continue
+    remember(parameter, value)
+    // A trailing comma continues a *path* list on the following token, as in
+    // `-Path a.txt, C:\Users\someone\f.txt`. Only a path parameter takes a list here:
+    // a value like `-Value "x,"` ends the parameter, and the next token is the cmdlet's
+    // positional path. Continuing the list for every valued parameter swallowed that
+    // path into `-Value` and never classified it.
+    if (POWERSHELL_PATH_PARAMETER.has(parameter)) {
+      while (value.trimEnd().endsWith(',') && at + 1 < args.length) {
+        const next = args[at + 1]
+        if (/^-{1,2}[A-Za-z][A-Za-z0-9]*(?:[:=].*)?$/.test(next)) break
+        at += 1
+        value = next
+        remember(parameter, value)
+      }
+    }
+  }
+  const pathValues = []
+  for (const name of POWERSHELL_PATH_PARAMETER) {
+    for (const value of values.get(name) ?? []) pathValues.push(value)
+  }
+  switch (cmdlet) {
+    case 'set-content':
+    case 'add-content':
+    case 'out-file':
+    case 'new-item':
+    case 'rename-item': {
+      // Every positional argument is a candidate destination. A parameter this rule does
+      // not know is read as a switch that consumes nothing (the fail-closed side for an
+      // unknown spelling), so an unknown parameter's value lands in `positional`; taking
+      // only the first let `Set-Content -ProgressAction SilentlyContinue C:\…\f.txt v`
+      // name `SilentlyContinue` as the "target" and never look at the real path. Content
+      // words are positionals too, but they resolve inside the workspace and are allowed,
+      // so the extra refusal is limited to path-like content.
+      for (const target of [...pathValues, ...positional]) keep(destinations, target)
+      // `New-Item -Path build -Name ..\..\escape.txt` writes `build\..\..\escape.txt`:
+      // the name is always placed below the path, and only then resolved. With no
+      // `-Path` it is relative to the working directory.
+      if (cmdlet === 'new-item') {
+        for (const name of values.get('name') ?? []) {
+          if (pathValues.length === 0) {
+            keep(destinations, name)
+            continue
+          }
+          for (const base of pathValues) keep(destinations, `${base.replace(/[\\/]+$/, '')}\\${name}`)
+        }
+      }
+      return { destinations, reads }
+    }
+    case 'copy-item':
+    case 'move-item': {
+      const explicit = values.get('destination') ?? []
+      for (const target of explicit.length > 0 ? explicit : positional.slice(-1)) keep(destinations, target)
+      // Every other positional is a source, which is read rather than written.
+      for (const source of explicit.length > 0 ? positional : positional.slice(0, Math.max(positional.length - 1, 0))) {
+        keep(reads, source)
+      }
+      return { destinations, reads }
+    }
+    default: {
+      // Remove-Item writes, i.e. deletes, every path it names.
+      for (const target of [...pathValues, ...positional]) keep(destinations, target)
+      return { destinations, reads }
+    }
+  }
+}
+
+/**
  * Whether one simple command deletes something.
  * @param {string} program - the invoked program.
  * @param {string[]} argv - its tokens.
@@ -1363,28 +1832,36 @@ function isSecretHunt(program, argv) {
  * @returns {{reason: string, detail: string} | undefined} the verdict, or undefined.
  */
 function classifyRmTarget(raw, resolved, context) {
-  const { cwd, home, settings, fence = '' } = context
+  const { cwd, home, settings, fence = '', powershell = false } = context
   // A bare glob removes the directory's whole contents.
   if (/^(?:\.\/)?(?:\*|\.\*|\{\*,\.\*\}|\*\.[A-Za-z0-9]+)$/.test(raw)) {
     return { reason: REASON.CRITICAL_RM, detail: 'removes every entry of a directory' }
   }
-  if (HOME_PREFIX.test(raw) && basenameOf(expandHome(raw, home)) === basenameOf(home)) {
+  // A trailing backslash is a separator only where the path is read the PowerShell way:
+  // a POSIX shell writes the literal file name `~\tester`, which is not the home folder.
+  const homePrefix = powershell === true ? HOME_PREFIX : POSIX_HOME_PREFIX
+  if (homePrefix.test(raw) && basenameOf(expandHome(raw, home, powershell === true)) === basenameOf(home)) {
     return { reason: REASON.CRITICAL_RM, detail: 'removes the home directory' }
   }
-  if (!isAbsolute(resolved)) {
-    const pathVerdict = classifyPathAccess({ fence, path: resolved, cwd, home, settings, mutate: true })
+  // A Windows-spelled path is absolute on every host. `path.isAbsolute` on a POSIX host
+  // says otherwise for `C:\work\repo`, so `Remove-Item -Recurse -Force .` and the same
+  // path spelled out skipped every root and ancestor check and were allowed.
+  if (!isAbsolute(resolved) && !isWindowsPath(resolved)) {
+    const pathVerdict = classifyPathAccess({ fence, path: resolved, cwd, home, settings, mutate: true, powershell })
     return pathVerdict
   }
   if (resolved === sep || /^[/\\][^/\\]+[/\\]?$/.test(resolved)) {
     return { reason: REASON.CRITICAL_RM, detail: 'removes a filesystem root' }
   }
-  if (home.length > 0 && (resolved === home || isAtOrUnder(home, resolved))) {
+  // The comparisons fold case for Windows paths: `C:\Work\Repo` is the same workspace
+  // as `C:\work\repo`, and which host the guard runs on must not decide the verdict.
+  if (home.length > 0 && isAtOrUnderPath(home, resolved)) {
     return { reason: REASON.CRITICAL_RM, detail: 'removes the home directory or an ancestor of it' }
   }
-  if (cwd.length > 0 && (resolved === cwd || isAtOrUnder(cwd, resolved))) {
+  if (cwd.length > 0 && isAtOrUnderPath(cwd, resolved)) {
     return { reason: REASON.CRITICAL_RM, detail: 'removes the service root or an ancestor of it' }
   }
-  return classifyPathAccess({ fence, path: resolved, cwd, home, settings, mutate: true })
+  return classifyPathAccess({ fence, path: resolved, cwd, home, settings, mutate: true, powershell })
 }
 
 /**
@@ -1412,8 +1889,8 @@ function classifyRmTarget(raw, resolved, context) {
  * @returns {{reason: string, detail: string} | undefined} the verdict, or undefined to allow.
  */
 function classifyMutationTarget(target, state) {
-  const { cwd, home, settings, fence = '' } = state
-  const verdict = classifyPathAccess({ fence, path: target, cwd, home, settings, mutate: true })
+  const { cwd, home, settings, fence = '', powershell = false } = state
+  const verdict = classifyPathAccess({ fence, path: target, cwd, home, settings, mutate: true, powershell })
   if (verdict !== undefined && verdict.reason !== REASON.OUTSIDE_WORKSPACE) return verdict
   const unplaceable = foreignHomeReason(target)
   if (unplaceable !== undefined) {
@@ -1436,7 +1913,9 @@ function classifyMutationTarget(target, state) {
  * @returns {string | undefined} the clause a refusal reads out, or undefined.
  */
 function foreignHomeReason(target) {
-  const foreignHome = /^~[^/\s]+/.exec(target)
+  // A backslash is a separator too: `~\f` is the home folder, while `~tester\f` is
+  // another user's home. Excluding only `/` read the first as the second.
+  const foreignHome = /^~[^/\\\s]+/.exec(target)
   return foreignHome === null ? undefined : `(${foreignHome[0]} is another user's home)`
 }
 
@@ -1466,13 +1945,13 @@ function foreignHomeReason(target) {
  *   target can be placed.
  */
 function unplaceableReason(target, state) {
-  const { home = '', unknownCd = '' } = state
+  const { home = '', unknownCd = '', powershell = false } = state
   // A device is not a write at all, so `cd "$DIR" && echo x > /dev/null` stays open
   // even when the directory the command runs in is unknown.
-  if (DEVICE_PATH.test(expandHome(target, home))) return undefined
+  if (DEVICE_PATH.test(expandHome(target, home, powershell === true))) return undefined
   // An absolute path is placeable however lost the directory is: `cd "$DIR" && echo x
   // > /tmp/x` names its own location. Only a relative target needs a directory.
-  if (unknownCd !== '' && !isAbsolute(expandHome(target, home))) return `after an unresolvable cd (${unknownCd})`
+  if (unknownCd !== '' && !isAbsolute(expandHome(target, home, powershell === true))) return `after an unresolvable cd (${unknownCd})`
   return foreignHomeReason(target)
 }
 
@@ -1545,7 +2024,7 @@ function nestedContext(context, state, extra = {}) {
  * may run it and this row may over-refuse rather than under-refuse.
  *
  * @param {string} command - the command string a worker is about to run.
- * @param {object} context - `{cwd, home, settings, fence}`, plus the optional
+ * @param {object} context - `{cwd, home, settings, fence, powershell}`, plus the optional
  *   `cwdUnknown` / `unresolvedCd` a nested `bash -c` payload inherits, the `depth` of
  *   the nesting that produced it, and an optional `state` that an `eval` payload
  *   shares with the line that called it.
@@ -1584,6 +2063,8 @@ function classifyShell(command, context) {
     cwd,
     /** The home folder, for the rules that expand `~` and `$HOME`. */
     home,
+    /** Whether this line is read the way PowerShell reads one (paths, `-Command`). */
+    powershell: context.powershell === true,
     unknown: inheritedUnknown === true,
     /** The `cd` that lost the directory, so a refusal can name the move it died on. */
     cd: typeof inheritedCd === 'string' ? inheritedCd : '',
@@ -1706,13 +2187,13 @@ function classifyShell(command, context) {
     if (body !== undefined) {
       while (body.length > 0 && CONTROL_WORDS.has(body[0])) body = body.slice(1)
       if (body.length > 0) {
-        const verdict = classifySimpleCommand(trimClosers(body), state, { cwd, home, settings, fence, depth })
+        const verdict = classifySimpleCommand(trimClosers(body), state, { cwd, home, settings, fence, depth, powershell: context.powershell === true })
         if (verdict !== undefined) return verdict
       }
       closeSubshells(raw, state, subshells)
       continue
     }
-    const verdict = classifySimpleCommand(tokens, state, { cwd, home, settings, fence, depth })
+    const verdict = classifySimpleCommand(tokens, state, { cwd, home, settings, fence, depth, powershell: context.powershell === true })
     if (verdict !== undefined) return verdict
     // The `)` of a subshell undoes its `cd`: a subshell's directory does not leak out.
     closeSubshells(raw, state, subshells)
@@ -1839,7 +2320,8 @@ function moveDirectory(program, argv, move, state, home) {
   }
   if (program === 'pushd') state.stack.push(here)
   state.previous = here
-  const absolute = destination === undefined ? '' : expandHome(destination, home)
+  const powershell = state.powershell === true
+  const absolute = destination === undefined ? '' : expandHome(destination, home, powershell)
   if (destination === undefined) {
     state.cwd = home
     state.unknown = home === ''
@@ -1857,7 +2339,7 @@ function moveDirectory(program, argv, move, state, home) {
     // `cd "$DIR" && cd ..` is no more placeable than `cd "$DIR"` was. An absolute
     // destination is placeable again, so it clears the doubt.
   } else {
-    state.cwd = resolveTarget(destination, state.cwd, home)
+    state.cwd = resolveTarget(destination, state.cwd, home, powershell)
     state.unknown = false
     state.cd = ''
   }
@@ -1978,16 +2460,40 @@ function substitutionContents(token) {
  * hid their payload completely. A short-option cluster containing `c` names the
  * payload as the next non-option token, and `-o NAME` / `-O NAME` consume a value of
  * their own before it: `bash -o pipefail -c "…"` must not take `pipefail` for the
- * payload.
+ * payload. The flag is returned as written so a refusal can say where the command
+ * line it names was found (`inside bash.exe -c`).
+ *
+ * PowerShell and `cmd` are different: `-Command` and `/c` take *every* remaining
+ * argument as one command line, quoted or not. Reading only the next token let
+ * `pwsh -Command Set-Content C:\Users\someone\f.txt x` hide the write behind a
+ * "command line" of just `Set-Content`. Only `bash`/`sh` and their relatives take a
+ * single argument.
  *
  * @param {string[]} argv - the shell's tokens, program first.
- * @returns {string | undefined} the payload, or undefined when there is none.
+ * @param {string} [shell] - the shell's bare lower-case name, from `shellProgramName`.
+ * @returns {{payload: string | undefined, flag: string} | undefined} the payload and
+ *   the flag that named it, or undefined when there is none.
  */
-function shellPayload(argv) {
+function shellPayload(argv, shell = '') {
+  const powershell = shell === 'pwsh' || shell === 'powershell'
+  /** The rest of the line is the command line, as PowerShell and cmd read it. */
+  const rest = (at, token) => {
+    const payload = argv.slice(at + 1).join(' ')
+    return { payload: payload.length === 0 ? undefined : payload, flag: token }
+  }
   for (let at = 1; at < argv.length; at += 1) {
     const token = argv[at]
     if (token === '--') return undefined
-    if (token === '-Command' || token === '/c' || token === '--command') return argv[at + 1]
+    const lower = token.toLowerCase()
+    if (powershell) {
+      // `-Command`, and its `-c` abbreviation, run everything after them.
+      if (lower === '-command' || lower === '--command' || lower === '-c') return rest(at, token)
+      continue
+    }
+    if (shell === 'cmd') {
+      if (lower === '/c' || lower === '/k') return rest(at, token)
+      continue
+    }
     if (token === '-o' || token === '+o' || token === '-O' || token === '+O' || token === '--rcfile' || token === '--init-file') {
       at += 1
       continue
@@ -1998,10 +2504,49 @@ function shellPayload(argv) {
       for (let next = at + 1; next < argv.length; next += 1) {
         const candidate = argv[next]
         if (candidate.startsWith('-') && candidate !== '-') continue
-        return candidate
+        return { payload: candidate, flag: token }
       }
-      return undefined
+      return { payload: undefined, flag: token }
     }
+  }
+  return undefined
+}
+
+/**
+ * Classify every path a deletion names, with the rule `rm` uses.
+ *
+ * `Remove-Item`, `del`, `ri`, `rd`, `rmdir` and `erase` are deletions just as much as
+ * `rm` is, so they must report the same reason for the same path: a target under the
+ * home folder is `CRITICAL_PATH` whether bash or PowerShell removes it, and an
+ * unrelated one outside the fence is `OUTSIDE_WORKSPACE`. Keeping the walk here is
+ * what guarantees the two spellings cannot drift apart again.
+ *
+ * @param {string[]} targets - the paths the command deletes, as written.
+ * @param {object} state - the shell state the command runs in.
+ * @param {object} context - `{cwd, home, settings, fence, powershell}`.
+ * @returns {{reason: string, detail: string} | undefined} the verdict, or undefined.
+ */
+function classifyDeletionTargets(targets, state, context) {
+  const { home, settings, fence = '' } = context
+  for (const raw of targets) {
+    if (SHELL_SUBSTITUTION.test(raw)) {
+      return { reason: REASON.CRITICAL_RM, detail: `deletes ${raw}, which only the shell can resolve` }
+    }
+    // A deletion of another user's home is the same unplaceable mutation a redirect
+    // to it is: `rm -rf ~tester/work` names a path only the shell can expand.
+    const unplaceable = unplaceableReason(raw, state)
+    if (unplaceable !== undefined) {
+      return { reason: REASON.OUTSIDE_WORKSPACE, detail: `deletes ${raw}, which cannot be placed ${unplaceable}` }
+    }
+    const resolved = resolveTarget(raw, state.cwd, home, state.powershell === true)
+    if (
+      isOutsideRootCritical(resolved, { root: settings.root, home }) ||
+      isOutsideRootCritical(state.cwd, { root: settings.root, home })
+    ) {
+      return { reason: REASON.CRITICAL_RM, detail: `deletes ${raw} outside the service root` }
+    }
+    const verdict = classifyRmTarget(raw, resolved, { ...context, fence })
+    if (verdict !== undefined) return verdict
   }
   return undefined
 }
@@ -2011,13 +2556,14 @@ function shellPayload(argv) {
  *
  * @param {string[]} tokens - the tokens of the command, group markers already removed.
  * @param {object} state - the shell state the command runs in.
- * @param {object} context - `{cwd, home, settings, fence, depth}` for the rules that ask
- *   about the origin rather than the current directory, and for the nesting cap that a
- *   substitution or a payload counts against.
+ * @param {object} context - `{cwd, home, settings, fence, powershell, depth}` for the rules
+ *   that ask about the origin rather than the current directory, whether the line is read
+ *   the way PowerShell reads one, and the nesting cap that a substitution or a payload
+ *   counts against.
  * @returns {{reason: string, detail: string} | undefined} the verdict, or undefined to allow.
  */
 function classifySimpleCommand(tokens, state, context) {
-  const { home, settings, fence = '' } = context
+  const { home, settings, fence = '', powershell = false } = context
   /** The command as written, so a detail can name the move it died on. */
   const simple = tokens.join(' ')
   const prefix = parsePrefix(tokens)
@@ -2052,14 +2598,58 @@ function classifySimpleCommand(tokens, state, context) {
   // one quoted argument and nothing else. It starts where this command runs, so a
   // `cd` in front of the `bash` carries into the payload, as does a directory this
   // row already lost. The `-c` may stand in a short-option cluster (`bash -lc`,
-  // `zsh -ic`) and `-o NAME` takes a value before it.
-  if (SHELL_PROGRAMS.has(program)) {
-    const payload = shellPayload(argv)
-    if (typeof payload === 'string' && payload.trim().length > 0) {
-      const nested = classifyShell(payload, nestedContext(context, state))
-      if (nested !== undefined) return nested
+  // `zsh -ic`) and `-o NAME` takes a value before it. The program is matched by its
+  // basename without `.exe`, in any case, so a shell started as a program — Git Bash
+  // behind PowerShell's `&`, `pwsh -Command`, `cmd /c` — is parsed the same way, and
+  // the refusal names the nesting so a caller can see where the command line was.
+  const shell = shellProgramName(program)
+  if (shell !== '') {
+    const invocation = shellPayload(argv, shell)
+    if (invocation !== undefined && typeof invocation.payload === 'string' && invocation.payload.trim().length > 0) {
+      // The payload is read by the shell that will run it: `bash -c` keeps POSIX
+      // rules, while a `pwsh`/`cmd` payload follows PowerShell's (case-insensitive
+      // segments, `$env:USERPROFILE`, a `-Command` payload running to the line's end).
+      const nested = classifyShell(
+        invocation.payload,
+        nestedContext(context, state, { powershell: POWERSHELL_SHELLS.has(shell) }),
+      )
+      if (nested !== undefined) {
+        return { reason: nested.reason, detail: `${nested.detail} inside ${basenameOf(program)} ${invocation.flag}` }
+      }
     }
   }
+  // `[System.IO.File]::WriteAllText("C:\…\f", "x")` is a write with neither a redirect
+  // nor a cmdlet. Its first argument is the path; one written as a variable is placed
+  // by its literal spelling, exactly as a bash mutation target is. In PowerShell the
+  // call can stand anywhere in the line — `if (Test-Path x) { [System.IO.File]::… }` —
+  // so every token is a candidate there, not only the program.
+  const dotnetAt = []
+  if (powershell === true) {
+    for (let at = 0; at < tokens.length; at += 1) {
+      if (DOTNET_FILE_WRITE_CALL.test(tokens[at])) dotnetAt.push(at)
+    }
+  } else if (DOTNET_FILE_WRITE.test(program)) {
+    const at = tokens.findIndex((token) => basenameOf(token) === program)
+    if (at >= 0) dotnetAt.push(at)
+  }
+  for (const at of dotnetAt) {
+    const argument = shellArguments(tokens.slice(at + 1)).find((token) => token !== '(' && token !== ')' && token !== ',')
+    if (argument !== undefined) {
+      // The lexer glues the argument separator to the quoted literal: `"path","x"`
+      // leaves `path,x` as one token, and `"path", "x"` leaves a trailing comma.
+      // The path is the first argument, so everything from the separator on is not
+      // part of it.
+      const verdict = classifyMutationTarget(argument.split(',')[0], {
+        cwd: state.cwd,
+        fence,
+        home,
+        settings,
+        powershell,
+      })
+      if (verdict !== undefined) return verdict
+    }
+  }
+
   // `eval` runs its arguments as a command line in this same shell, so — unlike a
   // `bash -c` payload — a `cd` inside it does leak out. The shared state is what
   // carries that move back to the rest of the line.
@@ -2102,30 +2692,21 @@ function classifySimpleCommand(tokens, state, context) {
       return { reason: REASON.CRITICAL_RM, detail: 'deletes everything find matches' }
     }
   }
-  if ((program === 'rm' || program === 'rmdir' || program === 'shred') && state.unknown) {
-    return { reason: REASON.CRITICAL_RM, detail: `deletes after an unresolvable cd (${simple.trim().slice(0, 80)})` }
-  }
-  if (program === 'rm' || program === 'rmdir' || program === 'shred') {
-    for (const raw of shellArguments(argv).slice(1).filter((token) => !token.startsWith('-'))) {
-      if (SHELL_SUBSTITUTION.test(raw)) {
-        return { reason: REASON.CRITICAL_RM, detail: `deletes ${raw}, which only the shell can resolve` }
-      }
-      // A deletion of another user's home is the same unplaceable mutation a redirect
-      // to it is: `rm -rf ~tester/work` names a path only the shell can expand.
-      const unplaceable = unplaceableReason(raw, state)
-      if (unplaceable !== undefined) {
-        return { reason: REASON.OUTSIDE_WORKSPACE, detail: `deletes ${raw}, which cannot be placed ${unplaceable}` }
-      }
-      const resolved = resolveTarget(raw, state.cwd, home)
-      if (
-        isOutsideRootCritical(resolved, { root: settings.root, home }) ||
-        isOutsideRootCritical(state.cwd, { root: settings.root, home })
-      ) {
-        return { reason: REASON.CRITICAL_RM, detail: `deletes ${raw} outside the service root` }
-      }
-      const verdict = classifyRmTarget(raw, resolved, context)
-      if (verdict !== undefined) return verdict
+  // PowerShell's deletions are deletions: `Remove-Item` and its aliases walk through
+  // the same classification as `rm`, so the reason codes match for the same target.
+  const powershellDelete = state.powershell === true && POWERSHELL_DELETE_CMDLET.has(program.toLowerCase())
+  if (program === 'rm' || program === 'rmdir' || program === 'shred' || powershellDelete) {
+    if (state.unknown) {
+      return { reason: REASON.CRITICAL_RM, detail: `deletes after an unresolvable cd (${simple.trim().slice(0, 80)})` }
     }
+    // A PowerShell deletion names its target through its own parameters (`-Path`,
+    // `-LiteralPath`, a comma list), so those are read first; a POSIX deletion names
+    // it positionally.
+    const targets = powershellDelete
+      ? powershellPathEffects(program, argv).destinations
+      : shellArguments(argv).slice(1).filter((token) => !token.startsWith('-'))
+    const deletionVerdict = classifyDeletionTargets(targets, state, { ...context, fence })
+    if (deletionVerdict !== undefined) return deletionVerdict
   }
   // `mv` and `rsync --delete` remove things without naming a delete program:
   // `mv . /tmp/gone` empties the directory it moves, and `rsync -a --delete` makes
@@ -2139,7 +2720,7 @@ function classifySimpleCommand(tokens, state, context) {
       if (unplaceable !== undefined) {
         return { reason: REASON.OUTSIDE_WORKSPACE, detail: `moves ${raw}, which cannot be placed ${unplaceable}` }
       }
-      const verdict = classifyRmTarget(raw, resolveTarget(raw, state.cwd, home), context)
+      const verdict = classifyRmTarget(raw, resolveTarget(raw, state.cwd, home, powershell), { ...context, fence })
       if (verdict !== undefined) return verdict
     }
   }
@@ -2150,7 +2731,7 @@ function classifySimpleCommand(tokens, state, context) {
     // the whole workspace, and `cd .. && rsync --delete src/ slot-1` look like an
     // ordinary subdirectory.
     const destination = shellArguments(argv).slice(1).filter((token) => !token.startsWith('-')).pop()
-    const resolved = destination === undefined ? '' : resolveTarget(destination, state.cwd, home)
+    const resolved = destination === undefined ? '' : resolveTarget(destination, state.cwd, home, powershell)
     const serviceRoot = settings.root !== '' ? settings.root : fence
     if (resolved.length > 0 && serviceRoot.length > 0 && (resolved === serviceRoot || isAtOrUnder(serviceRoot, resolved))) {
       return { reason: REASON.CRITICAL_RM, detail: 'rsync --delete empties the service root' }
@@ -2192,7 +2773,7 @@ function classifySimpleCommand(tokens, state, context) {
     // known one when a `cd` was not followable — the same placement a write gets, for the
     // same reason: refusing an ordinary `cat README.md` after `cd "$DIR"` would refuse
     // ordinary work while the sandbox still confines what can be written.
-    const verdict = classifyPathAccess({ fence, path: fileToken, cwd: state.cwd, home, settings, mutate: false })
+    const verdict = classifyPathAccess({ fence, path: fileToken, cwd: state.cwd, home, settings, mutate: false, powershell })
     if (verdict !== undefined && verdict.reason === REASON.SECRET) return verdict
   }
   // A write destination is mutated even though it is only an argument. This runs after
@@ -2201,7 +2782,7 @@ function classifySimpleCommand(tokens, state, context) {
   // a caller can act on.
   const effects = programPathEffects(program, argv)
   for (const reference of effects.reads) {
-    const verdict = classifyPathAccess({ fence, path: reference, cwd: state.cwd, home, settings, mutate: false })
+    const verdict = classifyPathAccess({ fence, path: reference, cwd: state.cwd, home, settings, mutate: false, powershell })
     if (verdict !== undefined) return verdict
   }
   for (const destination of effects.destinations) {
@@ -2210,6 +2791,25 @@ function classifySimpleCommand(tokens, state, context) {
       fence,
       home,
       settings,
+      powershell,
+    })
+    if (verdict !== undefined) return verdict
+  }
+  // PowerShell names a write destination as a parameter value rather than as an
+  // argument to a Unix program, so the same rule is applied through the cmdlet's own
+  // parameter reading. It runs after the Unix rules above so those keep their verdict.
+  const powershellEffects = powershellPathEffects(program, argv)
+  for (const reference of powershellEffects.reads) {
+    const verdict = classifyPathAccess({ fence, path: reference, cwd: state.cwd, home, settings, mutate: false, powershell })
+    if (verdict !== undefined) return verdict
+  }
+  for (const destination of powershellEffects.destinations) {
+    const verdict = classifyMutationTarget(destination, {
+      cwd: state.cwd,
+      fence,
+      home,
+      settings,
+      powershell,
     })
     if (verdict !== undefined) return verdict
   }
@@ -2230,7 +2830,7 @@ function classifySimpleCommand(tokens, state, context) {
  * @returns {{reason: string, detail: string} | undefined} the verdict, or undefined to allow.
  */
 function classifyRedirections(tokens, state, context) {
-  const { home, settings, fence = '' } = context
+  const { home, settings, fence = '', powershell = false } = context
   for (let position = 0; position < tokens.length; position += 1) {
     const redirect = parseRedirection(tokens[position])
     if (redirect === undefined) continue
@@ -2248,12 +2848,13 @@ function classifyRedirections(tokens, state, context) {
     if (isDescriptorTarget(operator, target)) continue
     const verdict =
       operator === '<' || operator === '<&'
-        ? classifyPathAccess({ fence, path: target, cwd: state.cwd, home, settings, mutate: false })
+        ? classifyPathAccess({ fence, path: target, cwd: state.cwd, home, settings, mutate: false, powershell })
         : classifyMutationTarget(target, {
             cwd: state.cwd,
             fence,
             home,
             settings,
+            powershell,
           })
     if (verdict !== undefined) return verdict
   }
@@ -2277,6 +2878,8 @@ function decideToolCall(input) {
   /** @type {{reason: string, detail: string} | undefined} */
   let verdict
   let subject = ''
+  // A PowerShell or cmd tool reads its paths and command lines the way Windows does.
+  const powershellTool = /^(?:pwsh|powershell|cmd)$/i.test(toolName)
 
   // The fence a mutation may not leave: the configured root when there is one, else
   // the directory the agent itself was started in. It is deliberately the *origin*
@@ -2295,9 +2898,9 @@ function decideToolCall(input) {
       typeof declared === 'string' && declared.length > 0
         ? isAbsolute(declared)
           ? declared
-          : resolveTarget(declared, cwd, home)
+          : resolveTarget(declared, cwd, home, powershellTool)
         : cwd
-    verdict = classifyShell(command, { cwd: shellCwd, fence, home, settings })
+    verdict = classifyShell(command, { cwd: shellCwd, fence, home, settings, powershell: powershellTool })
     subject = command
   } else {
     const mutate = MUTATING_TOOL.test(toolName)
@@ -2305,7 +2908,7 @@ function decideToolCall(input) {
     if (!mutate && !readable) return undefined
     const paths = [...pathArguments(args), ...patchTargets(args)]
     for (const candidate of paths) {
-      verdict = classifyPathAccess({ fence, path: candidate, cwd, home, settings, mutate })
+      verdict = classifyPathAccess({ fence, path: candidate, cwd, home, settings, mutate, powershell: powershellTool })
       if (verdict !== undefined) {
         subject = candidate
         break
@@ -2437,6 +3040,27 @@ function logDenial(ctx, message) {
 }
 
 /**
+ * The home directory the guard expands `~` and `$HOME` against.
+ *
+ * A native Windows process often has no `HOME`: PowerShell and cmd set `USERPROFILE`
+ * instead, and reading only `HOME` made every home-relative rule inert there — `~`
+ * and `~/.ssh` expanded to nothing. `os.homedir()` is the last fallback, which also
+ * keeps a caller that clears both variables behaving as before.
+ *
+ * @param {object} [env] - the environment, injectable for tests.
+ * @returns {string} the home directory, or an empty string when none is known.
+ */
+function homeDirectory(env = process.env) {
+  if (typeof env.HOME === 'string' && env.HOME.length > 0) return env.HOME
+  if (typeof env.USERPROFILE === 'string' && env.USERPROFILE.length > 0) return env.USERPROFILE
+  try {
+    return homedir()
+  } catch {
+    return ''
+  }
+}
+
+/**
  * Register the guard. One `tools/execute` wrapper, so every tool call in this
  * process — orchestrator and worker alike — passes the same wall.
  * @param {object} ctx - the Cordis context.
@@ -2444,7 +3068,7 @@ function logDenial(ctx, message) {
  */
 function apply(ctx, config = {}) {
   const settings = resolveSettings(config)
-  const home = typeof process.env.HOME === 'string' ? process.env.HOME : ''
+  const home = homeDirectory()
   // The root this wall falls back to when an agent reports no cwd: the configured
   // one, else the process cwd, which the SDK has already set to the service root.
   settings.rootExplicit = typeof settings.root === 'string' && settings.root !== ''

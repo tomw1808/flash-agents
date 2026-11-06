@@ -908,7 +908,7 @@ test('slot-path-length warns on Windows with a long base and is absent elsewhere
   const long = await runChecks(fakeOptions({}, { ...win32, root: '/repo', stateBase: longBase }).options)
   const row = find(long, 'slot-path-length')
   assert.equal(row.status, 'warn')
-  assert.match(row.detail, /^slot copies live at .*slot-0[\\/] \(\d+ characters\); Windows tools without long-path support/)
+  assert.match(row.detail, /^slot copies live at .*[\\/]slots[\\/]0[\\/] \(\d+ characters\); Windows tools without long-path support/)
   assert.match(row.detail, /MSVC cl\.exe/)
   assert.match(row.detail, /A short base leaves more room: set the plugin option "state_base" \(or FLASH_STATE_BASE\) to a folder such as C:\\fm/)
   assert.match(row.fix, /"state_base".*FLASH_STATE_BASE/)

@@ -1,7 +1,7 @@
 {
   "name": "flash-agents",
   "displayName": "Flash Agents",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "author": {
     "name": "Thomas Wiesner",
     "url": "https://github.com/tomw1808"
@@ -52,7 +52,7 @@
       "description": "How many worker copies of your repository may exist at once. Each one is a separate harness process, so this is a memory decision.",
       "default": 2,
       "min": 1,
-      "max": 8
+      "max": 16
     },
     "isolate": {
       "type": "string",

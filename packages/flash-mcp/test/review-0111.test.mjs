@@ -2,8 +2,7 @@
  * 0.1.11 review-round tests: a cache is moved only when nothing can still write into it, the
  * cache store ages out and trims safely, the patch (not the merge) is checked for conflict
  * markers, the final-message check only reads line-start markup, and the process watch
- * counts new processes as activity and warns about a held-open call only after it has seen
- * the command.
+ * counts new processes as activity.
  *
  * Real repositories, real `git` and real pools in temporary directories; the process table
  * is a fake one. Every directory is made here and removed when the file finishes: nothing
@@ -14,11 +13,11 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import test, { after } from 'node:test'
 
 import { ProcessWatch } from '../lib/proctree.js'
-import { rootDigest, WorkspaceIsolation } from '../lib/isolation.js'
+import { SLOT_LOCK_FORMAT, WorkspaceIsolation, rootDigest, slotLockPath } from '../lib/isolation.js'
 import { activityWarnings, createActivity, finalMessageProblem } from '../lib/service.js'
 
 const GIT_ID = ['-c', 'user.email=t@t', '-c', 'user.name=t']
@@ -95,43 +94,64 @@ function storedNumbers(baseDir, repo) {
 
 // ── 1. a cache is moved only when nothing can still write into it ───────────
 
-test('close keeps the cache of a slot whose retired tree still has a live runtime', async () => {
+test('close moves no cache out of a tree whose runtimes were not shut down', async () => {
   const repo = makeRepo()
   const base = tempDir('flash-review0111-base-')
   const logs = []
   const pool = makePool(repo, base, { log: (line) => logs.push(line) })
   const slot = await startCall(pool)
+  const stable = slot.dir
   writeBuild(pool, slot, 'old')
-  const orphan = slot.dir
   pool.retire(slot, { sessionStopped: false })
   pool.release(slot)
-  const next = await startCall(pool)
-  assert.notEqual(next.dir, orphan)
-  const target = writeBuild(pool, next, 'new')
-  pool.release(next)
+  // The tree that may still be written into is renamed aside, and the live slot keeps the
+  // stable path the next server of this root claims.
+  assert.equal(slot.dir, stable, 'the live slot keeps its stable path')
+  const orphan = slot.orphans.at(-1)
+  assert.equal(orphan, join(dirname(stable), `${basename(stable)}.retired-${pool.instance}`), 'the tree is renamed aside')
+  // Its cache went with the tree: its runtimes were not stopped, so it is not handed over.
+  const orphanCache = join(orphan, '.flash-cache', 'target', 'debug', 'app')
+  assert.equal(existsSync(orphanCache), true, 'the retired tree keeps the cache a live runtime may still write')
   pool.close()
   assert.deepEqual(storedNumbers(base, repo), [], 'nothing is moved from under a process that may still write')
-  assert.equal(existsSync(target), false)
+  // Nobody claims a retired name, so the tree is removed with its cache rather than stored.
+  assert.equal(existsSync(orphan), false)
   assert.ok(logs.some((line) => /close: not storing the build cache of .*not shut down/.test(line)), logs.join('\n'))
 })
 
-test('close keeps the cache of a slot a call still holds, and stores a retired tree whose runtimes were stopped', async () => {
+test('close leaves a stable slot’s cache in place, and stores the cache of a directory that cannot stay', async () => {
   const repo = makeRepo()
   const base = tempDir('flash-review0111-base-')
-  const logs = []
-  const pool = makePool(repo, base, { log: (line) => logs.push(line) })
+  const pool = makePool(repo, base)
   const slot = await startCall(pool)
-  writeBuild(pool, slot, 'held')
+  const target = writeBuild(pool, slot, 'held')
+  const slotDir = slot.dir
   pool.close()
-  assert.deepEqual(storedNumbers(base, repo), [], 'a busy slot is not moved')
-  assert.ok(logs.some((line) => /close: not storing the build cache of .*a call still holds slot 0/.test(line)), logs.join('\n'))
+  // The slot's directory is the path the next server claims, so its cache is not moved at
+  // all — not even while a call still holds it: the next build in that slot is the point.
+  assert.deepEqual(storedNumbers(base, repo), [], 'a stable slot’s cache goes nowhere')
+  assert.equal(existsSync(join(target, 'debug', 'app')), true, 'it is still in the slot')
+  assert.equal(existsSync(slotDir), true, 'and so is the slot directory')
 
-  const second = makePool(repo, base)
+  const second = makePool(repo, base, {
+    // A directory that cannot stay: the tree rename is refused, as Windows refuses it while a
+    // session holds a file open, so the slot moves to a retired name and the stopped tree
+    // keeps the stable path. Its cache is then the store's, not the tree's.
+    renameDirectory: (from, to) => {
+      if (basename(from) === '.flash-cache') {
+        renameSync(from, to)
+        return
+      }
+      const error = new Error('EPERM: operation not permitted, rename')
+      error.code = 'EPERM'
+      throw error
+    },
+  })
   const first = await startCall(second)
   writeBuild(second, first, 'stopped')
   second.retire(first, { sessionStopped: true })
   second.close()
-  assert.deepEqual(storedNumbers(base, repo), ['0'], 'a stopped orphan still gives up its cache')
+  assert.deepEqual(storedNumbers(base, repo), ['0'], 'a stopped tree in a directory that cannot stay still gives up its cache')
 })
 
 test('a dead server’s cache is rescued only when no retired tree of it may still run', async () => {
@@ -140,13 +160,22 @@ test('a dead server’s cache is rescued only when no retired tree of it may sti
   const digestDir = join(base, rootDigest(repo))
   const logs = []
 
-  // A server retires a tree with its runtime running, then "dies": its owner directory is
-  // renamed to a pid nothing has.
+  // A server retires a tree with its runtime still running — that marks the tree, because a
+  // process of it may outlive the server — and the next call in the slot builds the cache
+  // there. A second retirement moves the slot off that directory, so nothing claims it again.
   const dying = makePool(repo, base)
   const slot = await startCall(dying)
+  dying.retire(slot, { sessionStopped: false })
   writeBuild(dying, slot, 'running')
   dying.retire(slot, { sessionStopped: false })
-  renameSync(join(digestDir, String(process.pid)), join(digestDir, String(DEAD_PID)))
+  const marked = slot.orphans[1]
+  assert.match(basename(marked), /^0\.retired-/)
+  assert.equal(existsSync(join(digestDir, `.live-${basename(marked)}`)), true, 'the tree is marked')
+  // Then it dies: the retired tree's lock names a pid nothing has.
+  writeFileSync(
+    slotLockPath(marked),
+    `${JSON.stringify({ format: SLOT_LOCK_FORMAT, pid: DEAD_PID, startedAt: Date.now(), instance: 'dead0001' })}\n`,
+  )
 
   const next = makePool(repo, base, { log: (line) => logs.push(line) })
   assert.deepEqual(storedNumbers(base, repo), [], 'the cache of a tree that may still run is not rescued')
@@ -160,10 +189,21 @@ test('a dead server’s cache is rescued only when no retired tree of it may sti
 test('a put that meets a number filled meanwhile tries the next one, whether the error is EEXIST or EPERM', async () => {
   const repo = makeRepo()
   const base = tempDir('flash-review0111-base-')
+  const logs = []
   let raced = false
   const pool = makePool(repo, base, {
     slots: 2,
+    log: (line) => logs.push(line),
     renameDirectory: (from, to) => {
+      // The tree rename of `retire` is refused, as Windows refuses it while a session holds a
+      // file open. The stopped tree then keeps the stable path and the slot moves to a retired
+      // name — the one layout in which `close` still puts a tree's cache into the store, which
+      // is where the race below happens.
+      if (basename(from) !== '.flash-cache') {
+        const refused = new Error('EPERM: operation not permitted, rename')
+        refused.code = 'EPERM'
+        throw refused
+      }
       if (!raced) {
         raced = true
         // A concurrent server fills the number first; Windows answers EPERM.
@@ -178,8 +218,10 @@ test('a put that meets a number filled meanwhile tries the next one, whether the
   })
   const slot = await startCall(pool)
   writeBuild(pool, slot, 'one')
+  pool.retire(slot, { sessionStopped: true })
   pool.release(slot)
   pool.close()
+  assert.ok(logs.some((line) => line.includes('keeping the older layout')), logs.join('\n'))
   assert.deepEqual(storedNumbers(base, repo), ['0', '1'])
   assert.equal(existsSync(join(base, rootDigest(repo), 'caches', '1', 'target', 'debug', 'app')), true)
 })
@@ -340,33 +382,6 @@ test('a short-lived child between samples counts as activity and restarts the qu
   await still.step(0)
   for (let minute = 1; minute <= 5; minute += 1) await still.step(MIN)
   assert.equal(activityWarnings(still.activity, still.now).length, 1, 'the same tree with no new process is quiet')
-})
-
-test('a held-open warning needs the command to have been seen, then gone', async () => {
-  const children = (w) => [{ pid: 301, ppid: 100, cpuSeconds: 1, startedMs: w.start + 6_000, command: 'chrome --headless' }]
-
-  // Never matched: the shell wrapper shows an encoded command line, as PowerShell's -EncodedCommand does.
-  const encoded = makeWorld({
-    command: 'node check.js && echo done',
-    shell: 'powershell -EncodedCommand AAAA',
-    extra: children,
-  })
-  for (let at = 0; at < 4; at += 1) await encoded.step(at === 0 ? 0 : MIN)
-  assert.deepEqual(activityWarnings(encoded.activity, encoded.now), [], 'a command never seen never warns')
-
-  // Seen, then gone.
-  let alive = true
-  const seen = makeWorld({
-    command: 'node check.js && echo done',
-    shell: 'x',
-    extra: (w) => [...children(w), ...(alive ? [{ pid: 299, ppid: 100, cpuSeconds: 1, startedMs: w.start + 1, command: 'bash -c node check.js && echo done' }] : [])],
-  })
-  await seen.step(0)
-  alive = false
-  await seen.step(MIN)
-  assert.deepEqual(activityWarnings(seen.activity, seen.now), [], 'the first sighting of the absence is not enough')
-  await seen.step(MIN)
-  assert.match(activityWarnings(seen.activity, seen.now)[0], /^node check\.js && echo done finished, but processes it started \(cmake --build build -- ninja, chrome --headless\)/)
 })
 
 test('a runtime’s table is dropped when its session ends, and a late read does not bring the tree state back', async () => {

@@ -138,8 +138,13 @@ Rules that held up:
   one badly.
 - **Name what it must not touch** — including files a sibling in the same batch owns.
 - **Give the verification recipe, not just "run the tests".** Compiled projects: cloned build
-  state carries absolute paths and is unusable in a copy, so the recipe either removes it first
-  (`rm -rf .build` as the task's first step) or uses a scratch build directory inside the copy.
+  state carries absolute paths and is unusable in a copy. For SwiftPM, point a `cache:` folder at
+  the scratch path in the repository's `.flash-agents.json` — `"slotEnv": { "SWIFT_SCRATCH":
+  "cache:swift-build" }` — and build with `swift build --scratch-path "$SWIFT_SCRATCH"
+  --disable-sandbox`, and the same for `swift test`. Each slot then builds incrementally, and since
+  0.1.12 keeps that path across restarts, so the recipe does not remove `.build`. A repository
+  without that setting removes the cloned build state first (`rm -rf .build` as the task's first
+  step) or uses a scratch build directory inside the copy.
   Toolchains with a sandbox of their own cannot start it inside the worker's sandbox: SwiftPM
   needs `--disable-sandbox` on every `swift build`/`swift test`, or the worker reports
   `Operation not permitted` and cannot verify anything. A cold build in the copy is usually
@@ -231,6 +236,17 @@ round's "fails before and passes after" needs, and the fix round then makes them
   saw; the tree it used is retired, never recycled, but its warm build cache (`cache:` folders)
   moves to the replacement tree, so a retry does not build from cold. `isolation.buildCacheEmpty:
   true` says a call started with an empty cache.
+- `timing` in every result breaks the call down in milliseconds — `queuedMs`, `prepareMs`,
+  `setupMs`, `workerMs`, `collectMs`, `totalMs` — so a slow one shows whether it waited, copied,
+  set up, ran or was collected. `queuedMs` is 0 when there was no wait; a phase that did not run
+  is absent.
+- `flash_result` takes `jobIds` (2 to 16) as well as `jobId`: it returns the first that ends and
+  names the rest under `pending`; when another id answers, an id with no job and no stored report
+  is listed under `unknown`.
+- `flash_apply` and `flash_patch` take `excludeBase: true` on a patch that continued from a base
+  patch: only that call's own work is read or applied, not the base patch's change as well.
+- Run at most about four workers that compile at once on a 12-core machine; read-only work can run
+  beside them.
 - A slice of a few hundred lines with tests typically returns in two to six minutes; a coherent
   feature slice of 1,000–1,500 lines with tests in thirty to forty; a fix round of ten findings
   in thirty to forty. A large mechanical job (a multi-thousand-line split with scripts to

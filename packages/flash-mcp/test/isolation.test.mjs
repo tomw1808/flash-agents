@@ -30,8 +30,11 @@ import {
   durableBaseDir,
   migrateLegacyPatches,
   rootDigest,
+  SLOT_LOCK_FORMAT,
+  slotLockPath,
   slotPathWarning,
   slotRootPath,
+  stableSlotDirectory,
 } from '../lib/isolation.js'
 
 /**
@@ -1168,39 +1171,42 @@ test('a dead owner whose salvage fails is kept and retried, and its stored sibli
   }
 })
 
-test('a dead owner laid out by a real pool is salvaged from its instance directory', async () => {
-  // The defect this pins: a server's slots live in `<pid>/<instance>/slots/<name>`, and a
-  // sweep that looked at `<pid>/slots/<name>` found nothing, judged the dead owner clean
-  // and removed the whole directory with the uncommitted work still in it. The directory
-  // here is not hand-built: a real pool computes it, `prepare` builds the tree and the
-  // task file, and only then is the pid level moved under a dead pid, which is exactly
-  // what a crashed server leaves behind.
+test('a dead owner laid out by a real pool is salvaged from its slot directory', async () => {
+  // The defect this pins: a sweep that looks one directory away from where a real pool keeps
+  // its slot finds nothing, judges the dead owner clean and removes the tree with the
+  // uncommitted work still in it. The tree here is not hand-built: a real pool claims the
+  // slot, `prepare` builds it and records the task, and only then is the slot's lock
+  // rewritten to name a dead pid — which is exactly what a crashed server leaves behind.
   const repo = makeRepo()
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-iso-real-')))
   const anchor = new WorkspaceIsolation({ root: repo, slots: 1, baseDir: base, sweepIntervalMs: 0 })
-  const instance = anchor.stateDir.split(sep).pop()
   const slot = await anchor.lease()
   anchor.prepare(slot, { task: { kind: 'flash_task', label: 'the crashed pool’s task' } })
   writeFileSync(join(slot.dir, 'keep.txt'), 'work from a real prepared slot\n')
   anchor.release(slot)
-  const livePidDir = dirname(anchor.stateDir)
-  const deadPidDir = join(base, rootDigest(repo), '4194303')
-  // Renamed before `close()`: close only removes this pool's own state directory, which is
-  // no longer at its recorded path, so the dead owner's tree survives for the next sweep.
-  renameSync(livePidDir, deadPidDir)
-  anchor.close()
-  const deadSlot = join(deadPidDir, instance, 'slots', 'slot-0')
+  const deadSlot = slot.dir
+  assert.equal(deadSlot, stableSlotDirectory(repo, { baseDir: base, id: 0 }))
+  writeFileSync(
+    slotLockPath(deadSlot),
+    `${JSON.stringify({ format: SLOT_LOCK_FORMAT, pid: 4194303, startedAt: Date.now(), instance: 'dead0001' })}\n`,
+  )
 
   const next = new WorkspaceIsolation({ root: repo, slots: 1, baseDir: base, sweepIntervalMs: 0 })
   try {
-    assert.equal(existsSync(deadPidDir), false, 'the dead owner is removed after the salvage')
     const record = salvagedPatch(next)
     assert.ok(record, 'the real layout is found and salvaged')
-    assert.equal(record.salvagedFrom.slotDir, deadSlot)
+    assert.match(record.salvagedFrom.slotDir, /^.*slots[/\\]0\.dead-4194303-/)
+    assert.equal(record.salvagedFrom.pid, 4194303, 'the salvage names the pid whose lock was dead')
     assert.equal(record.task.label, 'the crashed pool’s task', 'the task file inside the copy is carried')
     assert.match(readFileSync(record.patchPath, 'utf8'), /work from a real prepared slot/)
+    // The dead tree was moved out of the way and the number is the next server’s: the same
+    // path, so the copy of this server lands where the crashed one’s did.
+    assert.equal(existsSync(deadSlot), true)
+    assert.equal(readdirSync(dirname(deadSlot)).filter((name) => name.startsWith('0.dead-')).length, 0, 'the moved tree is gone after the salvage')
+    assert.equal(next.slots[0].dir, deadSlot, 'the next server claims the same slot path')
   } finally {
     next.close()
+    anchor.close()
     rmSync(base, { recursive: true, force: true })
   }
 })
@@ -2152,7 +2158,7 @@ test('an injected base keeps the slot layout under it and sweeps a dead owner th
         pool.stateDir.startsWith(join(base, rootDigest(repo), String(process.pid)) + sep),
         `the pool's state ${pool.stateDir} must sit under ${base}`,
       )
-      assert.equal(pool.slots[0].dir, join(pool.stateDir, 'slots', 'slot-0'))
+      assert.equal(pool.slots[0].dir, stableSlotDirectory(repo, { baseDir: base, id: 0 }))
       assert.equal(existsSync(owner), false, 'the dead owner under the injected base is removed')
       assert.ok(salvagedPatch(pool), 'its unfinished work is salvaged as a patch')
     } finally {

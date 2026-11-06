@@ -258,7 +258,7 @@ test('a name nothing is close to is refused with the tool’s own argument list'
   assert.equal(
     textOf(result),
     'flash_apply failed: unknown arguments "banana", "dryrun" (did you mean "dryRun"?) for flash_apply; ' +
-      'its arguments are patchId, files, dryRun, force, threeWay',
+      'its arguments are patchId, files, dryRun, force, threeWay, excludeBase',
   )
 })
 

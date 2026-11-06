@@ -488,11 +488,14 @@ test('readPatch reports drift before an apply and null after it', async () => {
   isolation.close()
 })
 
-test('a 300-file patch is hashed in one batch, so its dry-run apply stays fast', async () => {
+test('a 300-file patch is hashed by one git process, not one per file', async () => {
   // Drift used to spawn `git hash-object` once per patch file, so a 300-file patch cost
   // 3.7 s per apply and 3.6 s for the first `flash_patch` page. The whole patch is now
-  // hashed in a single `git hash-object --stdin-paths` call, and this pins the result:
-  // an apply of a 300-file patch must not fall back to a process per file again.
+  // hashed in a single `git hash-object --stdin-paths` call, and this pins the result by
+  // counting the git processes git itself reports: a dry-run apply must not fall back to a
+  // process per file again. Wall-clock was the old bound, but `npm test` runs beside other
+  // suites and under load a single batch can still take a second; the regression is the
+  // number of spawns, not the scheduler's share of the machine.
   const files = {}
   for (let index = 0; index < 300; index += 1) files[`f${String(index).padStart(3, '0')}.txt`] = TWELVE_LINES
   const repo = makeRepo(files)
@@ -502,12 +505,31 @@ test('a 300-file patch is hashed in one batch, so its dry-run apply stays fast',
   })
   assert.equal(change.filesChanged.length, 300)
 
-  const startedAt = process.hrtime.bigint()
-  const dry = isolation.apply({ patchId: change.patchId, dryRun: true })
-  const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6
+  // `GIT_TRACE2_EVENT` makes every git process append one JSON line to the named file, so
+  // the child processes themselves are counted without wrapping `execFileSync` or `git`.
+  const traceDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-patch-trace-')))
+  const traceFile = join(traceDir, 'git-trace.jsonl')
+  const previousTrace = process.env.GIT_TRACE2_EVENT
+  let dry
+  let trace
+  process.env.GIT_TRACE2_EVENT = traceFile
+  try {
+    dry = isolation.apply({ patchId: change.patchId, dryRun: true })
+    trace = readFileSync(traceFile, 'utf8')
+  } finally {
+    if (previousTrace === undefined) delete process.env.GIT_TRACE2_EVENT
+    else process.env.GIT_TRACE2_EVENT = previousTrace
+    rmSync(traceDir, { recursive: true, force: true })
+  }
+  const hashing = trace
+    .split('\n')
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line))
+    .filter((event) => event.event === 'start' && Array.isArray(event.argv) && event.argv.includes('hash-object'))
+  assert.equal(hashing.length, 1, `the dry run started ${String(hashing.length)} git hash-object processes, expected one`)
+  assert.ok(hashing[0].argv.includes('--stdin-paths'), `the one process must hash the batch: ${hashing[0].argv.join(' ')}`)
   assert.deepEqual(dry.drift, { commitsBehind: 0, filesChangedSince: [] })
   assert.equal(dry.applied, false)
-  assert.ok(elapsedMs < 1000, `a 300-file dry run took ${elapsedMs.toFixed(1)} ms, expected under 1000 ms`)
   isolation.close()
 })
 
