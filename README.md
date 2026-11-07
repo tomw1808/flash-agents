@@ -1,62 +1,68 @@
 # Flash Agents
 
-<p align="center">
-  <em>Claude is your tech lead. Stop paying a tech lead to type.</em>
-</p>
+A Claude Code plugin (an MCP server plus two skills) that lets Claude hand coding tasks to cheaper
+models through Ollama. DeepSeek V4.1 Flash is the default. Each task runs in a sandboxed copy of
+your repository and comes back as a git patch. Claude reads the diff, runs your tests, and decides
+whether to apply it.
 
-<p align="center">
-  <strong>Claude plans, briefs and reviews. Cheap flash models read and type, each in a throwaway copy of your repo.<br>
-  Nothing lands until Claude has read the diff.</strong>
-</p>
+## What it is
 
----
+```
+Claude Code ──brief──► flash_task ──► dsh worker (Ollama model), in a copy of your repo
+            ◄── patch + report + usage ──┘
+Claude reads the diff, runs your tests ──► flash_apply ──► your working tree (uncommitted)
+```
 
-A good tech lead doesn't write every line. They cut the work into pieces, brief the team, and read
-every pull request. That's where their hours are worth the most.
+- **MCP tools:**
+  - `flash_task`: one task on one worker;
+  - `flash_batch`: several independent tasks in one call;
+  - `flash_apply` and `flash_patch`: land or read a stored patch;
+  - `flash_status`, `flash_result` and `flash_cancel`: manage background jobs.
 
-Claude Code works the other way round. Your most expensive model reads 40 files to find one seam,
-types 1,200 lines of adapter and tests, reruns the suite, and your plan runs out by lunchtime.
-Subagents don't help: they spend the same budget.
+  A `delegate` skill teaches Claude the loop: brief, dispatch, verify, review, fix, apply.
+- **Workers** are [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) (`dsh`)
+  agents. The model is chosen per call from an allowlist you set: DeepSeek V4.1 Flash, MiniMax M3.1
+  Flash, or any model your Ollama serves.
+- **Isolation:** a writing task runs in a disposable copy of your working tree, uncommitted changes
+  included. A sandbox confines the worker to that copy.
 
-**Flash Agents gives Claude a team.** Claude writes the brief. A flash model does the work:
-DeepSeek V4.1 Flash by default, at $0.30 per million input tokens on Ollama. Claude reads the
-diff, runs your tests, and applies only what it accepts.
+  A deterministic command filter (no model involved) refuses:
+  - reads of secrets (`.env`, `~/.ssh`, …);
+  - writes to `.git`;
+  - destructive git;
+  - writes outside the workspace.
 
-## The receipt
+  A worker that runs `rm -rf .` deletes its copy, not your repository.
+- **Output:**
+  - the patch, computed by `git diff` in the copy and not taken from the worker's own account;
+  - the worker's report, token usage and timing.
 
-Flash Agents built its own 0.1.6 release (20 October 2026):
+  Nothing touches your tree until `flash_apply`, and applied changes stay uncommitted.
+- **Read-only tasks** (code maps, reviews) run in your tree with every write refused.
+- **Parallelism:** each writing task gets its own copy. There are 2 copies by default, up to 16, so
+  several workers can run at once.
+- **No runtime dependencies.** Plain Node ESM, MIT-licensed. It runs on macOS and Linux, and on
+  Windows 11 with the limits listed under [Honest limits](#honest-limits).
 
-- Claude wrote the design and briefed **3 workers** on DeepSeek V4.1 Flash.
-- Claude's review **caught a race condition**. A 4th worker fixed it.
-- **25 files, +2,011 lines, 116/116 live checks**, 78 minutes from first hand-off to commit.
-- What the workers' tokens cost: **under $0.50.**
+## Why bother
 
-Claude's own tokens for the design and the review aren't in that number.
+Every token Claude Code spends comes out of your plan or your API bill, the mechanical ones
+included: reading 40 files to find one seam, typing 1,200 lines of adapter and tests, rerunning
+the suite. Claude subagents run on Claude, so they spend the same budget. Flash Agents moves that
+work to a model that costs $0.30 per million input tokens and $1.20 per million output tokens
+(DeepSeek V4.1 Flash on Ollama, [pricing](https://ollama.com/pricing) checked 20 October 2026).
+Claude keeps the design, the review and the verification.
 
-## Why I built this
+**Measured on this repository:**
 
-I saw DeepSeek's prices on Ollama, which says it never trains on your prompts. I wanted Claude's
-judgement without paying Claude prices for keystrokes.
+| Build | Claude | Flash workers | Change |
+|---|---|---|---|
+| 0.1.12 (5–6 Nov 2026) | 151 model calls, 122 k output tokens (upper bound: includes other work in that window) | 34 jobs, 2,881 model calls, 2.0 M output, 27.9 M input + 285 M cached | 42 files, +11,518 / −961 |
+| 0.1.6 (20 Oct 2026) | not measured | 4 jobs, 441 model calls, 230 k output, 756 k input; under $0.50 | 25 files, +2,011 |
 
-Now I use it every day as CTO of a fintech. More gets shipped, and tests and review are held to
-the same bar as before.
+**Not measured yet:** the same work done by Claude alone. That comparison is planned.
 
-## How it works
-
-1. **Claude briefs.** One goal per hand-off: the files it owns, the tests to write, the exact
-   commands that prove it works. The `delegate` skill teaches Claude this loop, so you just ask
-   for the change as usual.
-2. **A worker does it, in a copy.** Every writing job runs in a throwaway copy of your repo,
-   inside a sandbox that stops at the copy's edge. A worker that runs `rm -rf .` deletes a copy.
-   Claude picks the model per hand-off from your list (DeepSeek V4.1 Flash, MiniMax M3.1 Flash, …)
-   and can run several workers at once.
-3. **Claude checks.** The patch and the file list come from `git`, not from the worker's story.
-   Claude reads the diff, runs your tests, can have it reviewed by a second worker, and applies
-   what passes. Uncommitted: committing stays your call.
-
-## What it really handled
-
-On a 50k-line Swift app, with Claude steering and reviewing:
+**On a 50k-line Swift app**, with Claude briefing and reviewing:
 
 | Task | Size | Time | Outcome |
 |---|---|---|---|
@@ -65,38 +71,25 @@ On a 50k-line Swift app, with Claude steering and reviewing:
 | Test-harness rework | 1,500 lines, 29 tests | 37 min | landed unchanged |
 | A 7,000-line file split into 16, 41 scripts re-pointed | 7,900 lines moved | ~60 min | complete |
 
-## What I won't hide
-
-- **A flash model's diff is good; its picture of the whole system is not.** It misses flow across
-  a boundary and the nuance of a policy. That's why Claude still reads the core of every change.
-- **You need Ollama.** The cloud models run on your Ollama account and are billed by Ollama
-  (Pro: $20 a month with $60 of usage). Local Ollama models work too; they're weaker.
-- **Windows works, with limits.** The sandbox blocks owner-only temp folders and named pipes,
-  so some Python test setups don't run there. Details under [Honest limits](#honest-limits).
-
-## FAQ
-
-**Is a model this cheap any good?**
-On its own, no. With a written brief, the files it owns and the commands that prove it, yes.
-See the table above. When it stops partway, it says why, and the next hand-off carries on from its patch.
-
-**Why not just use subagents?**
-They run on Claude, so they spend your plan. Flash workers run on a different model.
-
-**Where does my code go?**
-To the Ollama model you pick, and nowhere else. Ollama: "we process your prompts and responses
-transiently to provide the service and never train on it" ([privacy](https://ollama.com/privacy)).
-With a local model it stays on your machine.
-
-**Will it commit or push?**
-No. A patch lands only when Claude or you apply it, and it lands uncommitted.
-
-**What does it cost?**
-The plugin is free and MIT-licensed. The models cost what your Ollama plan charges.
+**Trade-offs:**
+- **A flash model writes a good local diff but misses the system around it.** It gets flow across
+  a boundary wrong (a callback that carried an error was treated as noise) and the nuance of a
+  policy. Claude still has to read the core of every change, and the `delegate` skill tells it to.
+- **It needs a brief, not a one-liner.** It works best with one goal per task, the files it owns
+  and the commands that prove it works. A worker that stops partway says why, and the next call
+  continues from its patch (`basePatch`).
+- **You need Ollama.** The `:cloud` models run on your Ollama account and are billed by Ollama
+  (Pro: $20 a month with $60 of usage). Local models work too, but are weaker at tool calling.
+- **Your code goes to the model you pick.** Ollama's privacy policy says: "we process your prompts
+  and responses transiently to provide the service and never train on it"
+  ([privacy](https://ollama.com/privacy)). With a local model, the code stays on your machine.
+- **Windows has sandbox limits.** Owner-only temp folders and named pipes are blocked, so some
+  Python test setups, ninja and parallel MSBuild don't run inside a worker. Details are under
+  [Honest limits](#honest-limits).
 
 ## Install
 
-You need **Claude Code**, **Node 22.19+** (or 24.2+), and **[Ollama](https://ollama.com)**. About five minutes.
+You need **Claude Code**, **Node 22.19+** (or 24.2+), and **[Ollama](https://ollama.com)**.
 
 **1. Install the worker runtime and the default model**
 
@@ -130,14 +123,17 @@ Restart Claude Code when it asks you to.
 /flash-agents:setup
 ```
 
-It runs the doctor (Node, `dsh`, Ollama, the default and allowed models, `git`), writes the two
-worker profiles into `~/.dsh/profiles` (plus a `flash-orchestrator` preset for dsh's own UI), and
-proves the pipeline end to end with one real task. Every failing check
-prints the exact command that fixes it.
+The setup does three things:
+- runs the doctor, which checks Node, `dsh`, Ollama, the default and allowed models, and `git`;
+- writes the two worker profiles into `~/.dsh/profiles`, plus a `flash-orchestrator` preset for
+  dsh's own UI;
+- proves the pipeline end to end with one real task.
 
-Run it again after every plugin update: the update replaces the server but not the worker profile or
-the guard it runs with, so the installer has to rewrite both. No reconnect is needed afterwards: a
-worker runtime started before the install is replaced at its next use (see
+Every failing check prints the exact command that fixes it.
+
+Run it again after every plugin update. The update replaces the server but not the worker profile
+or the guard it runs with, so the installer has to rewrite both. No reconnect is needed afterwards:
+a worker runtime started before the install is replaced at its next use (see
 [Configuration](#configuration)).
 
 **4. Use it**
@@ -146,9 +142,18 @@ worker runtime started before the install is replaced at its next use (see
 /flash-agents:delegate add retry with exponential backoff to src/api/client.ts, with tests
 ```
 
-Or just ask in plain words — "use flash-agents for this", "fan this out". Claude frames the
-task, dispatches workers, checks every diff, has a read-only worker review the result, fixes
-in rounds, and applies the patches it accepts.
+Or ask in plain words: "use flash-agents for this", "fan this out". Claude then:
+1. writes the briefs and dispatches workers;
+2. checks every diff and runs your tests;
+3. has a read-only worker review the result;
+4. fixes in rounds;
+5. applies the patches it accepts.
+
+Without the plugin (any MCP client), see [Manual install](#manual-install-without-the-plugin).
+
+---
+
+Everything below is reference.
 
 ## What you get
 
