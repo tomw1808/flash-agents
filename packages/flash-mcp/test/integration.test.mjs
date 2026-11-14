@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -41,6 +41,9 @@ for (const profile of ['flash-service', 'flash-service-readonly']) {
  * `FLASH_DATA_DIR` at a throwaway directory, as the other service tests do.
  */
 const DATA_DIR = temporaryDataDir('flash-mcp-integration-data-')
+
+/** The state base every server here lays its copies under, instead of `$TMPDIR/flash-mcp`. */
+const STATE_BASE = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-integration-base-')))
 
 /** A running server plus a frame-level MCP client over it. */
 async function connect({ env = {}, root } = {}) {
@@ -84,6 +87,9 @@ async function connect({ env = {}, root } = {}) {
       // tools/call two seconds. The wait is injectable for this reason.
       earlyRetryDelayMs: 0,
       env: environment,
+      // Never the real temp state base, and never the real volume's free space.
+      stateBase: STATE_BASE,
+      statfs: () => ({ bsize: 4096, blocks: 1_000_000_000, bavail: 500_000_000 }),
     },
     input,
     output,

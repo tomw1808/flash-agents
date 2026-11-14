@@ -845,6 +845,8 @@ function checkStateBasePermissions({ base, env, fs, run }) {
  *        `FLASH_STATE_BASE`, or `.flash-agents.local.json`); the `state-base` row says it.
  * @param {string} [options.stateBaseLocalFile] - the absolute path of the local settings file
  *        that decided the base; the `state-base` row names it, as `clean` does.
+ * @param {{base: string, source?: string, pid?: number, at?: string, path: string}} [options.stateBaseRecord] -
+ *        the server's state base record, when it decided the base (nothing else named one).
  * @param {{path: string, message: string}} [options.localSettingsProblem] - a local settings
  *        file that could not be read or parsed and was ignored; the report warns about it.
  * @param {string} [options.stateBaseProblem] - why the configured state base is unusable, when
@@ -999,12 +1001,31 @@ export async function runChecks(options = {}) {
   } else if (config.stateBase !== undefined) {
     // Which layer decided the base matters: a plugin setting is synced between machines,
     // while the local settings file belongs to this one, and a user debugging a wrong base
-    // needs to know which file to edit. The row exists only when a base is configured, so
-    // the default layout keeps its existing report.
+    // needs to know which file to edit.
     const source = config.stateBaseSource ?? 'the configured state base'
     const at =
       config.stateBaseLocalFile === undefined ? '' : ` at ${config.stateBaseLocalFile}`
-    record('state-base', 'state base', 'ok', `using ${config.stateBase} (from ${source}${at})`, '')
+    const recorded = config.stateBaseRecord
+    const from =
+      recorded === undefined
+        ? `from ${source}${at}`
+        : `as the server${recorded.pid === undefined ? '' : ` (pid ${String(recorded.pid)})`} for this root recorded it` +
+          `${recorded.at === undefined ? '' : ` on ${recorded.at}`} in ${recorded.path}` +
+          `${recorded.source === undefined ? '' : `, set by ${recorded.source}`}`
+    record('state-base', 'state base', 'ok', `using ${config.stateBase} (${from})`, '')
+  } else if (config.stateDir === undefined && config.disk === true) {
+    // The default layout says so too when the disk is measured: a shell has no
+    // FLASH_STATE_BASE, and a doctor that silently measured the temp base while the copies sat
+    // under the plugin's configured one reported 0 B of a 300 GB footprint.
+    record(
+      'state-base',
+      'state base',
+      'ok',
+      `using the platform default ${join(canonicalTmpdir(), 'flash-mcp')}: no --state-base, no stateBase in ` +
+        '.flash-agents.local.json, no FLASH_STATE_BASE, and no server has recorded a base for this root; ' +
+        'the plugin setting "state_base" reaches only the server',
+      '',
+    )
   }
   // A local settings file the server ignores is not a failed prerequisite; it is worth a
   // warning, because the synced plugin setting then decides the base without a word.
@@ -1148,6 +1169,10 @@ export async function runChecks(options = {}) {
       const sentences = [
         `${String(report.slots.length)} slot copy(ies) take ${sizeText(copies)} plus ${sizeText(caches)} of build cache${parts.length === 0 ? '' : ` (${parts.join('; ')})`}`,
       ]
+      if (report.slots.length === 0 && (report.store?.caches.length ?? 0) === 0) {
+        // Zero alone reads as "clean"; it may as well mean the copies are under another base.
+        sentences.push(`nothing for this root was found under ${base}`)
+      }
       if (report.store !== null) {
         sentences.push(`the cache store ${report.store.dir} holds ${String(report.store.caches.length)} cache(s), ${sizeText(report.store.bytes)}`)
       }

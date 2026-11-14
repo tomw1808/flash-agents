@@ -36,6 +36,15 @@ export const QUIET_WINDOW_MS = 300_000
 export const QUIET_CPU_SECONDS = 1
 
 /**
+ * How much CPU a command's tree must use between two samples (about a minute apart) to count
+ * as working, for the call's idle stop. A test binary running flat out uses a CPU second per
+ * second, and a niced one on a loaded machine still far more than this; a process that only
+ * waits wakes for milliseconds. The quiet warning's own threshold is per five minutes, which
+ * a waiting process can reach, so the idle stop asks for more.
+ */
+export const ACTIVE_CPU_SECONDS = 5
+
+/**
  * How much of a process's command line is kept. Command lines can be kilobytes (a compiler
  * invocation, an inlined script); the head says what the process is.
  */
@@ -495,10 +504,28 @@ function displayCommand(entry) {
   return isSandboxProcess(entry) ? programOf(entry.command) : clipCommand(entry.command)
 }
 
-/** A child report: the entry's own start and CPU, never one process's clock with another's CPU. */
-function childReport(entry, now) {
+/**
+ * A child report: the entry's own start and CPU, never one process's clock with another's CPU,
+ * and beside them the CPU of the entry's whole subtree. `cargo test` itself sits at 0 CPU
+ * seconds while the test binaries below it do the work, so the entry's own figure alone read
+ * as an idle command for eleven minutes of a real test run.
+ *
+ * @param {object} entry - the process reported.
+ * @param {number} now - the clock.
+ * @param {object[]} [scope] - the processes the entry's subtree is taken from (the command's
+ *   subtree, or the runtime's tree for a fallback child); sandbox wrappers are not counted.
+ * @returns {{command: string, runningMs: number, cpuSeconds: number, treeCpuSeconds?: number, treeProcesses?: number}}
+ */
+function childReport(entry, now, scope) {
   const startedMs = entry.startedMs === undefined ? now : entry.startedMs
-  return { command: displayCommand(entry), runningMs: Math.max(0, now - startedMs), cpuSeconds: entry.cpuSeconds }
+  const report = { command: displayCommand(entry), runningMs: Math.max(0, now - startedMs), cpuSeconds: entry.cpuSeconds }
+  if (!Array.isArray(scope)) return report
+  const below = descendants(scope, entry.pid).filter((process) => !isSandboxProcess(process))
+  // Only worth a field when something below it exists; a leaf's tree figure is its own.
+  if (below.length === 0) return report
+  const tree = [entry, ...below]
+  const cpu = tree.reduce((sum, process) => sum + (typeof process.cpuSeconds === 'number' ? process.cpuSeconds : 0), 0)
+  return { ...report, treeCpuSeconds: Math.round(cpu * 10) / 10, treeProcesses: tree.length }
 }
 
 /**
@@ -580,14 +607,34 @@ function fallbackChild(tree, since) {
 export function childOfCall(record, now) {
   const subtree = record?.subtree
   if (!Array.isArray(subtree) || subtree.length === 0) {
-    return record?.fallback === undefined ? undefined : childReport(record.fallback, now)
+    return record?.fallback === undefined ? undefined : childReport(record.fallback, now, record.tree)
   }
   const depths = record.depths ?? depthsOf(subtree, record.rootPid)
   const entry =
     record.quiet === undefined
       ? longestRunning(subtree, record.command)
       : (deepestIdle(subtree, depths) ?? longestRunning(subtree, record.command))
-  return entry === undefined ? undefined : childReport(entry, now)
+  return entry === undefined ? undefined : childReport(entry, now, subtree)
+}
+
+/**
+ * The last moment any watched command of a call was seen working: its tree used at least
+ * `ACTIVE_CPU_SECONDS` of CPU since the sample before, or started a process that sample did
+ * not hold. Only commands still open (or background jobs still running) count, so a job that
+ * ended an hour ago cannot keep a call alive.
+ *
+ * @param {object} [proc] - the call's tree state (`observeTree`'s result).
+ * @param {(key: string) => boolean} [isWatched] - whether a call key still belongs to a
+ *   running command; every recorded call counts when omitted.
+ * @returns {{at: number, key: string, command: string} | undefined} the latest, or undefined.
+ */
+export function lastTreeActivity(proc, isWatched = () => true) {
+  let latest
+  for (const record of proc?.calls?.values() ?? []) {
+    if (typeof record.activeAt !== 'number' || !isWatched(record.key)) continue
+    if (latest === undefined || record.activeAt > latest.at) latest = { at: record.activeAt, key: record.key, command: record.command }
+  }
+  return latest
 }
 
 /**
@@ -648,6 +695,7 @@ export function observeTree(previous, { pid, table, at, calls }) {
           command: call.command,
           ...(call.jobId === undefined ? {} : { jobId: call.jobId }),
           fallback,
+          tree,
         })
       }
       continue
@@ -673,7 +721,19 @@ export function observeTree(previous, { pid, table, at, calls }) {
       baselineAt: at,
       baselineCpu: cpu,
       prevPids: pids,
+      prevCpu: cpu,
     }
+    // Work since the sample before, for the idle stop (see `lastTreeActivity`): CPU used by
+    // the processes both samples hold, the whole CPU of one that appeared, and the appearance
+    // itself — `cargo test` runs one short test binary after another, and a binary that came
+    // and went between two samples left only its successor behind. A first sight of the
+    // command counts the CPU it has used so far, all of it inside this call.
+    const sameRoot = prior !== undefined && prior.rootPid === root.pid && prior.prevCpu instanceof Map
+    let recent = 0
+    for (const [id, seconds] of cpu) recent += Math.max(0, seconds - (sameRoot ? (prior.prevCpu.get(id) ?? 0) : 0))
+    const fresh = sameRoot && [...pids].some((id) => !prior.prevPids.has(id))
+    if (recent >= ACTIVE_CPU_SECONDS || fresh) record.activeAt = at
+    else if (sameRoot && typeof prior.activeAt === 'number') record.activeAt = prior.activeAt
     if (prior !== undefined && prior.rootPid === root.pid && prior.baselineAt !== undefined) {
       record.baselineAt = prior.baselineAt
       record.baselineCpu = prior.baselineCpu

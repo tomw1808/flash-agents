@@ -14,7 +14,7 @@ import test from 'node:test'
 import { execFileSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 
 import {
@@ -1017,5 +1017,54 @@ test('a call without dsh carries the same sibling launcher sentence as the start
     await service.close()
     rmSync(base, { recursive: true, force: true })
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('the server records the state base it runs with, so clean and doctor in a shell can find it', async () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-record-base-')))
+  const options = {
+    ...parseCli([], { FLASH_STATE_BASE: base }, config),
+    root: realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-record-root-'))),
+    isolate: 'copy',
+    slots: 1,
+    env: doctorEnv(),
+  }
+  const { server, input, send, waitForFrame } = startTestServer(options, { startupSweepDelayMs: 60_000 })
+  server.service.isolation.startupSweep = () => Promise.resolve()
+  const recordPath = join(process.env.FLASH_DATA_DIR, rootDigest(options.root), 'state-base.json')
+  try {
+    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
+    await waitForFrame(1)
+    send({ jsonrpc: '2.0', method: 'notifications/initialized' })
+    await waitUntil(() => existsSync(recordPath))
+    const record = JSON.parse(readFileSync(recordPath, 'utf8'))
+    assert.equal(record.base, base)
+    assert.equal(record.source, 'the plugin setting "state_base" (FLASH_STATE_BASE)')
+    assert.equal(record.pid, process.pid)
+  } finally {
+    input.end()
+    await server.done
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test('doctor in a shell measures the state base the server recorded, and says where it came from', async () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-doctor-record-base-')))
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-doctor-record-root-')))
+  const dataDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-cli-doctor-record-data-')))
+  const slot = join(base, rootDigest(root), '4194303', 'dead0001', 'slots', 'slot-0')
+  mkdirSync(slot, { recursive: true })
+  writeFileSync(join(slot, 'work.txt'), 'x'.repeat(4096))
+  const recordPath = join(dataDir, rootDigest(root), 'state-base.json')
+  mkdirSync(dirname(recordPath), { recursive: true })
+  writeFileSync(recordPath, `${JSON.stringify({ base, source: 'the plugin setting "state_base" (FLASH_STATE_BASE)', pid: 4242 })}\n`)
+  try {
+    const lines = []
+    await runDoctor(['--root', root], { env: doctorEnv({ FLASH_DATA_DIR: dataDir }), write: (text) => lines.push(text), ...fakes() })
+    const text = lines.join('')
+    assert.ok(text.includes(`using ${base} (as the server (pid 4242) for this root recorded it in ${recordPath}`), text)
+    assert.match(text, /state-disk\s+1 slot copy\(ies\)/)
+  } finally {
+    for (const dir of [base, root, dataDir]) rmSync(dir, { recursive: true, force: true })
   }
 })

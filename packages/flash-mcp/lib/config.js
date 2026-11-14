@@ -23,6 +23,9 @@ const SECTIONS = ['route', 'limits', 'guard', 'dsh']
 /** The sections holding numeric limits that must be positive safe integers. */
 const LIMIT_SECTIONS = new Set(['limits'])
 
+/** The limits where 0 is meaningful — "no cap" — and so is allowed beside positive values. */
+const ZERO_MEANS_OFF = new Set(['limits.maxCacheBytes'])
+
 /** The entries that must be arrays of non-empty strings. */
 const STRING_ARRAY_PATHS = new Set(['guard.protectedSegments', 'guard.homeProtectedPaths', 'route.models'])
 
@@ -75,6 +78,10 @@ export const DEFAULT_CONFIG = deepFreeze({
     // trees and then applied patches are removed after a call; unapplied patches never
     // are, since one may be the only copy of finished work. 20 GiB.
     maxStateBytes: 21_474_836_480,
+    // How much one root's build caches (this server's slot caches and the stored ones) may
+    // take before the least recently used are removed. Off by default: a cache is what makes
+    // a build warm, and only the operator knows what the disk can spare. 0 = no cap.
+    maxCacheBytes: 0,
   },
   guard: {
     protectedSegments: ['.git'],
@@ -133,8 +140,13 @@ export function validateConfig(raw) {
         errors.push(`${path} has type ${typeName(value)}; expected ${expected}`)
         continue
       }
-      if (LIMIT_SECTIONS.has(section) && (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0)) {
-        errors.push(`${path} must be a positive safe integer, got ${String(value)}`)
+      const floor = ZERO_MEANS_OFF.has(path) ? 0 : 1
+      if (LIMIT_SECTIONS.has(section) && (typeof value !== 'number' || !Number.isSafeInteger(value) || value < floor)) {
+        errors.push(
+          floor === 0
+            ? `${path} must be a safe integer of 0 (no cap) or more, got ${String(value)}`
+            : `${path} must be a positive safe integer, got ${String(value)}`,
+        )
       }
       if (STRING_ARRAY_PATHS.has(path) && !isNonEmptyStringArray(value)) {
         errors.push(`${path} must be an array of non-empty strings`)

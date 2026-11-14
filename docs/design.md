@@ -385,6 +385,11 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
   estimate of the project instruction files the harness injected into the worker (`AGENTS.md`,
   `CLAUDE.md`, their `.local` overlays and `$DSH_HOME/AGENTS.md`, root to cwd). The harness renders
   at most 64 KB of them, most specific first; over that, a warning says the worker saw only part.
+- `basePatchFile` (`{ file, applied, threeWay, conflicts, note }`) appears when the call started from
+  a diff file inside the root. The diff is applied before the worker starts and the copy's base is
+  recorded again afterwards, as after a setup step, so the patch holds only the worker's change; the
+  record keeps `baseFile`, and `flash_apply` warns that the patch applies on top of that diff. It
+  cannot be combined with `basePatch`, whose patch is cumulative.
 - `basePatch` (`{ patchId, applied, threeWay, conflicts, note }`) appears when the call continued
   from a stored patch. A base patch the caller had already applied (uncommitted) arrives with the
   copy itself, because the copy is taken from the working tree, and applying it again merged the
@@ -790,6 +795,14 @@ it is reported in the log, and the retention window ages those out. A retired tr
 moved into its slot's current directory before the tree is removed, when that slot is idle and has
 no cache of its own (see above).
 
+Build caches are outside that cap: they are what makes the next build warm. `limits.maxCacheBytes`
+(default 0, no cap; `FLASH_MAX_CACHE_BYTES`, `--max-cache-bytes`) bounds them when the operator
+asks. The housekeeping timer measures the root's stored caches and this pool's slot caches with
+`fs.promises`, so the walk never blocks a request, and over the cap removes the stored caches oldest
+first, then the cache of the slot whose last call ended longest ago, each renamed to `trash-cache-*`
+and deleted in the background. A slot with a call in flight is never trimmed; another live server's
+slots are neither counted nor touched.
+
 Patches sit one level above that, in `<sha256(root)[0:12]>/patches`, precisely because the sweep
 reclaims a dead owner's directory whole: a self-test lost a finished worker's patch that way when
 the next service started on the same root. A patch therefore outlives the process that issued it,
@@ -800,7 +813,10 @@ directories that hold no files and no live server. `flash-agents clean` reports 
 digest — live server pids, and the number and MB of slot trees and patches — and reclaims what a
 startup would; `clean --all` also removes the trees of roots with no live server. Patches are never
 removed by `--all`, because a root without a live server is exactly where a caller might still want
-one. `clean` also removes this root's `trash-*` directories — a removal a crash left unfinished —
+one. The plugin's state-base setting reaches only the server, so a server writes the base it runs
+under to `<data dir>/<digest>/state-base.json`; `clean` and `doctor` without `--state-base`, a local
+settings file or `FLASH_STATE_BASE` read that record, and both say which base they read and why.
+`clean` also removes this root's `trash-*` directories — a removal a crash left unfinished —
 and reports how many. Unlike a server's sweep, every removal it reports is synchronous: `clean`
 prints its summary and exits, so a deletion left in the background would be abandoned half done
 while the summary claimed the disk back.
@@ -1053,7 +1069,7 @@ naming the path that is wrong instead of silently falling back to something else
     "model": "deepseek-v4.1-flash:cloud",
     "models": ["deepseek-v4.1-flash:cloud", "deepseek-v4.1-flash:1017-cloud", "minimax-m3.1-flash:cloud"]
   },
-  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 10800000, "idleTimeoutMs": 600000, "diffChars": 20000, "patchRetentionDays": 14, "maxStateBytes": 21474836480 },
+  "limits": { "slots": 2, "maxTasks": 16, "taskTimeoutMs": 10800000, "idleTimeoutMs": 600000, "diffChars": 20000, "patchRetentionDays": 14, "maxStateBytes": 21474836480, "maxCacheBytes": 0 },
   "guard": { "protectedSegments": [".git"], "fenceMutations": true },
   "dsh": { "package": "@deepseek-ai/dsh", "version": "0.2.0-rc.2" }
 }
@@ -1093,7 +1109,11 @@ that builds and tests between steps can take longer than an hour. What ends a *s
 `idleTimeoutMs` (default ten minutes, `FLASH_IDLE_TIMEOUT_MS` to override): every event from the
 session or any of its workers — model output, a tool call, a tool result — resets it, so a hung
 model stream or a wedged tool is stopped after ten silent minutes instead of holding a tree for
-hours. Either way the call salvages the worker's change as a patch and says why it stopped
+hours. A worker inside its own long command sends no event until the command ends, so the process
+watcher's samples count too: a command whose tree used at least five CPU seconds since the previous
+sample (`ACTIVE_CPU_SECONDS`), or started a new process, was working at that sample. An idle stop
+that fires while a worker is inside its own command names it, so the caller knows the stored change
+may be finished. Either way the call salvages the worker's change as a patch and says why it stopped
 (`TIMEOUT` or `IDLE`) and where the worker was.
 
 ### Prerequisites

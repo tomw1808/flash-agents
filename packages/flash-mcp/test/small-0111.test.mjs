@@ -357,6 +357,9 @@ test('overlaps: stored, unapplied patches that change the same files are listed 
       files: ['db/migrations/0007_next.sql'],
       label: 'users table',
       createdAt: service.isolation.patches.get(first.change.patchId).createdAt,
+      // Both create the same migration: the hunks meet on the whole new file.
+      hunks: [{ file: 'db/migrations/0007_next.sql', lines: 'new file', otherLines: 'new file' }],
+      sameBase: true,
     },
   ])
   const page = payload(await call('flash_patch', { patchId: first.change.patchId }))

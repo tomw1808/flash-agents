@@ -216,7 +216,9 @@ test('current entries carry the longest-running child of the command’s own sub
   const [call] = openCommands(world.activity, world.now)
   // The shell that holds `cd app && cargo check` is the command's own shell; `cargo check`
   // is the longest-running process it owns.
-  assert.deepEqual(call.child, { command: 'cargo check', runningMs: 29_900, cpuSeconds: 0.2 })
+  // Beside its own CPU, the child carries its whole subtree's (`cargo` itself idles while
+  // the compiler under it works).
+  assert.deepEqual(call.child, { command: 'cargo check', runningMs: 29_900, cpuSeconds: 0.2, treeCpuSeconds: 0.7, treeProcesses: 2 })
   assert.notEqual(call.child.command, call.command)
 
   // The same holds when the open command is `cargo check` alone.
@@ -262,9 +264,12 @@ function makeObserved() {
 
 test('spellings of one test command group together and name the command, not its wrapper', () => {
   const { state, run } = makeObserved()
-  run(1, 'nice -n 19 cargo test', { text: 'test a ... FAILED' })
-  run(2, 'cargo test 2>&1 | tail -50', { text: 'test b ... FAILED' })
-  run(3, 'cd app && /usr/bin/time -v timeout -k 5 600 env RUST_LOG=1 cargo test; echo "exit: $?"', { text: 'error: test failed, to rerun pass `-p app`' })
+  // The same failure each time: a run that fails differently is progress, not a repeat
+  // (see the 0.1.13 tests).
+  const failed = 'error: test failed, to rerun pass `-p app`'
+  run(1, 'nice -n 19 cargo test', { text: failed })
+  run(2, 'cargo test 2>&1 | tail -50', { text: failed })
+  run(3, 'cd app && /usr/bin/time -v timeout -k 5 600 env RUST_LOG=1 cargo test; echo "exit: $?"', { text: failed })
   const warnings = activityWarnings(state.activity)
   assert.equal(warnings.length, 1)
   assert.match(warnings[0], /^"cargo test" failed 3 times in this call \(last: exit code 1, \d+m?\d?s ago: error: test failed, to rerun pass `-p app`\); /)

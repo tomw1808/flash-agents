@@ -87,7 +87,7 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs'
-import { rm as removeTree } from 'node:fs/promises'
+import { lstat as lstatAsync, readdir as readdirAsync, rm as removeTree, stat as statAsync } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
@@ -988,6 +988,58 @@ function defaultPatchDir(root) {
 }
 
 /**
+ * The file a server leaves in its root's durable directory, naming the state base it runs
+ * with. The plugin setting "state_base" reaches only the server (as `FLASH_STATE_BASE` in its
+ * environment), so `clean` and `doctor` run from a shell used to read the temp base and report
+ * nothing while hundreds of gigabytes sat under the configured one. The durable directory does
+ * not move with the state base, so it is where a shell command can find out.
+ */
+export const STATE_BASE_RECORD_FILE = 'state-base.json'
+
+/**
+ * Where a root's state base record lives.
+ *
+ * @param {string} root - the canonical service root.
+ * @param {object} [options] - where to look.
+ * @param {string} [options.dataDir] - the durable base (`FLASH_DATA_DIR`); default the platform's.
+ * @param {Record<string, string | undefined>} [options.env] - environment `durableBaseDir` reads.
+ * @returns {string} the record's path.
+ */
+export function stateBaseRecordPath(root, { dataDir, env = process.env } = {}) {
+  return join(dataDir ?? durableBaseDir(env), rootDigest(root), STATE_BASE_RECORD_FILE)
+}
+
+/**
+ * The state base the last server for a root recorded, if a usable record exists.
+ *
+ * A missing, unreadable or malformed record is no record: the caller then falls back to its
+ * own default and says so, rather than failing a `clean` over a file it only reads for a hint.
+ *
+ * @param {string} root - the canonical service root.
+ * @param {object} [options] - see `stateBaseRecordPath`.
+ * @param {string} [options.dataDir] - the durable base.
+ * @param {Record<string, string | undefined>} [options.env] - environment to read.
+ * @returns {{base: string, source?: string, pid?: number, at?: string, path: string} | undefined}
+ */
+export function readStateBaseRecord(root, { dataDir, env = process.env } = {}) {
+  const path = stateBaseRecordPath(root, { dataDir, env })
+  let parsed
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'))
+  } catch {
+    return undefined
+  }
+  if (typeof parsed?.base !== 'string' || !isAbsolute(parsed.base)) return undefined
+  return {
+    base: parsed.base,
+    ...(typeof parsed.source === 'string' ? { source: parsed.source } : {}),
+    ...(Number.isInteger(parsed.pid) ? { pid: parsed.pid } : {}),
+    ...(typeof parsed.at === 'string' ? { at: parsed.at } : {}),
+    path,
+  }
+}
+
+/**
  * Whether a process is still running. Used to decide whose old trees are safe to remove.
  * @param {number} pid - the process id to ask about.
  * @returns {boolean} true when the process exists.
@@ -1548,6 +1600,44 @@ function treeBytes(dir, { skipTop = () => false, seen = new Set() } = {}) {
         total += treeBytes(child, { seen })
       } else if (entry.isFile()) {
         const info = lstatSync(child)
+        if (info.nlink > 1) {
+          const key = `${String(info.dev)}:${String(info.ino)}`
+          if (seen.has(key)) continue
+          seen.add(key)
+        }
+        total += info.size
+      }
+    } catch {
+      // A file that vanished mid-walk contributes nothing.
+    }
+  }
+  return total
+}
+
+/**
+ * `treeBytes` off the event loop: the same count (symlinks skipped, a hard-linked file counted
+ * once), read with `fs.promises` so measuring a 40 GB `target` leaves the server answering.
+ *
+ * @param {string} dir - the directory to size.
+ * @param {Set<string>} [seen] - hard-linked files already counted.
+ * @returns {Promise<number>} the sum of the file sizes, unreadable entries counted as zero.
+ */
+async function treeBytesAsync(dir, seen = new Set()) {
+  let entries
+  try {
+    entries = await readdirAsync(dir, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  let total = 0
+  for (const entry of entries) {
+    const child = join(dir, entry.name)
+    try {
+      if (entry.isSymbolicLink()) continue
+      if (entry.isDirectory()) {
+        total += await treeBytesAsync(child, seen)
+      } else if (entry.isFile()) {
+        const info = await lstatAsync(child)
         if (info.nlink > 1) {
           const key = `${String(info.dev)}:${String(info.ino)}`
           if (seen.has(key)) continue
@@ -3300,6 +3390,7 @@ function writePatchMeta(record) {
     reportPath,
     cancelled,
     basePatch,
+    baseFile,
   } = record
   const meta = { patchId, root, base, filesChanged, diffstat, createdAt, appliedAt }
   // The parent commit is the caller's HEAD at copy time. It is persisted exactly when it
@@ -3324,6 +3415,8 @@ function writePatchMeta(record) {
   if (cancelled !== undefined) meta.cancelled = cancelled
   // The patch this one continued from, so a later reader can tell the earlier patch is contained in it.
   if (typeof basePatch === 'string') meta.basePatch = basePatch
+  // The diff file the copy started from: the patch applies on top of that diff's change.
+  if (typeof baseFile === 'string') meta.baseFile = baseFile
   writeFileSync(record.metaPath, `${JSON.stringify(meta, null, 2)}\n`)
 }
 
@@ -8064,6 +8157,78 @@ function patchLineage(record, all) {
   return related
 }
 
+/**
+ * The old-file line ranges each hunk of a stored patch covers, context included, for the files
+ * asked about. A hunk's context is what a merge needs untouched, so two patches whose ranges
+ * meet are the ones a second apply may conflict on or quietly fold together. A path git had to
+ * quote (spaces, non-ASCII) is not matched and contributes no ranges; its file still counts as
+ * an overlap.
+ *
+ * @param {string} patchPath - the stored patch file.
+ * @param {string[]} files - the paths to read hunks for.
+ * @returns {Map<string, Array<[number, number]>> | undefined} the ranges per path, in patch
+ *   order, or undefined when the patch file cannot be read.
+ */
+function hunkRanges(patchPath, files) {
+  const wanted = new Set(files)
+  const ranges = new Map()
+  let text
+  try {
+    text = readFileSync(patchPath, 'utf8')
+  } catch {
+    return undefined
+  }
+  let current
+  for (const line of text.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      const names = /^diff --git a\/(.+?) b\/(.+)$/.exec(line)
+      current = names === null ? undefined : wanted.has(names[2]) ? names[2] : wanted.has(names[1]) ? names[1] : undefined
+      continue
+    }
+    if (current === undefined) continue
+    const hunk = /^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@/.exec(line)
+    if (hunk === null) continue
+    const start = Number(hunk[1])
+    const length = hunk[2] === undefined ? 1 : Number(hunk[2])
+    const list = ranges.get(current) ?? []
+    list.push([start, Math.max(start, start + length - 1)])
+    ranges.set(current, list)
+  }
+  return ranges
+}
+
+/**
+ * Where two patches' hunks meet in the files they share: each pair of intersecting ranges, as
+ * `start-end` in each patch's own base, or `new file` for a hunk that creates the file. A shared
+ * file either patch shows no hunk for — a binary file, a path git quoted, a patch file that
+ * cannot be read — is `unknown`: saying its hunks are apart would be a guess.
+ *
+ * @param {object} mine - the patch asked about.
+ * @param {object} other - the overlapping patch.
+ * @param {string[]} files - the files both change.
+ * @returns {{meeting: Array<{file: string, lines: string, otherLines: string}>, unknown: string[]}}
+ */
+function meetingHunks(mine, other, files) {
+  const ours = hunkRanges(mine.patchPath, files) ?? new Map()
+  const theirs = hunkRanges(other.patchPath, files) ?? new Map()
+  // A file the patch creates has an empty old side (`@@ -0,0`); "0" would read as a line.
+  const text = ([from, to]) => (to === 0 ? 'new file' : from === to ? String(from) : `${String(from)}-${String(to)}`)
+  const meeting = []
+  const unknown = []
+  for (const file of files) {
+    if (!ours.has(file) || !theirs.has(file)) {
+      unknown.push(file)
+      continue
+    }
+    for (const a of ours.get(file) ?? []) {
+      for (const b of theirs.get(file) ?? []) {
+        if (a[0] <= b[1] && b[0] <= a[1]) meeting.push({ file, lines: text(a), otherLines: text(b) })
+      }
+    }
+  }
+  return { meeting, unknown }
+}
+
 /** The `overlaps` field of a patch page or a result: present only when there is an overlap. */
 export function overlapField(overlaps) {
   return overlaps.length === 0 ? {} : { overlaps }
@@ -8101,6 +8266,9 @@ export class WorkspaceIsolation {
    *   kept before the startup prune removes it.
    * @param {number} [options.maxStateBytes] - how much this root's patches and retired
    *   trees may take before `trim` removes the reclaimable ones; 0 or omitted: no cap.
+   * @param {number} [options.maxCacheBytes] - how much this root's build caches (this pool's
+   *   slot caches and the stored ones) may take before `trimCaches` removes the least recently
+   *   used; 0 or omitted: no cap.
    * @param {number} [options.sweepIntervalMs] - how often a running pool sweeps dead
    *   owners and trims; 0 turns the timer off.
    * @param {string[]} [options.copyExclude] - names or relative paths left out of the copy
@@ -8144,6 +8312,7 @@ export class WorkspaceIsolation {
     allowSlotSetup = false,
     patchRetentionDays = PATCH_RETENTION_DAYS,
     maxStateBytes = 0,
+    maxCacheBytes = 0,
     sweepIntervalMs = SWEEP_INTERVAL_MS,
     deferStartupSweep = false,
     platform = process.platform,
@@ -8175,6 +8344,9 @@ export class WorkspaceIsolation {
     this.patchDir = this.ownsStateDir ? defaultPatchDir(this.root) : join(this.stateDir, 'calls')
     this.patchRetentionDays = patchRetentionDays
     this.maxStateBytes = maxStateBytes
+    this.maxCacheBytes = maxCacheBytes
+    /** The cache trim in flight, so a slow walk is never started twice. @type {Promise<object> | undefined} */
+    this.cacheTrim = undefined
     this.renameDirectory = renameDirectory
     this.linkLock = linkLock
     this.statfs = statfs
@@ -8761,6 +8933,42 @@ export class WorkspaceIsolation {
   }
 
   /**
+   * Write the state base this pool runs under into its root's durable directory (see
+   * `STATE_BASE_RECORD_FILE`), so `clean` and `doctor` run from a shell can find a base that
+   * only the server's environment named. Only the server calls it: a pool the doctor or a test
+   * builds must not overwrite what the live server recorded. A configured state directory has
+   * no default layout to point at, so it records nothing. A failed write is logged; it never
+   * stops the server.
+   *
+   * @param {object} [options] - what to record beside the base.
+   * @param {string} [options.source] - the layer that named the base (`FLASH_STATE_BASE`,
+   *   `--state-base`, the local settings file), or undefined for the platform temp base.
+   * @returns {string | undefined} the path written, or undefined when nothing was.
+   */
+  recordStateBase({ source } = {}) {
+    if (!this.ownsStateDir) return undefined
+    const path = join(dirname(this.patchDir), STATE_BASE_RECORD_FILE)
+    const record = {
+      base: this.baseDir,
+      source: source ?? 'the platform temp directory (no state base was configured)',
+      pid: process.pid,
+      at: new Date().toISOString(),
+    }
+    // Written beside and renamed into place, so a `clean` reading it never sees half a file.
+    const temp = join(dirname(path), `.${STATE_BASE_RECORD_FILE}.${randomUUID()}.tmp`)
+    try {
+      mkdirSync(dirname(path), { recursive: true })
+      writeFileSync(temp, `${JSON.stringify(record, null, 2)}\n`)
+      renameSync(temp, path)
+      return path
+    } catch (error) {
+      rmSync(temp, { force: true })
+      this.log(`could not record the state base in ${path}: ${error instanceof Error ? error.message : String(error)}`)
+      return undefined
+    }
+  }
+
+  /**
    * Whether the deferred start-up sweep has not finished yet.
    *
    * Read-only, so a service can tell a waiting call what it is waiting for ("the start-up
@@ -8846,6 +9054,9 @@ export class WorkspaceIsolation {
     } catch (error) {
       this.log(`housekeeping failed: ${messageOf(error)}`)
     }
+    // Measured off the event loop, so it is started here and never awaited: a walk over tens
+    // of gigabytes of build output must not hold up the requests the server is answering.
+    if (this.maxCacheBytes > 0) void this.trimCaches()
   }
 
   /**
@@ -8998,6 +9209,83 @@ export class WorkspaceIsolation {
       this.log(
         `trim: this root's state holds ${formatBytes(total)}, over the ${formatBytes(this.maxStateBytes)} cap; ` +
           'what is left is unapplied patches and retired trees whose work is already collected, which are kept',
+      )
+    }
+    result.bytes = total
+    return result
+  }
+
+  /**
+   * Keep this root's build caches under `maxCacheBytes`, least recently used first.
+   *
+   * With stable slots a root's caches only grow: 78 GB on one machine, 39.8 GB of it in one
+   * slot, and an idle server's copies once left a disk 4 % free. What counts is every cache
+   * this root keeps under the state base that this pool may touch: the caches in the store
+   * (no server is using them) and the `.flash-cache` of each of this pool's slots. Another
+   * live server's slots are its own and are neither counted nor touched. Removal order: the
+   * stored caches oldest first, then the caches of this pool's idle slots, the slot that
+   * finished work longest ago first. A busy slot's cache is never removed — a worker may be
+   * building into it — so a root still over the cap after that is reported in the log.
+   *
+   * Every cache is renamed out of the way and deleted in the background (see
+   * `removeTreeViaTrash`), and the sizes are read with `fs.promises`: neither blocks the
+   * server. A second call while one runs gets the same promise.
+   *
+   * @returns {Promise<{bytes: number, removed: number}>} what is left, and how many caches went.
+   */
+  trimCaches() {
+    if (this.cacheTrim === undefined) {
+      this.cacheTrim = this.#trimCaches().finally(() => {
+        this.cacheTrim = undefined
+      })
+    }
+    return this.cacheTrim
+  }
+
+  /** The body of `trimCaches`. @returns {Promise<{bytes: number, removed: number}>} */
+  async #trimCaches() {
+    const result = { bytes: 0, removed: 0 }
+    if (!(this.maxCacheBytes > 0) || this.cacheStore === undefined) return result
+    const stored = []
+    for (const name of storedCacheNames(this.cacheStore)) {
+      const dir = join(this.cacheStore, name)
+      let at = 0
+      try {
+        at = (await statAsync(dir)).mtimeMs
+      } catch {
+        continue
+      }
+      stored.push({ dir, at, bytes: await treeBytesAsync(dir), name: `cache-store-${name}`, what: `stored build cache ${dir}` })
+    }
+    const slots = []
+    for (const slot of this.slots) {
+      const dir = join(slot.dir, SLOT_CACHE)
+      slots.push({ slot, dir, at: slot.releasedAt ?? 0, bytes: await treeBytesAsync(dir), name: `cache-slot-${String(slot.id)}`, what: `the build cache of slot ${String(slot.id)} (${dir})` })
+    }
+    let total = [...stored, ...slots].reduce((sum, entry) => sum + entry.bytes, 0)
+    const order = [...stored.sort((a, b) => a.at - b.at), ...slots.sort((a, b) => a.at - b.at)]
+    const digestDir = join(this.baseDir, rootDigest(this.root))
+    for (const entry of order) {
+      if (total <= this.maxCacheBytes) break
+      if (entry.bytes === 0 || this.closed) continue
+      // Checked at the moment of removal: a slot leased while the sizes were read is busy now,
+      // and a stored cache another server claimed meanwhile is gone.
+      if (entry.slot?.busy === true || !existsSync(entry.dir)) continue
+      const removed = removeTreeViaTrash(entry.dir, {
+        parent: digestDir,
+        name: entry.name,
+        what: entry.what,
+        log: this.log,
+      })
+      if (!removed) continue
+      total -= entry.bytes
+      result.removed += 1
+      this.log(`cache trim: removed ${entry.what} (${formatBytes(entry.bytes)}), least recently used, to stay under the ${formatBytes(this.maxCacheBytes)} cap`)
+    }
+    if (total > this.maxCacheBytes) {
+      this.log(
+        `cache trim: this root's build caches hold ${formatBytes(total)}, over the ${formatBytes(this.maxCacheBytes)} cap; ` +
+          'what is left belongs to slots with a call in flight, which are never trimmed',
       )
     }
     result.bytes = total
@@ -9368,6 +9656,8 @@ export class WorkspaceIsolation {
       return
     }
     slot.busy = false
+    // When the slot last finished work: the cache trim takes the least recently used first.
+    slot.releasedAt = Date.now()
   }
 
   /**
@@ -9513,6 +9803,7 @@ export class WorkspaceIsolation {
     slot.uncommitted = { count: 0, files: [] }
     slot.headLeftOut = undefined
     slot.basePatchId = undefined
+    slot.baseFile = undefined
     // The worker has nowhere legitimate to name outside its copy — the wall refuses
     // it — so it is given a scratch directory *inside* the copy and told about it in
     // its prompt. It is not handed over through TMPDIR: the runtime's sandbox derives
@@ -10629,6 +10920,8 @@ export class WorkspaceIsolation {
       appliedAt: null,
     }
     if (slot.basePatchId !== undefined) record.basePatch = slot.basePatchId
+    // A patch made on top of a diff file applies to a tree that already holds that diff.
+    if (slot.baseFile !== undefined) record.baseFile = slot.baseFile
     if (preimage !== undefined) record.preimage = preimage
     // The task the copy was prepared for travels with the patch: after a crash or a
     // restart, the record itself says whose work this was.
@@ -10962,6 +11255,14 @@ export class WorkspaceIsolation {
                 : {}),
             })
       if (drift !== null && drift.filesChangedSince.length > 0) warnings.push(driftWarning(drift.filesChangedSince))
+      // Made on top of a diff file the copy started from: without that diff in this tree, the
+      // hunks next to it lack their context, and the reason is not in the patch itself.
+      if (typeof record.baseFile === 'string') {
+        warnings.push(
+          `this patch was made on top of the diff ${record.baseFile} and holds only the worker's change; ` +
+            'it applies to a tree that already holds that diff',
+        )
+      }
       // The outcome's own warnings (markers nobody reported) come after the ones above and
       // must not replace them.
       const { warnings: outcomeWarnings = [], ...settled } = outcome
@@ -11078,6 +11379,73 @@ export class WorkspaceIsolation {
       conflicts: outcome.conflicts ?? [],
       filesChanged: recordPaths(record.filesChanged),
     }
+  }
+
+  /**
+   * Start a call's copy from a diff file instead of a stored patch, and make that diff part
+   * of the copy's base, so the patch this call stores holds the worker's change alone.
+   *
+   * A session working on a branch in its own git worktree — outside the root, with another
+   * session's uncommitted files in the main checkout — froze the branch's changes as a diff
+   * and had every worker apply it as step 0. Every stored patch then carried that base again
+   * (one patch of 20 files held 8 of the worker's), and `overlaps` named every sibling. Here
+   * the diff is applied before the worker starts and the base is recorded again afterwards,
+   * exactly as after a setup step: whatever the diff changed is the copy's starting state.
+   *
+   * The plain apply is tried first, then `git apply --3way`, which needs the blobs the diff's
+   * `index` lines name to be in the copy's object store. Both run against a private copy of
+   * the index, so a merge never leaves unmerged entries in the copy's own index; a three-way
+   * apply that left conflict markers names the files in `conflicts`, for the worker to resolve.
+   *
+   * @param {Slot} slot - a slot `prepare` has already filled.
+   * @param {string} file - the diff file's absolute path (the caller has fenced it to the root).
+   * @param {string} [label] - how the result and the stored patch name the file (default `file`).
+   * @returns {{file: string, applied: true, threeWay: boolean, conflicts: string[], filesChanged: string[]}}
+   * @throws {Error} when the diff applies neither plainly nor three-way.
+   */
+  applyBaseFile(slot, file, label = file) {
+    const target = slot.repoDir ?? slot.dir
+    const realIndex = resolve(target, git(['rev-parse', '--git-path', 'index'], target).trim())
+    const indexFile = join(slot.tmpDir, `base-file-index-${randomUUID()}`)
+    let threeWay = false
+    let conflicts = []
+    let filesChanged = []
+    try {
+      if (existsSync(realIndex)) copyFileSync(realIndex, indexFile)
+      const env = { ...process.env, GIT_INDEX_FILE: indexFile }
+      filesChanged = git(['apply', '--numstat', file], target, env)
+        .split('\n')
+        .map((line) => line.split('\t')[2])
+        .filter((path) => typeof path === 'string' && path.length > 0)
+      try {
+        git(['apply', '--whitespace=nowarn', file], target, env)
+      } catch (plainError) {
+        threeWay = true
+        try {
+          git(['apply', '--3way', '--whitespace=nowarn', file], target, env)
+        } catch (mergeError) {
+          // A merge that wrote conflict markers exits non-zero too; those are the worker's to
+          // resolve, while a diff that did not apply at all is the caller's to fix.
+          conflicts = git(['diff', '--name-only', '--diff-filter=U'], target, env)
+            .split('\n')
+            .filter((path) => path.length > 0)
+          if (conflicts.length === 0) {
+            throw new Error(
+              `the diff in ${label} does not apply to this call's copy (${messageOf(plainError)}; three-way: ${messageOf(mergeError)}). ` +
+                'Start the copy from the commit the diff was made against (source: "head" when that is your HEAD), or regenerate the diff with full index lines so a three-way merge can place it',
+            )
+          }
+        }
+      }
+    } finally {
+      rmSync(indexFile, { force: true })
+    }
+    // The diff's change is now the copy's starting state: record the base again, so the
+    // worker's patch is measured from here and never carries the diff.
+    this.#recordBase(slot)
+    slot.baseFile = label
+    this.log(`applied the base diff ${label} in slot ${String(slot.id)}${threeWay ? ' (three-way)' : ''}; it is part of the copy's base`)
+    return { file: label, applied: true, threeWay, conflicts, filesChanged }
   }
 
   /**
@@ -11789,7 +12157,15 @@ export class WorkspaceIsolation {
    * it has not applied.
    *
    * @param {string} patchId - a patch id of this root.
-   * @returns {Array<{patchId: string, files: string[], label: string, createdAt: number}>} newest first.
+   * Each entry says where the two meet: `hunks` lists the line ranges (context included, in
+   * each patch's base) where a hunk of this patch and one of the other intersect, or
+   * `disjointHunks: true` when they share files but no hunk; `hunksUnknown` names shared files
+   * whose hunks could not be read (binary, a quoted path). `sameBase` says whether both were
+   * made from one commit, so the line numbers compare directly.
+   *
+   * @returns {Array<{patchId: string, files: string[], label: string, createdAt: number,
+   *   hunks?: Array<{file: string, lines: string, otherLines: string}>, hunksUnknown?: string[],
+   *   disjointHunks?: true, sameBase: boolean}>} newest first.
    */
   overlapsOf(patchId) {
     const record = this.#lookupPatch(patchId)
@@ -11803,11 +12179,20 @@ export class WorkspaceIsolation {
       const applied = new Set(Array.isArray(other.appliedFiles) ? other.appliedFiles : [])
       const files = recordPaths(other.filesChanged).filter((name) => mine.has(name) && !applied.has(name))
       if (files.length === 0) continue
+      // Which hunks meet decides the order: none meeting means a three-way apply of the second
+      // will most likely place both, while meeting hunks are where it may conflict. Line
+      // numbers are in each patch's own base, so they compare directly only when both copies
+      // were made from the same commit (`sameBase`).
+      const { meeting, unknown } = meetingHunks(record, other, files)
       found.push({
         patchId: other.patchId,
         files,
         label: typeof other.task?.label === 'string' ? other.task.label : '',
         createdAt: other.createdAt,
+        ...(meeting.length === 0 ? {} : { hunks: meeting }),
+        ...(unknown.length === 0 ? {} : { hunksUnknown: unknown }),
+        ...(meeting.length === 0 && unknown.length === 0 ? { disjointHunks: true } : {}),
+        sameBase: typeof record.baseParent === 'string' && record.baseParent === other.baseParent,
       })
     }
     return found.sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0))

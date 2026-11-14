@@ -40,7 +40,13 @@ import { DEFAULT_INITIALIZE_TIMEOUT_MS, resolveDshCommand } from './sdk.js'
 import { JobRegistry, JOB_TOOLS } from './jobs.js'
 import { allowedModels, loadConfig } from './config.js'
 import { FLASH_MCP_VERSION, formatChecks, profileVersionWarning, resolveDshHome, runChecks } from './doctor.js'
-import { WorkspaceIsolation, cleanLayout, durableBaseDir, requireAbsoluteStateBase } from './isolation.js'
+import {
+  WorkspaceIsolation,
+  cleanLayout,
+  durableBaseDir,
+  readStateBaseRecord,
+  requireAbsoluteStateBase,
+} from './isolation.js'
 
 /** The repository root this server runs from, named in the profile-stamp warning. */
 const REPO_ROOT = resolve(fileURLToPath(new URL('../../../', import.meta.url)))
@@ -114,9 +120,11 @@ export function instructionsFor(models = [DEFAULT_MODEL]) {
     '',
     '`flash_status` on a running job reports what its workers are doing: `current` lists each open',
     'tool call (`tool`, `command`, `since`, `runningMs`) as of the last heartbeat, and `warnings`',
-    'names a command that failed three or more times in the call, or one whose process tree has',
-    'used no CPU for minutes; a `current` entry carries `child` when a process under the runtime',
-    'has run longer than the command, and `background` (the job id) when it is a background job.',
+    'names a command that failed three or more times the same way with no file changed between, one',
+    'rerun with new arguments for twenty minutes, or one whose process tree has used no CPU for',
+    'minutes. What a worker is waiting on is listed first; a `current` entry carries `child` when a',
+    'process under the runtime has run longer than the command (with `treeCpuSeconds`, the CPU of',
+    'everything below it), and `background` (the job id) when it is a background job.',
     '',
     'Project facts every worker needs (layout, check commands, style rules) belong in an',
     '`AGENTS.md` or `CLAUDE.md` in the repository: the Harness loads those into every worker',
@@ -204,7 +212,12 @@ export function listTools(models = [DEFAULT_MODEL]) {
           },
           basePatch: {
             type: 'string',
-            description: "A patchId from an earlier writing call, or a unique prefix of one (at least 8 hex digits, with or without the `flash-` prefix). Its change is applied to this call's copy before the worker starts (three-way merged if the tree moved on), and the result's patch then contains both that change and the new work; the stored base patch itself is not applied to your tree.",
+            description: "A patchId from an earlier writing call, or a unique prefix of one (at least 8 hex digits, with or without the `flash-` prefix). Its change is applied to this call\'s copy before the worker starts (three-way merged if the tree moved on), and the result's patch then contains both that change and the new work; the stored base patch itself is not applied to your tree.",
+          },
+          basePatchFile: {
+            type: 'string',
+            description:
+              'A unified diff file inside the service root (path relative to it, or absolute), for instance `git diff` of a branch in another worktree written into an ignored folder. It is applied to this call\'s copy before the worker starts (three-way merged when it does not apply plainly) and becomes part of the copy\'s base, so the stored patch holds only the worker\'s own change; that patch applies to a tree that already holds the diff. Cannot be combined with basePatch.',
           },
           model: {
             type: 'string',
@@ -299,6 +312,11 @@ export function listTools(models = [DEFAULT_MODEL]) {
             type: 'string',
             description: "A patchId from an earlier writing call, or a unique prefix of one (at least 8 hex digits, with or without the `flash-` prefix). Its change is applied to this call's copy before the workers start (three-way merged if the tree moved on), and the result's patch then contains both that change and the new work; the stored base patch itself is not applied to your tree.",
           },
+          basePatchFile: {
+            type: 'string',
+            description:
+              'A unified diff file inside the service root (path relative to it, or absolute), for instance `git diff` of a branch in another worktree written into an ignored folder. It is applied to this call\'s copy before the worker starts (three-way merged when it does not apply plainly) and becomes part of the copy\'s base, so the stored patch holds only the worker\'s own change; that patch applies to a tree that already holds the diff. Cannot be combined with basePatch.',
+          },
           model: {
             type: 'string',
             enum: choices,
@@ -356,6 +374,12 @@ export function listTools(models = [DEFAULT_MODEL]) {
         'The result\'s `drift` says how far your tree moved since the patch\'s base (`commitsBehind`)',
         'and which of the patch\'s own files you changed in the meantime (`filesChangedSince`); a',
         'non-empty file list also comes back as a warning before you apply.',
+        '',
+        'The result also lists `overlaps`: the other unapplied patches of this root that change the',
+        'same files, each with the `hunks` where the two meet (or `disjointHunks: true`), as',
+        'flash_patch describes. With `dryRun` it tells you which order to apply them in, or which',
+        'worker to rerun with `basePatch`; after an apply it names the patches that now need',
+        '`threeWay`. It is left out when there are none.',
       ].join('\n'),
       inputSchema: {
         type: 'object',
@@ -414,8 +438,12 @@ export function listTools(models = [DEFAULT_MODEL]) {
         'It is on the page that starts at offset 0, and is `null` once the patch was applied.',
         '',
         'The first page also lists `overlaps`: other stored patches of this root that are not applied',
-        'and change some of the same files (`patchId`, `files`, `label`, `createdAt`). A patch that',
-        'continues from another (`basePatch`) is not an overlap. It is left out when there are none.',
+        'and change some of the same files (`patchId`, `files`, `label`, `createdAt`). Each says where',
+        'the two meet: `hunks` (`file`, this patch\'s `lines`, the other\'s `otherLines`, context',
+        'included) or `disjointHunks: true` when they share files but no hunk (`hunksUnknown` names a',
+        'shared file whose hunks cannot be compared, such as a binary one), and `sameBase` when both',
+        'were made from one commit so the line numbers compare directly. A patch that continues from',
+        'another (`basePatch`) is not an overlap. It is left out when there are none.',
         '',
         'Pass `excludeBase: true` to read only the work this patch added on top of the base patch',
         'it continued from.',
@@ -538,6 +566,7 @@ export function parseOptions(
     diffChars: numberFrom(env.FLASH_DIFF_CHARS, config.limits.diffChars),
     patchRetentionDays: numberFrom(env.FLASH_PATCH_RETENTION_DAYS, config.limits.patchRetentionDays),
     maxStateBytes: numberFrom(env.FLASH_MAX_STATE_BYTES, config.limits.maxStateBytes),
+    maxCacheBytes: numberFrom(env.FLASH_MAX_CACHE_BYTES, config.limits.maxCacheBytes ?? 0),
     logFile: textFrom(env.FLASH_LOG_FILE),
     help: false,
   }
@@ -599,6 +628,9 @@ export function parseOptions(
         break
       case '--max-state-bytes':
         options.maxStateBytes = numberFrom(next(), undefined)
+        break
+      case '--max-cache-bytes':
+        options.maxCacheBytes = numberFrom(next(), undefined)
         break
       case '--log-file':
         options.logFile = next()
@@ -796,6 +828,10 @@ Options:
   --max-state-bytes <n>     cap on this root's stored patches and retired trees; over it,
                             retired trees and applied patches are removed, unapplied
                             patches never (default: ${value('maxStateBytes')})
+  --max-cache-bytes <n>     cap on this root's build caches (this server's slot caches
+                            and the stored ones); over it, the least recently used are
+                            removed, a busy slot's never; 0 = no cap
+                            (default: ${value('maxCacheBytes')})
   --log-file <path>         append every diagnostic line, timestamped, to this file as
                             well as stderr
   -h, --help                show this help
@@ -803,7 +839,7 @@ Options:
 Environment: FLASH_SERVICE_ROOT, FLASH_SERVICE_PROFILE, FLASH_SERVICE_PROVIDER,
 FLASH_SERVICE_MODEL, FLASH_MODELS, FLASH_TASK_TIMEOUT_MS, FLASH_INIT_TIMEOUT_MS, FLASH_IDLE_TIMEOUT_MS, FLASH_BATCH_TIMEOUT_MS,
 FLASH_MAX_TASKS, FLASH_PER_ITEM_CHARS, FLASH_RESULT_MAX_CHARS, FLASH_MAX_TOKENS, FLASH_ISOLATE, FLASH_SLOTS,
-FLASH_STATE_DIR, FLASH_STATE_BASE, FLASH_COPY_EXCLUDE, FLASH_ALLOW_SLOT_SETUP, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_MAX_STATE_BYTES, FLASH_LOG_FILE,
+FLASH_STATE_DIR, FLASH_STATE_BASE, FLASH_COPY_EXCLUDE, FLASH_ALLOW_SLOT_SETUP, FLASH_DIFF_CHARS, FLASH_PATCH_RETENTION_DAYS, FLASH_MAX_STATE_BYTES, FLASH_MAX_CACHE_BYTES, FLASH_LOG_FILE,
 FLASH_DSH_BIN.
 
 The route and the numeric limits default to flash.config.json, the one file that owns
@@ -901,12 +937,16 @@ export function createToolCaller({ service, jobs, log = () => {}, waitProgressIn
           label,
         })(),
     })
+    // What is wrong with the brief itself is known now; a worker that cannot read its input
+    // files fails seconds in, and the caller should not have to wait for flash_result to hear it.
+    const warnings = typeof service.briefWarnings === 'function' ? service.briefWarnings(args, name) : []
     return okResult({
       jobId: job.jobId,
       kind: job.kind,
       state: 'running',
       startedAt: job.startedAt,
       label: job.label,
+      ...(warnings.length === 0 ? {} : { warnings }),
       note:
         'Running in the background. Use flash_result with this jobId (optionally waitSeconds) to ' +
         'collect its result, flash_status to see its progress, or flash_cancel to stop it.',
@@ -1619,6 +1659,10 @@ export function createService(options, log = () => {}, { deferStartupSweep = fal
       ...(options.diffChars === undefined ? {} : { diffChars: options.diffChars }),
       ...(options.patchRetentionDays === undefined ? {} : { patchRetentionDays: options.patchRetentionDays }),
       ...(options.maxStateBytes === undefined ? {} : { maxStateBytes: options.maxStateBytes }),
+      ...(options.maxCacheBytes === undefined ? {} : { maxCacheBytes: options.maxCacheBytes }),
+      // Never set by the command line: the in-process tests' way to hand the pool a stubbed
+      // volume, so a nearly full disk on the test machine cannot add a low-disk warning.
+      ...(options.statfs === undefined ? {} : { statfs: options.statfs }),
       ...(deferStartupSweep ? { deferStartupSweep: true } : {}),
     },
     log,
@@ -1740,6 +1784,10 @@ export function startServer(
     if (sweepStarted) return
     sweepStarted = true
     log(`startup sweep started (${trigger})`)
+    // The plugin setting reaches only this process, so the base is written where `clean` and
+    // `doctor` run from a shell can read it (see `STATE_BASE_RECORD_FILE`).
+    const recorded = service.isolation?.recordStateBase({ source: stateBaseSourceText(options) })
+    if (recorded !== undefined) log(`state base ${service.isolation.baseDir} recorded in ${recorded}`)
     void service.isolation?.startupSweep()
   }
 
@@ -1963,6 +2011,18 @@ export async function runDoctor(
     emit(usage())
     return 0
   }
+  // A shell has no FLASH_STATE_BASE: the plugin setting reaches only the server. When nothing
+  // here names a base, the one the server recorded for this root is the base the doctor
+  // measures, and the state-base row says that is where it came from.
+  let stateBaseRecord
+  if (options.stateBase === undefined && options.stateDir === undefined && stateBaseProblem === undefined) {
+    const dataDir = textFrom(env.FLASH_DATA_DIR)
+    stateBaseRecord = readStateBaseRecord(canonicalRoot(options.root ?? process.cwd()), {
+      ...(dataDir === undefined ? {} : { dataDir }),
+      env,
+    })
+    if (stateBaseRecord !== undefined) options.stateBase = stateBaseRecord.base
+  }
   const makeService = makeServiceOption ?? createService
   let checksOk = true
   // A plain doctor run, and `--e2e`, check the prerequisites first; a bare `--copy` is
@@ -1981,6 +2041,7 @@ export async function runDoctor(
       ...(options.stateBase === undefined ? {} : { stateBase: options.stateBase }),
       ...(options.stateBaseSource === undefined ? {} : { stateBaseSource: options.stateBaseSource }),
       ...(options.stateBaseLocalFile === undefined ? {} : { stateBaseLocalFile: options.stateBaseLocalFile }),
+      ...(stateBaseRecord === undefined ? {} : { stateBaseRecord }),
       ...(options.localSettingsProblem === undefined ? {} : { localSettingsProblem: options.localSettingsProblem }),
       ...(stateBaseProblem === undefined ? {} : { stateBaseProblem }),
       ...(stateBaseProblemFromLocal ? { stateBaseProblemFromLocal: true } : {}),
@@ -2438,6 +2499,20 @@ function formatMb(bytes) {
 }
 
 /**
+ * The layer that named a server's state base, in words an operator reading `clean` or
+ * `doctor` can act on: the plugin setting by its name, the local settings file by its path.
+ *
+ * @param {{stateBaseSource?: string, stateBaseLocalFile?: string}} options - parsed options.
+ * @returns {string | undefined} the phrase, or undefined when no base was configured.
+ */
+function stateBaseSourceText(options) {
+  const source = options?.stateBaseSource
+  if (source === undefined) return undefined
+  if (source === 'FLASH_STATE_BASE') return 'the plugin setting "state_base" (FLASH_STATE_BASE)'
+  return options.stateBaseLocalFile === undefined ? source : `${source} at ${options.stateBaseLocalFile}`
+}
+
+/**
  * The canonical spelling of a service root, so it matches its digest directory.
  * The service builds its own root with `realpathSync(resolve(root))`, so the same
  * resolver is used here; otherwise `clean` could name the wrong digest for a root
@@ -2492,7 +2567,11 @@ nothing else.
  * @param {object} [options] - injected effects, for tests.
  * @param {Record<string, string | undefined>} [options.env] - environment to read.
  * @param {(text: string) => void} [options.write] - output sink.
- * @param {string} [options.baseDir] - the state base directory, for tests.
+ * @param {string} [options.baseDir] - the state base directory, for tests; it stands in for
+ *   the environment layer.
+ * @param {string} [options.defaultBaseDir] - the platform default base (`$TMPDIR/flash-mcp`),
+ *   used only when no layer and no server record names one; injectable so a test of that
+ *   fallback never reads the real temp base.
  * @param {string} [options.home] - the home directory a `~` base expands against (default
  *   the process's; injectable so a test needs no real home).
  * @param {string} [options.platform] - platform whose local settings section applies
@@ -2502,7 +2581,7 @@ nothing else.
  */
 export async function runClean(
   argv = [],
-  { env = process.env, write, baseDir, home = homedir(), platform = process.platform, now } = {},
+  { env = process.env, write, baseDir, defaultBaseDir, home = homedir(), platform = process.platform, now } = {},
 ) {
   const emit = write ?? ((text) => process.stdout.write(text))
   let all = false
@@ -2554,8 +2633,15 @@ export async function runClean(
     throw error
   }
   const dataDir = textFrom(env.FLASH_DATA_DIR)
+  // The plugin setting reaches only the server, so a shell has no FLASH_STATE_BASE. The server
+  // records its base in the root's durable directory; with no flag, local file or environment
+  // naming one, that record is the base, and the first line says so (see `describeCleanBase`).
+  const record = readStateBaseRecord(canonicalRoot(root), { ...(dataDir === undefined ? {} : { dataDir }), env })
+  const recordUsed = base === undefined && record !== undefined
+  if (recordUsed) base = record.base
+  const sweptBase = base ?? defaultBaseDir
   const report = cleanLayout({
-    ...(base === undefined ? {} : { baseDir: base }),
+    ...(sweptBase === undefined ? {} : { baseDir: sweptBase }),
     ...(dataDir === undefined ? {} : { dataDir }),
     root: canonicalRoot(root),
     all,
@@ -2568,15 +2654,16 @@ export async function runClean(
     ...(now === undefined ? {} : { now }),
     log: (message) => emit(`[flash-mcp clean] ${message}\n`),
   })
-  // A base `clean` takes from the local settings file is named with its path, so a user
-  // editing FLASH_STATE_BASE knows which file to change instead.
-  const localBase = localState?.value === undefined ? undefined : localState
-  const localFile = localBase === undefined ? undefined : localBase.path
-  emit(
-    `flash-mcp state: ${report.baseDir}` +
-      (localBase === undefined ? '' : ` (from ${localBase.source} at ${localFile})`) +
-      '\n',
-  )
+  for (const line of describeCleanBase({
+    report,
+    localState: localState?.value === undefined ? undefined : localState,
+    baseFromFlag,
+    baseFromEnv: !baseFromFlag && localState?.value === undefined && !recordUsed && base !== undefined,
+    record,
+    recordUsed,
+  })) {
+    emit(`${line}\n`)
+  }
   emit(`flash-mcp patches: ${report.patchDir}\n`)
   if (report.legacyPatchDir !== undefined) emit(`flash-mcp legacy patches: ${report.legacyPatchDir}\n`)
   for (const entry of report.stats) {
@@ -2608,6 +2695,51 @@ export async function runClean(
       '\n',
   )
   return 0
+}
+
+/**
+ * The lines that open a `clean` report: which state base was read and why, and — when this
+ * root has nothing there — that it was looked for. A `clean` that read the temp base while the
+ * copies sat under the plugin's configured one used to say `removed: 0` and nothing else.
+ *
+ * @param {object} facts - what `runClean` decided.
+ * @param {{base: string, own: string, stats: Array<{own: boolean}>}} facts.report - `cleanLayout`'s report.
+ * @param {{source: string, path: string} | undefined} facts.localState - the local settings file that named the base.
+ * @param {boolean} facts.baseFromFlag - whether `--state-base` named it.
+ * @param {boolean} facts.baseFromEnv - whether the environment (or an injected base) named it.
+ * @param {{base: string, source?: string, pid?: number, at?: string, path: string} | undefined} facts.record -
+ *   the server's state base record for this root, if any.
+ * @param {boolean} facts.recordUsed - whether that record decided the base.
+ * @returns {string[]} the lines, without newlines.
+ */
+function describeCleanBase({ report, localState, baseFromFlag, baseFromEnv, record, recordUsed }) {
+  let from
+  if (baseFromFlag) from = 'from --state-base'
+  else if (localState !== undefined) from = `from ${localState.source} at ${localState.path}`
+  else if (recordUsed) {
+    const by = record.pid === undefined ? 'the server' : `the server (pid ${String(record.pid)})`
+    const when = record.at === undefined ? '' : ` on ${record.at}`
+    const how = record.source === undefined ? '' : `, set by ${record.source}`
+    from = `as ${by} for this root recorded it${when} in ${record.path}${how}`
+  } else if (baseFromEnv) from = 'from FLASH_STATE_BASE'
+  else {
+    from =
+      'the platform default: no --state-base, no stateBase in .flash-agents.local.json, no FLASH_STATE_BASE, ' +
+      'and no server has recorded a base for this root; the plugin setting "state_base" reaches only the server'
+  }
+  const lines = [`flash-mcp state: ${report.baseDir} (${from})`]
+  // A base the flag or environment chose over the one the server recorded is the operator's
+  // decision, but they should know the server's copies may be elsewhere.
+  if (record !== undefined && !recordUsed && resolve(record.base) !== resolve(report.baseDir)) {
+    lines.push(
+      `note: the server for this root last recorded state base ${record.base} (${record.path}); ` +
+        'its copies are there, not under the base read here',
+    )
+  }
+  if (!report.stats.some((entry) => entry.own)) {
+    lines.push(`nothing for this root (${report.own}) was found under ${report.baseDir}`)
+  }
+  return lines
 }
 
 /**

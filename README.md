@@ -192,6 +192,28 @@ above 128 as a signal (`exit 137 = killed by signal 9`). For `bash -c '<script>'
 `pwsh -Command`, it names the script's first 60 characters, so two scripts are told apart. When the
 brief asks for tests that fail before a fix, those failures are an `info` line, not a warning; only
 a shell command can be such a check, so a failed `edit` or `write` keeps the ordinary warning.
+A failure only counts toward the warning when it repeats the one before: same exit code, same last
+line, and no file edited or written in between. A worker fixing the tests its own change turned
+red, or trying edit scripts until one matches (a heredoc or `python3 -c` with different code is a
+new attempt), is making progress; the same build failing the same way with other flags is still a
+loop, and the warning then says `failed 5 times, the last 3 the same way with no file changed
+between them`. The opposite case is warned about too: one command run with four or more different
+argument lists back to back, twenty minutes or more in all, with no file changed between the runs
+(`"cargo mutants" ran 5 times with 5 different argument lists …`), since such a run never fails.
+
+`current` lists what a worker is waiting on first — its open shell call, or the background job it
+is reading — and background jobs nobody waits on after it, so the progress line names the `cargo
+test` the worker is in, not a `grep` it left running half an hour ago. A background job its worker
+has run three or more commands past without waiting on it carries `outlivedCommands` and a warning
+that it may be stuck, or a server the worker meant to leave running. On Linux and macOS a call
+whose 1-minute load average was above twice the hardware threads for at least a minute says so in
+its warnings: fewer calls at once may then finish sooner. A worker that starts a build beside a
+running background build with the same tool (`cargo`, `npm`, `go`, `gradle` and the like) is warned
+about, since the two wait on one lock or break each other's output; workers are also told to run one
+build at a time and to search with `git grep` or `rg` rather than `grep -r … .` over a build folder.
+A brief that names an existing file outside the root, under your home or temp folder, gets a warning
+in the background call's first answer and in the result: the worker's sandbox may not be able to
+read it, so copy it into an ignored folder of the repository.
 
 Since 0.1.12 `flash_result` also takes `jobIds` (2 to 16 ids, not with `jobId`): with `waitSeconds`
 it returns as soon as any one of them ends, with that job's result and `pending` naming the rest;
@@ -203,8 +225,14 @@ The service also watches each running worker's process tree from outside the san
 for every running call, with or without a progress token). `current` names a `child` of an open
 command (`child: { command, runningMs, cpuSeconds }`, such as the `cmake` under a `cargo check`):
 the deepest idle process of the command's own tree, or its longest-running one while the command is
-busy. Sandbox processes such as `bwrap`, `dsh` and the harness runner are never the child, and their
-CPU never counts. A command whose own tree used under a second of CPU for five minutes gets a
+busy. The child also carries `treeCpuSeconds` and `treeProcesses` for everything below it: `cargo`
+itself sits at 0 CPU seconds while its test binaries work, and the progress line shows the tree's
+figure (`running "cargo test --workspace" for 9m12s (340 CPU s so far); its processes were working
+40s ago`). That CPU also keeps the call alive: the idle stop (ten minutes without an event) does
+not fire while a command's processes keep working, and one that fires while the worker is inside its
+own command says so (`the worker was inside its own command "…", not waiting on the model, so its
+change may already be finished`). Sandbox processes such as `bwrap`, `dsh` and the harness runner
+are never the child, and their CPU never counts. A command whose own tree used under a second of CPU for five minutes gets a
 warning that it may be waiting forever — background commands included, as `<command> (background
 job <job id>) sat with no CPU for 5 min` — and a warning raised during the call stays in the result
 after the command ends. A call whose worker ends while one of its background commands is still
@@ -251,7 +279,16 @@ from that work: the patch is applied to the new copy first (merged if your tree 
 the new call's patch holds both, so you apply only the last one. The exception is a base patch you
 already applied: the copy is taken from your tree, so it already holds that change. It is not
 applied again, the result warns (`basePatch … was already in the tree the copy was taken from`), and
-the new patch holds only the new work, to apply on top of the base, not instead of it. A call whose worker ends with an empty report and no change comes back as
+the new patch holds only the new work, to apply on top of the base, not instead of it.
+
+`basePatchFile` starts a call from a diff file instead — say `git diff` of a branch in another git
+worktree, written into an ignored folder of the root (the file must be inside the root). The diff is
+applied to the copy before the worker starts (three-way when it does not apply plainly) and becomes
+part of the copy's base, so the stored patch holds only the worker's own change: a fleet started
+from one frozen branch no longer stores that branch in every patch, and `overlaps` no longer names
+every sibling. The result's `basePatchFile` says so, the record keeps the file's name, and
+`flash_apply` warns that the patch applies to a tree that already holds that diff. It cannot be
+combined with `basePatch`. A call whose worker ends with an empty report and no change comes back as
 `status: "error"` with `emptyResult: true`, not as a quiet success.
 
 A patch id can be quoted short: `flash_apply`, `flash_patch` and `basePatch` take any unique prefix
@@ -274,7 +311,13 @@ patch window: a server with a copy pool prunes the expired ones at start-up, and
 them. `flash_cancel` on a writing job stores the copy's change as a patch before the copy goes and
 returns its `patchId`, or says `stored: false` when there was none. `flash_patch` and a writing
 result list `overlaps`: other unapplied patches of the same root that change any of the same
-files, such as two jobs that both took the next schema number.
+files, such as two jobs that both took the next schema number. Each overlap says where the two
+meet: `hunks` lists the line ranges, context included, where a hunk of each touches (`{ file,
+lines: "1-5", otherLines: "1-7" }`), or `disjointHunks: true` when they share files but no hunk
+(`hunksUnknown` names a shared file whose hunks cannot be compared, such as a binary one), and
+`sameBase` says whether both copies came from one commit, so the line numbers compare directly.
+`flash_apply` lists them too: a `dryRun` tells you which order to apply two patches in, or which
+worker to rerun with `basePatch`, before anything is written.
 
 A writing call whose worker changed nothing stores no patch: `change.available` stays true,
 `filesChanged` is empty, there is no `patchId` or `patchPath`, and `change.note` says `the worker
@@ -369,7 +412,11 @@ Omit `model` for the default.
 
 The settings also cover how many copies may be in flight (up to 16, each a process, so this is a
 memory decision; default 2), where copies and patches live, and **Base folder for worker copies**
-(`state_base`; `FLASH_STATE_BASE` or `--state-base` for a manual install). That base moves the
+(`state_base`; `FLASH_STATE_BASE` or `--state-base` for a manual install). The plugin setting
+reaches only the server, so the server writes the base it runs with into the repository's data
+directory (`state-base.json`), and `flash-agents clean` and `doctor` run from a shell read it when
+no flag, `.flash-agents.local.json` or `FLASH_STATE_BASE` names one. Both say which base they read
+and why, and `clean` says when nothing of the repository was found there. That base moves the
 default copy layout only — a configured state directory replaces it — and it must be an absolute
 path, with a leading `~` expanded. It works on every platform. On Linux and macOS a short one
 such as `/tmp/fm` keeps a test's Unix socket paths under the length limit ("path must be shorter
@@ -485,7 +532,12 @@ checkout gets neither, because no `platform.linux` section names them.
   directory instead (see below), so the store serves the retired trees and a slot that is new.
   `flash-agents clean` removes the stored caches with the rest, `clean --caches` removes only them, and
   `doctor` lists what each slot, its cache and the store take on disk. A call warns when the volume
-  holding the copies has under 10 % or under 5 GiB free.
+  holding the copies has under 10 % or under 5 GiB free. `limits.maxCacheBytes`
+  (`FLASH_MAX_CACHE_BYTES`, `--max-cache-bytes`; default 0, no cap) bounds a repository's build
+  caches: every ten minutes the server measures the stored caches and its own slots' caches, off the
+  event loop, and over the cap removes the stored ones first, then the cache of the slot that has
+  been idle longest. A slot with a call in flight is never trimmed, and another live server's slots
+  are its own.
   `port:<base>` gives each slot its own port base (`base + slot × 10`; `port:41000/100` for a
   stride of 100), for test servers that would otherwise share a fixed port. `value:<text>` sets a
   plain value in every slot, for a setting the whole project shares rather than one brief:

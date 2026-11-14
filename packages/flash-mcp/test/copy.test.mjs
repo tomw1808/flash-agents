@@ -82,6 +82,12 @@ function readlinkSafe(path) {
 
 // ── entries that vanish mid-copy ────────────────────────────────────────────
 
+/**
+ * A statfs that reports a roomy volume. Without it a call's low-disk warning reads the real
+ * volume, and a test expecting no warning fails on any machine whose disk is nearly full.
+ */
+const ROOMY = () => ({ bsize: 4096, blocks: 1_000_000_000, bavail: 500_000_000 })
+
 test('copyTree skips and counts a file that vanished between readdir and the copy', () => {
   const from = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-from-')))
   const to = mkdtempSync(join(tmpdir(), 'flash-copy-to-'))
@@ -1838,7 +1844,7 @@ function makeService({ root, writes, ...overrides } = {}) {
       return client
     },
     log: () => {},
-    isolate: { slots: 1, stateDir: realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-svc-state-'))) },
+    isolate: { slots: 1, stateDir: realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-svc-state-'))), statfs: ROOMY },
     ...overrides,
   })
   return { client, service }
@@ -1922,7 +1928,7 @@ test('the resolved slotEnv is handed to the runtime factory, and only when confi
       return client
     },
     log: () => {},
-    isolate: { slots: 1, stateDir, slotEnv: { CARGO_HOME: 'home:cargo', CARGO_TARGET_DIR: 'cache:cargo-target' } },
+    isolate: { slots: 1, stateDir, statfs: ROOMY, slotEnv: { CARGO_HOME: 'home:cargo', CARGO_TARGET_DIR: 'cache:cargo-target' } },
   })
   await service.flashTask({ task: 'x', cwd: repo })
   const slotDir = service.isolation.slots[0].dir
@@ -1967,7 +1973,7 @@ test('an allowed setup runs before the worker, is reported in the result, and is
     const { client, service } = makeService({
       root: repo,
       writes: 'worker.txt',
-      isolate: { slots: 1, stateDir, allowSlotSetup: true },
+      isolate: { slots: 1, stateDir, statfs: ROOMY, allowSlotSetup: true },
     })
     const result = await service.flashTask({ task: 'do a thing', cwd: repo })
     assert.equal(setupRuns(counter), 1)
@@ -1995,7 +2001,7 @@ test('an allowed setup runs before the worker, is reported in the result, and is
 test('a failing setup step fails the call with SETUP_FAILED and releases the slot', async () => {
   const repo = makeSetupRepo({ script: "console.error('boom-tail'); process.exit(9)" })
   const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-copy-setup-fail-')))
-  const { service } = makeService({ root: repo, isolate: { slots: 1, stateDir, allowSlotSetup: true } })
+  const { service } = makeService({ root: repo, isolate: { slots: 1, stateDir, statfs: ROOMY, allowSlotSetup: true } })
   await assert.rejects(
     service.flashTask({ task: 'do a thing', cwd: repo }),
     (error) =>

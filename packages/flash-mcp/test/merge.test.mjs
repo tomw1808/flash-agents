@@ -600,3 +600,129 @@ test('a nested repository the top tracks as a gitlink keeps its pointer, with no
   assert.deepEqual(plainNames(change), ['top.txt'])
   isolation.close()
 })
+
+// ── a diff file as the copy's base (issue #5: a branch in another worktree) ──
+
+/** Write `files` into `repo`, freeze them as a staged diff in `.flash-briefs/base.patch`, and reset. */
+function freezeDiff(repo, files) {
+  writeFiles(repo, files)
+  execFileSync('git', ['add', '-A'], { cwd: repo })
+  const diff = gitOut(repo, 'diff', '--cached', '--full-index', '--binary')
+  execFileSync('git', ['reset', '-q', '--hard'], { cwd: repo })
+  execFileSync('git', ['clean', '-fdq'], { cwd: repo })
+  mkdirSync(join(repo, '.flash-briefs'), { recursive: true })
+  writeFileSync(join(repo, '.flash-briefs', 'base.patch'), diff)
+  return '.flash-briefs/base.patch'
+}
+
+test('flash_task with basePatchFile starts from the diff and stores only the worker’s change', async () => {
+  const repo = makeRepo({ 'a.txt': 'a1\na2\na3\n', '.gitignore': '.flash-briefs/\n' })
+  const file = freezeDiff(repo, { 'a.txt': 'a1 FROM BRANCH\na2\na3\n', 'b.txt': 'made on the branch\n' })
+  const prompts = []
+  const service = makeService(repo, tempDir('flash-merge-basefile-'), { 'c.txt': 'made by the worker\n' }, prompts)
+  try {
+    const result = await service.flashTask({ task: 'build on the branch', cwd: repo, basePatchFile: file })
+    // The defect: the branch's diff was the brief's step 0, so every patch carried it again.
+    assert.deepEqual([...result.change.filesChanged], ['c.txt'])
+    assert.equal(result.basePatchFile.file, file)
+    assert.equal(result.basePatchFile.applied, true)
+    assert.match(result.basePatchFile.note, /holds only the new work/)
+    const prompt = prompts.find((text) => text.includes(file))
+    assert.ok(prompt.includes(`The copy already contains the change from ${file}, applied before you started: a.txt, b.txt.`), prompt)
+
+    // The stored record names the diff, and an apply says what the patch sits on.
+    const record = JSON.parse(readFileSync(join(service.isolation.patchDir, `${result.change.patchId}.json`), 'utf8'))
+    assert.equal(record.baseFile, file)
+    const applied = service.isolation.apply({ patchId: result.change.patchId, dryRun: true })
+    assert.ok(
+      (applied.warnings ?? []).includes(
+        `this patch was made on top of the diff ${file} and holds only the worker's change; it applies to a tree that already holds that diff`,
+      ),
+      JSON.stringify(applied.warnings),
+    )
+  } finally {
+    await service.close()
+  }
+})
+
+test('basePatchFile is refused outside the root, beside basePatch, and when it does not apply', async () => {
+  const repo = makeRepo({ 'a.txt': 'a1\na2\na3\n' })
+  const service = makeService(repo, tempDir('flash-merge-basefile-bad-'), { 'c.txt': 'x\n' })
+  try {
+    const outside = join(tempDir('flash-merge-outside-'), 'base.patch')
+    writeFileSync(outside, 'diff --git a/a.txt b/a.txt\n')
+    await assert.rejects(service.flashTask({ task: 't', cwd: repo, basePatchFile: outside }), (error) => error.code === 'BASE_PATCH_FILE_OUTSIDE_ROOT')
+    writeFileSync(join(repo, 'base.patch'), 'diff --git a/a.txt b/a.txt\n')
+    await assert.rejects(
+      service.flashTask({ task: 't', cwd: repo, basePatchFile: 'base.patch', basePatch: 'flash-0123456789abcdef' }),
+      (error) => error.code === 'INVALID_ARGUMENT' && /cannot both be given/.test(error.message),
+    )
+    // A diff whose context is not in the copy, and whose blobs are not either.
+    writeFileSync(
+      join(repo, 'base.patch'),
+      'diff --git a/a.txt b/a.txt\nindex 1111111..2222222 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n-zz1\n+zz1 changed\n zz2\n zz3\n',
+    )
+    await assert.rejects(
+      service.flashTask({ task: 't', cwd: repo, basePatchFile: 'base.patch' }),
+      (error) => error.code === 'BASE_PATCH_UNAVAILABLE' && /the diff in base\.patch does not apply to this call's copy/.test(error.message),
+    )
+  } finally {
+    await service.close()
+  }
+})
+
+// ── overlaps name the hunks that meet, before an apply (issue #5) ────────────
+
+test('flash_apply names the other patches whose hunks meet this one, before anything is written', async () => {
+  const lines = Array.from({ length: 40 }, (_, index) => `line ${String(index + 1)}`)
+  const edit = (at, text) => `${lines.map((line, index) => (index === at ? text : line)).join('\n')}\n`
+  const repo = makeRepo({ 'list.txt': `${lines.join('\n')}\n` })
+  const stateDir = tempDir('flash-merge-overlap-')
+  const ids = {}
+  for (const [name, writes] of Object.entries({
+    near: { 'list.txt': edit(1, 'line 2 FROM NEAR') },
+    touching: { 'list.txt': edit(3, 'line 4 FROM TOUCHING') },
+    far: { 'list.txt': edit(35, 'line 36 FROM FAR') },
+  })) {
+    const service = makeService(repo, stateDir, writes)
+    ids[name] = (await service.flashTask({ task: `edit ${name}`, cwd: repo })).change.patchId
+    await service.close()
+  }
+  const service = makeService(repo, stateDir, {})
+  try {
+    const dry = service.flashApply({ patchId: ids.near, dryRun: true })
+    const byId = new Map(dry.overlaps.map((entry) => [entry.patchId, entry]))
+    // Lines 2 and 4 sit inside each other's three lines of context: a merge may conflict.
+    assert.deepEqual(byId.get(ids.touching).hunks, [{ file: 'list.txt', lines: '1-5', otherLines: '1-7' }])
+    assert.equal(byId.get(ids.touching).sameBase, true)
+    // Line 36 is far from both: same file, no meeting hunk.
+    assert.equal(byId.get(ids.far).disjointHunks, true)
+    assert.equal(byId.get(ids.far).hunks, undefined)
+    assert.equal(readFileSync(join(repo, 'list.txt'), 'utf8'), `${lines.join('\n')}\n`, 'a dry run wrote nothing')
+
+    // After the apply, the result names the patches that now need threeWay.
+    const applied = service.flashApply({ patchId: ids.near })
+    assert.deepEqual(applied.overlaps.map((entry) => entry.patchId).sort(), [ids.far, ids.touching].sort())
+  } finally {
+    await service.close()
+  }
+})
+
+test('an overlap whose hunks cannot be read says so instead of calling them apart', async () => {
+  const repo = makeRepo({ 'logo.bin': Buffer.from([0, 1, 2, 3]) })
+  const stateDir = tempDir('flash-merge-overlap-binary-')
+  const ids = []
+  for (const bytes of [[0, 9, 2, 3], [0, 1, 9, 3]]) {
+    const service = makeService(repo, stateDir, { 'logo.bin': Buffer.from(bytes) })
+    ids.push((await service.flashTask({ task: 'edit the logo', cwd: repo })).change.patchId)
+    await service.close()
+  }
+  const service = makeService(repo, stateDir, {})
+  try {
+    const [overlap] = service.flashApply({ patchId: ids[0], dryRun: true }).overlaps
+    assert.deepEqual(overlap.hunksUnknown, ['logo.bin'])
+    assert.equal(overlap.disjointHunks, undefined, 'a binary file has no hunks to compare, which is not "apart"')
+  } finally {
+    await service.close()
+  }
+})

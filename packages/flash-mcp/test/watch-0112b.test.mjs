@@ -168,6 +168,8 @@ test('a command in no process still gets a child, from the runtime’s longest-r
     command: 'pwsh -NoProfile -EncodedCommand ZgBvAG8A',
     runningMs: 3_000,
     cpuSeconds: 0.3,
+    treeCpuSeconds: 0.4,
+    treeProcesses: 2,
   })
   // The fallback is for `child` only: a quiet window never starts from a process that may not
   // be running the command.

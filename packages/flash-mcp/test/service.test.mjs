@@ -663,6 +663,12 @@ function makeService({ script, ...overrides } = {}) {
  * `localSettings` as the untracked `.flash-agents.local.json` after the commit, so a test
  * can tell the files the server read at start from ones edited afterwards.
  */
+/**
+ * A statfs that reports a roomy volume. Without it a call's low-disk warning reads the real
+ * volume, and a test expecting no warning fails on any machine whose disk is nearly full.
+ */
+const ROOMY = () => ({ bsize: 4096, blocks: 1_000_000_000, bavail: 500_000_000 })
+
 function makeIsolatedService({ slots = 2, file = 'worker-output.txt', script, slotEnv, settings, localSettings, ...overrides } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'flash-mcp-iso-')))
   execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root })
@@ -683,7 +689,7 @@ function makeIsolatedService({ slots = 2, file = 'worker-output.txt', script, sl
       return client
     },
     log: () => {},
-    isolate: { slots, stateDir, ...(slotEnv === undefined ? {} : { slotEnv }) },
+    isolate: { slots, stateDir, statfs: ROOMY, ...(slotEnv === undefined ? {} : { slotEnv }) },
     honoursModelEnv: () => true,
     earlyRetryDelayMs: 0,
     ...overrides,
@@ -1738,7 +1744,7 @@ test('every child prompt carries the standing worker instructions, in order', ()
   // (never the transcript) learns about a deviation, a wrong contract, or an unfinished task.
   // "Rules crossed" stays last and is pinned in service-0110.test.mjs; the five rules it
   // groups are pinned in small-0111.test.mjs.
-  assert.equal(WORKER_INSTRUCTIONS.length, 19)
+  assert.equal(WORKER_INSTRUCTIONS.length, 21)
   assert.match(WORKER_INSTRUCTIONS[0], /^Do not commit unless the task explicitly asks/)
   assert.match(WORKER_INSTRUCTIONS[1], /^If the work reaches for an escape hatch/)
   assert.equal(
@@ -1995,7 +2001,7 @@ test('read-only is the only selectable narrowing, and it runs its own process', 
     },
     // The pool's trees and reports go in this test's own temporary directory, not the
     // real temp state base.
-    isolate: { stateDir: mkdtempSync(join(tmpdir(), 'flash-service-state-')) },
+    isolate: { stateDir: mkdtempSync(join(tmpdir(), 'flash-service-state-')), statfs: ROOMY },
     log: () => {},
   })
 
@@ -2373,7 +2379,7 @@ test('a salvaged patch keeps baseParent across a restart, so its drift counts co
     root,
     clientFactory: () => new FakeSdkClient(),
     log: () => {},
-    isolate: { slots: 1, stateDir },
+    isolate: { slots: 1, stateDir, statfs: ROOMY },
     honoursModelEnv: () => true,
     earlyRetryDelayMs: 0,
   })
@@ -3959,7 +3965,7 @@ test('a long Windows slot root warns once in every call result, and only on win3
   const logs = []
   const { root, service } = makeIsolatedService({
     platform: 'win32',
-    isolate: { slots: 2, baseDir: base },
+    isolate: { slots: 2, baseDir: base, statfs: ROOMY },
     log: (line) => logs.push(line),
   })
   try {

@@ -137,6 +137,12 @@ Rules that held up:
   (which error becomes which case, and why). The worker implements a decision well and invents
   one badly.
 - **Name what it must not touch** — including files a sibling in the same batch owns.
+- **Name the helpers to reuse.** A worker that is not told about the shared parser or lookup
+  function writes its own beside it: in one night, four of eleven patches carried a copy of an
+  existing helper. "Use `parse_header` in `src/wire.rs`; do not write another" stops it.
+- **Keep input files inside the repository.** A worker cannot read a file in your session's `/tmp`
+  or elsewhere outside the root: write it into an ignored folder of the repository and name that
+  path. `flash_task` warns when a brief names an existing file outside the root.
 - **Give the verification recipe, not just "run the tests".** Compiled projects: cloned build
   state carries absolute paths and is unusable in a copy. For SwiftPM, point a `cache:` folder at
   the scratch path in the repository's `.flash-agents.json` — `"slotEnv": { "SWIFT_SCRATCH":
@@ -205,8 +211,11 @@ Rules that held up:
   `flash_status` has `queue` (`position`, `of`, and the `holders` of the trees, first come, first
   served), so you can see which job to wait for or cancel. When a job runs
   long, `flash_status` says what its workers are doing — `current` lists each open tool call
-  (`command`, `runningMs`) and `warnings` names a command that has failed three times (exit 1 from
-  `grep`, `rg`, `diff` or `cmp` is not a failure, and the line says when a later run succeeded).
+  (`command`, `runningMs`) and `warnings` names a command that has failed three times the same way
+  with no file changed in between (exit 1 from `grep`, `rg`, `diff` or `cmp` is not a failure, and the
+  line says when a later run succeeded), or one rerun with ever new arguments for twenty minutes.
+  `child.treeCpuSeconds` is the CPU of a command's whole tree: a `cargo test` at 0 s with a large
+  tree figure is working, not stuck.
 - A misspelt argument is refused with the nearest known name, and so are `provider`,
   `reasoningEffort`, `agentOptions`, `permissions` and `sandbox`: fix the call rather than dropping
   the field.
@@ -263,7 +272,9 @@ round's "fails before and passes after" needs, and the fix round then makes them
   applied, and the new patch is cumulative — apply it instead of the old one, never both. The
   exception: when you already applied the base patch to the tree, it is not applied again, the
   result warns and `basePatch.alreadyInTree` is true, and the new patch holds only the new work —
-  apply it on top of the base. An id can
+  apply it on top of the base. To start workers from a branch in another worktree, write its
+  `git diff --full-index` into an ignored folder of the root and pass it as `basePatchFile`: each
+  patch then holds only that worker's change. An id can
   be quoted short: `flash_apply`, `flash_patch` and `basePatch` take any unique prefix of at least
   eight hex digits, with or without `flash-`, and refuse an ambiguous one with the matches named.
 - `emptyResult: true` with `status: "error"`: the worker ended without a report and without a
@@ -275,7 +286,9 @@ round's "fails before and passes after" needs, and the fix round then makes them
   in `flash_status`. A `flash_status` warning that a command used no CPU for minutes usually means
   it waits forever (ninja on Windows); `current[].child` names what it is waiting in.
 - `overlaps` on a writing result names other unapplied patches that touch the same files: decide
-  which one wins before applying either.
+  which one wins before applying either. `hunks` shows where they meet (`disjointHunks: true`: they
+  share a file but no lines, so a three-way apply of the second will most likely be clean), and a
+  `flash_apply` with `dryRun` lists the same before anything is written.
 - Refusals appear in the result's `denials` and in the log with their reason; a worker that hit
   the wall says so in its reply.
 - The result's `change.diff` is clipped at a file boundary when it is long; `change.diffOmitted`

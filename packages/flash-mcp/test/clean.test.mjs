@@ -450,3 +450,64 @@ test('FLASH_STATE_BASE and --state-base make clean read that base', async () => 
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('clean with no base configured sweeps the base the server recorded for this root, and says so', async () => {
+  // The defect: the plugin setting reaches only the server, so `clean` in a shell read the
+  // temp base, reported `removed: 0`, and left 308 GB under the configured base.
+  const recorded = makeBase()
+  const platformDefault = makeBase()
+  const root = makeRoot()
+  const dataDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-clean-data-record-')))
+  const owner = join(recorded, rootDigest(root), '4194303')
+  mkdirSync(join(owner, 'dead0001', 'slots', 'slot-0'), { recursive: true })
+  writeFileSync(join(owner, 'dead0001', 'slots', 'slot-0', 'leftover.txt'), 'a crashed worker left this\n')
+  mkdirSync(join(dataDir, rootDigest(root)), { recursive: true })
+  writeFileSync(
+    join(dataDir, rootDigest(root), 'state-base.json'),
+    `${JSON.stringify({ base: recorded, source: 'the plugin setting "state_base" (FLASH_STATE_BASE)', pid: 4242, at: '2026-11-13T10:00:00.000Z' })}\n`,
+  )
+  try {
+    const lines = []
+    const code = await runClean(['--root', root], {
+      env: { FLASH_DATA_DIR: dataDir },
+      write: (text) => lines.push(text),
+      defaultBaseDir: platformDefault,
+    })
+    assert.equal(code, 0)
+    const text = lines.join('')
+    assert.equal(existsSync(owner), false, 'the dead owner under the recorded base is removed')
+    assert.match(text, /removed: 1 dead owner\(s\)/)
+    const first = text.split('\n').find((line) => line.startsWith('flash-mcp state:')) ?? ''
+    assert.ok(first.startsWith(`flash-mcp state: ${recorded} (as the server (pid 4242) for this root recorded it`), first)
+    assert.ok(first.includes(join(dataDir, rootDigest(root), 'state-base.json')), 'the line names the record it read')
+    assert.ok(first.includes('set by the plugin setting "state_base"'), 'and the layer that set the base')
+  } finally {
+    for (const dir of [recorded, platformDefault, root, dataDir]) rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('clean names the base it fell back to, that nothing for this root is there, and a recorded base it did not read', async () => {
+  const platformDefault = makeBase()
+  const elsewhere = makeBase()
+  const recorded = makeBase()
+  const root = makeRoot()
+  const dataDir = realpathSync(mkdtempSync(join(tmpdir(), 'flash-clean-data-fallback-')))
+  try {
+    const lines = []
+    await runClean(['--root', root], { env: { FLASH_DATA_DIR: dataDir }, write: (text) => lines.push(text), defaultBaseDir: platformDefault })
+    const text = lines.join('')
+    assert.match(text, /\(the platform default: no --state-base, no stateBase in \.flash-agents\.local\.json, no FLASH_STATE_BASE, and no server has recorded a base for this root; the plugin setting "state_base" reaches only the server\)/)
+    assert.ok(text.includes(`nothing for this root (${rootDigest(root)}) was found under ${platformDefault}`), text)
+
+    // A base the operator names wins over the record, but the record is mentioned.
+    mkdirSync(join(dataDir, rootDigest(root)), { recursive: true })
+    writeFileSync(join(dataDir, rootDigest(root), 'state-base.json'), `${JSON.stringify({ base: recorded, pid: 4242 })}\n`)
+    const flagLines = []
+    await runClean(['--root', root, '--state-base', elsewhere], { env: { FLASH_DATA_DIR: dataDir }, write: (text) => flagLines.push(text) })
+    const flagText = flagLines.join('')
+    assert.ok(flagText.includes(`flash-mcp state: ${elsewhere} (from --state-base)`), flagText)
+    assert.ok(flagText.includes(`note: the server for this root last recorded state base ${recorded}`), flagText)
+  } finally {
+    for (const dir of [platformDefault, elsewhere, recorded, root, dataDir]) rmSync(dir, { recursive: true, force: true })
+  }
+})

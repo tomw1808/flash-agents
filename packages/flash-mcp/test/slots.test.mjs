@@ -121,6 +121,12 @@ const LOCK_SKIP = process.platform === 'win32' || process.getuid?.() === 0
 
 const CACHE_SETTINGS = { slotEnv: { CARGO_TARGET_DIR: 'cache:target' }, slotSetup: [KEEP_STEP] }
 
+/**
+ * A statfs that reports a roomy volume. Without it a call's low-disk warning reads the real
+ * volume, and a test expecting no warning fails on any machine whose disk is nearly full.
+ */
+const ROOMY = () => ({ bsize: 4096, blocks: 1_000_000_000, bavail: 500_000_000 })
+
 test('the call after a timeout takes the retired tree’s build cache, and starts warm', async () => {
   const repo = makeRepo({ settings: CACHE_SETTINGS })
   const logs = []
@@ -387,7 +393,7 @@ function makeService(repo, { slots = 1, log = () => {}, ...overrides } = {}) {
       return runtime
     },
     log,
-    isolate: { slots, stateDir },
+    isolate: { slots, stateDir, statfs: ROOMY },
     honoursModelEnv: () => true,
     earlyRetryDelayMs: 0,
     ...overrides,

@@ -16,7 +16,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { availableParallelism, homedir, loadavg, tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
@@ -33,7 +33,7 @@ import {
 } from './isolation.js'
 import { estimateInstructions } from './instructions.js'
 import { HarnessSdkClient, DEFAULT_INITIALIZE_TIMEOUT_MS, resolveDshCommand } from './sdk.js'
-import { ProcessWatch, quietWarning, childOfCall } from './proctree.js'
+import { ProcessWatch, quietWarning, childOfCall, lastTreeActivity } from './proctree.js'
 import { FLASH_MCP_VERSION, profileHonoursModelEnv, resolveDshHome } from './doctor.js'
 
 /** Route the service pins; callers can never change the provider. */
@@ -138,6 +138,55 @@ const ACTIVITY_TOOL_CHARS = 120
  * a worker repeating a step its sandbox cannot finish leaves behind.
  */
 const REPEATED_FAILURE_THRESHOLD = 3
+
+/**
+ * How many foreground commands a worker may run past a background job, without waiting on
+ * it, before the job is marked and warned about. A build started in the background is usually
+ * waited on within a command or two; one that three later commands never looked at is
+ * forgotten, stuck, or a server meant to keep running.
+ */
+const BACKGROUND_OUTLIVED_COMMANDS = 3
+
+/**
+ * How many different argument lists one command must have been run with, back to back and with
+ * no file changed, before the rerun warning fires. Two or three probes of a command (a test
+ * filter narrowed, a flag added) are ordinary; a fourth variant with nothing fixed in between
+ * is a worker searching rather than working.
+ */
+const RERUN_VARIANTS = 4
+
+/**
+ * How long those runs must have taken together. Quick reruns cost little and are often a
+ * worker reading output a piece at a time; twenty minutes is long enough to matter and short
+ * of the 53 minutes that went unnoticed.
+ */
+const RERUN_TOTAL_MS = 20 * 60_000
+
+/**
+ * How far above the hardware thread count the load average may go before a call says so. At
+ * twice the threads every runnable process waits at least half the time; below that, a busy
+ * build machine is simply busy.
+ */
+const LOAD_HINT_PER_THREAD = 2
+
+/**
+ * The build tools whose second run in one tree waits on the first (cargo's build-directory
+ * lock, Gradle's daemon lock) or overwrites its output (npm and the rest write one output
+ * folder). Matched by program name only.
+ */
+/**
+ * How many outside paths the brief warning names before it only counts the rest: enough to
+ * find the folder they came from, short enough to stay one line.
+ */
+const BRIEF_PATHS_SHOWN = 5
+
+const BUILD_TOOLS = new Set(['cargo', 'go', 'gradle', 'gradlew', 'mvn', 'npm', 'pnpm', 'yarn', 'make', 'cmake', 'ninja', 'swift', 'dotnet', 'bazel'])
+
+/**
+ * How long a call's load must have been sampled before the hint may name it: the load average
+ * is a one-minute figure, so it describes nothing shorter.
+ */
+const LOAD_HINT_MIN_SAMPLED_MS = 60_000
 
 /**
  * How much of a shell invocation's script a repeated-failure warning names and groups by.
@@ -284,6 +333,11 @@ export class FlashTaskService {
    *   stamp read used for that re-read (injectable, so a test needs no real `~/.dsh`).
    * @param {Map<string, string | undefined> | Record<string, string | undefined>} [options.profileStampWarnings]
    *   the start-time verdict per profile, used until that profile's runtime boots.
+   * @param {() => {load: number, threads: number}} [options.loadProbe] - reads the machine's
+   *   1-minute load average and hardware thread count (default `os.loadavg` and
+   *   `os.availableParallelism`; injectable so a test never depends on the real machine).
+   * @param {number} [options.loadHintAfterMs] - how long a call's load must have been sampled
+   *   before the load hint may name it (default `LOAD_HINT_MIN_SAMPLED_MS`).
    * @param {() => Promise<object[]>} [options.processList] - reads the machine's process table
    *   (default `listProcesses`; injectable so a test watches a fake table, never the real one).
    * @param {(message: string) => void} [options.log] - diagnostic sink (stderr).
@@ -320,6 +374,8 @@ export class FlashTaskService {
     profileStampWarnings = new Map(),
     log = () => {},
     processList,
+    loadProbe = () => ({ load: loadavg()[0], threads: availableParallelism() }),
+    loadHintAfterMs = LOAD_HINT_MIN_SAMPLED_MS,
     clientFactory,
     isolate = {},
   }) {
@@ -371,6 +427,8 @@ export class FlashTaskService {
     this.log = log
     /** Reads runtimes' process trees for the stuck-command warning and the `child` of `current`, off the call path. */
     this.procWatch = new ProcessWatch({ list: processList, log })
+    this.loadProbe = loadProbe
+    this.loadHintAfterMs = loadHintAfterMs
     // Kept for the worker's prompt: the shell a worker's commands run in differs by platform,
     // and a worker that writes bash for PowerShell spends its turns on syntax errors.
     this.platform = platform
@@ -430,6 +488,7 @@ export class FlashTaskService {
             ...(isolate.baseDir === undefined ? {} : { baseDir: isolate.baseDir }),
             ...(isolate.patchRetentionDays === undefined ? {} : { patchRetentionDays: isolate.patchRetentionDays }),
             ...(isolate.maxStateBytes === undefined ? {} : { maxStateBytes: isolate.maxStateBytes }),
+            ...(isolate.maxCacheBytes === undefined ? {} : { maxCacheBytes: isolate.maxCacheBytes }),
             // The copy's exclusions and the worker's per-slot environment belong to the
             // repository, so a pool takes them from `.flash-agents.json` and from these
             // options; the options win per entry.
@@ -1152,7 +1211,43 @@ export class FlashTaskService {
     this.#resolveModel(args?.model, profileName)
     const pool = this.#isolationFor(profileName)
     this.#resolveSource(args?.source, pool)
-    this.#resolveBasePatch(args?.basePatch, pool)
+    this.#resolveBasePatchFile(args?.basePatchFile, pool, this.#resolveBasePatch(args?.basePatch, pool))
+  }
+
+  /**
+   * Warnings about the brief itself, known before any worker runs: files it names by an absolute
+   * path outside the root. A session once put a worker's input files in its own `/tmp` scratch
+   * folder; the sandbox denied them and the worker could not start. Only paths that exist and
+   * sit under the user's home or the temp directory count — those are where a session's own
+   * files live, while a path such as `/usr/include` is the system's and is readable anyway.
+   * Never throws: a brief that cannot be read is refused by the call's own validation.
+   *
+   * @param {object} args - the MCP tool arguments.
+   * @param {string} toolName - `flash_task` or `flash_batch`.
+   * @returns {string[]} one warning naming the paths, or none.
+   */
+  briefWarnings(args, toolName) {
+    let texts
+    try {
+      texts =
+        toolName === 'flash_batch'
+          ? normalizeTasks(args?.tasks, this.maxTasks, { readTaskFile: (value, field) => this.#readTaskFile(value, field) }).flatMap(
+              (entry) => [entry.task, entry.acceptance],
+            )
+          : [this.#resolveTask(args), args?.acceptance]
+    } catch {
+      return []
+    }
+    const paths = pathsOutsideRoot(texts.filter((text) => typeof text === 'string').join('\n'), this.root, {
+      home: this.home ?? homedir(),
+    })
+    if (paths.length === 0) return []
+    const shown = paths.slice(0, BRIEF_PATHS_SHOWN)
+    const more = paths.length > shown.length ? `, and ${String(paths.length - shown.length)} more` : ''
+    return [
+      `the brief names ${String(paths.length)} file(s) outside the service root (${shown.join(', ')}${more}); ` +
+        "the worker's sandbox may not be able to read them — copy them into the root (an ignored folder such as .flash-tmp/) and name that path",
+    ]
   }
 
   /**
@@ -1194,6 +1289,38 @@ export class FlashTaskService {
       )
     }
     return basePatchId
+  }
+
+  /**
+   * The `basePatchFile` argument: a diff file inside the root that the copy starts from, as
+   * part of its base (see `WorkspaceIsolation.applyBaseFile`). Refused for a read-only call,
+   * which has no copy, and beside `basePatch`, whose stored patch would be cumulative while
+   * this one is not — the two cannot describe one call's patch at once.
+   *
+   * @param {unknown} value - the requested path.
+   * @param {WorkspaceIsolation | undefined} pool - the call's copy pool, when it has one.
+   * @param {string | undefined} basePatchId - the call's `basePatch`, when it has one.
+   * @returns {{real: string, label: string} | undefined} the file, or undefined when none was given.
+   * @throws {FlashTaskError} `BASE_PATCH_UNAVAILABLE`, `INVALID_ARGUMENT` or `BASE_PATCH_FILE_OUTSIDE_ROOT`.
+   */
+  #resolveBasePatchFile(value, pool, basePatchId) {
+    if (value === undefined || value === null) return undefined
+    requireText(value, 'basePatchFile')
+    if (pool === undefined) {
+      throw new FlashTaskError(
+        'basePatchFile applies only to writing calls; a read-only call is not isolated, so it has no copy to apply the diff to',
+        'BASE_PATCH_UNAVAILABLE',
+      )
+    }
+    if (basePatchId !== undefined) {
+      throw new FlashTaskError(
+        'basePatch and basePatchFile cannot both be given: a basePatch call stores a cumulative patch, a basePatchFile call only its own work',
+        'INVALID_ARGUMENT',
+      )
+    }
+    const file = fencedFile(this.root, value, { field: 'basePatchFile', outsideCode: 'BASE_PATCH_FILE_OUTSIDE_ROOT' })
+    if (file.stats.size === 0) throw new FlashTaskError(`basePatchFile "${file.text}" is empty`, 'INVALID_ARGUMENT')
+    return { real: file.real, label: file.relative.split(sep).join('/') }
   }
 
   /**
@@ -1250,6 +1377,7 @@ export class FlashTaskService {
     // rest of the id — whether it exists, belongs to this root, and names the repository this
     // call's cwd resolves to — is checked once the copy exists, before the worker starts.
     const basePatchId = this.#resolveBasePatch(args?.basePatch, pool)
+    const baseFile = this.#resolveBasePatchFile(args?.basePatchFile, pool, basePatchId)
     // Progress spans the whole call, including a wait for a free tree: that wait is
     // itself work the client must not mistake for a dead server. The interval is
     // stopped on every path out of this method.
@@ -1337,6 +1465,13 @@ export class FlashTaskService {
         if (basePatchId !== undefined) {
           try {
             baseApplied = pool.applyBasePatch(slot, basePatchId)
+          } catch (error) {
+            throw new FlashTaskError(messageOf(error), 'BASE_PATCH_UNAVAILABLE')
+          }
+        }
+        if (baseFile !== undefined) {
+          try {
+            baseApplied = pool.applyBaseFile(slot, baseFile.real, baseFile.label)
           } catch (error) {
             throw new FlashTaskError(messageOf(error), 'BASE_PATCH_UNAVAILABLE')
           }
@@ -1472,6 +1607,8 @@ export class FlashTaskService {
         timing,
       })
       if (reportTarget.warning !== undefined) result.warnings = [...(result.warnings ?? []), reportTarget.warning]
+      const briefPaths = this.briefWarnings(args, 'flash_task')
+      if (briefPaths.length > 0) result.warnings = [...(result.warnings ?? []), ...briefPaths]
       // After the result is built, because the report it carries is the primary child's full
       // text (before the result's own clipping), and before the copy is emptied: the patch is
       // the record from here on.
@@ -1678,6 +1815,7 @@ export class FlashTaskService {
     const source = this.#resolveSource(args?.source, pool)
     // A fleet continues from a base patch exactly as one task does; see flashTask.
     const basePatchId = this.#resolveBasePatch(args?.basePatch, pool)
+    const baseFile = this.#resolveBasePatchFile(args?.basePatchFile, pool, basePatchId)
     // As with flash_task, progress spans the whole call, a wait for a free tree included.
     const activity = createActivity()
     // As in flashTask: the heartbeat reads the session id from the activity record, so a
@@ -1753,6 +1891,13 @@ export class FlashTaskService {
         if (basePatchId !== undefined) {
           try {
             baseApplied = pool.applyBasePatch(slot, basePatchId)
+          } catch (error) {
+            throw new FlashTaskError(messageOf(error), 'BASE_PATCH_UNAVAILABLE')
+          }
+        }
+        if (baseFile !== undefined) {
+          try {
+            baseApplied = pool.applyBaseFile(slot, baseFile.real, baseFile.label)
           } catch (error) {
             throw new FlashTaskError(messageOf(error), 'BASE_PATCH_UNAVAILABLE')
           }
@@ -1896,6 +2041,8 @@ export class FlashTaskService {
         timing,
       })
       if (reportTarget.warning !== undefined) result.warnings = [...(result.warnings ?? []), reportTarget.warning]
+      const briefPaths = this.briefWarnings(args, 'flash_batch')
+      if (briefPaths.length > 0) result.warnings = [...(result.warnings ?? []), ...briefPaths]
       // The fleet's record carries one paragraph per member: the patch outlives the call,
       // and the workers' own accounts are the only explanation of it.
       const report = result.fullReport ?? batchFinalMessage(result)
@@ -2254,8 +2401,9 @@ export class FlashTaskService {
     if (files !== undefined && (!Array.isArray(files) || files.some((name) => typeof name !== 'string' || name.length === 0))) {
       throw new FlashTaskError('files must be an array of non-empty file paths when present', 'INVALID_ARGUMENT')
     }
+    let outcome
     try {
-      return this.isolation.apply({
+      outcome = this.isolation.apply({
         patchId,
         ...(files === undefined ? {} : { files }),
         dryRun: args?.dryRun === true,
@@ -2266,6 +2414,11 @@ export class FlashTaskService {
     } catch (error) {
       throw new FlashTaskError(messageOf(error), 'APPLY_FAILED')
     }
+    // The other unapplied patches that touch the same lines: before an apply (a dry run) they
+    // say which order to take, and after one they are the patches that now need `threeWay` or
+    // a rerun from this one. Two overlapping patches once left two conflicts only the apply
+    // itself revealed.
+    return { ...outcome, ...this.#overlapFields({ patchId: outcome.patchId }) }
   }
 
   /**
@@ -2352,6 +2505,8 @@ export class FlashTaskService {
       // runtime's pid is the root every tool call's processes hang below.
       activity.runtimePid = client.pid
       activity.procWatch = this.procWatch
+      activity.loadProbe = this.loadProbe
+      activity.loadHintAfterMs = this.loadHintAfterMs
       run.sessions += 1
       unsubscribe = client.onNotification((method, params) => {
         observe(state, method, params, sessionId, completion, this.log)
@@ -3578,6 +3733,13 @@ function noteToolCall(activity, session, tool, args, id) {
   // carried the edit's own text and so split one stuck edit into many keys.
   const file = tool === 'bash' || tool === 'pwsh' ? undefined : fileArgumentOf(args)
   const matchCommand = matchCommandOf(tool, args)
+  // Foreground shell commands per worker, so a background job can say how many commands its
+  // worker has run past it without waiting (see `outlivedCommands`).
+  if ((tool === 'bash' || tool === 'pwsh') && !background) {
+    activity.shellCounts = activity.shellCounts ?? new Map()
+    activity.shellCounts.set(session, (activity.shellCounts.get(session) ?? 0) + 1)
+  }
+  if (tool === 'bash' || tool === 'pwsh') noteConcurrentBuild(activity, session, describeToolCall(tool, args))
   activity.openCalls.set(openCallKey(session, callId), {
     session,
     ...(id === undefined ? {} : { id }),
@@ -3589,6 +3751,56 @@ function noteToolCall(activity, session, tool, args, id) {
     ...(background ? { background: true } : {}),
     since: Date.now(),
   })
+}
+
+/**
+ * The build tool a command runs, when it is one whose second run in the same tree waits on the
+ * first or breaks it: the first word after any setup (`cd app &&`, `nice -n 19`, `env X=1`).
+ *
+ * @param {string} command - the command line.
+ * @returns {string | undefined} the tool, or undefined for any other command.
+ */
+function buildToolOf(command) {
+  const program = failureKey(command).split(' ')[0] ?? ''
+  const name = program.split(/[\\/]/).pop() ?? ''
+  return BUILD_TOOLS.has(name) ? name : undefined
+}
+
+/**
+ * Note a build a worker starts while one of its own background builds with the same tool is
+ * still running. Three times one worker started a second `cargo` command beside a background
+ * one: the second sat on cargo's lock with no CPU, and once a cancel between the two left a
+ * build that failed with `undefined hidden symbol` until `cargo clean`. Kept on the activity, so
+ * the result still says it after both have ended.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {string} session - the worker session starting the command.
+ * @param {string} command - the command being started.
+ * @returns {void}
+ */
+function noteConcurrentBuild(activity, session, command) {
+  const tool = buildToolOf(command)
+  if (tool === undefined) return
+  for (const job of activity.backgroundJobs?.values() ?? []) {
+    if (job.session !== session || buildToolOf(job.command) !== tool) continue
+    activity.concurrentBuilds = activity.concurrentBuilds ?? []
+    if (activity.concurrentBuilds.some((entry) => entry.jobId === job.jobId && entry.tool === tool)) continue
+    activity.concurrentBuilds.push({ tool, command, jobId: job.jobId, jobCommand: job.command })
+  }
+}
+
+/**
+ * The warnings for builds started beside a running background build of the same tool.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @returns {string[]} the warnings, in the order they happened.
+ */
+function concurrentBuildWarnings(activity) {
+  return (activity?.concurrentBuilds ?? []).map(
+    (entry) =>
+      `a worker started "${entry.command}" while its background job ${entry.jobId} (${entry.jobCommand}) was still running; ` +
+      `two ${entry.tool} commands in one copy wait on each other's lock or break each other's build output`,
+  )
 }
 
 /**
@@ -3662,6 +3874,10 @@ function noteToolResult(activity, session, event, log) {
     noteJobOutputResult(activity, call, event, text, log)
     return
   }
+  // A call that moved to the background has not ended; its run is counted when its job does.
+  const announced = backgroundJobIdIn(text)
+  const movedToBackground = announced !== '' && activity.backgroundJobs?.has(backgroundJobKey(call.session, announced)) === true
+  if (!movedToBackground) countRun(activity, call)
   const exitCode = exitCodeOf(text)
   const failure = event.data?.error
   const failed = (failure !== undefined && failure !== null) || (exitCode !== undefined && exitCode !== 0)
@@ -3741,6 +3957,7 @@ function noteBackgroundStart(activity, call, text) {
     command: call.command,
     ...(call.matchCommand === undefined ? {} : { matchCommand: call.matchCommand }),
     since: call.since,
+    shellCountAtStart: activity.shellCounts?.get(call.session) ?? 0,
   })
 }
 
@@ -3781,6 +3998,7 @@ function noteJobOutputResult(activity, call, event, text, log) {
   // a passing test run that prints the exit code of a deliberately failing child, say —
   // and counting that as the job's own failure warned about a command that succeeded.
   const exitCode = exitCodeInStatus(status)
+  countRun(activity, job)
   if (exitCode === 0) countSuccess(activity, job)
   if (exitCode === undefined || exitCode === 0) return
   countFailure(activity, job, { exitCode, log })
@@ -3848,11 +4066,29 @@ function countFailure(activity, call, { exitCode, name, output, log }) {
   if (exitCode === 1 && name === undefined && exitOneIsAnAnswer(call.command)) return
   const key = failureKeyOf(call)
   if (key.length === 0) return
-  const record = activity.failures.get(key) ?? { count: 0 }
+  const record = activity.failures.get(key) ?? { count: 0, streak: 0 }
+  // A repeat is the same step failing the same way with nothing changed in between. A worker
+  // fixing the tests its own change turned red, or trying one edit script after another until
+  // one matches, fails often while making progress; counting those as a loop raised "failed 8
+  // times" three times in a week when nothing was wrong. The same build retried with other
+  // flags and the same error is still a loop, so arguments alone do not break a streak; a
+  // command that carries its own program (a heredoc, `python3 -c`) is a new attempt when that
+  // program changed.
+  const exact = call.file === undefined ? exactCommandOf(call.command) : `${call.tool} ${call.file}`
+  const sameAttempt = call.file !== undefined || !carriesInlineProgram(call.command) || record.lastExact === exact
+  const repeat =
+    record.count > 0 &&
+    sameAttempt &&
+    record.lastExitCode === exitCode &&
+    record.lastName === name &&
+    record.lastLine === output &&
+    !((activity.lastChangeSeq ?? 0) > record.lastSeq)
+  record.streak = repeat ? record.streak + 1 : 1
   record.count += 1
   record.lastAt = Date.now()
   activity.resultSeq = (activity.resultSeq ?? 0) + 1
   record.lastSeq = activity.resultSeq
+  record.lastExact = exact
   record.lastExitCode = exitCode
   record.lastName = name
   record.lastLine = output
@@ -3867,10 +4103,91 @@ function countFailure(activity, call, { exitCode, name, output, log }) {
     record.commands.add(exactCommandOf(call.command))
   }
   activity.failures.set(key, record)
-  if (record.count < REPEATED_FAILURE_THRESHOLD) return
-  if (record.count % REPEATED_FAILURE_THRESHOLD !== 0) return
+  if (record.streak < REPEATED_FAILURE_THRESHOLD) return
+  if (record.streak % REPEATED_FAILURE_THRESHOLD !== 0) return
   log(repeatedFailureWarning(key, record, record.lastAt, activity))
 }
+
+/**
+ * The background job a shell result announced, if it announced one: the id `noteBackgroundStart`
+ * would have recorded.
+ *
+ * @param {string} text - the result's text.
+ * @returns {string} the job id, or '' when the result names none.
+ */
+function backgroundJobIdIn(text) {
+  if (typeof text !== 'string') return ''
+  const started = /^started background job (\S+)$/m.exec(text)
+  if (started !== null) return started[1]
+  const moved = /^\[still running after \d+ms; moved to background job ([^\]]+)\]$/m.exec(text)
+  return moved === null ? '' : moved[1].trim()
+}
+
+/**
+ * Count one finished shell run toward the rerun warning (see `rerunWarnings`): runs of one
+ * folded command with no file changed between them, how many different argument lists they
+ * had, and the time they took. A file change starts the count again: a worker fixing code
+ * between runs is the ordinary loop.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {{tool: string, command: string, since: number, file?: string}} call - the run that ended.
+ * @returns {void}
+ */
+function countRun(activity, call) {
+  if (!SHELL_TOOLS.has(call.tool) || call.file !== undefined || typeof call.command !== 'string') return
+  const key = failureKey(call.command)
+  if (key.length === 0) return
+  activity.reruns = activity.reruns ?? new Map()
+  const changeSeq = activity.lastChangeSeq ?? 0
+  let record = activity.reruns.get(key)
+  if (record === undefined || changeSeq > record.changeSeq) {
+    record = { runs: 0, variants: new Set(), totalMs: 0, changeSeq }
+    activity.reruns.set(key, record)
+  }
+  record.runs += 1
+  record.variants.add(exactCommandOf(call.command))
+  record.totalMs += Math.max(0, Date.now() - (call.since ?? Date.now()))
+  record.changeSeq = changeSeq
+}
+
+/**
+ * The warning for a command a worker keeps rerunning with other arguments and no change in
+ * between: a `cargo mutants` widened run after run for 53 minutes, never failing and always
+ * busy, so neither the failure nor the quiet warning fired and the job was cancelled by hand.
+ * Both thresholds must be met, so a few quick probes of one command stay silent.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @returns {string[]} the warnings.
+ */
+function rerunWarnings(activity) {
+  const warnings = []
+  for (const [key, record] of activity?.reruns ?? []) {
+    if (record.variants.size < RERUN_VARIANTS || record.totalMs < RERUN_TOTAL_MS) continue
+    warnings.push(
+      `"${key}" ran ${String(record.runs)} times with ${String(record.variants.size)} different argument lists in this call ` +
+        `(${formatElapsed(record.totalMs)} in total) with no file changed between the runs; a worker widening a run until ` +
+        'it shows what it wants may not stop on its own — check its report, or flash_cancel (the change so far is kept as a patch)',
+    )
+  }
+  return warnings
+}
+
+/**
+ * Whether a command line carries the program it runs: a heredoc, or an interpreter given its
+ * code inline (`python3 -c`, `node -e`, `perl -e`, `ruby -e`). Two such commands with different
+ * code are two attempts even when the failure key folds them together (`python3 -`).
+ * `bash -c '<script>'` needs no check here: its key already names the script.
+ *
+ * @param {string} command - the command line.
+ * @returns {boolean} true when the command holds its own code.
+ */
+function carriesInlineProgram(command) {
+  if (typeof command !== 'string') return false
+  return /<<-?\s*['"]?[A-Za-z_]\w*/.test(command) || INLINE_CODE_FLAG.test(command)
+}
+
+/** An interpreter followed, after any other flags, by its inline-code flag. */
+const INLINE_CODE_FLAG = /(?:^|[\s;&|(])(?:python[\d.]*|node|perl|ruby)(?:\s+-[A-Za-z]+)*?\s+(?:-c|-e|--eval)(?:\s|$)/
 
 /**
  * Note one successful run, so a warning about earlier failures of the same step can say the
@@ -3901,7 +4218,11 @@ function countSuccess(activity, call) {
     record.succeededSeq = seq
     record.succeededAt = at
   }
-  if (call.file !== undefined && FILE_CHANGING_TOOLS.has(call.tool)) activity.edits?.set(call.file, { seq, at })
+  if (call.file !== undefined && FILE_CHANGING_TOOLS.has(call.tool)) {
+    activity.edits?.set(call.file, { seq, at })
+    // Any file the worker changed is progress between two failures (see `countFailure`).
+    activity.lastChangeSeq = seq
+  }
 }
 
 /** The file tools whose success means the file now holds the worker's change. */
@@ -4453,7 +4774,12 @@ function signalExplanation(code) {
  * @returns {string} the warning.
  */
 function repeatedFailureWarning(key, record, now, activity) {
-  const failed = `"${key}" failed ${String(record.count)} times in this call (last: ${failureSummary(record, now)})`
+  const streak = record.streak ?? record.count
+  const times =
+    streak === record.count
+      ? `${String(record.count)} times`
+      : `${String(record.count)} times, the last ${String(streak)} the same way with no file changed between them`
+  const failed = `"${key}" failed ${times} in this call (last: ${failureSummary(record, now)})`
   const later = laterSuccess(record, activity)
   if (later !== undefined) {
     const what = later.kind === 'edit' ? `a later edit of ${record.file}` : 'a later run'
@@ -4489,11 +4815,15 @@ function laterSuccess(record, activity) {
 export function activityWarnings(activity, now = Date.now()) {
   const warnings = []
   for (const [key, record] of activity?.failures ?? []) {
-    if (record.count < REPEATED_FAILURE_THRESHOLD) continue
+    if ((record.streak ?? record.count) < REPEATED_FAILURE_THRESHOLD) continue
     if (isExpectedFailure(record, activity)) continue
     warnings.push(repeatedFailureWarning(key, record, now, activity))
   }
   warnings.push(...liveQuietWarnings(activity))
+  warnings.push(...outlivedBackgroundWarnings(activity, now))
+  warnings.push(...rerunWarnings(activity))
+  warnings.push(...concurrentBuildWarnings(activity))
+  warnings.push(...loadWarnings(activity, now))
   return warnings
 }
 
@@ -4604,7 +4934,7 @@ export function asksForFailBefore(...texts) {
 export function activityNotes(activity, now = Date.now()) {
   const notes = []
   for (const [key, record] of activity?.failures ?? []) {
-    if (record.count < REPEATED_FAILURE_THRESHOLD || !isExpectedFailure(record, activity)) continue
+    if ((record.streak ?? record.count) < REPEATED_FAILURE_THRESHOLD || !isExpectedFailure(record, activity)) continue
     const later = laterSuccess(record, activity)
     notes.push(
       `"${key}" failed ${String(record.count)} times and then passed ${formatElapsed(now - later.at)} ago, ` +
@@ -4630,7 +4960,8 @@ function childOf(activity, key, now) {
 }
 
 /**
- * The open tool calls of a call, longest-running first.
+ * The open tool calls of a call: what a worker is waiting on first, then background jobs
+ * nobody waits on, each group longest-running first.
  *
  * `since` is an ISO timestamp for a status reader; `runningMs` is what a render needs, and
  * keeping both means no reader has to trust this process's clock twice.
@@ -4648,7 +4979,10 @@ function childOf(activity, key, now) {
  *
  * @param {object} [activity] - the call's activity record.
  * @param {number} [now] - the clock to measure against.
- * @returns {{tool: string, command: string, since: string, runningMs: number, background?: string, child?: {command: string, runningMs: number, cpuSeconds: number}}[]} the calls.
+ * A job a worker waits on carries `waited: true`; one its worker has run
+ * `BACKGROUND_OUTLIVED_COMMANDS` or more commands past carries `outlivedCommands`.
+ *
+ * @returns {{tool: string, command: string, since: string, runningMs: number, background?: string, waited?: true, outlivedCommands?: number, child?: {command: string, runningMs: number, cpuSeconds: number, treeCpuSeconds?: number, treeProcesses?: number}}[]} the calls.
  */
 export function openCommands(activity, now = Date.now()) {
   const current = []
@@ -4666,6 +5000,7 @@ export function openCommands(activity, now = Date.now()) {
         since: new Date(job.since).toISOString(),
         runningMs: Math.max(0, now - job.since),
         background: job.jobId,
+        waited: true,
         ...(child === undefined ? {} : { child }),
       })
       continue
@@ -4681,16 +5016,57 @@ export function openCommands(activity, now = Date.now()) {
   for (const [key, job] of activity?.backgroundJobs?.entries() ?? []) {
     if (shown.has(key)) continue
     const child = childOf(activity, key, now)
+    const outlived = outlivedCommands(activity, job)
     current.push({
       tool: job.tool,
       command: job.command,
       since: new Date(job.since).toISOString(),
       runningMs: Math.max(0, now - job.since),
       background: job.jobId,
+      ...(outlived < BACKGROUND_OUTLIVED_COMMANDS ? {} : { outlivedCommands: outlived }),
       ...(child === undefined ? {} : { child }),
     })
   }
-  return current.sort((a, b) => b.runningMs - a.runningMs)
+  // What a worker is waiting on comes first — its open shell call, or the job it is reading —
+  // and a background job nobody waits on after: a `grep` that never returned headed every
+  // status line for 35 minutes while the `cargo test` the worker was really in showed only
+  // as its child. Within each group the longest-running comes first.
+  const group = (entry) => (entry.background === undefined || entry.waited === true ? 0 : 1)
+  return current.sort((a, b) => group(a) - group(b) || b.runningMs - a.runningMs)
+}
+
+/**
+ * How many foreground shell commands a background job's worker has started since the job
+ * began, without waiting on it.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @param {{session: string, shellCountAtStart?: number}} job - the background job.
+ * @returns {number} the count.
+ */
+function outlivedCommands(activity, job) {
+  const count = activity?.shellCounts?.get(job.session) ?? 0
+  return Math.max(0, count - (job.shellCountAtStart ?? count))
+}
+
+/**
+ * The warning for each background job its worker has run `BACKGROUND_OUTLIVED_COMMANDS` or
+ * more commands past without waiting on it. A job may be a server the worker meant to leave
+ * running, so the line says both readings instead of calling it stuck.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @param {number} now - the clock.
+ * @returns {string[]} the warnings, oldest job first.
+ */
+function outlivedBackgroundWarnings(activity, now) {
+  return openCommands(activity, now)
+    .filter((entry) => entry.outlivedCommands !== undefined)
+    .sort((a, b) => b.runningMs - a.runningMs)
+    .map(
+      (entry) =>
+        `background job ${entry.background} (${entry.command}) has run ${formatElapsed(entry.runningMs)} while its worker ` +
+        `ran ${String(entry.outlivedCommands)} other commands without waiting on it; it may be stuck, ` +
+        'or a server the worker meant to leave running',
+    )
 }
 
 /**
@@ -4727,9 +5103,17 @@ export function describeActivity(activity, now = Date.now()) {
   const ago = formatElapsed(now - activity.at)
   const step = activity.step === undefined ? '' : `step ${String(activity.step)} · `
   const running = openCommands(activity, now)[0]
+  // The tree's CPU, not the command's own: `cargo` sits at 0 s while its test binaries work.
+  const cpu = running?.child?.treeCpuSeconds ?? running?.child?.cpuSeconds
   const suffix =
-    running === undefined ? '' : `; running "${running.command}" for ${formatElapsed(running.runningMs)}`
-  return `${step}${activity.what} · last event ${ago} ago${suffix}`
+    running === undefined
+      ? ''
+      : `; running "${running.command}" for ${formatElapsed(running.runningMs)}` +
+        (cpu === undefined ? '' : ` (${String(cpu)} CPU s so far)`)
+  // "last event 9m36s ago" over a test run that is busy is the line that reads as a hang.
+  const tree = lastTreeActivity(activity.proc, (key) => callIsWatched(activity, key))
+  const busy = tree !== undefined && tree.at > activity.at ? `; its processes were working ${formatElapsed(now - tree.at)} ago` : ''
+  return `${step}${activity.what} · last event ${ago} ago${suffix}${busy}`
 }
 
 /**
@@ -5234,6 +5618,7 @@ function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs
     // Ask for a fresh look at the runtime's processes; the answer lands in a later reading,
     // so nothing here waits for the machine. This runs without a progress token too.
     activity?.procWatch?.refresh(activity).catch((error) => log(`could not watch the process tree: ${messageOf(error)}`))
+    noteLoad(activity, log)
     if (!sendsReports) return
     try {
       const now = Date.now()
@@ -5275,11 +5660,87 @@ function startProgress({ progress, token, label, sessionId, budgetMs, intervalMs
   }
 }
 
+/**
+ * Keep the highest 1-minute load average a call's heartbeats saw, beside the machine's thread
+ * count, for the load hint (see `loadWarnings`). A probe that fails is logged and skipped.
+ *
+ * @param {object} [activity] - the call's activity record, carrying `loadProbe`.
+ * @param {(message: string) => void} log - diagnostic sink.
+ * @returns {void}
+ */
+function noteLoad(activity, log) {
+  if (typeof activity?.loadProbe !== 'function') return
+  try {
+    const { load, threads } = activity.loadProbe()
+    if (!(Number.isFinite(load) && Number.isFinite(threads) && threads > 0)) return
+    const since = activity.load?.since ?? Date.now()
+    if (activity.load === undefined || load > activity.load.peak) activity.load = { peak: load, threads, since }
+  } catch (error) {
+    log(`could not read the load average: ${messageOf(error)}`)
+  }
+}
+
+/**
+ * The hint that the machine was overloaded while a call ran. Memory was never the limit for
+ * nine workers on a 24-thread machine; the CPU was, at a load near 117, and nothing in a result
+ * said so. `copies_allowed` counts copies, so this is the only place the CPU shows. Windows
+ * reports no load average, so it never gets the hint.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @param {number} [now] - the clock.
+ * @returns {string[]} the hint, or nothing.
+ */
+function loadWarnings(activity, now = Date.now()) {
+  const seen = activity?.load
+  if (seen === undefined || seen.peak <= seen.threads * LOAD_HINT_PER_THREAD) return []
+  // A 1-minute average speaks for a call that was sampled at least that long; a call of a few
+  // seconds on a machine someone else is loading says nothing about its own workers.
+  if (now - seen.since < (activity.loadHintAfterMs ?? LOAD_HINT_MIN_SAMPLED_MS)) return []
+  const perThread = Math.round((seen.peak / seen.threads) * 10) / 10
+  return [
+    `the machine's 1-minute load average reached ${seen.peak.toFixed(1)} on ${String(seen.threads)} hardware threads ` +
+      `during this call (${String(perThread)} per thread); the workers were competing for CPU, so fewer calls at once may finish sooner`,
+  ]
+}
+
 /** Render elapsed milliseconds as a compact span, e.g. `4m20s`. */
 function formatElapsed(ms) {
   const seconds = Math.max(0, Math.floor(ms / 1000))
   const minutes = Math.floor(seconds / 60)
   return minutes === 0 ? `${String(seconds)}s` : `${String(minutes)}m${String(seconds % 60)}s`
+}
+
+/**
+ * The last sign of life of a call: its last session event, or the last sample in which a
+ * command a worker is still running did real work in its process tree (see
+ * `lastTreeActivity`), whichever is later.
+ *
+ * @param {object} activity - the call's activity record.
+ * @returns {number} epoch milliseconds.
+ */
+export function lastActivityAt(activity) {
+  const tree = lastTreeActivity(activity?.proc, (key) => callIsWatched(activity, key))
+  return tree === undefined ? activity.at : Math.max(activity.at, tree.at)
+}
+
+/**
+ * What an idle stop adds when a worker was inside a command of its own: a worker waiting on
+ * its shell is not a worker lost in the model, and the caller deciding whether the salvaged
+ * patch is worth reviewing needs to know which it was. The salvage note says what was stored.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {number} now - the clock.
+ * @returns {string} `; the worker was inside its own command …`, or '' when none was open.
+ */
+function idleCommandNote(activity, now) {
+  const running = openCommands(activity, now).find((entry) => entry.background === undefined || entry.waited === true)
+  if (running === undefined) return ''
+  const tree = running.child?.treeCpuSeconds ?? running.child?.cpuSeconds
+  const cpu = tree === undefined ? '' : `, its processes had used ${String(tree)} CPU s`
+  return (
+    `; the worker was inside its own command "${running.command}" (running ${formatElapsed(running.runningMs)}${cpu}), ` +
+    'not waiting on the model, so its change may already be finished'
+  )
 }
 
 /** Wait for completion, bounded by the task budget and the client's signal. */
@@ -5305,14 +5766,18 @@ export function raceWithBudget(promise, { timeoutMs, idleTimeoutMs, activity, la
         ),
       )
     }, timeoutMs)
-    // Stuck, not slow: no event from the session or any worker for the idle window.
+    // Stuck, not slow: no event from the session or any worker for the idle window, and no
+    // work in the process tree of any command a worker is running. A worker inside its own
+    // eleven-minute `cargo test` sends no event until the test ends, and was stopped as idle
+    // with the tests passing underneath it.
     const idleTimer = idleTimeoutMs > 0 && activity !== undefined
       ? setInterval(() => {
-          if (Date.now() - activity.at < idleTimeoutMs) return
+          const now = Date.now()
+          if (now - lastActivityAt(activity) < idleTimeoutMs) return
           finish(
             reject,
             new FlashTaskError(
-              `${String(label)} stopped: no activity for ${formatElapsed(idleTimeoutMs)} on session ${sessionId} (${describeActivity(activity)}); the session continues inside Harness but is no longer reported${stderrHint(diagnostics)}`,
+              `${String(label)} stopped: no activity for ${formatElapsed(idleTimeoutMs)} on session ${sessionId} (${describeActivity(activity, now)})${idleCommandNote(activity, now)}; the session continues inside Harness but is no longer reported${stderrHint(diagnostics)}`,
               'IDLE',
             ),
           )
@@ -5568,6 +6033,8 @@ export const WORKER_INSTRUCTIONS = [
   'Do not rewrite lines you do not mean to change; keep a file\'s encoding and characters (a worker turned "…" into `â€¦` on Windows).',
   'When you change a package, run the project\'s linter on every package you changed, not only the one the brief names.',
   'When the brief needs a piece outside its scope that is missing, say that it belongs in another layer and stop that part, instead of building around it.',
+  'Run one build or test at a time in this copy: a second `cargo`, `npm`, `go` or `gradle` command started while one still runs in the background waits on its lock or breaks its output. Wait for the background one (or stop it) first.',
+  'Search with `git grep` or `rg`, which skip ignored folders such as `target/` and `node_modules/`; `grep -r … .` walks the build output too and can run for many minutes.',
   'If a change touches code beside a stated rule (an "only", a "never", a "one place", a design note the task quotes), list it in the report under its own heading "Rules crossed", with the reason.',
 ]
 
@@ -5617,7 +6084,7 @@ const DISCARD_SCRATCH =
  */
 function promptBasePatch(basePatch) {
   return {
-    patchId: basePatch.patchId,
+    ...(basePatch.file === undefined ? { patchId: basePatch.patchId } : { file: basePatch.file }),
     filesChanged: basePatch.filesChanged ?? [],
     conflicts: basePatch.conflicts ?? [],
     ...(basePatch.alreadyInTree === true ? { alreadyInTree: true } : {}),
@@ -5675,7 +6142,9 @@ export function buildChildPrompt({ cwd, task, acceptance, copy, uncommitted, slo
       ? []
       : [
           '',
-          basePatch.alreadyInTree === true
+          basePatch.file !== undefined
+            ? `The copy already contains the change from ${basePatch.file}, applied before you started: ${baseFiles.join(', ')}. Continue from it; do not redo it, and do not revert it.`
+            : basePatch.alreadyInTree === true
             ? `The copy already contains the change from an earlier call (patch ${basePatch.patchId}) to ${baseFiles.join(', ')}: it was already in the tree the copy was taken from, so it was not applied again. Continue from it; do not redo it.`
             : `The copy already contains the change from an earlier call (patch ${basePatch.patchId}), applied before you started: ${baseFiles.join(', ')}. Continue from it; do not redo it.`,
           ...(baseConflicts.length === 0 ? [] : [`It did not apply cleanly: ${baseConflicts.join(', ')} hold conflict markers. Resolve them first.`]),
@@ -5762,6 +6231,17 @@ function promptSlotSetup(pool, setup, slot) {
  */
 function basePatchFields(basePatch) {
   if (basePatch === undefined) return {}
+  if (basePatch.file !== undefined) {
+    return {
+      basePatchFile: {
+        file: basePatch.file,
+        applied: true,
+        threeWay: basePatch.threeWay === true,
+        conflicts: basePatch.conflicts ?? [],
+        note: "the copy started with this diff applied as part of its base, so change.patchId holds only the new work; it applies to a tree that already holds the diff",
+      },
+    }
+  }
   if (basePatch.alreadyInTree === true) {
     return {
       basePatch: {
@@ -5963,6 +6443,76 @@ function isTimeoutError(error) {
  * @throws {FlashTaskError} when the path is unreadable, outside the root, or not a usable file.
  */
 export function readTaskFile(root, requested, { field = 'taskFile', log = () => {} } = {}) {
+  const { text, real, stats } = fencedFile(root, requested, { field, outsideCode: 'TASK_FILE_OUTSIDE_ROOT' })
+  if (stats.size > MAX_TASK_FILE_BYTES) {
+    throw new FlashTaskError(
+      `${field} "${text}" is ${String(stats.size)} bytes; the most this service reads is ` +
+        `${String(MAX_TASK_FILE_BYTES)} (256 KB)`,
+      'INVALID_ARGUMENT',
+    )
+  }
+  const content = readFileSync(real, 'utf8')
+  if (content.trim().length === 0) {
+    throw new FlashTaskError(`${field} "${text}" is empty`, 'INVALID_ARGUMENT')
+  }
+  log(`task read from ${real} (${String(content.length)} chars)`)
+  return content
+}
+
+/**
+ * The absolute paths a text names that exist outside the root, under the user's home or the
+ * temp directory (see `FlashTaskService.briefWarnings`). A token is a `/…`, `~/…` or `X:\…`
+ * path ending at whitespace, a quote or a bracket; trailing punctuation is dropped.
+ *
+ * @param {string} text - the brief.
+ * @param {string} root - the service root.
+ * @param {object} [options] - where a session keeps its own files.
+ * @param {string} [options.home] - the user's home directory.
+ * @param {string[]} [options.scratch] - temp directories (default the platform's, `/tmp`).
+ * @returns {string[]} the paths as the brief wrote them, each once, in order.
+ */
+export function pathsOutsideRoot(text, root, { home = homedir(), scratch = [tmpdir(), '/tmp'] } = {}) {
+  const canonical = (path) => {
+    try {
+      return realpathSync(path)
+    } catch {
+      return resolve(path)
+    }
+  }
+  const inside = (path, dir) => {
+    const relation = relative(dir, path)
+    return relation === '' || (relation !== '..' && !relation.startsWith(`..${sep}`) && !isAbsolute(relation))
+  }
+  const realRoot = canonical(root)
+  const sessionDirs = [home, ...scratch].filter((dir) => typeof dir === 'string' && dir.length > 0).map(canonical)
+  const found = []
+  for (const match of text.matchAll(/(?:^|[\s"'`(=:<\[])((?:~|[A-Za-z]:)?[\\/][^\s"'`)<>\]]+)/g)) {
+    const written = match[1].replace(/[.,;:!?]+$/, '')
+    if (found.includes(written)) continue
+    const expanded = written.startsWith('~') ? join(home, written.slice(1)) : written
+    if (!isAbsolute(expanded) || !existsSync(expanded)) continue
+    const real = canonical(expanded)
+    // Strictly below home or a temp folder: "/tmp" alone in a sentence is no file to read.
+    if (inside(real, realRoot) || !sessionDirs.some((dir) => real !== dir && inside(real, dir))) continue
+    found.push(written)
+  }
+  return found
+}
+
+/**
+ * A regular file named by an argument, fenced to the service root like `cwd`: a relative path
+ * is read against the root, and a path — or a symlink — that resolves outside it is refused.
+ *
+ * @param {string} root - the service root.
+ * @param {unknown} requested - the argument's value.
+ * @param {object} options - how to report a refusal.
+ * @param {string} options.field - the argument's name.
+ * @param {string} options.outsideCode - the error code for a path outside the root.
+ * @returns {{text: string, real: string, relative: string, stats: import('node:fs').Stats}} the
+ *   path as given, its real path, that path relative to the root, and its stats.
+ * @throws {FlashTaskError} when the path is unreadable, outside the root, or not a regular file.
+ */
+function fencedFile(root, requested, { field, outsideCode }) {
   const text = requireText(requested, field)
   const absolute = isAbsolute(text) ? resolve(text) : resolve(root, text)
   let real
@@ -5977,26 +6527,14 @@ export function readTaskFile(root, requested, { field = 'taskFile', log = () => 
   if (relation === '..' || relation.startsWith(`..${sep}`) || isAbsolute(relation)) {
     throw new FlashTaskError(
       `${field} "${text}" is outside the service root ${root}; this service is confined to that root`,
-      'TASK_FILE_OUTSIDE_ROOT',
+      outsideCode,
     )
   }
   const stats = statSync(real)
   if (!stats.isFile()) {
     throw new FlashTaskError(`${field} "${text}" is not a regular file`, 'INVALID_ARGUMENT')
   }
-  if (stats.size > MAX_TASK_FILE_BYTES) {
-    throw new FlashTaskError(
-      `${field} "${text}" is ${String(stats.size)} bytes; the most this service reads is ` +
-        `${String(MAX_TASK_FILE_BYTES)} (256 KB)`,
-      'INVALID_ARGUMENT',
-    )
-  }
-  const content = readFileSync(real, 'utf8')
-  if (content.trim().length === 0) {
-    throw new FlashTaskError(`${field} "${text}" is empty`, 'INVALID_ARGUMENT')
-  }
-  log(`task read from ${real} (${String(content.length)} chars)`)
-  return content
+  return { text, real, relative: relation, stats }
 }
 
 function requireText(value, field) {
