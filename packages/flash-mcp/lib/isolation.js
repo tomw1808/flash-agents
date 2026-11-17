@@ -6947,6 +6947,67 @@ function cutAtLineBoundary(text, limit) {
 }
 
 /**
+ * Lines that open one test, in the languages workers write: a Rust `#[test]` (or
+ * `#[tokio::test]`), a Python `def test_…`, a Go `func Test…`, a JUnit or Swift Testing
+ * `@Test`, an XCTest `func test…`, an xUnit/NUnit/MSTest attribute, and a JavaScript
+ * `it('…'` or `test('…'`. One test is one such line, so a test's body can change freely.
+ */
+const TEST_DEFINITION =
+  /^\s*(?:#\[(?:[\w:]+::)?test\b|(?:async\s+)?def\s+test_?\w*\s*\(|func\s+Test\w*\s*\(|func\s+test\w*\s*\(|@Test\b|\[(?:Test|Fact|Theory|TestMethod|TestCase)\b|(?:it|test)(?:\.(?:only|skip|todo|concurrent))?\s*\(\s*['"`])/
+
+/**
+ * What a patch does to a repository's tests and file sizes, counted over the whole patch, not
+ * the clipped diff: a job asked to remove four kinds of constructs deleted 476 tests, 91 of them
+ * unrelated, and another rewrote twelve documents with `indent=2` (+35,000 lines). Both were in
+ * its report and in a diffstat of 156 files; neither stood out.
+ *
+ * `tests` counts test definitions removed and added (see `TEST_DEFINITION`), in all and per
+ * file. `grown` is every file that existed before and gained lines, with its net growth, largest
+ * first; a new file is not in it, since all of it is new by intent.
+ *
+ * @param {string} patch - the whole patch.
+ * @returns {{tests: {removed: number, added: number, byFile: {file: string, removed: number, added: number}[]},
+ *   grown: {file: string, lines: number}[]}} the counts.
+ */
+export function patchShape(patch) {
+  const tests = new Map()
+  const lines = new Map()
+  const created = new Set()
+  let file
+  for (const line of String(patch ?? '').split('\n')) {
+    const header = /^diff --git "?a\/.*"? "?b\/(.*?)"?$/.exec(line)
+    if (header !== null) {
+      file = header[1]
+      continue
+    }
+    if (file === undefined) continue
+    if (line.startsWith('new file mode')) created.add(file)
+    if (line.startsWith('+++ ') || line.startsWith('--- ')) continue
+    const sign = line[0]
+    if (sign !== '+' && sign !== '-') continue
+    const growth = lines.get(file) ?? 0
+    lines.set(file, growth + (sign === '+' ? 1 : -1))
+    if (!TEST_DEFINITION.test(line.slice(1))) continue
+    const count = tests.get(file) ?? { file, removed: 0, added: 0 }
+    if (sign === '+') count.added += 1
+    else count.removed += 1
+    tests.set(file, count)
+  }
+  const byFile = [...tests.values()].sort((a, b) => b.removed - b.added - (a.removed - a.added))
+  return {
+    tests: {
+      removed: byFile.reduce((sum, entry) => sum + entry.removed, 0),
+      added: byFile.reduce((sum, entry) => sum + entry.added, 0),
+      byFile,
+    },
+    grown: [...lines.entries()]
+      .filter(([name, growth]) => growth > 0 && !created.has(name))
+      .map(([name, growth]) => ({ file: name, lines: growth }))
+      .sort((a, b) => b.lines - a.lines),
+  }
+}
+
+/**
  * Clip a patch to whole file sections within a character budget.
  *
  * A patch cut at an arbitrary character is a patch nobody can read: the `diff` in a result
@@ -10871,6 +10932,7 @@ export class WorkspaceIsolation {
       ignored,
       ignoredChanged,
       diffstat: diffstat.trim(),
+      shape: patchShape(full),
       diff: clipped.diff,
       diffChars: full.length,
       diffOmitted: clipped.diffOmitted,

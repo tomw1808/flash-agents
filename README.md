@@ -200,17 +200,30 @@ loop, and the warning then says `failed 5 times, the last 3 the same way with no
 between them`. The opposite case is warned about too: one command run with four or more different
 argument lists back to back, twenty minutes or more in all, with no file changed between the runs
 (`"cargo mutants" ran 5 times with 5 different argument lists …`), since such a run never fails.
+A command that carries its own program (a heredoc, `python3 -c`) is left out of that count: each is a
+new program, and the files it writes are not seen as changes.
 
 `current` lists what a worker is waiting on first — its open shell call, or the background job it
 is reading — and background jobs nobody waits on after it, so the progress line names the `cargo
 test` the worker is in, not a `grep` it left running half an hour ago. A background job its worker
 has run three or more commands past without waiting on it carries `outlivedCommands` and a warning
-that it may be stuck, or a server the worker meant to leave running. On Linux and macOS a call
+that it may be stuck, or a server the worker meant to leave running — only while the last process
+sample found the job's own process. A job leaves `current` when the Harness tells its worker the job
+finished, or when a sample no longer finds the process an earlier one did, whether or not the worker
+ever reads it; a job whose process is not found is never given another command's process as `child`. On Linux and macOS a call
 whose 1-minute load average was above twice the hardware threads for at least a minute says so in
 its warnings: fewer calls at once may then finish sooner. A worker that starts a build beside a
 running background build with the same tool (`cargo`, `npm`, `go`, `gradle` and the like) is warned
 about, since the two wait on one lock or break each other's output; workers are also told to run one
 build at a time and to search with `git grep` or `rg` rather than `grep -r … .` over a build folder.
+Since 0.1.14 the guard refuses such a build outright for `cargo`, `go`, `gradle` and `swift` while the
+same worker's own build of that tool still runs (`CONCURRENT_BUILD`), and tells it to wait for the
+first with `job_output` or stop it with `job_kill`; `guard.refuseConcurrentBuilds: false` in
+`flash.config.json` turns that off. A worker that names another slot's copy in a command or a path
+(`cd …/slots/12 && cargo test`) is warned about: that tree is another job's work in progress, and the
+sandbox, which confines writes only, cannot refuse the read. Workers are told to stay in their own
+copy. An idle stop names the last tool result the worker was given, its length and how long ago it
+came, so a stalled model can be told from a result too large to read.
 A brief that names an existing file outside the root, under your home or temp folder, gets a warning
 in the background call's first answer and in the result: the worker's sandbox may not be able to
 read it, so copy it into an ignored folder of the repository.

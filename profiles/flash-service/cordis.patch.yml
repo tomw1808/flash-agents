@@ -175,6 +175,10 @@
         # sandbox allows. With isolation on, the workspace is a disposable copy, so
         # "outside the workspace" means "not mine to touch".
         fenceMutations: ${guard.fenceMutations}
+        # A build is refused while the same worker's own build of the same tool
+        # (cargo, go, gradle, swift) still runs in its copy: it would wait on the
+        # first one's lock and double the load. The refusal says to wait or stop it.
+        refuseConcurrentBuilds: ${guard.refuseConcurrentBuilds}
         # Credential locations, resolved against the worker's home directory.
         # The sandbox denies writes outside the workspace but permits reads, so
         # without these a worker could read a private key and report it back.

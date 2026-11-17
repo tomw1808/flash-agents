@@ -88,6 +88,9 @@ export const DEFAULT_CONFIG = deepFreeze({
     protectEnvFiles: true,
     blockDestructiveGit: true,
     fenceMutations: true,
+    // Refuse a build while the same worker's own build of the same tool still runs (cargo, go,
+    // gradle, swift): a warning alone did not stop two whole-suite runs side by side.
+    refuseConcurrentBuilds: true,
     homeProtectedPaths: [
       '.ssh',
       '.aws',

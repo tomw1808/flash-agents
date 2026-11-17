@@ -19,6 +19,7 @@ import {
   FLASH_GUARD_DENIED,
   REASON,
   apply,
+  buildToolOf,
   classifyPathAccess,
   classifyShell,
   decideToolCall,
@@ -1866,4 +1867,68 @@ test('a single-letter /x is a switch only for cmd\'s own deletion commands', () 
   assert.equal(ask('cmd /c del /f build\\out.txt'), undefined)
   // PowerShell's Remove-Item has no `/f` switch: `/f` names `C:\f`, outside the workspace.
   assert.notEqual(ask('Remove-Item /f'), undefined)
+})
+
+test('a second build of the same tool is refused while the worker’s own first one runs', async () => {
+  // 0.1.13 only warned, and a worker still ran two whole-suite `cargo test` runs three minutes
+  // apart with single tests beside them; the machine's load reached 49.8 on 24 threads.
+  const handlers = new Map()
+  const jobs = [
+    { id: 'bash-3', kind: 'bash', owner: 'worker-a', status: 'running', label: 'cargo test --workspace 2>&1 | tail -40' },
+    { id: 'bash-1', kind: 'bash', owner: 'worker-a', status: 'completed', label: 'go test ./...' },
+    { id: 'bash-9', kind: 'bash', owner: 'worker-b', status: 'running', label: './gradlew build' },
+  ]
+  const ctx = {
+    logger: { info: () => {} },
+    get: (service) => (service === 'jobs' ? { list: (owner) => jobs.filter((job) => job.owner === owner || job.owner === undefined) } : undefined),
+    on: (eventName, handler) => handlers.set(eventName, handler),
+  }
+  apply(ctx, {})
+  const handler = handlers.get('tools/execute')
+  let bodyRan = 0
+  const next = async () => {
+    bodyRan += 1
+    return { content: [{ type: 'text', text: 'ran' }] }
+  }
+  const worker = (id) => ({ id, meta: { cwd: ROOT } })
+
+  const refused = await handler({ name: 'bash', arguments: { command: 'cd crates/core && nice -n 19 cargo t -p core parse' }, agent: worker('worker-a') }, next)
+  assert.equal(bodyRan, 0)
+  assert.equal(refused.error.info.reason, REASON.CONCURRENT_BUILD)
+  assert.match(
+    refused.content[0].text,
+    /^Error: flash-guard refused bash \(CONCURRENT_BUILD\): job bash-3 \("cargo test --workspace 2>&1 \| tail -40"\) is still running cargo in this copy, .*Wait for it with job_output \(job_id "bash-3", wait: true\), or stop it with job_kill/,
+  )
+  assert.doesNotMatch(refused.error.message, /do not retry it/, 'a queue, not a wall: the build may run once the first ends')
+
+  // Another tool, a non-building cargo subcommand, a finished job, another worker's job.
+  for (const [command, agent] of [
+    ['cargo fmt --all', 'worker-a'],
+    ['go test ./...', 'worker-a'],
+    ['git status', 'worker-a'],
+    ['cargo test', 'worker-b'],
+    ['./gradlew test', 'worker-a'],
+  ]) {
+    const before = bodyRan
+    await handler({ name: 'bash', arguments: { command }, agent: worker(agent) }, next)
+    assert.equal(bodyRan, before + 1, `${command} by ${agent} runs`)
+  }
+
+  // Turned off, the same build runs.
+  const off = new Map()
+  apply({ ...ctx, on: (eventName, h) => off.set(eventName, h) }, { refuseConcurrentBuilds: false })
+  const before = bodyRan
+  await off.get('tools/execute')({ name: 'bash', arguments: { command: 'cargo test -p core' }, agent: worker('worker-a') }, next)
+  assert.equal(bodyRan, before + 1)
+})
+
+test('a build tool is found behind setup, wrappers and toolchains, and only for its building subcommands', () => {
+  assert.equal(buildToolOf('cd app && CARGO_TARGET_DIR=x nice -n 19 cargo test --workspace 2>&1 | tail -5'), 'cargo')
+  assert.equal(buildToolOf('cargo +nightly -q clippy'), 'cargo')
+  assert.equal(buildToolOf('timeout 600 go test ./...'), 'go')
+  assert.equal(buildToolOf('./gradlew build'), 'gradle')
+  assert.equal(buildToolOf('swift build -c release'), 'swift')
+  assert.equal(buildToolOf('cargo fmt'), undefined)
+  assert.equal(buildToolOf('echo cargo test'), undefined)
+  assert.equal(buildToolOf('go version'), undefined)
 })

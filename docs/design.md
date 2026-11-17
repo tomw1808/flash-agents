@@ -422,6 +422,14 @@ applies it later. See [Isolation](#isolation-the-worker-gets-a-tree-it-may-wreck
   was later edited or written, the warning says so (`…; a later run succeeded 2m0s ago`) instead of
   suggesting a cancel. A command piped into `tee` reports `tee`'s exit code, so a failure on the left
   of a pipe cannot be seen there.
+- `change.tests` (`{ removed, added, byFile: [{ file, removed, added }] }`) counts the test
+  definitions the whole patch removes and adds — a Rust `#[test]`, a Python `def test_…`, a Go
+  `func Test…`, a JUnit or Swift `@Test`, an XCTest `func test…`, an xUnit attribute, a JavaScript
+  `it('…'` or `test('…'` — and appears when either count is above zero. A patch that removes more
+  than it adds gets a warning naming the files; one whose existing files grew by 1,000 lines or more
+  each gets a warning naming them too (a reformat or a generated block looks like this). One job
+  deleted 476 tests, 91 of them unrelated, and another reformatted twelve documents (+35,000
+  lines); both said so in their reports, but a diffstat of 156 files did not.
 - `warnings` also carries, per call: a base patch skipped because the tree already held it; a
   nested repository whose changes could not be read into the patch; a settings file that cannot be
   used; and a changed `slotEnv` whose runtime was still in use (see
@@ -556,7 +564,14 @@ both ways: `cd .. && echo x > slot-2/x` was read as an ordinary write inside the
 
 A denied call never runs: the wrapper returns an `isError` result instead of calling `next()`, and
 carries `error.info.code = "FLASH_GUARD_DENIED"` with a reason (`PROTECTED_SECRET`,
-`PROTECTED_STATE`, `CRITICAL_PATH`, `OUTSIDE_WORKSPACE`, `DESTRUCTIVE_GIT`). Those refusals are
+`PROTECTED_STATE`, `CRITICAL_PATH`, `OUTSIDE_WORKSPACE`, `DESTRUCTIVE_GIT`, `CONCURRENT_BUILD`).
+`CONCURRENT_BUILD` is a queue, not a wall: since 0.1.14 a `cargo`, `go`, `gradle` or `swift` build is
+refused while the same worker's own build of that tool still runs (the row reads the worker's jobs
+from the Harness's job registry; every shell command is a job while it runs), and the message says
+to wait for the first with `job_output` or stop it with `job_kill`, not that the denial is final.
+`cargo fmt` or `go version` beside a running build stays allowed, and another worker's jobs never
+count. A warning alone did not stop a worker from starting two whole-suite runs side by side.
+`guard.refuseConcurrentBuilds: false` turns the rule off. Those refusals are
 attributed back to the task that caused them in `results[i].denials`:
 
 ```json

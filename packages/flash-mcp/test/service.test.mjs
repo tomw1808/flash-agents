@@ -1744,7 +1744,7 @@ test('every child prompt carries the standing worker instructions, in order', ()
   // (never the transcript) learns about a deviation, a wrong contract, or an unfinished task.
   // "Rules crossed" stays last and is pinned in service-0110.test.mjs; the five rules it
   // groups are pinned in small-0111.test.mjs.
-  assert.equal(WORKER_INSTRUCTIONS.length, 21)
+  assert.equal(WORKER_INSTRUCTIONS.length, 22)
   assert.match(WORKER_INSTRUCTIONS[0], /^Do not commit unless the task explicitly asks/)
   assert.match(WORKER_INSTRUCTIONS[1], /^If the work reaches for an escape hatch/)
   assert.equal(

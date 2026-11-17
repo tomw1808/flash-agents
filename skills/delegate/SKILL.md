@@ -143,6 +143,13 @@ Rules that held up:
 - **Keep input files inside the repository.** A worker cannot read a file in your session's `/tmp`
   or elsewhere outside the root: write it into an ignored folder of the repository and name that
   path. `flash_task` warns when a brief names an existing file outside the root.
+- **Ask for every red test, not only its own.** Ask the worker to list every test that fails
+  compared with the base, by file, whichever check it ran. Three workers ran at once on separate
+  files; one changed a rule 18 tests in another file relied on, saw them fail in its
+  whole-workspace run, and reported them as "legacy" instead of as its own effect.
+- **Say how often to run the whole suite.** A worker told to run the whole suite once, at the
+  end, still started four whole-suite runs; the guard now refuses a second build beside a running
+  one, but name the test programs to run, and when, in the brief.
 - **Give the verification recipe, not just "run the tests".** Compiled projects: cloned build
   state carries absolute paths and is unusable in a copy. For SwiftPM, point a `cache:` folder at
   the scratch path in the repository's `.flash-agents.json` — `"slotEnv": { "SWIFT_SCRATCH":

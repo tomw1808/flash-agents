@@ -80,6 +80,9 @@ const REASON = Object.freeze({
   // transport error; it is caught and denied instead, because a wall that cannot
   // classify a call must not let it run.
   GUARD_ERROR: 'GUARD_ERROR',
+  // Not a wall but a queue: a second build of the same tool while the worker's own first one
+  // still runs. The message says to wait for or stop the first, not that the denial is final.
+  CONCURRENT_BUILD: 'CONCURRENT_BUILD',
 })
 
 /** Tools whose command string carries a shell program. */
@@ -157,6 +160,13 @@ const DEFAULT_SETTINGS = Object.freeze({
   // sandbox's writable set is wider than the root, so a worker could delete a file in
   // the caller's tree by naming its absolute path.
   fenceMutations: true,
+  /**
+   * Whether a build is refused while the same worker's own build of the same tool still runs
+   * (see `BUILD_COMMANDS`). Warned about in 0.1.13, a worker still ran two whole-suite `cargo
+   * test` runs in the background three minutes apart with single tests beside them, and the
+   * machine's load reached 49.8 on 24 threads.
+   */
+  refuseConcurrentBuilds: true,
 })
 
 /**
@@ -199,6 +209,102 @@ function resolveSettings(config = {}) {
     homeProtectedPaths: stringArrayOr(source.homeProtectedPaths, DEFAULT_SETTINGS.homeProtectedPaths),
     blockDestructiveGit: booleanOr(source.blockDestructiveGit, DEFAULT_SETTINGS.blockDestructiveGit),
     fenceMutations: booleanOr(source.fenceMutations, DEFAULT_SETTINGS.fenceMutations),
+    refuseConcurrentBuilds: booleanOr(source.refuseConcurrentBuilds, DEFAULT_SETTINGS.refuseConcurrentBuilds),
+  }
+}
+
+/**
+ * The build tools whose second run in one tree waits on the first's lock or doubles the load,
+ * each with the subcommands that build (`null`: every task builds). `cargo fmt` or `go version`
+ * beside a running test suite stays allowed.
+ */
+const BUILD_COMMANDS = new Map([
+  ['cargo', new Set(['build', 'b', 'test', 't', 'check', 'c', 'clippy', 'run', 'r', 'bench', 'nextest', 'doc', 'mutants', 'llvm-cov', 'tarpaulin'])],
+  ['go', new Set(['build', 'test', 'run', 'vet', 'install'])],
+  ['gradle', null],
+  ['gradlew', null],
+  ['swift', new Set(['build', 'test', 'run'])],
+])
+
+/** Programs that run the command after them: `nice -n 19 cargo test` is a cargo build. */
+const COMMAND_WRAPPERS = new Set(['env', 'nice', 'timeout', 'time', 'nohup', 'command', 'stdbuf', 'ionice', 'taskset'])
+
+/**
+ * The build tool a shell command runs, when one of its simple commands is a build (see
+ * `BUILD_COMMANDS`): setup before it (`cd app &&`, `X=1`, `nice -n 19`) is skipped.
+ *
+ * @param {string} command - the shell command.
+ * @returns {string | undefined} the tool (`gradlew` reads as `gradle`), or undefined.
+ */
+function buildToolOf(command) {
+  let simples
+  try {
+    simples = splitSimpleCommands(String(command ?? ''))
+  } catch {
+    return undefined
+  }
+  for (const tokens of simples) {
+    let at = 0
+    while (at < tokens.length) {
+      const token = tokens[at]
+      const word = basenameOf(token)
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token) || token.startsWith('-') || /^\d+(?:\.\d+)?[smhd]?$/.test(token)) at += 1
+      else if (COMMAND_WRAPPERS.has(word)) at += 1
+      else break
+    }
+    const program = basenameOf(tokens[at] ?? '').replace(/\.(?:bat|cmd|exe)$/i, '')
+    if (!BUILD_COMMANDS.has(program)) continue
+    const subcommands = BUILD_COMMANDS.get(program)
+    const tool = program === 'gradlew' ? 'gradle' : program
+    if (subcommands === null) return tool
+    const sub = tokens.slice(at + 1).find((token) => !token.startsWith('-') && !token.startsWith('+'))
+    if (sub !== undefined && subcommands.has(sub)) return tool
+  }
+  return undefined
+}
+
+/**
+ * The refusal for a build started while the same worker's own build of the same tool runs.
+ *
+ * The bash tool registers every command as a job when it starts, so the worker's running jobs
+ * are exactly its commands still in flight, background or not; this call is not among them
+ * yet. Jobs come from the Harness's registry (`ctx.jobs`), filtered to the caller's own: two
+ * workers in two copies never share a lock.
+ *
+ * @param {{list: (owner: string) => object[]} | undefined} jobs - the job registry.
+ * @param {object} exec - the tool dispatch: `name`, `arguments`, `agent`.
+ * @param {object} settings - resolved settings.
+ * @returns {{reason: string, detail: string, message: string} | undefined} the refusal, or undefined.
+ */
+function concurrentBuildVerdict(jobs, exec, settings) {
+  if (settings.refuseConcurrentBuilds !== true || !SHELL_TOOL.test(String(exec?.name ?? ''))) return undefined
+  const owner = exec?.agent?.id
+  if (owner === undefined || typeof jobs?.list !== 'function') return undefined
+  const args = exec?.arguments
+  // Read the way `decideToolCall` reads a shell tool's program.
+  const command = args === null || typeof args !== 'object' ? undefined : (args.command ?? args.cmd ?? args.script)
+  const tool = typeof command === 'string' ? buildToolOf(command) : undefined
+  if (tool === undefined) return undefined
+  const running = jobs
+    .list(owner)
+    .find(
+      (job) =>
+        job?.owner === owner &&
+        (job.status === 'running' || job.status === 'pending') &&
+        typeof job.label === 'string' &&
+        buildToolOf(job.label) === tool,
+    )
+  if (running === undefined) return undefined
+  const detail =
+    `job ${String(running.id)} ("${running.label.slice(0, 160)}") is still running ${tool} in this copy, and a second ${tool} ` +
+    "command waits on its lock or breaks its output, and doubles the machine's load"
+  return {
+    reason: REASON.CONCURRENT_BUILD,
+    detail,
+    message:
+      `flash-guard refused ${String(exec?.name)} (${REASON.CONCURRENT_BUILD}): ${detail}. ` +
+      `Wait for it with job_output (job_id "${String(running.id)}", wait: true), or stop it with job_kill if it no ` +
+      'longer matters, then run this command. Run the whole suite once, at the end, unless the task says otherwise.',
   }
 }
 
@@ -3061,6 +3167,20 @@ function homeDirectory(env = process.env) {
 }
 
 /**
+ * The Harness's job registry, when this context has one; the guard never requires it.
+ *
+ * @param {object} ctx - the Cordis context.
+ * @returns {object | undefined} the registry.
+ */
+function jobsOf(ctx) {
+  try {
+    return ctx.get?.('jobs') ?? ctx.jobs
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Register the guard. One `tools/execute` wrapper, so every tool call in this
  * process — orchestrator and worker alike — passes the same wall.
  * @param {object} ctx - the Cordis context.
@@ -3101,6 +3221,14 @@ function apply(ctx, config = {}) {
         message: denialMessage(String(exec?.name), { reason: REASON.GUARD_ERROR, detail }),
       }
     }
+    if (verdict === undefined) {
+      try {
+        verdict = concurrentBuildVerdict(jobsOf(ctx), exec, settings)
+      } catch (error) {
+        // The queue rule is a convenience, not a wall: a registry it cannot read lets the call run.
+        logDenial(ctx, `could not read the job registry: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
     if (verdict === undefined) return next()
     logDenial(ctx, `${verdict.reason} on ${String(exec?.name)}`)
     return denialResult(verdict)
@@ -3114,7 +3242,9 @@ export {
   DEFAULT_SETTINGS,
   FLASH_GUARD_DENIED,
   REASON,
+  buildToolOf,
   classifyPathAccess,
+  concurrentBuildVerdict,
   classifyShell,
   decideToolCall,
   expandHome,

@@ -673,12 +673,16 @@ export function lastTreeActivity(proc, isWatched = () => true) {
  * @param {number} sample.at - when the table was read.
  * @param {{key: string, tool: string, command: string, since: number, jobId?: string, background?: boolean}[]} sample.calls
  *   the open shell calls and running background jobs, longest-running first.
- * @returns {{sampledAt: number, tree: object[], calls: Map<string, object>, quiets: object[]}} the state.
+ * A background job whose process an earlier sample found and this one does not is listed in
+ * `gone`: it has ended, whether or not its worker ever reads it. A background job whose process
+ * is not found gets no fallback `child`.
+ *
+ * @returns {{sampledAt: number, tree: object[], calls: Map<string, object>, quiets: object[], gone: string[]}} the state.
  */
 export function observeTree(previous, { pid, table, at, calls }) {
   const tree = descendants(table, pid)
   const previousCalls = previous?.calls instanceof Map ? previous.calls : new Map()
-  const state = { sampledAt: at, tree, calls: new Map(), quiets: [...(previous?.quiets ?? [])] }
+  const state = { sampledAt: at, tree, calls: new Map(), quiets: [...(previous?.quiets ?? [])], gone: [] }
   const claimed = new Set()
   // Newest call first: when two calls ran the same command, the one that started last owns the
   // younger process, and the older call then takes what is left rather than nothing.
@@ -687,6 +691,16 @@ export function observeTree(previous, { pid, table, at, calls }) {
     if (typeof call.command !== 'string' || call.command.length === 0) continue
     const root = findCommandRoot(tree, call.command, { since: call.since, claimed })
     if (root === undefined) {
+      // A background job whose own process an earlier sample found, and this one does not, has
+      // ended: nothing else removes a job its worker never reads to the end, and a 1-second
+      // edit script stayed listed as running for 20 minutes with a "may be stuck" warning.
+      if (call.jobId !== undefined && typeof previousCalls.get(call.key)?.rootPid === 'number') {
+        state.gone.push(call.key)
+        continue
+      }
+      // A background job is never given the fallback: the oldest fresh process of the tree is
+      // some other command's, and 19 ended jobs all showed the same `sleep 55` as their child.
+      if (call.jobId !== undefined) continue
       const fallback = fallbackChild(tree, call.since)
       if (fallback !== undefined) {
         state.calls.set(call.key, {
@@ -858,6 +872,9 @@ export class ProcessWatch {
     if (activity.proc !== undefined && activity.proc.sampledAt >= entry.read) return
     activity.proc = observeTree(activity.proc, { pid, table: entry.table, at: entry.read, calls })
     for (const quiet of activity.proc.quiets ?? []) rememberActivityQuiet(activity, quiet)
+    // A job whose process is gone has ended; its worker may read it later, but it is no longer
+    // running, and `current` must not keep it (see `observeTree`).
+    for (const key of activity.proc.gone ?? []) activity.backgroundJobs?.delete(key)
   }
 }
 

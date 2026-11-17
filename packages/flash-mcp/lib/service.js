@@ -17,7 +17,7 @@
 
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { availableParallelism, homedir, loadavg, tmpdir } from 'node:os'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 import {
@@ -1423,6 +1423,8 @@ export class FlashTaskService {
         }
       }
       const { promptCwd, runtimeCwd, extraEnv, slotPorts, slotValues } = this.#runLocation(slot, rootCwd, pool)
+      // The copy this call owns, so a command in a sibling copy can be named (see `noteForeignSlot`).
+      if (slot !== undefined) activity.slotDir = slot.dir
       if (slot !== undefined) await this.#restartForSlotEnv(slot, profileName, runtimeCwd, model, extraEnv)
       if (slot !== undefined) {
         const prepareStarted = performance.now()
@@ -1858,6 +1860,8 @@ export class FlashTaskService {
         }
       }
       const { promptCwd, runtimeCwd, extraEnv, slotPorts, slotValues } = this.#runLocation(slot, rootCwd, pool)
+      // The copy this call owns, so a command in a sibling copy can be named (see `noteForeignSlot`).
+      if (slot !== undefined) activity.slotDir = slot.dir
       if (slot !== undefined) await this.#restartForSlotEnv(slot, profileName, runtimeCwd, model, extraEnv)
       if (slot !== undefined) {
         const prepareStarted = performance.now()
@@ -2812,6 +2816,10 @@ export class FlashTaskService {
         // outside the patch, and invisible to the list comparison above.
         ...((change.ignoredChanged ?? []).length === 0 ? {} : { ignoredChanged: change.ignoredChanged }),
         diffstat: change.diffstat,
+        // Beside the diffstat, so a mass deletion of tests reads at a glance (see `patchShape`).
+        ...(change.shape === undefined || change.shape.tests.removed + change.shape.tests.added === 0
+          ? {}
+          : { tests: change.shape.tests }),
         diff: change.diff,
         // Truncation is measured by what the clipping left out, not by the returned text's
         // length: a diff that ends at a file boundary can be far shorter than the limit and
@@ -3032,6 +3040,7 @@ export class FlashTaskService {
     if ((change?.ignoredChanged ?? []).length > 0) {
       warnings.push(ignoredChangedWarning(change))
     }
+    warnings.push(...changeShapeWarnings(change))
     // The call's own settings: a reload by a later call must not add or drop this line.
     const setupWarning = slot === undefined ? undefined : (slot.settings ?? this.isolation)?.slotSetupWarning
     if (setupWarning !== undefined) warnings.push(setupWarning)
@@ -3207,6 +3216,7 @@ export class FlashTaskService {
     if ((change?.ignoredChanged ?? []).length > 0) {
       warnings.push(ignoredChangedWarning(change))
     }
+    warnings.push(...changeShapeWarnings(change))
     // Over budget, the harness keeps the most specific files and drops the broader
     // ones, so the worker's prompt is quietly missing project-wide rules. Say so.
     if (instructions.overBudget) warnings.push(overBudgetWarning(instructions))
@@ -3586,7 +3596,39 @@ function touchActivity(activity, event, workerSession, log = () => {}) {
   } else if (type === 'tool/result') {
     activity.what = 'reading a tool result'
     noteToolResult(activity, workerSession, event, log)
+  } else if (type === 'user/message' || type === 'agent/inbox/spliced') {
+    noteJobNotices(activity, workerSession, event, log)
   } else if (type.startsWith('assistant/') || type.startsWith('llm/')) activity.what = 'model responding'
+}
+
+/**
+ * Read the Harness's completion notices out of a worker's own inbox: a background job the
+ * worker never reads with `job_output` ends without a terminal read, and stayed in `current`
+ * for the rest of the call — 19 ended `python3 - <<EOF` edit scripts each "running 20m0s", with
+ * a "may be stuck" warning each, hid the one real warning beside them.
+ *
+ * The notice is a user message the Harness writes, `background job <id> (<kind>: <label>)
+ * finished [status: …]. Read its output with job_output.`; it arrives as a `user/message`, or
+ * inside the messages an `agent/inbox/spliced` inserted. Only a whole line of that shape is
+ * read, and only a job this worker started is settled by it.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {string | undefined} session - the worker session the message belongs to.
+ * @param {object} event - the `user/message` or `agent/inbox/spliced` event.
+ * @param {(message: string) => void} log - diagnostic sink.
+ * @returns {void}
+ */
+function noteJobNotices(activity, session, event, log) {
+  if (typeof session !== 'string' || activity?.backgroundJobs === undefined) return
+  const data = event?.data ?? {}
+  const messages = Array.isArray(data.inserted) ? data.inserted : [data.message ?? data]
+  for (const message of messages) {
+    for (const line of toolResultText(message).split(/\r?\n/)) {
+      const notice = /^background job (\S+) \(.*\) finished (\[status:[^\]]*\])/.exec(line.trim())
+      if (notice === null) continue
+      settleBackgroundJob(activity, backgroundJobKey(session, notice[1]), lastStatusOf(notice[2]) ?? '', log)
+    }
+  }
 }
 
 /**
@@ -3740,6 +3782,7 @@ function noteToolCall(activity, session, tool, args, id) {
     activity.shellCounts.set(session, (activity.shellCounts.get(session) ?? 0) + 1)
   }
   if (tool === 'bash' || tool === 'pwsh') noteConcurrentBuild(activity, session, describeToolCall(tool, args))
+  noteForeignSlot(activity, tool, args)
   activity.openCalls.set(openCallKey(session, callId), {
     session,
     ...(id === undefined ? {} : { id }),
@@ -3787,6 +3830,154 @@ function noteConcurrentBuild(activity, session, command) {
     if (activity.concurrentBuilds.some((entry) => entry.jobId === job.jobId && entry.tool === tool)) continue
     activity.concurrentBuilds.push({ tool, command, jobId: job.jobId, jobCommand: job.command })
   }
+}
+
+/**
+ * The ways a command can spell the directory that holds this call's copy and its siblings: as
+ * it is, without macOS's `/private` in front, and with the home directory written `~`.
+ *
+ * @param {string} slotsDir - the directory that holds the slots.
+ * @param {string} home - the home directory.
+ * @returns {string[]} the spellings, longest first.
+ */
+function slotsDirSpellings(slotsDir, home) {
+  const spellings = new Set([slotsDir])
+  if (slotsDir.startsWith('/private/')) spellings.add(slotsDir.slice('/private'.length))
+  for (const spelled of [...spellings]) {
+    if (home.length > 1 && spelled.startsWith(home + sep)) spellings.add(`~${spelled.slice(home.length)}`)
+  }
+  return [...spellings].sort((a, b) => b.length - a.length)
+}
+
+/**
+ * Every string an argument object holds, however deep: a `read` names its path in one field, a
+ * shell call its command in another.
+ *
+ * @param {unknown} args - the tool call's arguments, a JSON string in practice.
+ * @returns {string[]} the strings.
+ */
+function argumentStrings(args) {
+  let value = args
+  if (typeof args === 'string') {
+    try {
+      value = JSON.parse(args)
+    } catch {
+      return [args]
+    }
+  }
+  const strings = []
+  const walk = (node) => {
+    if (typeof node === 'string') strings.push(node)
+    else if (Array.isArray(node)) node.forEach(walk)
+    else if (node !== null && typeof node === 'object') Object.values(node).forEach(walk)
+  }
+  walk(value)
+  return strings
+}
+
+/**
+ * Note a tool call that reaches into another slot's copy. A worker in slot 13 ran
+ * `cd …/slots/12 && CARGO_TARGET_DIR=…/slots/13/.flash-cache/… cargo test`, while slot 12 held
+ * another job's half-done tree: its writes went to its own slot, so the sandbox let it through,
+ * and it built and tested the other worker's code. The sandbox cannot refuse a read there, so
+ * the call says so instead, once per sibling copy. Kept on the activity, so the result still
+ * says it after the command ended.
+ *
+ * @param {object} activity - the call's activity record (`slotDir` is set for an isolated call).
+ * @param {string} tool - the tool called.
+ * @param {unknown} args - its arguments.
+ * @returns {void}
+ */
+function noteForeignSlot(activity, tool, args) {
+  const slotDir = activity?.slotDir
+  if (typeof slotDir !== 'string' || slotDir.length === 0) return
+  const own = basename(slotDir)
+  const spellings = slotsDirSpellings(dirname(slotDir), activity.home ?? homedir())
+  for (const text of argumentStrings(args)) {
+    for (const spelled of spellings) {
+      let at = text.indexOf(spelled)
+      while (at !== -1) {
+        const rest = text.slice(at + spelled.length)
+        const name = /^[\\/]([^\\/\s'"`;&|()<>]+)/.exec(rest)?.[1]
+        if (name !== undefined && name !== own) {
+          activity.foreignSlots = activity.foreignSlots ?? []
+          if (!activity.foreignSlots.some((entry) => entry.slot === name)) {
+            activity.foreignSlots.push({ slot: name, path: `${spelled}${rest[0]}${name}`, command: describeToolCall(tool, args) })
+          }
+        }
+        at = text.indexOf(spelled, at + spelled.length)
+      }
+    }
+  }
+}
+
+/**
+ * How many lines an existing file must grow by before the result names it. Twelve documents a
+ * worker reformatted against its brief grew by about 3,000 lines each; a feature's own source
+ * file seldom grows by a thousand in one call, and a new file is never counted.
+ */
+const GROWN_FILE_LINES = 1000
+
+/** How many files a shape warning names before it counts the rest; the result's field has all. */
+const SHAPE_FILES_SHOWN = 10
+
+/**
+ * Name up to `SHAPE_FILES_SHOWN` entries and count the rest.
+ *
+ * @param {string[]} names - the rendered entries.
+ * @returns {string} the list.
+ */
+function shownFiles(names) {
+  const shown = names.slice(0, SHAPE_FILES_SHOWN).join(', ')
+  return names.length <= SHAPE_FILES_SHOWN ? shown : `${shown} and ${String(names.length - SHAPE_FILES_SHOWN)} more`
+}
+
+/**
+ * The warnings a patch's shape earns (see `patchShape`): tests it removes on balance, and
+ * existing files it grows by `GROWN_FILE_LINES` or more. A worker's report named both of its
+ * 476 deleted tests and its 35,000-line reformat, but nothing else did.
+ *
+ * @param {{shape?: {tests: {removed: number, added: number, byFile: {file: string, removed: number, added: number}[]},
+ *   grown: {file: string, lines: number}[]}}} [change] - the call's change.
+ * @returns {string[]} the warnings.
+ */
+function changeShapeWarnings(change) {
+  const shape = change?.shape
+  if (shape === undefined) return []
+  const warnings = []
+  const net = shape.tests.removed - shape.tests.added
+  if (net > 0) {
+    const files = shape.tests.byFile
+      .filter((entry) => entry.removed > entry.added)
+      .map((entry) => `${entry.file} (-${String(entry.removed - entry.added)})`)
+    warnings.push(
+      `the patch removes ${String(shape.tests.removed)} test definition(s) and adds ${String(shape.tests.added)}, ` +
+        `${String(net)} fewer in all: ${shownFiles(files)}; check that each was meant to go`,
+    )
+  }
+  const grown = shape.grown.filter((entry) => entry.lines >= GROWN_FILE_LINES)
+  if (grown.length > 0) {
+    warnings.push(
+      `${String(grown.length)} existing file(s) grew by ${GROWN_FILE_LINES.toLocaleString('en-US')} lines or more: ` +
+        `${shownFiles(grown.map((entry) => `${entry.file} (+${entry.lines.toLocaleString('en-US')})`))}; ` +
+        'a reformat or a generated block looks like this',
+    )
+  }
+  return warnings
+}
+
+/**
+ * The warnings for tool calls that reached into another slot's copy.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @returns {string[]} the warnings, in the order they happened.
+ */
+function foreignSlotWarnings(activity) {
+  return (activity?.foreignSlots ?? []).map(
+    (entry) =>
+      `a worker used ${entry.path}, another call's copy ("${entry.command}"): that tree holds another job's work in ` +
+      'progress, so what it built or tested there says nothing about this change',
+  )
 }
 
 /**
@@ -3864,9 +4055,17 @@ function closeSessionCalls(activity, session) {
 function noteToolResult(activity, session, event, log) {
   if (typeof session !== 'string' || activity?.openCalls === undefined) return
   const call = closeOpenCall(activity, session, toolCallIdOf(event), event.data?.name ?? event.data?.tool)
+  const text = toolResultText(event.data?.message)
+  // The last result a worker was given, for an idle stop to name (see `idleLastResultNote`).
+  const name = call?.tool ?? event.data?.name ?? event.data?.tool
+  activity.lastResult = {
+    ...(typeof name === 'string' ? { tool: name } : {}),
+    ...(call?.command === undefined ? {} : { command: call.command }),
+    chars: text.length,
+    at: Date.now(),
+  }
   // A result nobody saw start says nothing about which command failed.
   if (call === undefined) return
-  const text = toolResultText(event.data?.message)
   // Only a shell result announces a background job; a job's own output could quote the
   // phrase back at us, and must not overwrite the entry it is being read through.
   if (call.tool === 'bash' || call.tool === 'pwsh') noteBackgroundStart(activity, call, text)
@@ -3991,6 +4190,22 @@ function noteJobOutputResult(activity, call, event, text, log) {
     return
   }
   if (status.trim() === 'running') return
+  settleBackgroundJob(activity, key, status, log)
+}
+
+/**
+ * Forget a background job that has ended, and count its run and a failed exit.
+ *
+ * Called by a terminal `job_output` read and by the Harness's completion notice, whichever
+ * comes first; the second finds no job and counts nothing again.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {string} key - the job's key (see `backgroundJobKey`).
+ * @param {string} status - the text inside its terminal `[status: …]`.
+ * @param {(message: string) => void} log - diagnostic sink.
+ * @returns {void}
+ */
+function settleBackgroundJob(activity, key, status, log) {
   const job = activity.backgroundJobs.get(key)
   activity.backgroundJobs.delete(key)
   if (job === undefined) return
@@ -4127,7 +4342,8 @@ function backgroundJobIdIn(text) {
  * Count one finished shell run toward the rerun warning (see `rerunWarnings`): runs of one
  * folded command with no file changed between them, how many different argument lists they
  * had, and the time they took. A file change starts the count again: a worker fixing code
- * between runs is the ordinary loop.
+ * between runs is the ordinary loop. A command carrying its own program (a heredoc,
+ * `python3 -c`) is not counted at all.
  *
  * @param {object} activity - the call's activity record.
  * @param {{tool: string, command: string, since: number, file?: string}} call - the run that ended.
@@ -4135,6 +4351,11 @@ function backgroundJobIdIn(text) {
  */
 function countRun(activity, call) {
   if (!SHELL_TOOLS.has(call.tool) || call.file !== undefined || typeof call.command !== 'string') return
+  // A command that carries its own program is a new program each time, not one command rerun
+  // with other arguments — and the files it writes are invisible here, since only `edit` and
+  // `write` count as a change. 82 `python3 - <<EOF` edit scripts, each rewriting a test file,
+  // were warned about as "ran 82 times … with no file changed between the runs".
+  if (carriesInlineProgram(call.command)) return
   const key = failureKey(call.command)
   if (key.length === 0) return
   activity.reruns = activity.reruns ?? new Map()
@@ -4823,6 +5044,7 @@ export function activityWarnings(activity, now = Date.now()) {
   warnings.push(...outlivedBackgroundWarnings(activity, now))
   warnings.push(...rerunWarnings(activity))
   warnings.push(...concurrentBuildWarnings(activity))
+  warnings.push(...foreignSlotWarnings(activity))
   warnings.push(...loadWarnings(activity, now))
   return warnings
 }
@@ -5016,7 +5238,9 @@ export function openCommands(activity, now = Date.now()) {
   for (const [key, job] of activity?.backgroundJobs?.entries() ?? []) {
     if (shown.has(key)) continue
     const child = childOf(activity, key, now)
-    const outlived = outlivedCommands(activity, job)
+    // A job the last process sample could not find running is not called stuck: the sample
+    // runs once a minute, and an edit script that ended in a second is never in one.
+    const outlived = jobSeenRunning(activity, key) ? outlivedCommands(activity, job) : 0
     current.push({
       tool: job.tool,
       command: job.command,
@@ -5033,6 +5257,19 @@ export function openCommands(activity, now = Date.now()) {
   // as its child. Within each group the longest-running comes first.
   const group = (entry) => (entry.background === undefined || entry.waited === true ? 0 : 1)
   return current.sort((a, b) => group(a) - group(b) || b.runningMs - a.runningMs)
+}
+
+/**
+ * Whether a background job may be running as far as the process sample can tell: no sample has
+ * been taken (the table could not be read, say), or the last one found the job's own process.
+ *
+ * @param {object} [activity] - the call's activity record.
+ * @param {string} key - the job's key.
+ * @returns {boolean} false only when a sample was taken and held no process of the job.
+ */
+function jobSeenRunning(activity, key) {
+  if (activity?.proc?.calls === undefined) return true
+  return typeof activity.proc.calls.get(key)?.rootPid === 'number'
 }
 
 /**
@@ -5743,6 +5980,23 @@ function idleCommandNote(activity, now) {
   )
 }
 
+/**
+ * What an idle stop adds when no command was open: the last tool result the worker was given,
+ * how long it was and how long ago it came. A stalled job stopped after 14 silent minutes
+ * "reading a tool result", and nothing said whether the model had stalled or the result was
+ * too large to read.
+ *
+ * @param {object} activity - the call's activity record.
+ * @param {number} now - the clock.
+ * @returns {string} `; the last tool result …`, or '' when a command was open or none came.
+ */
+function idleLastResultNote(activity, now) {
+  const last = activity?.lastResult
+  if (last === undefined || idleCommandNote(activity, now) !== '') return ''
+  const what = last.command === undefined ? (last.tool ?? 'a tool') : `"${last.command}"`
+  return `; the last tool result was ${what}, ${last.chars.toLocaleString('en-US')} characters, given to the model ${formatElapsed(now - last.at)} ago`
+}
+
 /** Wait for completion, bounded by the task budget and the client's signal. */
 export function raceWithBudget(promise, { timeoutMs, idleTimeoutMs, activity, label, signal, sessionId, diagnostics }) {
   return new Promise((resolve, reject) => {
@@ -5777,7 +6031,7 @@ export function raceWithBudget(promise, { timeoutMs, idleTimeoutMs, activity, la
           finish(
             reject,
             new FlashTaskError(
-              `${String(label)} stopped: no activity for ${formatElapsed(idleTimeoutMs)} on session ${sessionId} (${describeActivity(activity, now)})${idleCommandNote(activity, now)}; the session continues inside Harness but is no longer reported${stderrHint(diagnostics)}`,
+              `${String(label)} stopped: no activity for ${formatElapsed(idleTimeoutMs)} on session ${sessionId} (${describeActivity(activity, now)})${idleCommandNote(activity, now)}${idleLastResultNote(activity, now)}; the session continues inside Harness but is no longer reported${stderrHint(diagnostics)}`,
               'IDLE',
             ),
           )
@@ -6035,6 +6289,7 @@ export const WORKER_INSTRUCTIONS = [
   'When the brief needs a piece outside its scope that is missing, say that it belongs in another layer and stop that part, instead of building around it.',
   'Run one build or test at a time in this copy: a second `cargo`, `npm`, `go` or `gradle` command started while one still runs in the background waits on its lock or breaks its output. Wait for the background one (or stop it) first.',
   'Search with `git grep` or `rg`, which skip ignored folders such as `target/` and `node_modules/`; `grep -r … .` walks the build output too and can run for many minutes.',
+  'Work only in the directory you were given: never `cd` into, build or read a sibling copy beside it (another worker\'s tree, half done), and keep build output inside your own directory.',
   'If a change touches code beside a stated rule (an "only", a "never", a "one place", a design note the task quotes), list it in the report under its own heading "Rules crossed", with the reason.',
 ]
 
